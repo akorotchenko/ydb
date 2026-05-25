@@ -35,6 +35,10 @@ The on-disk format distinction is resolved at the single point where `TChild` is
 
 A `uint32 Version` field in `TBtreeIndexMeta` proto discriminates the two formats (absent/0 = v0, 1 = v1). `TMeta` on-disk binary layout is untouched. The reader checks `Version` and follows the appropriate child layout path. The writer emits whichever format the global switcher selects; both v0 and v1 writers are kept and tested.
 
+`TBtreeIndexMeta` is the b-tree analogue of `TMeta` — it is the authoritative descriptor for the entire b-tree index (root page reference, level count, row count, data size, format version). The `Version` field belongs here because `TBtreeIndexMeta` owns the b-tree's on-disk format description.
+
+`TBtreeIndexMeta::PageId` (root node reference) is kept as-is in both formats. The loader calls `TMeta::GetLocation(PageId)` once at part-open time to obtain the root's `TPageLocation`.
+
 ---
 
 ## Two page-collection interfaces
@@ -265,18 +269,48 @@ No `offsetToPageId` map anywhere. No `TPageId` at any subsystem boundary.
 6. Change `TPrivatePageCache`: replace `TPageId` in `TPage::Id`, `TPageCollection::PageMap`, `TPageCollection::StickyPages`, and all public methods with `TPageLocation` / `TPageOffset`; remove `GetPageType` / `GetPageSize` helpers that called into `IPageCollection::Page(pageId)` for data pages.
 7. Add `TEvDataRequest` / `TEvDataResult` carrying `TVector<TPageLocation>`.
 8. Change `TPage` in shared cache to store `TPageLocation` for all page types (key=`Offset`, size for accounting, crc32 for verification); re-key `TCollection::PageMap`, `PendingRequests`, and `DroppedPages` from `TPageId` to `TPageOffset`.
-9. Add `TryGetPage(part, TPageLocation, TGroupId)` to `IPages`; implement in `TEnv`, `TLoaderEnv`, test fakes.
-10. Migrate `TPartGroupBtreeIndexIter` reads to `TryGetPage(part, child.GetLocation(), groupId)`.
-11. Migrate `flat_fwd_cache` / `flat_fwd_warmed`: change `IPageLoadingQueue::AddToQueue` and `IPageLoadingLogic::Get` to take `TPageLocation`; re-key `NFwd::TPage`, `TLoadedPagesCircularBuffer`, and `TIndexPageLocator` from `TPageId` / `TPageOffset` to `TPageOffset`; wire b-tree leaf read-ahead to extract locations via `TChild::GetLocation()`.
-12. Update bio actor to use `IDataPageCollection::Bounds(location)`.
+9. Add `TryGetPage(part, TPageLocation, TGroupId)` to `IPages`; implement in `TEnv`, `TLoaderEnv` (re-key `SavedPages` / `NeedPages` from `TPageId` to `TPageOffset`), test fakes.
+10. Migrate `TPartGroupBtreeIndexIter` reads to `TryGetPage(part, child.GetLocation(), groupId)`; change `TNodeState::PageId` from `TPageId` to `TPageOffset`.
+11. Migrate `flat_fwd_cache` / `flat_fwd_warmed`: change `IPageLoadingQueue::AddToQueue` and `IPageLoadingLogic::Get` to take `TPageLocation`; re-key `NFwd::TPage`, `TLoadedPagesCircularBuffer`, and `TIndexPageLocator` from `TPageId` to `TPageOffset`; wire b-tree leaf read-ahead to extract locations via `TChild::GetLocation()`.
+12. Migrate `TEvFetch` in `flat_bio_events.h` from `TVector<TPageId>` to `TVector<TPageLocation>`; update bio actor to use `IDataPageCollection::Bounds(location)` for I/O dispatch.
 13. Update writer to emit v1 `TChild` when global switcher is on; keep v0 writer path fully functional when switcher is off.
 14. Add global write-time switcher (default: off, i.e. v0).
-15. Remove all flat index code: `TPartGroupFlatIndexIter`, `EPage::FlatIndex`, flat index writer, `TIndexPages::FlatGroups` / `FlatHistoric`, and all related call sites.
+15. Remove all flat index code: `TPartGroupFlatIndexIter`, `EPage::FlatIndex`, flat index writer, `TIndexPages::FlatGroups` / `FlatHistoric`, loader fields `FlatGroupIndexes` / `FlatHistoricIndexes`, and all related call sites.
 
 ---
 
-## Open questions
+## `TPageId` scope boundary
 
-- **`TBtreeIndexMeta::PageId`** (root node): kept as-is in both formats. The loader calls `TMeta::GetLocation(PageId)` to obtain the root's `TPageLocation` at load time, same as any other child node.
-- **Flat index removal**: all flat index code (`TPartGroupFlatIndexIter`, `EPage::FlatIndex`, flat index writer, `TIndexPages::FlatGroups` / `FlatHistoric`, etc.) is deleted as part of this branch — the deprecation period has ended.
-- **`TBtreeIndexMeta` as the b-tree's own meta descriptor**: `TBtreeIndexMeta` is the b-tree analogue of `TMeta` — it owns the structural description of the entire b-tree index (root page reference, level count, row count, data size). The `uint32 Version` field belongs here because `TBtreeIndexMeta` is the authoritative descriptor for the b-tree's on-disk format. Absent/0 = v0 child layout; 1 = v1 child layout. `TMeta` on-disk binary layout is untouched.
+The following uses of `TPageId` are **explicitly kept** — they address structural pages or are internal to `IPageCollection`:
+
+| Location | Field / usage | Reason kept |
+|---|---|---|
+| `flat_part_loader.h` | `SchemeId`, `GlobsId`, `LargeId`, `SmallId`, `ByKeyId`, `GarbageStatsId`, `TxIdStatsId` | Structural pages, loaded once, `TPageId` is correct here |
+| `flat_part_loader.h` | `TBtreeGroupIndexes`, `TBtreeHistoricIndexes` (root pageIds) | B-tree root, resolved to `TPageLocation` via `TMeta::GetLocation` at load time |
+| `TBtreeIndexMeta::PageId` | Root node reference | Kept as-is; loader calls `TMeta::GetLocation(PageId)` once |
+| `IPageCollection` internals | `Page(pageId)`, `Bounds(pageId)`, `Verify(pageId,...)` | Interface is for structural pages only; not called for data or b-tree node pages |
+| `TMeta::Steps` / `Extra` arrays | Indexed by `TPageId` | Internal to `TMeta`; accessed only via `GetLocation(pageId)` |
+
+The following uses of `TPageId` are **migrated to `TPageOffset` / `TPageLocation`**:
+
+| Location | Field / usage | Migration |
+|---|---|---|
+| `flat_bio_events.h::TEvFetch` | `TVector<TPageId> Pages` | → `TVector<TPageLocation>` |
+| `flat_part_index_iter_bree_index.h::TNodeState` | `TPageId PageId` | → `TPageOffset` (node identified by location in new API) |
+| `flat_part_loader.h::TLoaderEnv` | `SavedPages`, `NeedPages` keyed by `TPageId` | → keyed by `TPageOffset` |
+| `flat_sausagecache.h::TPage` | `const TPageId Id` | → `TPageLocation` |
+| `flat_sausagecache.h::TPageCollection` | `PageMap`, `StickyPages` keyed by `TPageId` | → keyed by `TPageOffset` |
+| `shared_page.h::TPage` | `const TPageId PageId` | → `TPageLocation` |
+| `shared_sausagecache.cpp::TCollection` | `PageMap`, `PendingRequests`, `DroppedPages` | → keyed by `TPageOffset` |
+| `shared_cache_events.h::TEvRequest/TEvResult` | `TVector<TPageId>` | → `TVector<TPageLocation>` |
+| `flat_fwd_iface.h::IPageLoadingQueue` | `AddToQueue(TPageId, EPage)` | → `AddToQueue(TPageLocation, EPage)` |
+| `flat_fwd_iface.h::IPageLoadingLogic` | `Get(queue, TPageId, EPage, lower)` | → `Get(queue, TPageLocation, EPage, lower)` |
+| `flat_fwd_cache.h::NFwd::TPage` | `TPageId PageId` | → `TPageOffset` |
+| `flat_fwd_cache.h::TLoadedPagesCircularBuffer` | keyed by `TPageId` | → keyed by `TPageOffset` |
+| `flat_fwd_cache.h::TIndexPageLocator` | `TMap<TPageId, ...>` | → `TMap<TPageOffset, ...>` |
+| `flat_sausage_fetch.h::TLoadedPage` | `TPageId PageId` | → `TPageLocation` |
+
+### `TBlobs` outer/extern blob read-ahead (`flat_fwd_blobs.h`)
+
+`TBlobs` manages read-ahead for outer (small) and extern (large) blobs via `TFrames` frame entries. Its `Lower`, `Upper`, `Grow` fields and `FrameTo`, `Propagate`, `Rewind` methods use `TPageId` as a **frame reference number** — an index into `TFrames`, not a page collection page. This is a separate addressing space from page-collection `TPageId`s. These fields are **not migrated** in this branch; `TFrames` references remain `ui32`-typed frame indices.
+
