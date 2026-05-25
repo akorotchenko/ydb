@@ -79,20 +79,28 @@ Each b-tree internal node stores N keys and N+1 children.  A child entry today i
   TEvRequest { PageCollection, TVector<TPageId> }
        │
        ▼
-  shared_sausagecache
+  private_sausagecache  (per-tablet)
        │  TPage { TPageId, Size, … }
-       │  TCollection::PageMap  keyed by TPageId
+       │  TPageCollection::PageMap   keyed by TPageId
+       │  TPageCollection::StickyPages  keyed by TPageId
+       │  GetPageType/GetPageSize call IPageCollection::Page(pageId)
        │
        ├─ cache hit → TSharedData
        │
-       └─ cache miss → bio_actor
-              │  IPageCollection::Bounds(TPageId) → blob range
-              │
-              ▼
-         blobstorage
-              │
-              ▼
-         TLoadedPage { TPageId, TSharedData }
+       └─ shared_sausagecache  (process-wide)
+               │  TPage { TPageId, Size, … }
+               │  TCollection::PageMap  keyed by TPageId
+               │
+               ├─ cache hit → TSharedData
+               │
+               └─ cache miss → bio_actor
+                      │  IPageCollection::Bounds(TPageId) → blob range
+                      │
+                      ▼
+                 blobstorage
+                      │
+                      ▼
+                 TLoadedPage { TPageId, TSharedData }
 ```
 
 Every layer must carry `TPageId` and have access to `IPageCollection` to resolve sizes and blob positions.
@@ -149,20 +157,27 @@ TPageLocation { TPageOffset offset;  // ui64 — byte position in page collectio
   TEvRequest { IDataPageCollection, TVector<TPageLocation> }
        │
        ▼
-  shared_sausagecache
+  private_sausagecache  (per-tablet)
        │  TPage { TPageLocation, … }
-       │  TCollection::PageMap  keyed by TPageOffset
+       │  TPageCollection::PageMap   keyed by TPageOffset
+       │  TPageCollection::StickyPages  keyed by TPageOffset
        │
        ├─ cache hit → TSharedData
        │
-       └─ cache miss → bio_actor
-              │  IDataPageCollection::Bounds(TPageLocation) → blob range
-              │
-              ▼
-         blobstorage
-              │
-              ▼
-         TLoadedPage { TPageLocation, TSharedData }
+       └─ shared_sausagecache  (process-wide)
+               │  TPage { TPageLocation, … }
+               │  TCollection::PageMap  keyed by TPageOffset
+               │
+               ├─ cache hit → TSharedData
+               │
+               └─ cache miss → bio_actor
+                      │  IDataPageCollection::Bounds(TPageLocation) → blob range
+                      │
+                      ▼
+                 blobstorage
+                      │
+                      ▼
+                 TLoadedPage { TPageLocation, TSharedData }
 ```
 
 No layer below the b-tree iterator needs `IPageCollection` for data or b-tree pages.  `TPageId` does not appear at any interface boundary.
@@ -193,16 +208,18 @@ No layer below the b-tree iterator needs `IPageCollection` for data or b-tree pa
 
 4. **`TLoadedPage`** — replace `TPageId` with `TPageLocation`.
 
-5. **Shared cache** — replace `TPageId` in `TPage`, `TCollection::PageMap`, `PendingRequests`, `DroppedPages`, `TEvRequest`, `TEvResult` with `TPageLocation` / `TPageOffset`.
+5. **Private cache** — replace `TPageId` in `TPrivatePageCache::TPage`, `TPageCollection::PageMap`, `TPageCollection::StickyPages`, and all public methods with `TPageLocation` / `TPageOffset`; remove `GetPageType` / `GetPageSize` helpers that called back into `IPageCollection` for data pages.
 
-6. **`IPages`** — replace `TryGetPage(part, TPageId, TGroupId)` with `TryGetPage(part, TPageLocation, TGroupId)`; implement in `TEnv`, `TLoaderEnv`, test fakes.
+6. **Shared cache** — replace `TPageId` in `TPage`, `TCollection::PageMap`, `PendingRequests`, `DroppedPages`, `TEvRequest`, `TEvResult` with `TPageLocation` / `TPageOffset`.
 
-7. **B-tree iterator** — migrate `TPartGroupBtreeIndexIter` to call `TryGetPage(part, child.GetLocation(), groupId)`.
+7. **`IPages`** — replace `TryGetPage(part, TPageId, TGroupId)` with `TryGetPage(part, TPageLocation, TGroupId)`; implement in `TEnv`, `TLoaderEnv`, test fakes.
 
-8. **Forward cache** — change `IPageLoadingQueue::AddToQueue` and `IPageLoadingLogic::Get` to take `TPageLocation`; re-key `NFwd::TPage`, `TLoadedPagesCircularBuffer`, `TIndexPageLocator` to `TPageOffset`; wire scan read-ahead to extract locations from leaf nodes via `TChild::GetLocation()`.
+8. **B-tree iterator** — migrate `TPartGroupBtreeIndexIter` to call `TryGetPage(part, child.GetLocation(), groupId)`.
 
-9. **Bio actor** — switch to `IDataPageCollection::Bounds(location)` for I/O dispatch.
+9. **Forward cache** — change `IPageLoadingQueue::AddToQueue` and `IPageLoadingLogic::Get` to take `TPageLocation`; re-key `NFwd::TPage`, `TLoadedPagesCircularBuffer`, `TIndexPageLocator` to `TPageOffset`; wire scan read-ahead to extract locations from leaf nodes via `TChild::GetLocation()`.
 
-10. **Writer** — emit v1 `TChild` when switcher is on; keep v0 writer path fully functional when off.
+10. **Bio actor** — switch to `IDataPageCollection::Bounds(location)` for I/O dispatch.
 
-11. **Remove flat index** — delete `TPartGroupFlatIndexIter`, `EPage::FlatIndex`, flat index writer, `TIndexPages::FlatGroups / FlatHistoric`, and all related call sites.
+11. **Writer** — emit v1 `TChild` when switcher is on; keep v0 writer path fully functional when off.
+
+12. **Remove flat index** — delete `TPartGroupFlatIndexIter`, `EPage::FlatIndex`, flat index writer, `TIndexPages::FlatGroups / FlatHistoric`, and all related call sites.

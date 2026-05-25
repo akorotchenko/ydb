@@ -262,6 +262,7 @@ No `offsetToPageId` map anywhere. No `TPageId` at any subsystem boundary.
 3. Add `TMeta::GetLocation(TPageId) -> TPageLocation` method (reads directly from existing `Steps` and `Extra` arrays, no allocation).
 4. Add `uint32 Version` to `TBtreeIndexMeta` in `flat_table_part.proto`; define old (v0) and new (v1) `TChild` / `TShortChild` layouts in C++.
 5. Change `TLoadedPage` to carry `TPageLocation`.
+6. Change `TPrivatePageCache`: replace `TPageId` in `TPage::Id`, `TPageCollection::PageMap`, `TPageCollection::StickyPages`, and all public methods with `TPageLocation` / `TPageOffset`; remove `GetPageType` / `GetPageSize` helpers that called into `IPageCollection::Page(pageId)` for data pages.
 7. Add `TEvDataRequest` / `TEvDataResult` carrying `TVector<TPageLocation>`.
 8. Change `TPage` in shared cache to store `TPageLocation` for all page types (key=`Offset`, size for accounting, crc32 for verification); re-key `TCollection::PageMap`, `PendingRequests`, and `DroppedPages` from `TPageId` to `TPageOffset`.
 9. Add `TryGetPage(part, TPageLocation, TGroupId)` to `IPages`; implement in `TEnv`, `TLoaderEnv`, test fakes.
