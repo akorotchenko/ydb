@@ -206,18 +206,28 @@ No layer below the b-tree iterator needs `IPageCollection` for data or b-tree pa
 |---|---|
 | SSTs per tablet | 10 |
 | Tablet data size | 2 GiB |
-| SST size | ~200 MiB |
+| SST size | 2 GiB / 10 = **200 MiB** |
 | Tablets per node | 10,000 |
 | SSTs per node | 100,000 |
 | Data page target size | 7 KiB (`flat_page_conf.h`) |
-| B-tree node target size | 7 KiB, ~50 children/node |
-| Data pages per SST | ~200 MiB / 7 KiB ≈ **29,000** |
-| B-tree internal nodes per SST | ~600 (3-level tree: 1 root + ~12 L1 + ~580 L2) |
-| Total children per SST | ~29,600 (one leaf pointer per data page + internal) |
+| B-tree node target size | 7 KiB, ~64 children/node |
+| Data pages per SST | 200 MiB / 7 KiB ≈ **30,000** |
+| B-tree internal nodes per SST | ~47 (3-level tree: 1 root + 8 L1 + 38 L2) |
+| Total children per SST | ~30,050 |
+
+### On-disk: `TMeta` blob size (unchanged)
+
+Each page occupies 24 bytes in the `TMeta` blob (`TEntry` = 16 B + `TExtra` = 8 B):
+
+```
+TMeta blob per SST = 30,000 × 24 B ≈ 0.69 MiB
+```
+
+This on-disk layout is **unchanged** by this refactor — `TMeta` binary format is frozen.
 
 ### On-disk: `TChild` size change (v0 → v1)
 
-`TChild` in v1 adds `Offset_` (ui64, replaces ui32 `PageId_`) plus `Size_` (ui32) and `Crc32_` (ui32):
+`TChild` in v1 replaces `PageId_` (ui32, 4 B) with `Offset_` (ui64, 8 B) and adds `Size_` (ui32, 4 B) and `Crc32_` (ui32, 4 B):
 
 ```
 v0 TChild: 36 bytes
@@ -226,28 +236,33 @@ v1 TChild: 44 bytes  (+8 bytes per child)
 
 | Scope | v0 | v1 | Delta |
 |---|---|---|---|
-| Per SST | 29,600 × 36 B ≈ 1.02 MiB | 29,600 × 44 B ≈ 1.24 MiB | **+237 KiB** |
-| Per tablet (10 SSTs) | ~10.2 MiB | ~12.4 MiB | **+2.3 MiB** |
-| Per node (100,000 SSTs) | ~102 MiB | ~124 MiB | **+22 MiB** |
+| Per SST | 30,050 × 36 B ≈ 1.03 MiB | 30,050 × 44 B ≈ 1.26 MiB | **+240 KiB** |
+| Per tablet (10 SSTs) | ~10.3 MiB | ~12.6 MiB | **+2.4 MiB** |
+| Per node (100,000 SSTs) | ~103 MiB | ~126 MiB | **+24 MiB** |
 
-B-tree index pages are a small fraction of total SST size (~1.2 MiB index vs 200 MiB data per SST — **0.6%**), so the on-disk bloat is negligible relative to total data size.
+B-tree index pages are ~0.6% of total SST size, so the on-disk bloat is negligible relative to the 200 MiB SST body.
 
-### In-memory: `TMeta::Steps` vector
+### In-memory: `TMeta` resident memory
 
-`TMeta` holds a `TVector<ui64> Steps` — one `ui64` per page in the collection — as a resident in-memory array for offset lookups. This is currently the dominant in-memory cost of `TMeta` for large SSTs.
+`TMeta` holds `Raw` (a `TSharedData` blob) with `Index` and `Extra` as direct pointers into it:
+
+- `Index` (`TEntry[]`, 16 B/page) — page end-offsets, used for size and blob-range lookup
+- `Extra` (`TExtra[]`, 8 B/page) — page type and crc32
 
 ```
-Steps size per SST = (29,000 data pages + ~600 index pages) × 8 bytes
-                   ≈ 29,600 × 8 B ≈ 237 KiB per SST
+Index per SST = 30,000 × 16 B = 0.46 MiB
+Extra per SST = 30,000 ×  8 B = 0.23 MiB
+─────────────────────────────────────────
+TMeta resident per SST          = 0.69 MiB
 ```
 
-| Scope | Steps memory |
+| Scope | TMeta resident |
 |---|---|
-| Per SST | ~237 KiB |
-| Per tablet (10 SSTs) | ~2.3 MiB |
-| Per node (100,000 SSTs) | **~23 GiB** |
+| Per SST | ~0.69 MiB |
+| Per tablet (10 SSTs) | ~6.9 MiB |
+| Per node (100,000 SSTs) | **~69 GiB** |
 
-In v1 parts the `Steps` vector is still needed to serve v0-format lookups via `TMeta::GetLocation()` and for structural pages. However, once all SSTs on a node have been recompacted to v1 format the `Steps` vector becomes redundant for the hot read path — data and b-tree page locations are embedded in `TChild` nodes directly. At that point `Steps` can be made non-resident (memory-mapped or loaded on demand), potentially reclaiming the full **~23 GiB per node** as swappable rather than wired memory. This is a follow-on optimization enabled by this refactor but not implemented in this branch.
+In v1 parts, `Index` (offset, size) and `Extra` (crc32) information is embedded directly in `TChild` nodes, so `TMeta::Raw` is no longer needed on the hot read path for data and b-tree pages. Once all SSTs on a node are recompacted to v1, the `Raw` blob (**~69 GiB per node**) can be made non-resident (memory-mapped / loaded on demand), swappable rather than wired. This is a follow-on optimization enabled by this refactor but not implemented in this branch.
 
 ---
 
