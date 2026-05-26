@@ -149,7 +149,7 @@ TPageLocation { TPageOffset offset;  // ui64 — byte position in page collectio
                 ui32        crc32; } // page checksum
 ```
 
-Page identity is still scoped to a collection — full identity is the pair `(TLogoBlobID, TPageOffset)`, same shape as the previous `(TLogoBlobID, TPageId)`.  The cache continues to partition by `TLogoBlobID`, so `TPageOffset` only needs to be unique within that scope.  What changes is what subsystems need *from* the collection: previously `IPageCollection` was called per page read to translate `TPageId → (size, blob range, crc32)`; now the collection is consulted only once per I/O request, via `IDataPageCollection::Bounds(location) → blob range`.  Size and crc32 travel inside `TPageLocation`, so verification and accounting need no collection access at all.
+Page identity is still scoped to a collection — full identity is the pair `(TLogoBlobID, TPageOffset)`, same shape as the previous `(TLogoBlobID, TPageId)`.  The cache continues to partition by `TLogoBlobID`, so `TPageOffset` alone — just the `Offset` field — is the cache key within that scope.  `Size` and `Crc32` are *not* part of the key; they ride alongside it as fields of `TPageLocation`, the value passed into request APIs.  What changes is what subsystems need *from* the collection: previously `IPageCollection` was called per page read to translate `TPageId → (size, blob range, crc32)`; now the collection is consulted only once per I/O request, via `IDataPageCollection::Bounds(location) → blob range`.  Size and crc32 ride with the request, so verification and accounting need no collection access at all.
 
 ### In-memory: read path (target)
 
@@ -200,7 +200,7 @@ No layer below the b-tree iterator needs `IPageCollection` for data or b-tree pa
 | Concern | Before | After |
 |---|---|---|
 | Data-page identity at interfaces | `TPageId` (ui32, collection-relative, opaque) | `TPageLocation` (offset+size+crc32, collection-relative but carries size & crc32) |
-| Cache key | `TPageId` — opaque, requires `IPageCollection` per page read for size/blob range/crc32 | `TPageOffset` (within collection partitioned by `TLogoBlobID`) — collection consulted only for blob range via `IDataPageCollection::Bounds`; size and crc32 travel with the key in `TPageLocation` |
+| Cache key | `TPageId` — opaque, requires `IPageCollection` per page read for size/blob range/crc32 | `TPageOffset` alone (within collection partitioned by `TLogoBlobID`).  Size and crc32 are *not* part of the key — they travel alongside it inside `TPageLocation`, the value passed into request APIs.  Collection consulted only for blob range via `IDataPageCollection::Bounds(location)`. |
 | B-tree leaf read | Requires `IPageCollection` lookup for size/blob range | Location embedded in `TChild`; no lookup |
 | Scan read-ahead | Passes `TPageId` through all layers | Passes `TPageLocation` extracted directly from leaf nodes |
 | Verification | Requires `IPageCollection::Verify(pageId, body)` | `IDataPageCollection::Verify(location, body)` — static, no instance |
