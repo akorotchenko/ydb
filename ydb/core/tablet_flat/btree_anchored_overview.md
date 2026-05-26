@@ -149,7 +149,7 @@ TPageLocation { TPageOffset offset;  // ui64 — byte position in page collectio
                 ui32        crc32; } // page checksum
 ```
 
-`TPageOffset` alone is sufficient as a cache key (unique within a collection already partitioned by `TLogoBlobID`).
+Page identity is still scoped to a collection — full identity is the pair `(TLogoBlobID, TPageOffset)`, same shape as the previous `(TLogoBlobID, TPageId)`.  The cache continues to partition by `TLogoBlobID`, so `TPageOffset` only needs to be unique within that scope.  What changes is what subsystems need *from* the collection: previously `IPageCollection` was called per page read to translate `TPageId → (size, blob range, crc32)`; now the collection is consulted only once per I/O request, via `IDataPageCollection::Bounds(location) → blob range`.  Size and crc32 travel inside `TPageLocation`, so verification and accounting need no collection access at all.
 
 ### In-memory: read path (target)
 
@@ -191,7 +191,7 @@ TPageLocation { TPageOffset offset;  // ui64 — byte position in page collectio
                  TLoadedPage { TPageLocation, TSharedData }
 ```
 
-No layer below the b-tree iterator needs `IPageCollection` for data or b-tree pages.  `TPageId` does not appear at any interface boundary.
+No layer below the b-tree iterator needs `IPageCollection` for data or b-tree pages — only `IDataPageCollection`, and only at I/O dispatch.  `TPageId` does not appear at any interface boundary.
 
 ---
 
@@ -200,7 +200,7 @@ No layer below the b-tree iterator needs `IPageCollection` for data or b-tree pa
 | Concern | Before | After |
 |---|---|---|
 | Data-page identity at interfaces | `TPageId` (ui32, collection-relative) | `TPageLocation` (offset+size+crc32, self-contained) |
-| Cache key | `TPageId` — opaque without `IPageCollection` | `TPageOffset` — directly comparable, no collection needed |
+| Cache key | `TPageId` — opaque, requires `IPageCollection` per page read for size/blob range/crc32 | `TPageOffset` (within collection partitioned by `TLogoBlobID`) — collection consulted only for blob range via `IDataPageCollection::Bounds`; size and crc32 travel with the key in `TPageLocation` |
 | B-tree leaf read | Requires `IPageCollection` lookup for size/blob range | Location embedded in `TChild`; no lookup |
 | Scan read-ahead | Passes `TPageId` through all layers | Passes `TPageLocation` extracted directly from leaf nodes |
 | Verification | Requires `IPageCollection::Verify(pageId, body)` | `IDataPageCollection::Verify(location, body)` — static, no instance |
@@ -253,6 +253,16 @@ v1 TChild: 44 bytes  (+8 bytes per child)
 
 B-tree index pages are ~0.6% of total SST size, so the on-disk bloat is negligible relative to the 200 MiB SST body.
 
+The +8 B/child cost is more than offset by the fact that the corresponding 24 B/page in `TMeta` (`TEntry` 16 B + `TExtra` 8 B) becomes redundant for data and b-tree pages — the same information now lives in `TChild`.  In v1 the writer no longer assigns `TPageId`s to data and b-tree pages at all: only structural pages (scheme, bloom, …) get `TPageId`s, and they form their own small contiguous 0-based sequence indexing `TMeta`'s `TEntry` / `TExtra` arrays.  The on-disk `TMeta` binary *layout* is unchanged (no format version bump), but the *blob shrinks* because it indexes only the handful of structural pages.
+
+| Per SST | v0 | v1 |
+|---|---|---|
+| `TMeta` entries (data + b-tree + structural) | ~30,050 × 24 B ≈ 720 KiB | ~handful × 24 B (structural only) ≈ <1 KiB |
+| `TChild` (b-tree internal nodes) | 30,050 × 36 B ≈ 1.03 MiB | 30,050 × 44 B ≈ 1.26 MiB |
+| **Combined on-disk metadata** | **~1.75 MiB** | **~1.26 MiB** |
+
+Net on-disk savings: ~480 KiB/SST, or **~48 GiB per node** at 100,000 SSTs.
+
 ### In-memory: `TMeta` resident memory
 
 `TMeta` holds `Raw` (a `TSharedData` blob) with `Index` and `Extra` as direct pointers into it:
@@ -273,7 +283,7 @@ TMeta resident per SST          = 0.69 MiB
 | Per tablet (10 SSTs) | ~6.9 MiB |
 | Per node (100,000 SSTs) | **~69 GiB** |
 
-In v1 parts, `Index` (offset, size) and `Extra` (crc32) information is embedded directly in `TChild` nodes, so `TMeta::Raw` is no longer needed on the hot read path for data and b-tree pages. Once all SSTs on a node are recompacted to v1, the `Raw` blob (**~69 GiB per node**) can be made non-resident (memory-mapped / loaded on demand), swappable rather than wired. This is a follow-on optimization enabled by this refactor but not implemented in this branch.
+In v1 parts, `Index` (offset, size) and `Extra` (crc32) information is embedded directly in `TChild` nodes, and v1 writers omit the corresponding entries from `TMeta`.  `TMeta::Raw` for a v1 SST therefore holds only structural-page entries — a handful, not 30,000.  Once all SSTs on a node are recompacted to v1, the **~69 GiB per node** of resident `TMeta` shrinks to a negligible amount; no demand-loading / mmap mechanism is needed for `Raw` because there is nothing left to demand-load.
 
 ---
 

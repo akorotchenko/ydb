@@ -33,11 +33,42 @@ The on-disk format distinction is resolved at the single point where `TChild` is
 
 `TChild` embeds `TPageLocation` `(offset, size, crc32)` directly. `GetLocation()` returns it inline — no collection lookup.
 
-A `uint32 Version` field in `TBtreeIndexMeta` proto discriminates the two formats (absent/0 = v0, 1 = v1). `TMeta` on-disk binary layout is untouched. The reader checks `Version` and follows the appropriate child layout path. The writer emits whichever format the global switcher selects; both v0 and v1 writers are kept and tested.
+The format discriminator is `TLayout.BTreeIndexesFormatVersion` (already exists in the proto): absent/0 = v0, 1 = v1.  No new version field is needed.  `TMeta` on-disk binary layout is untouched.  The reader checks `BTreeIndexesFormatVersion` and follows the appropriate child layout path.  The writer emits whichever format the global switcher selects; both v0 and v1 writers are kept and tested.
 
-`TBtreeIndexMeta` is the b-tree analogue of `TMeta` — it is the authoritative descriptor for the entire b-tree index (root page reference, level count, row count, data size, format version). The `Version` field belongs here because `TBtreeIndexMeta` owns the b-tree's on-disk format description.
+`TBtreeIndexMeta` is the b-tree analogue of `TMeta` — it is the authoritative descriptor for the entire b-tree index (root page reference, level count, row count, data size).
 
-`TBtreeIndexMeta::PageId` (root node reference) is kept as-is in both formats. The loader calls `TMeta::GetLocation(PageId)` once at part-open time to obtain the root's `TPageLocation`.
+In v1, b-tree internal nodes and data pages are **not** assigned `TPageId`s.  They have no `TEntry` / `TExtra` entries in `TMeta`; they are addressable only by `TPageLocation`.  The `TMeta` array indexes only structural pages (scheme, bloom, …), which form their own small contiguous 0-based `TPageId` sub-sequence — option (b) of the page-id numbering choice.  This is what makes the on-disk `TMeta` shrink in v1 (see overview doc for sizing).
+
+Consequences for `TBtreeIndexMeta`:
+- In v0, `TBtreeIndexMeta.RootPageId` references the b-tree root by `TPageId`; the loader resolves it via `TMeta::GetLocation(RootPageId)` once at part-open time.
+- In v1, `TBtreeIndexMeta` instead carries the root's `TPageLocation` directly — proto adds `uint64 RootOffset`, `uint32 RootSize`, `uint32 RootCrc32`.  `RootPageId` is unused / unset when `BTreeIndexesFormatVersion == 1`.  This avoids a special-case `TPageId` for the root, which would otherwise be the lone b-tree exception to the "no `TPageId` for b-tree / data pages" rule.
+
+### Bootstrap chain: how `TPageLocation` addressing starts
+
+The part's metadata is reached via `TMeta` (the on-disk page-collection metablob), but the b-tree itself is reached via `TPageLocation`.  These two addressing schemes meet at exactly one point: the scheme page's **inplace data**.
+
+The sausage layer supports attaching a small `inplace` byte string to any page (`TWriter::AddInplace` → `TRecord::PushInplace` → `TMeta::GetPageInplaceData`).  The part writer uses this exactly once, at `flat_part_writer.h:621`:
+
+```cpp
+WriteInplace(Current.Scheme, MakeMetaBlob(last));
+```
+
+The inplace blob is the serialized `TRoot` proto — which contains `TLayout`, which contains `TBTreeIndexMeta` records.  So the read-time chain is:
+
+```
+TMeta entry for scheme page         ← TPageId-addressed (structural)
+    → scheme page body + inplace
+        → TRoot proto
+            → TLayout
+                → TBtreeIndexMeta { RootOffset, RootSize, RootCrc32 }   (v1)
+                    → b-tree root page                ← TPageLocation
+                        → b-tree internal TChild      ← TPageLocation
+                            → data page               ← TPageLocation
+```
+
+`TPageId`-addressing is confined to the top three lines (structural pages, indexed in `TMeta`).  From `TBtreeIndexMeta` downward, addressing is `TPageLocation` end-to-end.  No b-tree or data page is ever indexed by a `TPageId` in v1.
+
+This also constrains writer ordering: the scheme page is emitted *last*, after the b-tree is finalized, because `MakeMetaBlob` needs the root's offset/size/crc32 to populate `TBtreeIndexMeta`.  Current writer flow already does this (line 621 is at the end of part finalization), so no reordering is required.
 
 ---
 
@@ -264,7 +295,7 @@ No `offsetToPageId` map anywhere. No `TPageId` at any subsystem boundary.
 1. Add `TPageOffset`, `TPageLocation` to `flat_page_iface.h`.
 2. Add `IDataPageCollection`; implement in `TMeta` (shares blob array with `IPageCollection`).
 3. Add `TMeta::GetLocation(TPageId) -> TPageLocation` method (reads directly from existing `Steps` and `Extra` arrays, no allocation).
-4. Add `uint32 Version` to `TBtreeIndexMeta` in `flat_table_part.proto`; define old (v0) and new (v1) `TChild` / `TShortChild` layouts in C++.
+4. Add root-location fields (`uint64 RootOffset`, `uint32 RootSize`, `uint32 RootCrc32`) to `TBtreeIndexMeta` in `flat_table_part.proto`, used only when `TLayout.BTreeIndexesFormatVersion == 1` (field already exists); define old (v0) and new (v1) `TChild` / `TShortChild` layouts in C++.
 5. Change `TLoadedPage` to carry `TPageLocation`.
 6. Change `TPrivatePageCache`: replace `TPageId` in `TPage::Id`, `TPageCollection::PageMap`, `TPageCollection::StickyPages`, and all public methods with `TPageLocation` / `TPageOffset`; remove `GetPageType` / `GetPageSize` helpers that called into `IPageCollection::Page(pageId)` for data pages.
 7. Add `TEvDataRequest` / `TEvDataResult` carrying `TVector<TPageLocation>`.
@@ -274,7 +305,7 @@ No `offsetToPageId` map anywhere. No `TPageId` at any subsystem boundary.
 10a. Migrate `TChargeBTreeIndex`: change `TChildState::PageId` from `TPageId` to `TPageOffset`; migrate `TryGetDataPage` / `HasDataPage` to call `Env->TryGetPage(Part, TPageLocation, groupId)`.
 11. Migrate `flat_fwd_cache` / `flat_fwd_warmed`: change `IPageLoadingQueue::AddToQueue` and `IPageLoadingLogic::Get` to take `TPageLocation`; re-key `NFwd::TPage`, `TLoadedPagesCircularBuffer`, and `TIndexPageLocator` from `TPageId` to `TPageOffset`; wire b-tree leaf read-ahead to extract locations via `TChild::GetLocation()`.
 12. Migrate `TEvFetch` in `flat_bio_events.h` from `TVector<TPageId>` to `TVector<TPageLocation>`; update bio actor to use `IDataPageCollection::Bounds(location)` for I/O dispatch.
-13. Update writer to emit v1 `TChild` when global switcher is on; keep v0 writer path fully functional when switcher is off.
+13. Update writer to emit v1 `TChild` when global switcher is on; in v1, do not assign `TPageId`s to data and b-tree pages — only structural pages enter `TMeta`'s `TEntry`/`TExtra` arrays.  Emit root location into `TBtreeIndexMeta::RootOffset/Size/Crc32` instead of `PageId`.  Keep v0 writer path fully functional when switcher is off.
 14. Add global write-time switcher (default: off, i.e. v0).
 15. Remove all flat index code: `TPartGroupFlatIndexIter`, `EPage::FlatIndex`, flat index writer, `TIndexPages::FlatGroups` / `FlatHistoric`, loader fields `FlatGroupIndexes` / `FlatHistoricIndexes`, and all related call sites.
 
@@ -287,8 +318,8 @@ The following uses of `TPageId` are **explicitly kept** — they address structu
 | Location | Field / usage | Reason kept |
 |---|---|---|
 | `flat_part_loader.h` | `SchemeId`, `GlobsId`, `LargeId`, `SmallId`, `ByKeyId`, `GarbageStatsId`, `TxIdStatsId` | Structural pages, loaded once, `TPageId` is correct here |
-| `flat_part_loader.h` | `TBtreeGroupIndexes`, `TBtreeHistoricIndexes` (root pageIds) | B-tree root, resolved to `TPageLocation` via `TMeta::GetLocation` at load time |
-| `TBtreeIndexMeta::PageId` | Root node reference | Kept as-is; loader calls `TMeta::GetLocation(PageId)` once |
+| `flat_part_loader.h` | `TBtreeGroupIndexes`, `TBtreeHistoricIndexes` (root pageIds) | v0 only: b-tree root by `TPageId`, resolved via `TMeta::GetLocation` at load time. v1: root identified by `TPageLocation` carried in `TBtreeIndexMeta`. |
+| `TBtreeIndexMeta.RootPageId` | Root node reference | v0 only: loader calls `TMeta::GetLocation(RootPageId)` once. v1: unused; root location is in new `TBtreeIndexMeta` fields (`RootOffset` / `RootSize` / `RootCrc32`). |
 | `IPageCollection` internals | `Page(pageId)`, `Bounds(pageId)`, `Verify(pageId,...)` | Interface is for structural pages only; not called for data or b-tree node pages |
 | `TMeta::Steps` / `Extra` arrays | Indexed by `TPageId` | Internal to `TMeta`; accessed only via `GetLocation(pageId)` |
 
