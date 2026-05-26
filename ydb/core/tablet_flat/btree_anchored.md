@@ -271,6 +271,7 @@ No `offsetToPageId` map anywhere. No `TPageId` at any subsystem boundary.
 8. Change `TPage` in shared cache to store `TPageLocation` for all page types (key=`Offset`, size for accounting, crc32 for verification); re-key `TCollection::PageMap`, `PendingRequests`, and `DroppedPages` from `TPageId` to `TPageOffset`.
 9. Add `TryGetPage(part, TPageLocation, TGroupId)` to `IPages`; implement in `TEnv`, `TLoaderEnv` (re-key `SavedPages` / `NeedPages` from `TPageId` to `TPageOffset`), test fakes.
 10. Migrate `TPartGroupBtreeIndexIter` reads to `TryGetPage(part, child.GetLocation(), groupId)`; change `TNodeState::PageId` from `TPageId` to `TPageOffset`.
+10a. Migrate `TChargeBTreeIndex`: change `TChildState::PageId` from `TPageId` to `TPageOffset`; migrate `TryGetDataPage` / `HasDataPage` to call `Env->TryGetPage(Part, TPageLocation, groupId)`.
 11. Migrate `flat_fwd_cache` / `flat_fwd_warmed`: change `IPageLoadingQueue::AddToQueue` and `IPageLoadingLogic::Get` to take `TPageLocation`; re-key `NFwd::TPage`, `TLoadedPagesCircularBuffer`, and `TIndexPageLocator` from `TPageId` to `TPageOffset`; wire b-tree leaf read-ahead to extract locations via `TChild::GetLocation()`.
 12. Migrate `TEvFetch` in `flat_bio_events.h` from `TVector<TPageId>` to `TVector<TPageLocation>`; update bio actor to use `IDataPageCollection::Bounds(location)` for I/O dispatch.
 13. Update writer to emit v1 `TChild` when global switcher is on; keep v0 writer path fully functional when switcher is off.
@@ -303,6 +304,8 @@ The following uses of `TPageId` are **migrated to `TPageOffset` / `TPageLocation
 | `shared_page.h::TPage` | `const TPageId PageId` | → `TPageLocation` |
 | `shared_sausagecache.cpp::TCollection` | `PageMap`, `PendingRequests`, `DroppedPages` | → keyed by `TPageOffset` |
 | `shared_cache_events.h::TEvRequest/TEvResult` | `TVector<TPageId>` | → `TVector<TPageLocation>` |
+| `flat_part_charge_btree_index.h::TChildState` | `TPageId PageId` | → `TPageOffset` |
+| `flat_part_charge_btree_index.h::TChargeBTreeIndex` | `TryGetDataPage(TPageId, TGroupId)`, `HasDataPage(TPageId, TGroupId)` — call `Env->TryGetPage(Part, pageId, groupId)` | → `TryGetPage(Part, TPageLocation, groupId)` |
 | `flat_fwd_iface.h::IPageLoadingQueue` | `AddToQueue(TPageId, EPage)` | → `AddToQueue(TPageLocation, EPage)` |
 | `flat_fwd_iface.h::IPageLoadingLogic` | `Get(queue, TPageId, EPage, lower)` | → `Get(queue, TPageLocation, EPage, lower)` |
 | `flat_fwd_cache.h::NFwd::TPage` | `TPageId PageId` | → `TPageOffset` |
