@@ -6,7 +6,7 @@ Branch: `BTreeAncoredPageCollection`
 
 Split tablet_flat's page-collection addressing into two distinct id types:
 
-- `TPageId` (ui32) — confined to `IPageCollection` internals and the on-disk old-format `TChild` field. Never crosses an API boundary.
+- `TPageId` (ui32) — confined to `IPageCollection` internals, structural-page references in the part loader (scheme, bloom, …), and the on-disk old-format (v0) `TChild` field. Never crosses an API boundary for data or b-tree pages.
 - `TPageLocation { TPageOffset offset; ui32 size; ui32 crc32; }` — universal identity at **all internal API boundaries** for every page type, for both old-format and new-format parts.
 
 The on-disk format distinction is resolved at the single point where `TChild` is read. From that point on only `TPageLocation` / `TPageOffset` flows through every interface — IPages, shared cache, forward cache, bio — regardless of which on-disk format the part uses.
@@ -17,7 +17,7 @@ The on-disk format distinction is resolved at the single point where `TChild` is
 
 - Hot read path **O(1)**. No per-read scans or reverse maps.
 - `TPageLocation` / `TPageOffset` is the universal identity at all internal API boundaries for both old-format and new-format parts.
-- `TPageId` is confined to: `IPageCollection` implementation internals, `TMeta::GetLocation(pageId)` call sites, and the on-disk old-format `TChild` field. It never appears in IPages, shared cache, forward cache, or bio interfaces.
+- `TPageId` is confined to: `IPageCollection` implementation internals, `TMeta::GetLocation(pageId)` call sites, structural-page references in the part loader (scheme, bloom, …), and the on-disk v0 `TChild` field. It never appears in IPages, shared cache, forward cache, or bio interfaces.
 - No `offsetToPageId` map at any level.
 - **Both on-disk formats are fully supported for reading and writing indefinitely.** A global write-time switcher selects which format new compactions produce. Switching back to the old format must produce correct old-format output.
 
@@ -166,7 +166,7 @@ struct TChild {
 
 `TShortChild` follows the same versioned split.
 
-The node header already carries `IsShortChildFormat`; add a version bit to `TBtreeIndexMeta` (not per-node) to select old vs new child layout for the whole part.
+The node header already carries `IsShortChildFormat`; the existing `TLayout.BTreeIndexesFormatVersion` proto field (not per-node) selects old vs new child layout for the whole part — no new version field is added.
 
 ---
 
@@ -204,7 +204,7 @@ All callers — structural and data alike — pass `TPageLocation`. Callers that
 
 `TPage` stores `TPageLocation` for all pages — structural and data alike. `TPageId` is no longer stored in `TPage`. `TPageLocation` provides the cache key (`Offset`, unique within a collection since the cache is partitioned by `TLogoBlobID`), `Size` for memory accounting, and `Crc32` for verification.
 
-`TEvRequest` carries `TVector<TPageLocation>` for all page types. `TEvResult` returns `TVector<TLoaded>` where each `TLoaded` carries `TPageOffset` (sufficient to identify the page back to the requester; size and crc32 are already known to the requester from the original `TPageLocation`).
+`TEvRequest` carries `TVector<TPageLocation>` for all page types. `TEvResult` returns `TVector<TLoaded>` where each `TLoaded` carries `TPageLocation` (matches the `TLoadedPage` shape produced by the bio actor; the requester already has size and crc32 from the original `TPageLocation`, but carrying it through avoids an extra lookup on the return path and lets the receiver re-verify cheaply).
 
 `TCollection` internal structures (`PageMap`, `PendingRequests`, `DroppedPages`) are all re-keyed from `TPageId` to `TPageOffset`.
 

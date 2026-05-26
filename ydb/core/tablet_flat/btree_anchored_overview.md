@@ -17,7 +17,7 @@ With a 7 KiB target page size and a 200 MiB SST, a single SST has ~30,000 data p
 
 **Why is `TMeta` forced to stay resident?**  Because `TPageId` — the current page identity at every interface — is opaque: it carries no size, no offset, no checksum.  Every subsystem that touches a data page (private cache, shared cache, bio actor, forward cache) must resolve `TPageId → (blob, offset, size, crc32)` by calling back into `IPageCollection`, which reads directly from the `TMeta` arrays.  As long as any of these subsystems is active, `TMeta` cannot be unloaded.
 
-**The fix.**  Replace `TPageId` at every subsystem interface with `TPageLocation { offset, size, crc32 }` — still collection-relative (the `offset` is into the collection's blob sequence), but it carries everything needed to *use* a page once the collection is known: size for accounting, crc32 for verification, offset for blob-range lookup.  Once `TPageLocation` flows through all layers, no subsystem below the b-tree iterator needs `IPageCollection` for data or b-tree pages, and `TMeta::Raw` can be made non-resident (memory-mapped / demand-loaded) rather than wired.
+**The fix.**  Replace `TPageId` at every subsystem interface with `TPageLocation { offset, size, crc32 }` — still collection-relative (the `offset` is into the collection's blob sequence), but it carries everything needed to *use* a page once the collection is known: size for accounting, crc32 for verification, offset for blob-range lookup.  Once `TPageLocation` flows through all layers, no subsystem below the b-tree iterator needs `IPageCollection` for data or b-tree pages.  In v1 parts the per-page metadata for data and b-tree pages is moved into the b-tree's own `TChild` entries, so the writer omits those entries from `TMeta` entirely — `TMeta::Raw` shrinks at the source to only structural-page entries, and the **~69 GiB per node** wired metadata becomes negligible.
 
 ### Secondary consequences
 
@@ -137,7 +137,7 @@ The leaf (and internal) child entry embeds the full page location inline:
   total: 44 bytes
 ```
 
-Format version (v0 vs v1) is carried in `TBtreeIndexMeta.Version` in the part protobuf — absent/0 = v0, 1 = v1.  The `TMeta` binary layout on disk is unchanged.
+Format version (v0 vs v1) is carried in `TLayout.BTreeIndexesFormatVersion` (existing proto field, no new field added) — absent/0 = v0, 1 = v1.  The `TMeta` binary layout on disk is unchanged.
 
 For v0 parts, `TPageLocation` is derived on demand via `TMeta::GetLocation(PageId_)` — an O(1) read from the already-mapped `Steps` and `Extra` arrays, no allocation.
 
@@ -293,7 +293,7 @@ In v1 parts, `Index` (offset, size) and `Extra` (crc32) information is embedded 
 
 2. **`IDataPageCollection`** — new interface for data and b-tree pages; implemented by `TMeta` sharing its blob array with `IPageCollection`.  Add `TMeta::GetLocation(TPageId)` as an O(1) helper for v0 compatibility.
 
-3. **B-tree child format** — add `uint32 Version` to `TBtreeIndexMeta` proto; define v0 and v1 `TChild` / `TShortChild` layouts in C++.  Both formats remain readable and writable; a global switcher selects which format new compactions produce.
+3. **B-tree child format** — use existing `TLayout.BTreeIndexesFormatVersion` (0 = v0, 1 = v1) as the discriminator; add root-location fields (`RootOffset`, `RootSize`, `RootCrc32`) to `TBtreeIndexMeta` for v1; define v0 and v1 `TChild` / `TShortChild` layouts in C++.  Both formats remain readable and writable; a global switcher selects which format new compactions produce.
 
 4. **`TLoadedPage`** — replace `TPageId` with `TPageLocation`.
 
@@ -309,6 +309,6 @@ In v1 parts, `Index` (offset, size) and `Extra` (crc32) information is embedded 
 
 10. **Bio actor** — switch to `IDataPageCollection::Bounds(location)` for I/O dispatch.
 
-11. **Writer** — emit v1 `TChild` when switcher is on; keep v0 writer path fully functional when off.
+11. **Writer** — emit v1 `TChild` when switcher is on; in v1, do not assign `TPageId`s to data and b-tree pages (only structural pages enter `TMeta`'s `TEntry`/`TExtra` arrays); emit root location into `TBtreeIndexMeta::RootOffset/Size/Crc32` instead of `RootPageId`.  Keep v0 writer path fully functional when off.
 
 12. **Remove flat index** — delete `TPartGroupFlatIndexIter`, `EPage::FlatIndex`, flat index writer, `TIndexPages::FlatGroups / FlatHistoric`, and all related call sites.
