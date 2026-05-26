@@ -199,7 +199,7 @@ No layer below the b-tree iterator needs `IPageCollection` for data or b-tree pa
 
 | Concern | Before | After |
 |---|---|---|
-| Data-page identity at interfaces | `TPageId` (ui32, collection-relative, opaque) | `TPageLocation` (offset+size+crc32, collection-relative but carries size & crc32) |
+| Data-page identity at interfaces | `TPageId` (ui32, collection-relative) | `TPageLocation` (offset+size+crc32, collection-relative) |
 | Cache key | `TPageId` — opaque, requires `IPageCollection` per page read for size/blob range/crc32 | `TPageOffset` alone (within collection partitioned by `TLogoBlobID`).  Size and crc32 are *not* part of the key — they travel alongside it inside `TPageLocation`, the value passed into request APIs.  Collection consulted only for blob range via `IDataPageCollection::Bounds(location)`. |
 | B-tree leaf read | Requires `IPageCollection` lookup for size/blob range | Location embedded in `TChild`; no lookup |
 | Scan read-ahead | Passes `TPageId` through all layers | Passes `TPageLocation` extracted directly from leaf nodes |
