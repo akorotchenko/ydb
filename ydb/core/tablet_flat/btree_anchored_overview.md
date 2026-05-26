@@ -6,17 +6,28 @@ Branch: `BTreeAncoredPageCollection`
 
 ## Problem statement
 
-Every page in a tablet_flat SST (sorted string table) is identified by a `TPageId` — a dense `ui32` index into the page collection's metadata array.  This works well for the handful of structural pages (scheme, bloom, frames, …) that are loaded once at part-open time, but it creates a fundamental coupling problem for data pages and b-tree index nodes:
+### Primary goal: reduce resident memory held by `TMeta`
 
-1. **Cache keyed on the wrong identity.**  The shared page cache stores and looks up pages by `(collection-label, TPageId)`.  `TPageId` is meaningful only within one specific page collection; it carries no information about where the page actually lives in blobstorage.  This prevents the cache from being byte-addressed and makes it impossible to share or deduplicate pages across format generations.
+Each SST carries a `TMeta` metadata blob that is mapped into memory when the part is opened and stays wired for the lifetime of the part.  `TMeta` holds two parallel arrays over all pages in the SST:
 
-2. **B-tree leaf pointers require a collection lookup on the read path.**  A b-tree `TChild` node stores the `TPageId` of its data-page child.  To fetch that page the reader must call back into `IPageCollection::Bounds(pageId)` to learn the blob offset and size — an unnecessary indirection that ties every data-page access to the structural metadata layer.
+- `Index` (`TEntry[]`, 16 B/page) — page end-offsets used to compute blob address and page size
+- `Extra` (`TExtra[]`, 8 B/page) — page type and crc32
 
-3. **Scan read-ahead carries pageIds through every layer.**  The forward cache, bio actor, and shared cache all pass `TVector<TPageId>` for prefetch requests.  Each layer must therefore keep a reference to `IPageCollection` just to resolve sizes and blob positions.
+With a 7 KiB target page size and a 200 MiB SST, a single SST has ~30,000 data pages.  Their combined metadata occupies ~0.69 MiB per SST, or **~69 GiB per node** (100,000 SSTs), all wired and non-swappable.
 
-4. **`TPageId` space is shared between structurally unrelated pages.**  Scheme, bloom, b-tree internal nodes, and data pages are all numbered in one flat sequence.  There is no type safety at interface boundaries; any `ui32` can be passed as any page.
+**Why is `TMeta` forced to stay resident?**  Because `TPageId` — the current page identity at every interface — is opaque: it carries no size, no offset, no checksum.  Every subsystem that touches a data page (private cache, shared cache, bio actor, forward cache) must resolve `TPageId → (blob, offset, size, crc32)` by calling back into `IPageCollection`, which reads directly from the `TMeta` arrays.  As long as any of these subsystems is active, `TMeta` cannot be unloaded.
 
-5. **Flat index is still present** despite being superseded by the b-tree index and past its support lifetime, adding dead weight to every read path.
+**The fix.**  Replace `TPageId` at every subsystem interface with `TPageLocation { offset, size, crc32 }` — a self-contained page identity.  Once `TPageLocation` flows through all layers, no subsystem below the b-tree iterator needs `IPageCollection` for data or b-tree pages, and `TMeta::Raw` can be made non-resident (memory-mapped / demand-loaded) rather than wired.
+
+### Secondary consequences
+
+- **B-tree leaf pointers require a collection lookup today.**  A `TChild` stores `TPageId`; reaching the data page requires `IPageCollection::Bounds(pageId)`.  The new on-disk format embeds `TPageLocation` directly in `TChild`, eliminating the lookup entirely.
+
+- **Scan read-ahead must carry `TPageId` through every layer.**  Each layer holds a reference to `IPageCollection` just to resolve page sizes and blob positions.  With `TPageLocation` at interfaces this coupling disappears.
+
+- **`TPageId` space is shared between structurally unrelated pages.**  Scheme, bloom, b-tree internal nodes, and data pages share one flat `ui32` sequence with no type safety at interface boundaries.
+
+- **Flat index is removed** as part of this work — it has been superseded by the b-tree index and is dead weight on every read path.
 
 ---
 
