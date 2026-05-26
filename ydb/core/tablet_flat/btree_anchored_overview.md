@@ -17,7 +17,7 @@ With a 7 KiB target page size and a 200 MiB SST, a single SST has ~30,000 data p
 
 **Why is `TMeta` forced to stay resident?**  Because `TPageId` — the current page identity at every interface — is opaque: it carries no size, no offset, no checksum.  Every subsystem that touches a data page (private cache, shared cache, bio actor, forward cache) must resolve `TPageId → (blob, offset, size, crc32)` by calling back into `IPageCollection`, which reads directly from the `TMeta` arrays.  As long as any of these subsystems is active, `TMeta` cannot be unloaded.
 
-**The fix.**  Replace `TPageId` at every subsystem interface with `TPageLocation { offset, size, crc32 }` — a self-contained page identity.  Once `TPageLocation` flows through all layers, no subsystem below the b-tree iterator needs `IPageCollection` for data or b-tree pages, and `TMeta::Raw` can be made non-resident (memory-mapped / demand-loaded) rather than wired.
+**The fix.**  Replace `TPageId` at every subsystem interface with `TPageLocation { offset, size, crc32 }` — still collection-relative (the `offset` is into the collection's blob sequence), but it carries everything needed to *use* a page once the collection is known: size for accounting, crc32 for verification, offset for blob-range lookup.  Once `TPageLocation` flows through all layers, no subsystem below the b-tree iterator needs `IPageCollection` for data or b-tree pages, and `TMeta::Raw` can be made non-resident (memory-mapped / demand-loaded) rather than wired.
 
 ### Secondary consequences
 
@@ -199,7 +199,7 @@ No layer below the b-tree iterator needs `IPageCollection` for data or b-tree pa
 
 | Concern | Before | After |
 |---|---|---|
-| Data-page identity at interfaces | `TPageId` (ui32, collection-relative) | `TPageLocation` (offset+size+crc32, self-contained) |
+| Data-page identity at interfaces | `TPageId` (ui32, collection-relative, opaque) | `TPageLocation` (offset+size+crc32, collection-relative but carries size & crc32) |
 | Cache key | `TPageId` — opaque, requires `IPageCollection` per page read for size/blob range/crc32 | `TPageOffset` (within collection partitioned by `TLogoBlobID`) — collection consulted only for blob range via `IDataPageCollection::Bounds`; size and crc32 travel with the key in `TPageLocation` |
 | B-tree leaf read | Requires `IPageCollection` lookup for size/blob range | Location embedded in `TChild`; no lookup |
 | Scan read-ahead | Passes `TPageId` through all layers | Passes `TPageLocation` extracted directly from leaf nodes |
@@ -226,15 +226,15 @@ No layer below the b-tree iterator needs `IPageCollection` for data or b-tree pa
 | B-tree internal nodes per SST | ~47 (3-level tree: 1 root + 8 L1 + 38 L2) |
 | Total children per SST | ~30,050 |
 
-### On-disk: `TMeta` blob size (unchanged)
+### On-disk: `TMeta` blob (v0 baseline)
 
 Each page occupies 24 bytes in the `TMeta` blob (`TEntry` = 16 B + `TExtra` = 8 B):
 
 ```
-TMeta blob per SST = 30,000 × 24 B ≈ 0.69 MiB
+v0 TMeta blob per SST = 30,000 × 24 B ≈ 0.69 MiB
 ```
 
-This on-disk layout is **unchanged** by this refactor — `TMeta` binary format is frozen.
+The on-disk binary *layout* (header, blob-id list, `TEntry[]`, `TExtra[]`, inplace data, CRC) is unchanged in v1 — no format version bump.  But the *blob size* shrinks dramatically in v1 because the writer no longer assigns `TPageId`s to data and b-tree pages, so their entries are omitted (see the next section).
 
 ### On-disk: `TChild` size change (v0 → v1)
 
