@@ -204,7 +204,7 @@ All callers — structural and data alike — pass `TPageLocation`. Callers that
 
 `TPage` stores `TPageLocation` for all pages — structural and data alike. `TPageId` is no longer stored in `TPage`. `TPageLocation` provides the cache key (`Offset`, unique within a collection since the cache is partitioned by `TLogoBlobID`), `Size` for memory accounting, and `Crc32` for verification.
 
-`TEvRequest` carries `TVector<TPageLocation>` for all page types. `TEvResult` returns `TVector<TLoaded>` where each `TLoaded` carries `TPageLocation` (matches the `TLoadedPage` shape produced by the bio actor; the requester already has size and crc32 from the original `TPageLocation`, but carrying it through avoids an extra lookup on the return path and lets the receiver re-verify cheaply).
+`TEvRequest` carries `TVector<TPageLocation>` for all page types. `TEvResult` returns `TVector<TLoaded>` where each `TLoaded` carries `TPageLocation` (matches the `TLoadedPage` shape produced by the bio actor). On the return path only `Offset` is load-bearing — it's the demux/cache key the receiver uses to match the page back to the requesting slot. `Size` and `Crc32` ride along as fields of the uniform `TPageLocation` identity; CRC verification itself runs once, in the bio actor before `TEvResult` is sent (the today's single `IPageCollection::Verify` call site becomes `IDataPageCollection::Verify(location, body)` — static, size+crc32 only).
 
 `TCollection` internal structures (`PageMap`, `PendingRequests`, `DroppedPages`) are all re-keyed from `TPageId` to `TPageOffset`.
 
@@ -227,7 +227,7 @@ Bio actor receives `TPageLocation`, dispatches I/O via `IDataPageCollection::Bou
 
 ### Read-ahead of page locations from b-tree leaves
 
-For scan operations the forward cache pre-reads upcoming data page locations directly from b-tree leaf nodes. Because `TChild::GetLocation()` returns `TPageLocation` inline (new format) or via `TMeta::GetLocation(PageId_)` (old format), the read-ahead path extracts locations from leaves without any additional collection lookup — O(1) per leaf entry.
+For scan operations, the forward cache pre-reads upcoming data page locations directly from b-tree leaf nodes. Because `TChild::GetLocation()` returns `TPageLocation` inline (new format) or via `TMeta::GetLocation(PageId_)` (old format), the read-ahead path extracts locations from leaves without any additional collection lookup — O(1) per leaf entry.
 
 ### Interface changes
 
