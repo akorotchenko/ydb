@@ -1,25 +1,27 @@
 #pragma once
 #include "defs.h"
-#include "flat_update_op.h"
-#include "flat_mem_eggs.h"
 #include "flat_mem_blobs.h"
-#include "flat_row_scheme.h"
-#include "flat_row_nulls.h"
-#include "flat_row_celled.h"
+#include "flat_mem_eggs.h"
 #include "flat_page_blobs.h"
+#include "flat_row_celled.h"
+#include "flat_row_nulls.h"
+#include "flat_row_scheme.h"
 #include "flat_sausage_solid.h"
 #include "flat_table_committed.h"
+#include "flat_table_misc.h"
+#include "flat_update_op.h"
 #include "util_fmt_abort.h"
 #include "util_pool.h"
+
 #include <ydb/core/scheme/scheme_tablecell.h>
 #include <ydb/core/scheme/scheme_type_id.h>
 #include <ydb/core/util/btree_cow.h>
+
 #include <ydb/library/yverify_stream/yverify_stream.h>
 
 #include <library/cpp/containers/absl/flat_hash_map.h>
 #include <library/cpp/containers/absl/flat_hash_set.h>
 #include <library/cpp/containers/stack_vector/stack_vec.h>
-
 #include <util/generic/vector.h>
 #include <util/memory/pool.h>
 
@@ -203,8 +205,39 @@ namespace NMem {
             , Tree(Comparator, &TreeAllocatorState)
         {}
 
+        // Append distinct live uncommitted delta tx ids to seen; true when older memtables can stop.
+        bool CountLiveUncommittedDeltas(const TRawVals key_, const NTable::ITransactionMapSimplePtr& committed,
+            absl::flat_hash_set<ui64>& seen) const {
+            const TCelled key(key_, *Scheme->Keys, true);
+            const NMem::TTreeValue* const current = Tree.Find(NMem::TCandidate{ key.Cells });
+            if (!current) {
+                return false;
+            }
+            for (const NMem::TUpdate* n = current->GetFirst(); n; n = n->Next) {
+                if (n->RowVersion.Step != Max<ui64>()) {
+                    return true; // committed versions become history rows, they split across pages
+                }
+                if (n->Rop == ERowOp::Absent) {
+                    continue; // lock-only nodes do not become delta rows
+                }
+                if (!n->HasLockIdentity) {
+                    continue; // volatile deltas lack a lock identity
+                }
+                if (committed.Find(n->RowVersion.TxId)) {
+                    continue; // committed-by-map, becomes a history version
+                }
+                if (Removed.contains(n->RowVersion.TxId)) {
+                    continue; // removed (aborted), no longer counts toward the limit
+                }
+                seen.insert(n->RowVersion.TxId);
+            }
+            return false;
+        }
+
         void Update(ERowOp rop, TRawVals key_, TOpsRef ops, TArrayRef<const TMemGlob> pages, TRowVersion rowVersion,
-                    NTable::ITransactionMapSimplePtr committed)
+            NTable::ITransactionMapSimplePtr committed,
+            const TSet<TIntrusiveConstPtr<TMemTable>, TOrderByEpoch<TMemTable>>& frozen = {},
+            ui32 maxUncommittedDeltas = 0)
         {
             Y_DEBUG_ABORT_UNLESS(
                 rop == ERowOp::Upsert || rop == ERowOp::Erase || rop == ERowOp::Reset,
@@ -243,6 +276,23 @@ namespace NMem {
             const TCelled key(key_, *Scheme->Keys, true);
             const NMem::TTreeValue* const current = Tree.Find(NMem::TCandidate{ key.Cells });
             const NMem::TUpdate* next = current ? current->GetFirst() : nullptr;
+
+            // Count distinct transactions of live uncommitted data deltas
+            if (maxUncommittedDeltas > 0 && rowVersion.Step == Max<ui64>()) {
+                absl::flat_hash_set<ui64> seen;
+                if (!CountLiveUncommittedDeltas(key_, committed, seen)) {
+                    for (auto it = frozen.rbegin(); it != frozen.rend(); ++it) {
+                        if ((*it)->CountLiveUncommittedDeltas(key_, committed, seen)) {
+                            break;
+                        }
+                    }
+                }
+                bool currentTxSeen = seen.contains(rowVersion.TxId);
+                if (!currentTxSeen && seen.size() >= maxUncommittedDeltas) {
+                    // The key's delta chain is at the limit; the datashard restarts the write
+                    throw TDeltaChainException{};
+                }
+            }
 
             ScratchMergeTags.clear();
             ScratchMergeTagsLast.clear();
@@ -360,6 +410,7 @@ namespace NMem {
             update->Items = mergedSize;
             update->Rop = rop;
             update->Lock = ELockMode::None;
+            update->HasLockIdentity = (maxUncommittedDeltas != 0);
 
             ui32 dstIndex = 0;
 
@@ -459,6 +510,7 @@ namespace NMem {
             update->Items = 0;
             update->Rop = ERowOp::Absent;
             update->Lock = mode;
+            update->HasLockIdentity = false;
 
             if (current) {
                 Tree.UpdateUnsafe()->Chain = update;

@@ -170,6 +170,7 @@ TDataShard::TDataShard(const TActorId &tablet, TTabletStorageInfo *info)
     , CdcInitialScanReadAheadHi(0, 0, 128*1024*1024)
     , EnableLockedWrites(1, 0, 1)
     , MaxLockedWritesPerKey(1000, 0, 1000000)
+    , MaxUncommittedDeltas(0, 0, 1000000)
     , EnableLeaderLeases(1, 0, 1)
     , MinLeaderLeaseDurationUs(250000, 1000, 5000000)
     , ChangeRecordDebugPrint(0, 0, 1)
@@ -359,6 +360,7 @@ void TDataShard::InitControls() {
 
         TControlBoard::RegisterSharedControl(EnableLockedWrites, icb.DataShardControls.EnableLockedWrites);
         TControlBoard::RegisterSharedControl(MaxLockedWritesPerKey, icb.DataShardControls.MaxLockedWritesPerKey);
+        TControlBoard::RegisterSharedControl(MaxUncommittedDeltas, icb.DataShardControls.MaxUncommittedDeltas);
 
         TControlBoard::RegisterSharedControl(EnableLeaderLeases, icb.DataShardControls.EnableLeaderLeases);
         TControlBoard::RegisterSharedControl(MinLeaderLeaseDurationUs, icb.DataShardControls.MinLeaderLeaseDurationUs);

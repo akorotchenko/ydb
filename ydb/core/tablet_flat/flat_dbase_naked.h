@@ -752,7 +752,8 @@ namespace NTable {
 
             NUtil::SubSafe(Stats.MemTableWaste, wrap->GetMemWaste());
             NUtil::SubSafe(Stats.MemTableBytes, wrap->GetMemSize());
-            wrap->UpdateTx(rop, key, ops, Annex, txId);
+            // Redo replay restores committed state; the live-write limit must not throw during boot.
+            wrap->UpdateTx(rop, key, ops, Annex, txId, 0);
             Stats.MemTableWaste += wrap->GetMemWaste();
             Stats.MemTableBytes += wrap->GetMemSize();
             Stats.MemTableOps += 1;

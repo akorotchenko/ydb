@@ -152,7 +152,7 @@ public:
 
     void Update(ui32 table, ERowOp, TRawVals key, TArrayRef<const TUpdateOp>, TRowVersion rowVersion = TRowVersion::Min());
 
-    void UpdateTx(ui32 table, ERowOp, TRawVals key, TArrayRef<const TUpdateOp>, ui64 txId);
+    void UpdateTx(ui32 table, ERowOp, TRawVals key, TArrayRef<const TUpdateOp>, ui64 txId, ui32 maxUncommittedDeltas = 0);
     void LockRowTx(ui32 table, ELockMode, TRawVals key, ui64 txId);
     void RemoveTx(ui32 table, ui64 txId);
     void CommitTx(ui32 table, ui64 txId, TRowVersion rowVersion = TRowVersion::Min());

@@ -277,6 +277,9 @@ private:
     TDataShard& Self;
     NTable::TDatabase& Db;
 
+    // Per-write snapshot of the live delta-chain limit, consistent for all participants
+    YDB_READONLY_DEF(ui32, MaxUncommittedDeltas);
+
     TDataShardChangeGroupProvider ChangeGroupProvider;
 
     absl::flat_hash_map<TPathId, THolder<IDataShardChangeCollector>> ChangeCollectors;

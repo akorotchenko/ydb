@@ -238,5 +238,8 @@ namespace NTable {
 
     static_assert(sizeof(TCellOp) == 1, "Unexpected TCellOp unit size");
 
+    // Thrown when a key's uncommitted delta chain reaches the delta-chain limit.
+    struct TDeltaChainException {};
+
 }
 }

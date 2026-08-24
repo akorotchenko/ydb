@@ -1,10 +1,13 @@
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
+#include <ydb/core/tablet_flat/test/libs/rows/tool.h>
 #include <ydb/core/tablet_flat/test/libs/table/model/large.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_iter.h>
 #include <ydb/core/tablet_flat/test/libs/table/wrap_warm.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_cooker.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_wreck.h>
+#include <ydb/core/tablet_flat/flat_row_eggs.h>
+#include <ydb/core/tablet_flat/flat_table_committed.h>
 
 #include <library/cpp/testing/unittest/registar.h>
 
@@ -166,8 +169,215 @@ Y_UNIT_TEST_SUITE(Memtable)
         TWreck<TCheckIter, TIntrusiveConstPtr<TMemTable>>(Mass, 666).Do(EWreck::Cached, egg);
     }
 
+    Y_UNIT_TEST(UncommittedDeltaLimit)
+    {
+        TLayoutCook lay;
+        lay
+            .Col(0, 0,  NScheme::NTypeIds::Uint32)
+            .Col(0, 1,  NScheme::NTypeIds::String)
+            .Key({0});
+
+        auto scheme = lay.RowScheme();
+        NTest::TRowTool tool(*scheme);
+
+        TCooker cooker(scheme);
+        auto table = cooker.Unwrap();
+
+        const ui32 limit = 4;
+
+        // Distinct TxIds: each write adds a separate delta node (no coalescing)
+        for (ui32 i = 0; i < limit; ++i) {
+            const auto row = *TSchemedCookRow(*scheme).Col(1_u32, "v");
+            auto pair = tool.Split(row, true, true);
+            table->Update(ERowOp::Upsert, pair.Key, pair.Ops, {},
+                TRowVersion(Max<ui64>(), 100 + i), /* committed */ nullptr, {}, limit);
+        }
+
+        // The (limit+1)-th distinct TxId throws; the write is not applied to the memtable
+        {
+            const auto row = *TSchemedCookRow(*scheme).Col(1_u32, "v");
+            auto pair = tool.Split(row, true, true);
+            UNIT_ASSERT_EXCEPTION(
+                table->Update(ERowOp::Upsert, pair.Key, pair.Ops, {},
+                    TRowVersion(Max<ui64>(), 999), /* committed */ nullptr, {}, limit),
+                TDeltaChainException);
+        }
+
+        // Same-TxId writes must NOT throw regardless of the limit (no new delta row)
+        for (ui32 i = 0; i < limit + 10; ++i) {
+            const auto row = *TSchemedCookRow(*scheme).Col(1_u32, "w");
+            auto pair = tool.Split(row, true, true);
+            table->Update(ERowOp::Upsert, pair.Key, pair.Ops, {},
+                TRowVersion(Max<ui64>(), 100), /* committed */ nullptr, {}, limit);
+        }
+    }
+
+    Y_UNIT_TEST(UncommittedDeltaLimitDisabled)
+    {
+        TLayoutCook lay;
+        lay
+            .Col(0, 0,  NScheme::NTypeIds::Uint32)
+            .Col(0, 1,  NScheme::NTypeIds::String)
+            .Key({0});
+
+        auto scheme = lay.RowScheme();
+        NTest::TRowTool tool(*scheme);
+
+        TCooker cooker(scheme);
+        auto table = cooker.Unwrap();
+
+        // 0 = no limit
+        for (ui32 i = 0; i < 100; ++i) {
+            const auto row = *TSchemedCookRow(*scheme).Col(1_u32, "v");
+            auto pair = tool.Split(row, true, true);
+            table->Update(ERowOp::Upsert, pair.Key, pair.Ops, {},
+                TRowVersion(Max<ui64>(), 100 + i), /* committed */ nullptr);
+        }
+    }
+
+    Y_UNIT_TEST(UncommittedDeltaLimitIgnoresLocks)
+    {
+        TLayoutCook lay;
+        lay
+            .Col(0, 0,  NScheme::NTypeIds::Uint32)
+            .Col(0, 1,  NScheme::NTypeIds::String)
+            .Key({0});
+
+        auto scheme = lay.RowScheme();
+        NTest::TRowTool tool(*scheme);
+
+        TCooker cooker(scheme);
+        auto table = cooker.Unwrap();
+
+        const ui32 limit = 4;
+
+        const auto row = *TSchemedCookRow(*scheme).Col(1_u32, "v");
+        auto pair = tool.Split(row, true, true);
+
+        // Add many lock-only (Absent) deltas — they must NOT count toward the limit
+        for (ui32 i = 0; i < limit + 10; ++i) {
+            table->LockRow(ELockMode::Exclusive, pair.Key, 100 + i);
+        }
+
+        // Now add real data deltas up to the limit — should still succeed
+        for (ui32 i = 0; i < limit; ++i) {
+            table->Update(ERowOp::Upsert, pair.Key, pair.Ops, {},
+                TRowVersion(Max<ui64>(), 200 + i), /* committed */ nullptr, {}, limit);
+        }
+
+        // The (limit+1)-th data delta throws
+        UNIT_ASSERT_EXCEPTION(
+            table->Update(ERowOp::Upsert, pair.Key, pair.Ops, {},
+                TRowVersion(Max<ui64>(), 999), /* committed */ nullptr, {}, limit),
+            TDeltaChainException);
+    }
+
+    Y_UNIT_TEST(UncommittedDeltaLimitCountsErase)
+    {
+        TLayoutCook lay;
+        lay
+            .Col(0, 0,  NScheme::NTypeIds::Uint32)
+            .Col(0, 1,  NScheme::NTypeIds::String)
+            .Key({0});
+
+        auto scheme = lay.RowScheme();
+        NTest::TRowTool tool(*scheme);
+
+        TCooker cooker(scheme);
+        auto table = cooker.Unwrap();
+
+        const ui32 limit = 4;
+
+        const auto row = *TSchemedCookRow(*scheme).Col(1_u32, "v");
+        auto pair = tool.Split(row, true, true);
+
+        // Erase (non-Absent) deltas count toward the limit, like data deltas
+        for (ui32 i = 0; i < limit; ++i) {
+            table->Update(ERowOp::Erase, pair.Key, {}, {},
+                TRowVersion(Max<ui64>(), 100 + i), /* committed */ nullptr, {}, limit);
+        }
+
+        // The (limit+1)-th Erase delta throws
+        UNIT_ASSERT_EXCEPTION(
+            table->Update(ERowOp::Erase, pair.Key, {}, {},
+                TRowVersion(Max<ui64>(), 999), /* committed */ nullptr, {}, limit),
+            TDeltaChainException);
+    }
+
+    Y_UNIT_TEST(UncommittedDeltaLimitIgnoresCommittedByMap)
+    {
+        TLayoutCook lay;
+        lay
+            .Col(0, 0,  NScheme::NTypeIds::Uint32)
+            .Col(0, 1,  NScheme::NTypeIds::String)
+            .Key({0});
+
+        auto scheme = lay.RowScheme();
+        NTest::TRowTool tool(*scheme);
+
+        TCooker cooker(scheme);
+        auto table = cooker.Unwrap();
+
+        const ui32 limit = 1;
+
+        const auto row = *TSchemedCookRow(*scheme).Col(1_u32, "v");
+        auto pair = tool.Split(row, true, true);
+
+        // Live delta from tx 100
+        table->Update(ERowOp::Upsert, pair.Key, pair.Ops, {},
+            TRowVersion(Max<ui64>(), 100), /* committed */ nullptr, {}, limit);
+
+        // Commit tx 100: its delta becomes committed-by-map and must not count
+        auto committedMap = TSingleTransactionMap::Create(100, TRowVersion(1, 1));
+        NTable::ITransactionMapSimplePtr committed(committedMap);
+
+        // A second live tx is allowed (only 1 live delta after exclusion)
+        table->Update(ERowOp::Upsert, pair.Key, pair.Ops, {},
+            TRowVersion(Max<ui64>(), 101), committed, {}, limit);
+
+        // A third live tx trips the limit (2 live deltas > limit 1)
+        UNIT_ASSERT_EXCEPTION(
+            table->Update(ERowOp::Upsert, pair.Key, pair.Ops, {},
+                TRowVersion(Max<ui64>(), 102), committed, {}, limit),
+            TDeltaChainException);
+    }
+
+    Y_UNIT_TEST(UncommittedDeltaLimitIgnoresIneligible)
+    {
+        // Writes that don't enforce the limit produce ineligible deltas that never count
+        TLayoutCook lay;
+        lay
+            .Col(0, 0,  NScheme::NTypeIds::Uint32)
+            .Col(0, 1,  NScheme::NTypeIds::String)
+            .Key({0});
+
+        auto scheme = lay.RowScheme();
+        NTest::TRowTool tool(*scheme);
+
+        TCooker cooker(scheme);
+        auto table = cooker.Unwrap();
+
+        const ui32 limit = 1;
+        const auto row = *TSchemedCookRow(*scheme).Col(1_u32, "v");
+        auto pair = tool.Split(row, true, true);
+
+        // Ineligible (limit 0) deltas never count toward the limit
+        for (ui32 i = 0; i < 10; ++i) {
+            table->Update(ERowOp::Upsert, pair.Key, pair.Ops, {},
+                TRowVersion(Max<ui64>(), 100 + i), /* committed */ nullptr, {}, 0);
+        }
+
+        // An eligible (limit-enforcing) delta is allowed despite the ineligible ones
+        table->Update(ERowOp::Upsert, pair.Key, pair.Ops, {},
+            TRowVersion(Max<ui64>(), 200), /* committed */ nullptr, {}, limit);
+
+        // A second eligible delta trips the limit
+        UNIT_ASSERT_EXCEPTION(
+            table->Update(ERowOp::Upsert, pair.Key, pair.Ops, {},
+                TRowVersion(Max<ui64>(), 201), /* committed */ nullptr, {}, limit),
+            TDeltaChainException);
+    }
+
 }
-
-
 }
 }

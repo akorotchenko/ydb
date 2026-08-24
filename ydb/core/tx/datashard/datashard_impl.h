@@ -319,6 +319,8 @@ class TDataShard
     friend class TS3DownloadsManager;
     template <typename TSettings> friend class TS3Downloader;
     template <typename T> friend class TBackupRestoreUnitBase;
+    friend class TExecuteWriteUnit;
+    friend class TExecuteDataTxUnit;
     friend struct TSetupSysLocks;
     friend class TDataShardLocksDb;
 
@@ -1870,6 +1872,11 @@ public:
         return value;
     }
 
+    ui64 GetMaxUncommittedDeltas() const {
+        ui64 value = MaxUncommittedDeltas;
+        return value;
+    }
+
     bool GetChangeRecordDebugPrint() const {
         ui64 value = ChangeRecordDebugPrint;
         return value != 0;
@@ -3021,6 +3028,7 @@ private:
 
     TControlWrapper EnableLockedWrites;
     TControlWrapper MaxLockedWritesPerKey;
+    TControlWrapper MaxUncommittedDeltas;
 
     TControlWrapper EnableLeaderLeases;
     TControlWrapper MinLeaderLeaseDurationUs;

@@ -4489,5 +4489,95 @@ Y_UNIT_TEST_SUITE(DataShardWrite) {
         UNIT_ASSERT_VALUES_EQUAL(getTxCompleteLagCounter(), 0u);
     }
 
+    Y_UNIT_TEST(DeltaChainLimitRestartsWriteUntilResolved) {
+        // A write to a full delta chain is restarted (not parked): it completes once a chain delta resolves.
+        TPortManager pm;
+        TServerSettings::TControls controls;
+        controls.MutableDataShardControls()->SetMaxUncommittedDeltas(1);
+
+        TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings
+            .SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetControls(controls);
+
+        auto [runtime, server, sender] = TestCreateServer(serverSettings);
+
+        TShardedTableOptions opts;
+        const auto [shards, tableId] = CreateShardedTable(server, sender, "/Root", "table-1", opts);
+        const ui64 shard = shards[0];
+        const ui32 lockNodeId = runtime.GetNodeId(0);
+
+        TVector<TShardedTableOptions::TColumn> columns{
+            {"key", "Uint32", true, false},
+            {"value", "Uint32", false, false},
+        };
+
+        auto makeWrite = [&](ui64 txId, ui32 value) {
+            auto req = MakeWriteRequestOneKeyValue(
+                /*txId=*/txId,
+                NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE,
+                NKikimrDataEvents::TEvWrite::TOperation::OPERATION_UPSERT,
+                tableId,
+                columns,
+                1, value);
+            req->SetLockId(txId, lockNodeId);
+            req->Record.SetLockMode(NKikimrDataEvents::OPTIMISTIC);
+            return req;
+        };
+
+        const ui64 chainTxId = 1000001;  // fills the chain to the limit
+        const ui64 waiterTxId = 1000002; // restarts until a chain delta resolves
+        NLongTxService::TLockHandle chainLock(chainTxId, runtime.GetActorSystem(0));
+        NLongTxService::TLockHandle waiterLock(waiterTxId, runtime.GetActorSystem(0));
+
+        // Fill the chain to the limit: the chain writer writes key 1
+        auto fillResult = Write(runtime, sender, shard, makeWrite(chainTxId, 10));
+        UNIT_ASSERT_VALUES_EQUAL(fillResult.GetTxLocks().size(), 1u);
+
+        // The waiter's write to the same key cannot apply while the chain is full;
+        // it is restarted and must not complete yet.
+        runtime.SendToPipe(shard, sender, makeWrite(waiterTxId, 20).release(), 0, GetPipeConfigWithRetries(), TActorId(), 0, {});
+        {
+            bool gotResult = false;
+            try {
+                auto ev = runtime.GrabEdgeEventRethrow<NEvents::TDataEvents::TEvWriteResult>(sender, TDuration::MilliSeconds(250));
+                gotResult = bool(ev);
+            } catch (const yexception&) {
+                // timeout — the write is being restarted on the delta-chain limit
+            }
+            UNIT_ASSERT_C(!gotResult, "Expected the write to be deferred while the delta chain is full");
+        }
+
+        // Commit the chain writer: its delta resolves, so the waiter's next restart applies
+        {
+            auto req = std::make_unique<NEvents::TDataEvents::TEvWrite>(NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE);
+            auto& locks = *req->Record.MutableLocks();
+            locks.set_op(NKikimrDataEvents::TKqpLocks::Commit);
+            *locks.add_locks() = fillResult.GetTxLocks().at(0);
+            runtime.SendToPipe(shard, sender, req.release(), 0, GetPipeConfigWithRetries(), TActorId(), 0, {});
+        }
+
+        // The waiter completes once the chain resolves; match by lock id, since the
+        // lock-commit operation also replies with a result.
+        bool waiterDone = false;
+        for (int i = 0; i < 20 && !waiterDone; ++i) {
+            try {
+                auto ev = runtime.GrabEdgeEventRethrow<NEvents::TDataEvents::TEvWriteResult>(sender, TDuration::MilliSeconds(500));
+                if (ev && ev->Get()) {
+                    for (const auto& lock : ev->Get()->Record.GetTxLocks()) {
+                        if (lock.GetLockId() == waiterTxId) {
+                            waiterDone = true;
+                            break;
+                        }
+                    }
+                }
+            } catch (const yexception&) {
+                // no result in this window — keep waiting
+            }
+        }
+        UNIT_ASSERT_C(waiterDone, "Expected the restarted write to complete after the chain resolved");
+    }
+
 } // Y_UNIT_TEST_SUITE(DataShardWrite)
 } // namespace NKikimr

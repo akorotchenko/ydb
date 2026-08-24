@@ -1540,6 +1540,11 @@ message TImmediateControlsConfig {
           MinValue: 0,
           MaxValue: 31536000, // 365 * 86400
           DefaultValue: 60 }];
+        optional uint64 MaxUncommittedDeltas = 26 [(ControlOptions) = {
+          Description: "Maximum number of uncommitted deltas per key before deferring writes until a delta resolves (0 = no limit)",
+          MinValue: 0,
+          MaxValue: 1000000,
+          DefaultValue: 0 }];
     }
 
     message TTxLimitControls {

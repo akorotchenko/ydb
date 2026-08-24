@@ -5,6 +5,8 @@
 #include "setup_sys_locks.h"
 #include "datashard_locks_db.h"
 
+#include <ydb/core/tablet_flat/flat_row_eggs.h>
+
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::TX_DATASHARD
 
 
@@ -55,7 +57,7 @@ bool TExecuteDataTxUnit::IsReadyToExecute(TOperation::TPtr op) const {
         return false;
     }
 
-    return !op->HasRuntimeConflicts();
+    return !op->HasRuntimeConflicts() && !op->IsWaitingForRestart();
 }
 
 EExecutionStatus TExecuteDataTxUnit::Execute(TOperation::TPtr op,
@@ -195,6 +197,16 @@ EExecutionStatus TExecuteDataTxUnit::Execute(TOperation::TPtr op,
         tx->ReleaseTxData(txc, ctx);
 
         return EExecutionStatus::Restart;
+    } catch (const NTable::TDeltaChainException&) {
+        // The key's delta chain is at the limit; restart the data tx after a delay instead of parking on the chain
+        tx->GetDataTx()->ResetCollectedChanges();
+        tx->ReleaseTxData(txc, ctx);
+        if (txc.DB.HasChanges()) {
+            txc.DB.RollbackChanges();
+        }
+        op->SetWaitingForRestartFlag();
+        ctx.Schedule(TDuration::MilliSeconds(1), new TDataShard::TEvPrivate::TEvRestartOperation(op->GetTxId()));
+        return EExecutionStatus::Continue;
     } catch (const TNotReadyTabletException&) {
         YDB_LOG_TRACE_CTX(ctx, "TExecuteDataTxUnit::ExecuteDataTx: tablet is not ready for execution",
             {"tabletId", DataShard.TabletID()},

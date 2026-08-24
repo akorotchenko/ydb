@@ -978,7 +978,8 @@ void TTable::Update(ERowOp rop, TRawVals key, TOpsRef ops, TArrayRef<const TMemG
         }
     }
 
-    MemTable().Update(rop, key, ops, apart, rowVersion, CommittedTransactions);
+    // Committed writes are never part of the uncommitted delta chain, so the limit does not apply here
+    MemTable().Update(rop, key, ops, apart, rowVersion, CommittedTransactions, {}, 0);
     if (TableObserver) {
         TableObserver->OnUpdate(rop, key, ops, rowVersion);
     }
@@ -1063,7 +1064,7 @@ void TTable::RemoveTxStatusRef(ui64 txId)
     }
 }
 
-void TTable::UpdateTx(ERowOp rop, TRawVals key, TOpsRef ops, TArrayRef<const TMemGlob> apart, ui64 txId)
+void TTable::UpdateTx(ERowOp rop, TRawVals key, TOpsRef ops, TArrayRef<const TMemGlob> apart, ui64 txId, ui32 maxUncommittedDeltas)
 {
     auto& memTable = MemTable();
     bool hadTxDataRef = memTable.GetTxIdStats().contains(txId);
@@ -1078,7 +1079,7 @@ void TTable::UpdateTx(ERowOp rop, TRawVals key, TOpsRef ops, TArrayRef<const TMe
 
     // Use a special row version that marks this update as uncommitted
     TRowVersion rowVersion(Max<ui64>(), txId);
-    MemTable().Update(rop, key, ops, apart, rowVersion, CommittedTransactions);
+    MemTable().Update(rop, key, ops, apart, rowVersion, CommittedTransactions, Frozen, maxUncommittedDeltas);
 
     if (!hadTxDataRef) {
         Y_DEBUG_ABORT_UNLESS(memTable.GetTxIdStats().contains(txId));

@@ -47,6 +47,8 @@ namespace NMem {
         ui16 Items;
         ERowOp Rop : 4;
         ELockMode Lock : 4;
+        // False for volatile deltas (stored without a lock identity)
+        bool HasLockIdentity;
     };
 
     struct TTreeKey {

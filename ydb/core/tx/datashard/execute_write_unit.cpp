@@ -7,6 +7,7 @@
 #include "datashard_integrity_trails.h"
 
 #include <ydb/core/engine/mkql_engine_flat_host.h>
+#include <ydb/core/tablet_flat/flat_row_eggs.h>
 #include <ydb/library/aclib/user_context.h>
 
 namespace NKikimr {
@@ -39,7 +40,7 @@ public:
             return false;
         }
 
-        return !op->HasRuntimeConflicts();
+        return !op->HasRuntimeConflicts() && !op->IsWaitingForRestart();
     }
 
     void FillDeferredBreakerInfo(ui64 lockTxId, NKikimrQueryStats::TTxStats* txStats) {
@@ -728,6 +729,13 @@ public:
             if (txc.DB.HasChanges()) {
                 txc.DB.RollbackChanges();
             }
+            return EExecutionStatus::Continue;
+        } catch (const NTable::TDeltaChainException&) {
+            // The key's delta chain is at the limit; restart the write after a delay instead of parking on the chain
+            ResetChanges(userDb, txc);
+            writeOp->ReleaseTxData(txc);
+            op->SetWaitingForRestartFlag();
+            ctx.Schedule(TDuration::MilliSeconds(1), new TDataShard::TEvPrivate::TEvRestartOperation(op->GetTxId()));
             return EExecutionStatus::Continue;
         } catch (const TNotReadyTabletException&) {
             return OnTabletNotReadyException(userDb, *writeOp, validatedOperationIndex, txc, ctx);

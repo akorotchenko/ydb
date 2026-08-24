@@ -14,6 +14,7 @@ using NTableIndex::NFulltext::TGen;
 TDataShardUserDb::TDataShardUserDb(TDataShard& self, NTable::TDatabase& db, ui64 globalTxId, const TRowVersion& mvccVersion, NMiniKQL::TEngineHostCounters& counters, TInstant now)
     : Self(self)
     , Db(db)
+    , MaxUncommittedDeltas(ui32(self.GetMaxUncommittedDeltas()))
     , ChangeGroupProvider(self, db)
     , GlobalTxId(globalTxId)
     , LockTxId(0)
@@ -413,7 +414,7 @@ void TDataShardUserDb::UpsertRowInt(
         if (collector && !collector->OnUpdateTx(tableId, localTableId, rowOp, key, ops, writeTxId, userCtx))
             throw TNotReadyTabletException();
 
-        Db.UpdateTx(localTableId, rowOp, key, ops, writeTxId);
+        Db.UpdateTx(localTableId, rowOp, key, ops, writeTxId, IsImmediateTx && writeTxId == GetLockTxId() ? GetMaxUncommittedDeltas() : 0);
     }
 
     if (VolatileTxId) {
