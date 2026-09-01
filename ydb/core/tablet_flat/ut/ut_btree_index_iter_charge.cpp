@@ -629,10 +629,8 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndex) {
                         // The flat implementation always returns 0 bytes charged, if the bytes limit is not set
                         UNIT_ASSERT_VALUES_UNEQUAL_C(treeChargeResult.BytesPrecharged, 0, message);
 
-                        if (params.Slices == TTestParams::None) {
-                            AssertLoadedTheSame(part, bTreeEnv, flatEnv, message,
-                                false, reverse && itemsLimit, !reverse && itemsLimit);
-                        }
+                        AssertLoadedTheSame(part, bTreeEnv, flatEnv, message,
+                            false, reverse && itemsLimit, !reverse && itemsLimit);
                     }
                 }
             }
@@ -705,10 +703,8 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndex) {
                                 // The flat implementation always returns 0 bytes charged, if the bytes limit is not set
                                 UNIT_ASSERT_VALUES_UNEQUAL_C(treeChargeResult.BytesPrecharged, 0, message);
 
-                                if (params.Slices == TTestParams::None) {
-                                    AssertLoadedTheSame(part, bTreeEnv, flatEnv, message,
-                                        true, reverse && itemsLimit, !reverse && itemsLimit);
-                                }
+                                AssertLoadedTheSame(part, bTreeEnv, flatEnv, message,
+                                    true, reverse && itemsLimit, !reverse && itemsLimit);
                             }
                         }
                     }
@@ -805,9 +801,7 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndex) {
 
         CheckChargeRowId(params, part, tags, eggs.Scheme->Keys.Get());
         CheckChargeKeys(params, part, tags, eggs.Scheme->Keys.Get());
-        if (params.Slices == TTestParams::None) {
-            CheckChargeBytesLimit(params, part, tags, eggs.Scheme->Keys.Get());
-        }
+        CheckChargeBytesLimit(params, part, tags, eggs.Scheme->Keys.Get());
     }
 
     Y_UNIT_TEST(NoNodes) {
@@ -866,60 +860,6 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndex) {
         CheckPart({.Levels = 3, .Groups = true, .History = true, .StickSomePages = true});
     }
 
-    // -- Slice coverage ---------------------------------------------------
-    Y_UNIT_TEST(OneNode_Slices) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::End)) {
-            CheckPart({.Levels = 1, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(OneNode_Groups_Slices) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 1, .Groups = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(OneNode_History_Slices) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 1, .History = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(OneNode_Groups_History_Slices) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 1, .Groups = true, .History = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_Slices) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::End)) {
-            CheckPart({.Levels = 3, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_Groups_Slices) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 3, .Groups = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_History_Slices) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 3, .History = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_Groups_History_Slices) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 3, .Groups = true, .History = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_Groups_History_Slices_Sticky) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 3, .Groups = true, .History = true, .Slices = TTestParams::ESlices(slices), .StickSomePages = true});
-        }
-    }
 }
 
 Y_UNIT_TEST_SUITE(TPartBtreeIndexIteration) {
@@ -1438,14 +1378,29 @@ Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIterV2) {
         // Both must have the same row count
         UNIT_ASSERT_VALUES_EQUAL(v1Part.Stat.Rows, v2Part.Stat.Rows);
 
-        // Iterate both btree indexes and compare row-by-row
-        TTestEnv v1Env, v2Env;
+        // Iterate both btree indexes and compare page-by-page. Keep V1 resident,
+        // but force V2 through miss/load/resume to validate byte-offset requests.
+        TTestEnv v1Env;
+        TTouchEnvV2 v2Env(&v2Part);
         auto v1Index = CreateIndexIter(&v1Part, &v1Env, {});
         auto v2Index = CreateIndexIter(&v2Part, &v2Env, {});
 
+        auto retryV2 = [&](auto&& action) -> EReady {
+            for (ui32 attempt = 0; attempt <= 10; attempt++) {
+                v2Env.LoadTouched();
+                if (auto ready = action(); ready != EReady::Page) {
+                    return ready;
+                }
+            }
+            UNIT_ASSERT_C(false, "V2 index iteration did not become ready");
+            return EReady::Page;
+        };
+
         for (size_t i = 0; ; i++) {
             auto v1Ready = i == 0 ? v1Index->Seek(0) : v1Index->Next();
-            auto v2Ready = i == 0 ? v2Index->Seek(0) : v2Index->Next();
+            auto v2Ready = retryV2([&]() {
+                return i == 0 ? v2Index->Seek(0) : v2Index->Next();
+            });
 
             UNIT_ASSERT_VALUES_EQUAL_C(v1Ready, v2Ready,
                 "V2 iteration readiness differs at step " + ToString(i));
@@ -1459,6 +1414,35 @@ Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIterV2) {
                 "V2 next row id mismatch at step " + ToString(i));
             UNIT_ASSERT_VALUES_EQUAL_C(v1Index->GetLocation().Size, v2Index->GetLocation().Size,
                 "V2 page size mismatch at step " + ToString(i));
+        }
+
+        // Key-based seek must land on the same page, not merely return the same status.
+        const auto* keyDefaults = v1Eggs.Scheme->Keys.Get();
+        for (ui32 first : {0u, 1u, 3u, 5u}) {
+            for (ui32 second : {0u, 5u, 13u}) {
+                for (bool reverse : {false, true}) {
+                    for (ESeek seek : {ESeek::Exact, ESeek::Lower, ESeek::Upper}) {
+                        TTestEnv v1SeekEnv, v2SeekEnv;
+                        auto v1Seek = CreateIndexIter(&v1Part, &v1SeekEnv, {});
+                        auto v2Seek = CreateIndexIter(&v2Part, &v2SeekEnv, {});
+                        auto key = MakeKey(first, second);
+                        auto v1Ready = reverse
+                            ? v1Seek->SeekReverse(seek, key, keyDefaults)
+                            : v1Seek->Seek(seek, key, keyDefaults);
+                        auto v2Ready = reverse
+                            ? v2Seek->SeekReverse(seek, key, keyDefaults)
+                            : v2Seek->Seek(seek, key, keyDefaults);
+
+                        UNIT_ASSERT_VALUES_EQUAL(v1Ready, v2Ready);
+                        UNIT_ASSERT_VALUES_EQUAL(v1Seek->IsValid(), v2Seek->IsValid());
+                        if (v1Ready == EReady::Data) {
+                            UNIT_ASSERT_VALUES_EQUAL(v1Seek->GetRowId(), v2Seek->GetRowId());
+                            UNIT_ASSERT_VALUES_EQUAL(v1Seek->GetNextRowId(), v2Seek->GetNextRowId());
+                            UNIT_ASSERT_VALUES_EQUAL(v1Seek->GetLocation().Size, v2Seek->GetLocation().Size);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1474,17 +1458,6 @@ Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIterV2) {
         CheckV2Iter({.Levels = 3});
     }
 
-    Y_UNIT_TEST(NoNodes_Groups_V2) {
-        CheckV2Iter({.Levels = 0, .Groups = true});
-    }
-
-    Y_UNIT_TEST(OneNode_History_V2) {
-        CheckV2Iter({.Levels = 1, .History = true});
-    }
-
-    Y_UNIT_TEST(FewNodes_Groups_History_V2) {
-        CheckV2Iter({.Levels = 3, .Groups = true, .History = true});
-    }
 }
 
 Y_UNIT_TEST_SUITE(TChargeBTreeIndexV2) {
@@ -1581,6 +1554,8 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndexV2) {
         auto limited = charge.Do(TCells{}, TCells{}, 0, meta.GetRowCount() - 1,
             keyDefaults, 5, 0);
         UNIT_ASSERT_C(limited.Ready, "V2 limited charge must be ready");
+        UNIT_ASSERT_GE_C(limited.ItemsPrecharged, 5,
+            "V2 full-range charge with limit 5 must precharge at least 5 items");
         UNIT_ASSERT_LE_C(limited.ItemsPrecharged, unlimited.ItemsPrecharged,
             "V2 limited charge must not precharge more items than unlimited ("
             << limited.ItemsPrecharged << " vs " << unlimited.ItemsPrecharged << ")");
@@ -1649,16 +1624,6 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndexV2) {
     Y_UNIT_TEST(FewNodes_History_V2) {
         CheckV2ChargeBasic({.Levels = 3, .History = true});
         CheckV2VsV1Charge({.Levels = 3, .History = true});
-    }
-
-    Y_UNIT_TEST(FewNodes_Sticky_V2) {
-        CheckV2ChargeBasic({.Levels = 3, .StickSomePages = true});
-        CheckV2VsV1Charge({.Levels = 3, .StickSomePages = true});
-    }
-
-    Y_UNIT_TEST(FewNodes_Groups_History_Sticky_V2) {
-        CheckV2ChargeBasic({.Levels = 3, .Groups = true, .History = true, .StickSomePages = true});
-        CheckV2VsV1Charge({.Levels = 3, .Groups = true, .History = true, .StickSomePages = true});
     }
 
     // -- V2 resume twins -----------------------------------------------------
@@ -1798,6 +1763,8 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndexV2) {
             auto r = DoV2Resume(eggs, params, /*reverse=*/false,
                 /*useKeys=*/false, limit, 0,
                 "row-id fwd limit=" + ToString(limit));
+            UNIT_ASSERT_C(r.ItemsPrecharged > 0,
+                "row-id fwd limit=" << limit << " must precharge items");
             UNIT_ASSERT_LE_C(r.ItemsPrecharged, unlimited.ItemsPrecharged,
                 "row-id fwd limit=" << limit
                 << " must not precharge more items than unlimited");
@@ -1806,6 +1773,8 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndexV2) {
             r = DoV2Resume(eggs, params, /*reverse=*/true,
                 /*useKeys=*/false, limit, 0,
                 "row-id rev limit=" + ToString(limit));
+            UNIT_ASSERT_C(r.ItemsPrecharged > 0,
+                "row-id rev limit=" << limit << " must precharge items");
             UNIT_ASSERT_LE_C(r.ItemsPrecharged, unlimited.ItemsPrecharged,
                 "row-id rev limit=" << limit
                 << " must not precharge more items than unlimited");
@@ -1815,6 +1784,8 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndexV2) {
                 r = DoV2Resume(eggs, params, /*reverse=*/false,
                     /*useKeys=*/true, limit, 0,
                     "keys fwd limit=" + ToString(limit));
+                UNIT_ASSERT_C(r.ItemsPrecharged > 0,
+                    "keys fwd limit=" << limit << " must precharge items");
                 UNIT_ASSERT_LE_C(r.ItemsPrecharged, unlimited.ItemsPrecharged,
                     "keys fwd limit=" << limit
                     << " must not precharge more items than unlimited");
@@ -1822,114 +1793,14 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndexV2) {
         }
     }
 
-    // -- V2 charge slice coverage --------------------------------------------
-    Y_UNIT_TEST(OneNode_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::End)) {
-            CheckV2ChargeBasic({.Levels = 1, .Slices = TTestParams::ESlices(slices)});
-            CheckV2VsV1Charge({.Levels = 1, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(OneNode_Groups_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckV2ChargeBasic({.Levels = 1, .Groups = true, .Slices = TTestParams::ESlices(slices)});
-            CheckV2VsV1Charge({.Levels = 1, .Groups = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(OneNode_History_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckV2ChargeBasic({.Levels = 1, .History = true, .Slices = TTestParams::ESlices(slices)});
-            CheckV2VsV1Charge({.Levels = 1, .History = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(OneNode_Groups_History_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckV2ChargeBasic({.Levels = 1, .Groups = true, .History = true, .Slices = TTestParams::ESlices(slices)});
-            CheckV2VsV1Charge({.Levels = 1, .Groups = true, .History = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::End)) {
-            CheckV2ChargeBasic({.Levels = 3, .Slices = TTestParams::ESlices(slices)});
-            CheckV2VsV1Charge({.Levels = 3, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_Groups_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckV2ChargeBasic({.Levels = 3, .Groups = true, .Slices = TTestParams::ESlices(slices)});
-            CheckV2VsV1Charge({.Levels = 3, .Groups = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_History_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckV2ChargeBasic({.Levels = 3, .History = true, .Slices = TTestParams::ESlices(slices)});
-            CheckV2VsV1Charge({.Levels = 3, .History = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_Groups_History_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckV2ChargeBasic({.Levels = 3, .Groups = true, .History = true, .Slices = TTestParams::ESlices(slices)});
-            CheckV2VsV1Charge({.Levels = 3, .Groups = true, .History = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_Groups_History_Slices_Sticky_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckV2ChargeBasic({.Levels = 3, .Groups = true, .History = true, .Slices = TTestParams::ESlices(slices), .StickSomePages = true});
-            CheckV2VsV1Charge({.Levels = 3, .Groups = true, .History = true, .Slices = TTestParams::ESlices(slices), .StickSomePages = true});
-        }
-    }
 }
 
 // ========================================================================
-// V2 twin tests for TPartBtreeIndexIteration
+// V2 reverse-iteration twin for the raw group index
 // ========================================================================
 
-Y_UNIT_TEST_SUITE(TPartBtreeIndexIterationV2) {
+Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIterReverseV2) {
     using namespace NTest;
-
-    // Compare V2 btree iteration vs V1 btree iteration for the same data
-    void CheckV2Iteration(const TPartEggs& v1Eggs, const TPartEggs& v2Eggs, TTestParams /*params*/) {
-        const auto v1Part = *v1Eggs.Lone();
-        const auto v2Part = *v2Eggs.Lone();
-
-        UNIT_ASSERT_VALUES_EQUAL(v1Part.Stat.Rows, v2Part.Stat.Rows);
-
-        // Verify V2 root
-        const auto& v2Meta = v2Part.IndexPages.BTreeGroups[0];
-        UNIT_ASSERT_C(v2Meta.HasRootV2(), "V2 root expected");
-        UNIT_ASSERT_C(!v2Meta.HasRootV1(), "V2 part must not have V1 root");
-        UNIT_ASSERT_C(v2Meta.RootV2.Offset.IsByteOffset(), "V2 root must be byte offset");
-
-        // Iterate forward through both parts and compare row-by-row
-        TTestEnv v1Env, v2Env;
-        auto v1Index = CreateIndexIter(&v1Part, &v1Env, {});
-        auto v2Index = CreateIndexIter(&v2Part, &v2Env, {});
-
-        for (size_t i = 0; ; i++) {
-            auto v1Ready = i == 0 ? v1Index->Seek(0) : v1Index->Next();
-            auto v2Ready = i == 0 ? v2Index->Seek(0) : v2Index->Next();
-
-            UNIT_ASSERT_VALUES_EQUAL_C(v1Ready, v2Ready,
-                "V2 iteration readiness differs at step " + ToString(i));
-            if (v1Ready != EReady::Data) {
-                break;
-            }
-
-            UNIT_ASSERT_VALUES_EQUAL_C(v1Index->GetRowId(), v2Index->GetRowId(),
-                "V2 row id mismatch at step " + ToString(i));
-            UNIT_ASSERT_VALUES_EQUAL_C(v1Index->GetNextRowId(), v2Index->GetNextRowId(),
-                "V2 next row id mismatch at step " + ToString(i));
-            UNIT_ASSERT_VALUES_EQUAL_C(v1Index->GetLocation().Size, v2Index->GetLocation().Size,
-                "V2 page size mismatch at step " + ToString(i));
-        }
-    }
 
     // Reverse iteration
     void CheckV2IterationReverse(const TPartEggs& v1Eggs, const TPartEggs& v2Eggs) {
@@ -1954,148 +1825,23 @@ Y_UNIT_TEST_SUITE(TPartBtreeIndexIterationV2) {
         }
     }
 
-    // Key-based seek: sweep representative keys, seek modes, and directions.
-    // V1 equivalent (CheckSeekKey) does a full combinatorial sweep across the
-    // key space; here we sample enough to catch V2-specific seek regressions.
-    void CheckV2KeySeek(const TPartEggs& v1Eggs, const TPartEggs& v2Eggs) {
-        const auto v1Part = *v1Eggs.Lone();
-        const auto v2Part = *v2Eggs.Lone();
-        const auto* keyDefaults = v1Eggs.Scheme->Keys.Get();
-        const TRowId lastRow = v1Part.Stat.Rows - 1;
-
-        const ui32 maxFirst = lastRow > 0 ? lastRow / 7 : 0;
-        for (ui32 first : {0u, 1u, maxFirst / 2, maxFirst}) {
-            for (ui32 second : {0u, 5u, 13u}) {
-                for (bool reverse : {false, true}) {
-                    for (ESeek seek : {ESeek::Exact, ESeek::Lower, ESeek::Upper}) {
-                        TTestEnv v1Env, v2Env;
-                        auto v1Index = CreateIndexIter(&v1Part, &v1Env, {});
-                        auto v2Index = CreateIndexIter(&v2Part, &v2Env, {});
-
-                        auto key = MakeKey(first, second);
-                        auto v1Ready = reverse
-                            ? v1Index->SeekReverse(seek, key, keyDefaults)
-                            : v1Index->Seek(seek, key, keyDefaults);
-                        auto v2Ready = reverse
-                            ? v2Index->SeekReverse(seek, key, keyDefaults)
-                            : v2Index->Seek(seek, key, keyDefaults);
-
-                        UNIT_ASSERT_VALUES_EQUAL_C(v1Ready, v2Ready,
-                            "V2 key seek mismatch: "
-                            << (reverse ? "reverse " : "")
-                            << seek
-                            << " key={" << first << "," << second << "}");
-                    }
-                }
-            }
-        }
-    }
-
     void CheckPart(TTestParams params) {
         auto v1Eggs = MakePart(params);
         auto v2Eggs = MakeV2Part(params);
 
-        CheckV2Iteration(v1Eggs, v2Eggs, params);
         CheckV2IterationReverse(v1Eggs, v2Eggs);
-        CheckV2KeySeek(v1Eggs, v2Eggs);
     }
 
     Y_UNIT_TEST(NoNodes_V2) {
         CheckPart({.Levels = 0});
     }
 
-    Y_UNIT_TEST(NoNodes_Groups_V2) {
-        CheckPart({.Levels = 0, .Groups = true});
-    }
-
-    Y_UNIT_TEST(NoNodes_History_V2) {
-        CheckPart({.Levels = 0, .History = true});
-    }
-
     Y_UNIT_TEST(OneNode_V2) {
         CheckPart({.Levels = 1});
     }
 
-    Y_UNIT_TEST(OneNode_Groups_V2) {
-        CheckPart({.Levels = 1, .Groups = true});
-    }
-
-    Y_UNIT_TEST(OneNode_History_V2) {
-        CheckPart({.Levels = 1, .History = true});
-    }
-
     Y_UNIT_TEST(FewNodes_V2) {
         CheckPart({.Levels = 3});
-    }
-
-    Y_UNIT_TEST(FewNodes_Groups_V2) {
-        CheckPart({.Levels = 3, .Groups = true});
-    }
-
-    Y_UNIT_TEST(FewNodes_History_V2) {
-        CheckPart({.Levels = 3, .History = true});
-    }
-
-    Y_UNIT_TEST(FewNodes_Groups_History_V2) {
-        CheckPart({.Levels = 3, .Groups = true, .History = true});
-    }
-
-    Y_UNIT_TEST(OneNode_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::End)) {
-            CheckPart({.Levels = 1, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(OneNode_Groups_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 1, .Groups = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(OneNode_History_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 1, .History = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(OneNode_Groups_History_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 1, .Groups = true, .History = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_Sticky_V2) {
-        CheckPart({.Levels = 3, .StickSomePages = true});
-    }
-
-    Y_UNIT_TEST(FewNodes_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::End)) {
-            CheckPart({.Levels = 3, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_Groups_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 3, .Groups = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_History_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 3, .History = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_Groups_History_Slices_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 3, .Groups = true, .History = true, .Slices = TTestParams::ESlices(slices)});
-        }
-    }
-
-    Y_UNIT_TEST(FewNodes_Groups_History_Slices_Sticky_V2) {
-        for (auto slices : xrange<ui32>(TTestParams::ESlices::None + 1, TTestParams::ESlices::Many + 1)) {
-            CheckPart({.Levels = 3, .Groups = true, .History = true, .Slices = TTestParams::ESlices(slices), .StickSomePages = true});
-        }
     }
 }
 
