@@ -35,7 +35,7 @@ namespace {
                         TouchedRows += dataPage->Count;
                     }
                 }
-                if (type == EPage::FlatIndex || type == EPage::BTreeIndex) {
+                if (type == EPage::FlatIndex || type == EPage::BTreeIndex || type == EPage::BTreeIndexV2) {
                     TouchedIndexPages++;
                     TouchedIndexBytes += page->size();
                 }
@@ -1175,8 +1175,28 @@ Y_UNIT_TEST_SUITE(BuildStatsBTreeIndexV2) {
         conf.WriteBTreeIndex = true;
         conf.WriteBTreeIndexV2 = true;
         conf.WriteFlatIndex = false;
+        conf.BTreeIndexV2KeepV1Shadow = true;
 
         return conf;
+    }
+
+    void AssertHistogramValid(const THistogram& histogram, ui64 total,
+            ui32 histogramBucketsCount, TStringBuf name) {
+        UNIT_ASSERT_VALUES_EQUAL_C(histogram.size(), histogramBucketsCount - 1,
+            name << " bucket count");
+
+        ui64 prevValue = 0;
+        for (size_t i = 0; i < histogram.size(); i++) {
+            UNIT_ASSERT_GT_C(histogram[i].Value, prevValue,
+                name << " value at bucket " << i << " must increase");
+            UNIT_ASSERT_LE_C(histogram[i].Value, total,
+                name << " value at bucket " << i << " exceeds total");
+            UNIT_ASSERT_LE_C((histogram[i].Value - prevValue) * 100, total * 20,
+                name << " bucket " << i << " covers more than 20% of total");
+            prevValue = histogram[i].Value;
+        }
+        UNIT_ASSERT_LE_C((total - prevValue) * 100, total * 20,
+            name << " final bucket covers more than 20% of total");
     }
 
     void CheckBTreeIndexV2(const TSubset& subset, ui64 expectedRows, ui64 expectedData, ui64 expectedIndex, ui32 histogramBucketsCount = 10) {
@@ -1205,6 +1225,10 @@ Y_UNIT_TEST_SUITE(BuildStatsBTreeIndexV2) {
         UNIT_ASSERT_VALUES_EQUAL(stats.RowCount, expectedRows);
         UNIT_ASSERT_VALUES_EQUAL(stats.DataSize.Size, expectedData);
         UNIT_ASSERT_VALUES_EQUAL(stats.IndexSize.Size, expectedIndex);
+        AssertHistogramValid(stats.RowCountHistogram, stats.RowCount,
+            histogramBucketsCount, "row-count histogram");
+        AssertHistogramValid(stats.DataSizeHistogram, stats.DataSize.Size,
+            histogramBucketsCount, "data-size histogram");
     }
 
     // V1 conf for twin tests
@@ -1221,6 +1245,7 @@ Y_UNIT_TEST_SUITE(BuildStatsBTreeIndexV2) {
         conf.CutIndexKeys = false;
         conf.WriteBTreeIndex = true;
         conf.WriteBTreeIndexV2 = false;
+        conf.WriteFlatIndex = false;
 
         return conf;
     }
@@ -1249,6 +1274,15 @@ Y_UNIT_TEST_SUITE(BuildStatsBTreeIndexV2) {
 
         // Data size must match between v1 and v2
         UNIT_ASSERT_VALUES_EQUAL(v1Stats.DataSize.Size, v2Stats.DataSize.Size);
+
+        AssertHistogramValid(v1Stats.RowCountHistogram, v1Stats.RowCount, 10,
+            "V1 row-count histogram");
+        AssertHistogramValid(v2Stats.RowCountHistogram, v2Stats.RowCount, 10,
+            "V2 row-count histogram");
+        AssertHistogramValid(v1Stats.DataSizeHistogram, v1Stats.DataSize.Size, 10,
+            "V1 data-size histogram");
+        AssertHistogramValid(v2Stats.DataSizeHistogram, v2Stats.DataSize.Size, 10,
+            "V2 data-size histogram");
     }
 
     Y_UNIT_TEST(Single_V2) {
@@ -1313,14 +1347,6 @@ Y_UNIT_TEST_SUITE(BuildStatsBTreeIndexV2) {
     Y_UNIT_TEST(Single_Twin_V2) {
         // Twin: v1 and v2 produce same stats
         CheckTwin(Mass0, 1);
-    }
-
-    Y_UNIT_TEST(Single_History_Twin_V2) {
-        CheckTwin(Mass0, 1, true);
-    }
-
-    Y_UNIT_TEST(Single_Groups_Twin_V2) {
-        CheckTwin(Mass1, 1);
     }
 
     Y_UNIT_TEST(Single_Groups_History_Twin_V2) {

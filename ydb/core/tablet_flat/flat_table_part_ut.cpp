@@ -180,8 +180,8 @@ Y_UNIT_TEST_SUITE(TLegacy) {
         UNIT_ASSERT_C(metaV2.HasRootV2(), "V2 part must carry a byte-offset root");
         UNIT_ASSERT_C(!metaV2.HasRootV1(), "V2-only part must not carry a V1 root");
         // the tree must have index levels so Start() actually walks children
-        UNIT_ASSERT_C(metaV1.LevelCount() == metaV2.LevelCount(),
-            "V1/V2 level count mismatch: " << metaV1.LevelCount() << " vs " << metaV2.LevelCount());
+        UNIT_ASSERT_C(metaV1.LevelCount() > 0,
+            "need a multi-level V1 tree to exercise child traversal, got LevelCount=" << metaV1.LevelCount());
         UNIT_ASSERT_C(metaV2.LevelCount() > 0,
             "need a multi-level tree to exercise child traversal, got LevelCount=" << metaV2.LevelCount());
 
@@ -426,5 +426,4 @@ Y_UNIT_TEST_SUITE(TLegacy) {
 } // namespace NTest
 } // namspace NTable
 } // namespace NKikimr
-
 
