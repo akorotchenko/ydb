@@ -3,6 +3,7 @@
 #include "defs.h"
 #include "flat_bio_events.h"
 #include "shared_handle.h"
+#include "shared_cache_item.h"
 #include "shared_page.h"
 #include <ydb/core/protos/shared_cache.pb.h>
 
@@ -12,14 +13,15 @@
 #include <util/generic/hash_set.h>
 
 namespace NKikimr::NSharedCache {
-    using EPriority = NTabletFlatExecutor::NBlockIO::EPriority;
-    using TPageId = NTable::NPage::TPageId;
+using EPriority = NTabletFlatExecutor::NBlockIO::EPriority;
+using TPageId = NTable::NPage::TPageId;
 
     enum class EWakeupTag {
         DoGCScheduled = 1,
         DoGCManual = 2,
         DoLimitDecrease = 3,
         ContinueBTreeWalk = 4,
+        DoLimitMaintenance = 5,
     };
 
     enum EEv {
@@ -29,10 +31,13 @@ namespace NKikimr::NSharedCache {
         EvUnregister,
         EvDetach,
         EvAttach,
+        EvAttached,
         EvSaveCompactedPages,
         EvRequest,
         EvResult,
         EvUpdated,
+        EvInFlightReleased,
+        EvRequestAnswered,
         EvStickyCollectionPages,
 
         EvEnd
@@ -52,14 +57,23 @@ namespace NKikimr::NSharedCache {
     static_assert(EvEnd < EventSpaceEnd(TKikimrEvents::ES_FLAT_EXECUTOR), "");
 
     struct TEvUnregister : public TEventLocal<TEvUnregister, EvUnregister> {
+        TIntrusivePtr<TCollectionRegistry> Registry;
+
+        explicit TEvUnregister(TIntrusivePtr<TCollectionRegistry> registry = {})
+            : Registry(std::move(registry))
+        {
+        }
     };
 
     struct TEvDetach : public TEventLocal<TEvDetach, EvDetach> {
         const TLogoBlobID PageCollectionId;
+        TIntrusivePtr<TCollectionRegistry> Registry;
 
-        TEvDetach(const TLogoBlobID &pageCollectionId)
+        TEvDetach(const TLogoBlobID& pageCollectionId, TIntrusivePtr<TCollectionRegistry> registry = {})
             : PageCollectionId(pageCollectionId)
-        {}
+            , Registry(std::move(registry))
+        {
+        }
     };
 
     // notifies Shared Cache about Private Cache owned shared bodies
@@ -67,9 +81,10 @@ namespace NKikimr::NSharedCache {
     struct TEvSync : public TEventLocal<TEvSync, EvTouch> {
         THashMap<TLogoBlobID, THashSet<TPageOffset>> Pages;
 
-        TEvSync(THashMap<TLogoBlobID, THashSet<TPageOffset>> &&pages)
+        TEvSync(THashMap<TLogoBlobID, THashSet<TPageOffset>>&& pages)
             : Pages(std::move(pages))
-        {}
+        {
+        }
     };
 
     struct TEvAttach : public TEventLocal<TEvAttach, EvAttach> {
@@ -89,18 +104,40 @@ namespace NKikimr::NSharedCache {
         };
 
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
+        TIntrusivePtr<TCollectionRegistry> Registry;
         ECacheMode CacheMode;
         // Authoritative for the sender: an empty vector withdraws that owner's walks.
         TVector<TBtreeSeed> BtreeSeeds;
         // Revisit unchanged sticky seeds after the owner's private cache is recreated.
         bool ReplayStickyWalk = false;
 
+        // The cache walks the seeded B-trees itself.
         TEvAttach(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, ECacheMode cacheMode,
             TVector<TBtreeSeed> btreeSeeds = {}, bool replayStickyWalk = false)
             : PageCollection(std::move(pageCollection))
             , CacheMode(cacheMode)
             , BtreeSeeds(std::move(btreeSeeds))
             , ReplayStickyWalk(replayStickyWalk)
+        {
+        }
+
+        // The registry ties the collection to the owner's shared cache state.
+        TEvAttach(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, ECacheMode cacheMode,
+            TIntrusivePtr<TCollectionRegistry> registry = {})
+            : PageCollection(std::move(pageCollection))
+            , Registry(std::move(registry))
+            , CacheMode(cacheMode)
+        {
+        }
+    };
+
+    struct TEvAttached : public TEventLocal<TEvAttached, EvAttached> {
+        TLogoBlobID PageCollectionId;
+        TCollectionCacheItem CacheItem;
+
+        TEvAttached(const TLogoBlobID& pageCollectionId, TCollectionCacheItem cacheItem)
+            : PageCollectionId(pageCollectionId)
+            , CacheItem(cacheItem)
         {
         }
     };
@@ -137,10 +174,13 @@ namespace NKikimr::NSharedCache {
     struct TEvResult : public TEventLocal<TEvResult, EvResult> {
         using EStatus = NKikimrProto::EReplyStatus;
 
-        TEvResult(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, EStatus status, ui64 cookie)
+        TEvResult(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, EStatus status, ui64 cookie,
+            ui64 executorGeneration = 0, ui64 requestId = 0)
             : Status(status)
             , PageCollection(std::move(pageCollection))
             , Cookie(cookie)
+            , ExecutorGeneration(executorGeneration)
+            , RequestId(requestId)
         { }
 
         void Describe(IOutputStream &out) const
@@ -177,6 +217,103 @@ namespace NKikimr::NSharedCache {
         TVector<TLoaded> Pages;
         TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad;
         const ui64 Cookie;
+        const ui64 ExecutorGeneration;
+        const ui64 RequestId;
+    };
+
+    struct TRequestCompletionParams {
+        NActors::TActorSystem* ActorSystem = nullptr;
+        TActorId ReplyTo;
+        ui64 EventCookie = 0;
+        ui64 ExecutorGeneration = 0;
+        ui64 RequestId = 0;
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
+        TVector<TPageLocation> Pages;
+        TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad;
+        ui64 Cookie = 0;
+        NActors::TActorId Notify;
+    };
+
+    class TRequestCompletion final : public TThrRefBase {
+    public:
+        explicit TRequestCompletion(TRequestCompletionParams&& params) noexcept;
+
+        void Complete(ui32 index, TSharedPageRef page, EPageFetchCompletion completion) noexcept;
+
+        const TVector<TPageLocation>& Locations() const noexcept {
+            return Locations_;
+        }
+
+    private:
+        void SendResult() noexcept;
+
+    private:
+        NActors::TActorSystem* const ActorSystem_;
+        const TActorId ReplyTo_;
+        const ui64 EventCookie_;
+        const ui64 ExecutorGeneration_;
+        const ui64 RequestId_;
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
+        TVector<TPageLocation> Locations_;
+        TVector<TSharedPageRef> Pages_;
+        TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad_;
+        const ui64 Cookie_;
+        const NActors::TActorId Notify_;
+        std::atomic<TEvResult::EStatus> Status_{ NKikimrProto::OK };
+        std::atomic<ui32> Remaining_;
+    };
+
+    // In-flight accounting of one dispatched fetch: the last completed page releases it to the cache actor.
+    class TDispatchInFlight final : public TThrRefBase {
+    public:
+        TDispatchInFlight(
+            NActors::TActorSystem* actorSystem, TActorId actor, ui64 cookie, ui64 bytes, ui32 pages) noexcept;
+
+        void PageCompleted() noexcept;
+
+    private:
+        NActors::TActorSystem* const ActorSystem_;
+        const TActorId Actor_;
+        const ui64 Cookie_;
+        const ui64 Bytes_;
+        const ui32 Pages_;
+        std::atomic<ui32> Remaining_;
+    };
+
+    struct TEvRequestAnswered : public TEventLocal<TEvRequestAnswered, EvRequestAnswered> {
+        explicit TEvRequestAnswered(ui64 status) noexcept
+            : Status(status)
+        { }
+
+        const ui64 Status;
+    };
+
+    struct TEvInFlightReleased : public TEventLocal<TEvInFlightReleased, EvInFlightReleased> {
+        TEvInFlightReleased(ui64 cookie, ui64 bytes, ui32 pages) noexcept
+            : Cookie(cookie)
+            , Bytes(bytes)
+            , Pages(pages)
+        { }
+
+        const ui64 Cookie; // queue type
+        const ui64 Bytes; // fetch cookie, the requested size
+        const ui32 Pages;
+    };
+
+    class TRequestPageWaiter final : public TPageFetchWaiter {
+    public:
+        TRequestPageWaiter(TIntrusivePtr<TRequestCompletion> completion, ui32 index) noexcept;
+
+        void Complete(TPageCacheItem page, EPageFetchCompletion completion) noexcept override;
+
+        void SetInFlight(TIntrusivePtr<TDispatchInFlight> inFlight) noexcept {
+            InFlight_ = std::move(inFlight);
+        }
+
+    private:
+        TIntrusivePtr<TRequestCompletion> Completion_;
+        TIntrusivePtr<TDispatchInFlight> InFlight_;
+        const ui32 Index_;
     };
 
     struct TEvUpdated : public TEventLocal<TEvUpdated, EvUpdated> {
@@ -195,7 +332,7 @@ namespace NKikimr::NSharedCache {
         const TLogoBlobID CollectionId;
         TVector<TPageLocation> Locations;
     };
-}
+    } // namespace NKikimr::NSharedCache
 
 template<> inline
 void Out<NKikimr::NTable::NPage::TPageLocation>(IOutputStream& o, const NKikimr::NTable::NPage::TPageLocation& val) {
