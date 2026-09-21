@@ -13,7 +13,7 @@ using TPageLocation = NTable::NPage::TPageLocation;
 using EPage = NTable::NPage::EPage;
 using ECacheMode = NTable::NPage::ECacheMode;
 
-struct TCollection;
+class TCollection;
 
 enum EPageState {
     PageStateNo,

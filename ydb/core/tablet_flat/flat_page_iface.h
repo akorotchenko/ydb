@@ -43,6 +43,11 @@ namespace NPage {
             return TPageOffset(static_cast<ui64>(value) | IndexTag);
         }
 
+        static TPageOffset FromRaw(ui64 value) noexcept {
+            Y_DEBUG_ABORT_UNLESS(value != MaxRaw);
+            return TPageOffset(value);
+        }
+
         /** Max sentinel — all bits set */
         static TPageOffset Max() noexcept { return TPageOffset(); }
         static TPageOffset Min() noexcept { return TPageOffset(ui64(0)); }
@@ -177,6 +182,10 @@ namespace NPage {
         /// Construct from a page index (independently addressed pages)
         static TPageLocation FromPageIndex(ui32 pageId, ui64 size, EPage type = EPage::Undef, ui32 crc32 = 0) noexcept {
             return {TPageOffset::FromPageIndex(pageId), size, type, crc32};
+        }
+
+        const TPageLocation& Location() const noexcept {
+            return *this;
         }
 
         TPageLocation(TPageOffset offset, ui64 size = 0, EPage type = EPage::Undef, ui32 crc32 = 0) noexcept

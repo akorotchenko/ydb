@@ -1,6 +1,7 @@
 #pragma once
 
 #include "defs.h"
+#include "shared_cache_fwd.h"
 
 #include <ydb/library/actors/util/shared_data.h>
 
@@ -475,6 +476,8 @@ private:
     bool Used;
     NTable::NPage::EPage Type = NTable::NPage::EPage::Undef;
 };
+
+TSharedPageRef MakeSharedPageRef(TSharedCachePageRef&& page);
 
 /**
  * A smart reference to a page pinned in memory

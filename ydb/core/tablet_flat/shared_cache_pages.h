@@ -7,6 +7,7 @@ namespace NKikimr::NSharedCache {
 class TSharedCachePages : public TThrRefBase {
 public:
     TIntrusivePtr<TSharedPageGCList> GCList = new TSharedPageGCList;
+    TIntrusivePtr<TThrRefBase> Cache;
 };
 
-}
+} // namespace NKikimr::NSharedCache
