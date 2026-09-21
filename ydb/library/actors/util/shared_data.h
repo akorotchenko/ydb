@@ -12,6 +12,37 @@ namespace NActors {
 
     class TSharedData {
     public:
+        class TBuffer {
+        public:
+            TBuffer() noexcept = default;
+            TBuffer(const TBuffer&) = delete;
+            TBuffer& operator=(const TBuffer&) = delete;
+            TBuffer(TBuffer&& other) noexcept;
+            TBuffer& operator=(TBuffer&& other) noexcept;
+            ~TBuffer() noexcept;
+
+            Y_FORCE_INLINE explicit operator bool() const noexcept {
+                return Data_ != nullptr;
+            }
+
+            Y_FORCE_INLINE const char* data() const noexcept {
+                return Data_;
+            }
+
+            TSharedData Share(size_t size) const noexcept;
+
+        private:
+            friend class TSharedData;
+
+            explicit TBuffer(char* data) noexcept
+                : Data_(data)
+            {
+            }
+
+        private:
+            char* Data_ = nullptr;
+        };
+
         class IOwner {
         public:
             virtual ~IOwner() = default;
@@ -193,33 +224,47 @@ namespace NActors {
             return Copy(data.data(), data.size());
         }
 
+        TBuffer Extract() && noexcept;
+
     private:
-        Y_FORCE_INLINE THeader* Header() const noexcept {
-            Y_DEBUG_ABORT_UNLESS(Data_);
-            return reinterpret_cast<THeader*>(Data_ - sizeof(THeader));
+        static Y_FORCE_INLINE THeader* Header(char* data) noexcept {
+            Y_DEBUG_ABORT_UNLESS(data);
+            return reinterpret_cast<THeader*>(data - sizeof(THeader));
         }
 
         static bool IsPrivate(THeader* header) noexcept {
             return 1 == header->RefCount.load(std::memory_order_relaxed);
         }
 
-        void AddRef() noexcept {
-            if (Data_) {
-                Header()->RefCount.fetch_add(1, std::memory_order_relaxed);
+        static void AddRef(char* data) noexcept {
+            if (data) {
+                Header(data)->RefCount.fetch_add(1, std::memory_order_relaxed);
             }
         }
 
-        void Release() noexcept {
-            if (Data_) {
-                auto* header = Header();
+        static void Release(char* data) noexcept {
+            if (data) {
+                auto* header = Header(data);
                 if (1 == header->RefCount.fetch_sub(1, std::memory_order_acq_rel)) {
                     if (auto* owner = header->Owner) {
-                        owner->Deallocate(Data_);
+                        owner->Deallocate(data);
                     } else {
-                        Deallocate(Data_);
+                        Deallocate(data);
                     }
                 }
             }
+        }
+
+        Y_FORCE_INLINE THeader* Header() const noexcept {
+            return Header(Data_);
+        }
+
+        void AddRef() noexcept {
+            AddRef(Data_);
+        }
+
+        void Release() noexcept {
+            Release(Data_);
         }
 
     private:
@@ -230,5 +275,40 @@ namespace NActors {
         char* Data_;
         size_t Size_;
     };
+
+    inline TSharedData::TBuffer::TBuffer(TBuffer&& other) noexcept
+        : Data_(other.Data_)
+    {
+        other.Data_ = nullptr;
+    }
+
+    inline TSharedData::TBuffer& TSharedData::TBuffer::operator=(TBuffer&& other) noexcept {
+        if (this != &other) {
+            TSharedData::Release(Data_);
+            Data_ = other.Data_;
+            other.Data_ = nullptr;
+        }
+        return *this;
+    }
+
+    inline TSharedData::TBuffer::~TBuffer() noexcept {
+        TSharedData::Release(Data_);
+    }
+
+    inline TSharedData TSharedData::TBuffer::Share(size_t size) const noexcept {
+        Y_DEBUG_ABORT_UNLESS(Data_ || size == 0);
+        TSharedData result = TSharedData::AttachUnsafe(Data_, size);
+        result.AddRef();
+        return result;
+    }
+
+    inline TSharedData::TBuffer TSharedData::Extract() && noexcept {
+        TBuffer result(Data_);
+        Data_ = nullptr;
+        Size_ = 0;
+        return result;
+    }
+
+    static_assert(sizeof(TSharedData::TBuffer) == sizeof(char*));
 
 }

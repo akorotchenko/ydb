@@ -73,6 +73,25 @@ namespace NActors {
             UNIT_ASSERT(data.data() == nullptr);
         }
 
+        Y_UNIT_TEST(BufferOwnership) {
+            auto data = TSharedData::Copy("Hello", 5);
+            const char* ptr = data.data();
+
+            auto buffer = std::move(data).Extract();
+            UNIT_ASSERT(!data);
+            UNIT_ASSERT(buffer);
+            UNIT_ASSERT(buffer.data() == ptr);
+
+            auto shared = buffer.Share(5);
+            UNIT_ASSERT(shared.IsShared());
+            UNIT_ASSERT(shared.data() == ptr);
+            UNIT_ASSERT_VALUES_EQUAL(shared.ToString(), TString("Hello"));
+
+            buffer = {};
+            UNIT_ASSERT(shared.IsPrivate());
+            UNIT_ASSERT_VALUES_EQUAL(shared.ToString(), TString("Hello"));
+        }
+
         class TCustomOwner : public TSharedData::IOwner {
             using THeader = TSharedData::THeader;
 
@@ -195,6 +214,20 @@ namespace NActors {
                 auto disowned = data;
                 disowned.Detach();
                 UNIT_ASSERT(owner.NextDeallocated() == nullptr);
+            }
+
+            UNIT_ASSERT(owner.NextDeallocated() == ptr);
+            UNIT_ASSERT(owner.NextDeallocated() == nullptr);
+
+            // Test buffer ownership preserves a custom owner
+            {
+                auto data = owner.Allocate(42);
+                ptr = data.data();
+                auto buffer = std::move(data).Extract();
+                auto shared = buffer.Share(42);
+                buffer = {};
+                UNIT_ASSERT(owner.NextDeallocated() == nullptr);
+                UNIT_ASSERT(shared.data() == ptr);
             }
 
             UNIT_ASSERT(owner.NextDeallocated() == ptr);
