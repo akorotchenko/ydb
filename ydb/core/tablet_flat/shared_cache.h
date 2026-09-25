@@ -1,5 +1,6 @@
 #pragma once
 
+#include "shared_cache_collection.h"
 #include "shared_cache_table.h"
 
 #include <util/generic/noncopyable.h>

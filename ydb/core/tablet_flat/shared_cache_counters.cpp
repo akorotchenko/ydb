@@ -22,6 +22,11 @@ TSharedPageCacheCounters::TSharedPageCacheCounters(const TIntrusivePtr<::NMonito
     , CacheMissInMemoryBytes(counters->GetCounter("CacheMissInMemoryBytes", true))
     , InFlightPages(counters->GetCounter("InFlightPages"))
     , InFlightBytes(counters->GetCounter("InFlightBytes"))
+    , TargetInMemoryBytes(counters->GetCounter("TargetInMemoryBytes"))
+    , ActiveInMemoryBytes(counters->GetCounter("ActiveInMemoryBytes"))
+    , EvictedPages(counters->GetCounter("EvictedPages", true))
+    , EvictedBytes(counters->GetCounter("EvictedBytes", true))
+    , S3FIFOEvictOps(counters->GetCounter("S3FIFOEvictOps", true))
     // page collection counters:
     , PageCollections(counters->GetCounter("PageCollections"))
     , Owners(counters->GetCounter("Owners"))

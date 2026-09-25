@@ -398,7 +398,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
         });
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 3);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
 
@@ -407,7 +407,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
         });
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 1);
     }
@@ -426,7 +426,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{20, sharedCache.Collection2, {_P(6), _P(7)}}
         });
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 9);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 9);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 9);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
@@ -441,7 +441,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{3, sharedCache.Collection1, {}}
         }, NKikimrProto::ERROR);
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 6);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 6);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
@@ -452,7 +452,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection1, {_P(5), _P(6)});
         sharedCache.CheckResults({});
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 4);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
@@ -467,7 +467,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{2, sharedCache.Collection2, {_P(4), _P(5)}}
         });
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
@@ -484,7 +484,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckFetches({
             TFetch{20, sharedCache.Collection1, {_P(1), _P(2)}}
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 8);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
 
@@ -492,7 +492,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckFetches({
             TFetch{20, sharedCache.Collection1, {_P(3), _P(4)}}
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
 
         sharedCache.Provide(sharedCache.Collection1, {_P(3), _P(4)}, ASYNC_QUEUE_COOKIE);
@@ -500,7 +500,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             // TODO: shouldn't we finish with Collection1 page 5?
             TFetch{20, sharedCache.Collection2, {_P(1), _P(2)}},
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
 
         sharedCache.Provide(sharedCache.Collection2, {_P(1), _P(2)}, ASYNC_QUEUE_COOKIE);
@@ -508,7 +508,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{10, sharedCache.Collection2, {_P(3)}},
             TFetch{10, sharedCache.Collection1, {_P(5)}},
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
 
         sharedCache.Provide(sharedCache.Collection2, {_P(3)});
@@ -517,7 +517,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{2, sharedCache.Collection2, {_P(1), _P(2), _P(3)}},
             TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4), _P(5)}}
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 2);
     }
@@ -536,7 +536,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{10, sharedCache.Collection1, {_P(2)}},
         });
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 6);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 6);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
@@ -556,7 +556,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             // page 2 is still in-fly
             TFetch{10, sharedCache.Collection2, {_P(4)}},
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 4);
@@ -568,7 +568,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckFetches({
             TFetch{10, sharedCache.Collection2, {_P(6)}},
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 4);
@@ -582,7 +582,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{6, sharedCache.Collection2, {_P(6)}},
             TFetch{4, sharedCache.Collection2, {_P(4)}}
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 4);
@@ -598,7 +598,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckFetches({
             TFetch{20, sharedCache.Collection1, {_P(1), _P(2)}}
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 5);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
 
@@ -606,7 +606,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckFetches({
             TFetch{50, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4), _P(6)}}
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 7);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 7);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 10);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
 
@@ -614,21 +614,21 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckResults({
             TFetch{2, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4), _P(6)}},
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
 
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2)}, ASYNC_QUEUE_COOKIE);
         sharedCache.CheckFetches({
             TFetch{10, sharedCache.Collection1, {_P(5)}}
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
 
         sharedCache.Provide(sharedCache.Collection1, {_P(5)}, ASYNC_QUEUE_COOKIE);
         sharedCache.CheckResults({
             TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4), _P(5)}},
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
     }
 
@@ -1103,7 +1103,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{10, sharedCache.Collection2, {_P(2)}},
             TFetch{10, sharedCache.Collection1, {_P(3)}},
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 3);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 2);
@@ -1113,7 +1113,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckResults({
             TFetch{1, sharedCache.Collection1, {}}
         }, NKikimrProto::RACE);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 3);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 1);
@@ -1133,7 +1133,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckResults({
             TFetch{2, sharedCache.Collection2, {_P(2)}}
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 1);
@@ -1152,7 +1152,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckFetches({
             TFetch{20, sharedCache.Collection1, {_P(1), _P(2)}}
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 2);
@@ -1163,7 +1163,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{1, sharedCache.Collection1, {}},
             TFetch{2, sharedCache.Collection1, {}}
         }, NKikimrProto::RACE);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
@@ -1198,7 +1198,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{3, sharedCache.Collection2, {_P(10), _P(11), _P(12)}},
         });
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
@@ -1319,7 +1319,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{10, sharedCache.Collection2, {_P(2)}},
             TFetch{10, sharedCache.Collection1, {_P(3)}},
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 3);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 2);
@@ -1330,7 +1330,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{1, sharedCache.Collection1, {}},
             TFetch{2, sharedCache.Collection2, {}}
         }, NKikimrProto::RACE);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 3);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
@@ -1347,7 +1347,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckResults({
             TFetch{4, sharedCache.Collection1, {_P(1), _P(3)}}
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
@@ -1366,7 +1366,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckFetches({
             TFetch{20, sharedCache.Collection1, {_P(1), _P(2)}}
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 2);
@@ -1378,7 +1378,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{2, sharedCache.Collection1, {}},
             TFetch{3, sharedCache.Collection2, {}}
         }, NKikimrProto::RACE);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 3);
@@ -1399,7 +1399,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{4, sharedCache.Collection1, {_P(1), _P(5), _P(9), _P(10)}}
         });
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 3);
@@ -1418,7 +1418,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{10, sharedCache.Collection1, {_P(1)}},
             TFetch{10, sharedCache.Collection2, {_P(10)}}
         });
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 2);
@@ -1429,7 +1429,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{2, sharedCache.Collection2, {}},
             TFetch{3, sharedCache.Collection2, {}}
         }, NKikimrProto::RACE);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
@@ -1442,7 +1442,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{1, sharedCache.Collection1, {_P(1)}},
         });
         sharedCache.CheckFetches({});
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
@@ -1453,7 +1453,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection2, {_P(10)}, ASYNC_QUEUE_COOKIE);
         sharedCache.CheckResults({});
         sharedCache.CheckFetches({});
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
@@ -1472,7 +1472,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{40, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
         });
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 4);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissInMemoryPages->Val(), 0);
@@ -1486,7 +1486,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
         });
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissInMemoryPages->Val(), 0);
@@ -1498,7 +1498,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.CheckFetches({});
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissInMemoryPages->Val(), 0);
@@ -1507,7 +1507,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
         });
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissInMemoryPages->Val(), 0);
@@ -2058,7 +2058,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             { TFetch{ 0, sharedCache.Collection1, {} } },
             NKikimrProto::ERROR);
         sharedCache.CheckFetches({});
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
 
         sharedCache.Unregister(sharedCache.Sender1);
 
@@ -2758,7 +2758,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{40, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
         });
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 4);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissInMemoryPages->Val(), 0);
@@ -2772,7 +2772,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
         });
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissInMemoryPages->Val(), 0);
@@ -2786,7 +2786,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckFetches({});
         sharedCache.CheckResults({});
 
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissInMemoryPages->Val(), 0);
@@ -2902,7 +2902,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 0);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 1);

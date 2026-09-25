@@ -29,6 +29,12 @@ struct TSharedPageCacheCounters final : public TAtomicRefCount<TSharedPageCacheC
     const TCounterPtr CacheMissInMemoryBytes;
     const TCounterPtr InFlightPages;
     const TCounterPtr InFlightBytes;
+    // Legacy actor counters: still reported until the actor is cut over to the new cache.
+    const TCounterPtr TargetInMemoryBytes;
+    const TCounterPtr ActiveInMemoryBytes;
+    const TCounterPtr EvictedPages;
+    const TCounterPtr EvictedBytes;
+    const TCounterPtr S3FIFOEvictOps;
 
     // page collection counters:
     const TCounterPtr PageCollections;

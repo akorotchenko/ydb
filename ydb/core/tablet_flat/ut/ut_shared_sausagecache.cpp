@@ -280,11 +280,11 @@ void WakeupSharedCache(TMyEnvBase& env) {
 // Waits until the shared cache has nothing in flight, i.e. the in-memory preload (and the walk
 // feeding it) has finished.
 void WaitInFlyDrain(TMyEnvBase& env, THolder<TSharedPageCacheCounters>& counters) {
-    for (ui32 i = 0; i < 400 && counters->LoadInFlyPages->Val() != 0; ++i) {
+    for (ui32 i = 0; i < 400 && counters->InFlightPages->Val() != 0; ++i) {
         WakeupSharedCache(env);
     }
 
-    UNIT_ASSERT_VALUES_EQUAL(counters->LoadInFlyPages->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(counters->InFlightPages->Val(), 0);
 }
 
 void DoReadRows(TMyEnvBase& env, TTxReadRows* read, bool retry = false) {
@@ -326,7 +326,7 @@ Y_UNIT_TEST(Limits) {
         DoReadRows(env, new TTxReadRows(key, retried));
     }
     LogCounters(counters);
-    UNIT_ASSERT_VALUES_EQUAL(counters->LoadInFlyBytes->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(counters->InFlightBytes->Val(), 0);
     UNIT_ASSERT_DOUBLES_EQUAL(counters->ActiveBytes->Val(), static_cast<i64>(8_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_VALUES_EQUAL(counters->ActiveLimitBytes->Val(), 8_MB);
     UNIT_ASSERT_VALUES_EQUAL(counters->PassiveBytes->Val(), passiveBytes);
@@ -394,7 +394,7 @@ Y_UNIT_TEST(Limits_Config) {
         DoReadRows(env, new TTxReadRows(key, retried));
     }
     LogCounters(counters);
-    UNIT_ASSERT_VALUES_EQUAL(counters->LoadInFlyBytes->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(counters->InFlightBytes->Val(), 0);
     UNIT_ASSERT_DOUBLES_EQUAL(counters->ActiveBytes->Val(), static_cast<i64>(8_MB), static_cast<i64>(1_MB / 3)); // 2 full layers (fresh & staging)
     UNIT_ASSERT_VALUES_EQUAL(counters->ActiveLimitBytes->Val(), 8_MB);
     UNIT_ASSERT_VALUES_EQUAL(counters->PassiveBytes->Val(), passiveBytes);

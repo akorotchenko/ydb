@@ -218,7 +218,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             // and schedule another decrease after we process the current event queue.
             newLimit = currentLimit - Config.GetMaxLimitDecreaseStepBytes();
             LimitDecreaseScheduled = true;
-            Send(SelfId(), new TKikimrEvents::TEvWakeup(static_cast<ui64>(EWakeupTag::DoLimitDecrease)));
+            Send(SelfId(), new TKikimrEvents::TEvWakeup(static_cast<ui64>(EWakeupTag::DoLimitMaintenance)));
         }
 
         // limit of cache depends only on config and mem because passive pages may go in and out arbitrary
@@ -978,7 +978,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             break;
         case EWakeupTag::DoGCManual:
             break;
-        case EWakeupTag::DoLimitDecrease:
+        case EWakeupTag::DoLimitMaintenance:
             LimitDecreaseScheduled = false;
             ActualizeCacheSizeLimit();
             break;
@@ -1679,16 +1679,16 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     inline void AddInFlyPages(ui64 count, ui64 size) {
         ui64 totalBytes = size + sizeof(TPage) * count;
         StatLoadInFlyBytes += totalBytes;
-        Counters.LoadInFlyPages->Add(count);
-        Counters.LoadInFlyBytes->Add(totalBytes);
+        Counters.InFlightPages->Add(count);
+        Counters.InFlightBytes->Add(totalBytes);
     }
 
     inline void RemoveInFlyPages(ui64 count, ui64 size) {
         ui64 totalBytes = size + sizeof(TPage) * count;
         Y_ENSURE(StatLoadInFlyBytes >= totalBytes);
         StatLoadInFlyBytes -= totalBytes;
-        Counters.LoadInFlyPages->Sub(count);
-        Counters.LoadInFlyBytes->Sub(totalBytes);
+        Counters.InFlightPages->Sub(count);
+        Counters.InFlightBytes->Sub(totalBytes);
     }
 
     inline void AddAlivePage(const TPage* page) {

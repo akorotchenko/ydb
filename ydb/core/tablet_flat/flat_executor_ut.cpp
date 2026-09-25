@@ -8555,7 +8555,7 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_BTreeIndex) {
         watchRequests = true;
         env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
 
-        for (ui32 i = 0; i < 400 && counters->LoadInFlyPages->Val() != 0; ++i) {
+        for (ui32 i = 0; i < 400 && counters->InFlightPages->Val() != 0; ++i) {
             WakeupSharedCache(env);
         }
 
