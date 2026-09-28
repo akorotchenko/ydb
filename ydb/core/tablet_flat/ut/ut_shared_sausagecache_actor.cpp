@@ -1,15 +1,20 @@
+#include <ydb/core/base/counters.h>
+#include <ydb/core/cms/console/console.h>
+#include <ydb/core/protos/bootstrap.pb.h>
+#include <ydb/core/testlib/actors/block_events.h>
+#include <ydb/core/testlib/actors/test_runtime.h>
+#include <ydb/core/testlib/actors/wait_events.h>
+#include <ydb/core/testlib/basics/appdata.h>
+
+#include <ydb/library/actors/testlib/test_runtime.h>
+
+#include <library/cpp/testing/unittest/registar.h>
+
+#include <flat_sausagecache.h>
 #include <shared_cache_counters.h>
 #include <shared_cache_events.h>
 #include <shared_sausagecache.h>
-#include <ydb/core/cms/console/console.h>
-#include <ydb/core/base/counters.h>
-#include <ydb/core/testlib/actors/block_events.h>
-#include <ydb/core/testlib/actors/wait_events.h>
-#include <ydb/core/testlib/actors/test_runtime.h>
-#include <ydb/core/testlib/basics/appdata.h>
-#include <ydb/library/actors/testlib/test_runtime.h>
-#include <library/cpp/testing/unittest/registar.h>
-#include <ydb/core/protos/bootstrap.pb.h>
+#include <thread>
 
 namespace NKikimr::NSharedCache {
 using namespace NActors;
@@ -19,6 +24,7 @@ using namespace NPageCollection;
 static const ui64 NO_QUEUE_COOKIE = 1;
 static const ui64 ASYNC_QUEUE_COOKIE = 2;
 static const ui64 TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE = 4;
+static const ui64 CORE_FETCH_COOKIE = 5;
 
 static const ui64 PAGE_TOTAL_SIZE = sizeof(TPage) + 10;
 
@@ -193,9 +199,10 @@ struct TSharedPageCacheMock {
         return *this;
     }
 
-    TSharedPageCacheMock& Request(TActorId sender, TIntrusiveConstPtr<TPageCollectionMock> collection, TVector<TPageLocation> locations, EPriority priority = EPriority::Fast) {
+    TSharedPageCacheMock& Request(TActorId sender, TIntrusiveConstPtr<TPageCollectionMock> collection,
+        TVector<TPageLocation> locations, EPriority priority = EPriority::Fast, ui64 eventCookie = 0) {
         auto request = new TEvRequest(priority, collection, std::move(locations), ++RequestId);
-        Send(sender, request, RequestId);
+        Send(sender, request, eventCookie ? eventCookie : RequestId);
 
         TWaitForFirstEvent<TEvRequest> waiter(Runtime);
         waiter.Wait();
@@ -253,8 +260,9 @@ struct TSharedPageCacheMock {
 
     TSharedPageCacheMock& Attach(TActorId sender, TIntrusiveConstPtr<TPageCollectionMock> collection,
         ECacheMode cacheMode = ECacheMode::Regular, TVector<TEvAttach::TBtreeSeed> btreeSeeds = {},
-        bool replayStickyWalk = false) {
-        auto attach = new TEvAttach(collection, cacheMode, std::move(btreeSeeds), replayStickyWalk);
+        bool routeToCore = false, TVector<TPageOffset> stickyOffsets = {}, bool replayStickyWalk = false) {
+        auto attach = new TEvAttach(
+            collection, cacheMode, std::move(btreeSeeds), routeToCore, std::move(stickyOffsets), replayStickyWalk);
         Send(sender, attach);
 
         TWaitForFirstEvent<TEvAttach> waiter(Runtime);
@@ -389,23 +397,353 @@ struct TSharedPageCacheMock {
 };
 
 Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
+    Y_UNIT_TEST(CoreRouteStartsAfterCurrentAttachAcknowledgement) {
+        TPrivatePageCache cache;
+        TIntrusiveConstPtr<TPageCollectionMock> source = new TPageCollectionMock(7, 10);
+        auto collection = MakeIntrusive<TPrivatePageCache::TPageCollection>(source);
+        cache.AddPageCollection(collection);
+        TSharedPageRef page = TSharedPageRef::MakePrivate(TSharedData::Copy(TString(10, 'x')));
+        cache.AddPage(_P(1).Offset, 10, page, collection.Get());
+        const TCollectionCacheItem coreItem = TCollectionCacheItem::FromValidated(TCacheItem::Make(1, 2));
+
+        collection->SetPendingAttachId(2);
+        UNIT_ASSERT(cache.TryGetPage(_P(1).Offset, collection.Get()));
+        UNIT_ASSERT(!cache.CompleteAttach(collection->Id, 1, coreItem));
+        UNIT_ASSERT(cache.TryGetPage(_P(1).Offset, collection.Get()));
+        UNIT_ASSERT(cache.CompleteAttach(collection->Id, 2, coreItem));
+        UNIT_ASSERT(collection->RoutesToCore());
+        UNIT_ASSERT(collection->GetCoreCacheItem() == coreItem);
+        UNIT_ASSERT_VALUES_EQUAL(cache.GetStats().SharedBodyBytes, 0);
+        UNIT_ASSERT(!collection->FindPage(_P(1).Offset));
+
+        auto copied = MakeIntrusive<TPrivatePageCache::TPageCollection>(*collection);
+        UNIT_ASSERT(!copied->RoutesToCore());
+        UNIT_ASSERT(!copied->GetCoreCacheItem());
+        UNIT_ASSERT_VALUES_EQUAL(copied->GetPendingAttachId(), 0);
+    }
+    Y_UNIT_TEST(LateAttachAcknowledgementCannotRouteReattachedCollection) {
+        TPrivatePageCache cache;
+        TIntrusiveConstPtr<TPageCollectionMock> source = new TPageCollectionMock(8, 10);
+        auto oldCollection = MakeIntrusive<TPrivatePageCache::TPageCollection>(source);
+        cache.AddPageCollection(oldCollection);
+        oldCollection->SetPendingAttachId(1);
+        cache.DropPageCollection(oldCollection.Get());
+
+        auto newCollection = MakeIntrusive<TPrivatePageCache::TPageCollection>(source);
+        cache.AddPageCollection(newCollection);
+        newCollection->SetPendingAttachId(2);
+        const TCollectionCacheItem coreItem = TCollectionCacheItem::FromValidated(TCacheItem::Make(1, 2));
+        UNIT_ASSERT(!cache.CompleteAttach(newCollection->Id, 1, coreItem));
+        UNIT_ASSERT(!newCollection->RoutesToCore());
+        UNIT_ASSERT(cache.CompleteAttach(newCollection->Id, 2, {}));
+        UNIT_ASSERT(!newCollection->RoutesToCore());
+    }
+    Y_UNIT_TEST(CoreStickyFetchCompletesByGeneration) {
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        TSharedPageCacheMock sharedCache(config);
+        const TPageLocation page = _P(1, EPage::DataPage);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page }, EPriority::Fast,
+            ui64(ERequestTypeCookie::StickyPages));
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { page } } });
+        const ui64 generation = sharedCache.LoadRunIds[sharedCache.Collection1->Label()][page.Offset];
+        UNIT_ASSERT(generation != 0);
+        sharedCache.Provide(sharedCache.Collection1, { page }, CORE_FETCH_COOKIE);
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1) } } });
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 1);
+
+        auto duplicate = new NBlockIO::TEvData(NKikimrProto::OK, sharedCache.Collection1, 10, generation);
+        duplicate->Pages.emplace_back(page.Offset, TSharedData::Copy(TString(10, 'x')));
+        sharedCache.Send(sharedCache.BlockIoSender, duplicate, CORE_FETCH_COOKIE);
+        sharedCache.CheckResults({});
+
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page }, EPriority::Fast,
+            ui64(ERequestTypeCookie::StickyPages));
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { _P(1) } } });
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
+
+        const TPageLocation failedPage = _P(2, EPage::DataPage);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { failedPage }, EPriority::Fast,
+            ui64(ERequestTypeCookie::StickyPages));
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { failedPage } } });
+        sharedCache.Fail(sharedCache.Collection1, { failedPage }, CORE_FETCH_COOKIE);
+        sharedCache.CheckResults({ TFetch{ 3, sharedCache.Collection1, {} } }, NKikimrProto::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
+    }
+
+    Y_UNIT_TEST(CoreStickyFetchAfterDetachFails) {
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        TSharedPageCacheMock sharedCache(config);
+        const TPageLocation page = _P(1, EPage::DataPage);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page }, EPriority::Fast,
+            ui64(ERequestTypeCookie::StickyPages));
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { page } } });
+        sharedCache.Detach(sharedCache.Sender1, sharedCache.Collection1);
+        sharedCache.Provide(sharedCache.Collection1, { page }, CORE_FETCH_COOKIE);
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, {} } }, NKikimrProto::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
+    }
+
+    Y_UNIT_TEST(CoreStickyAsyncQueueUsesGeneration) {
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        TSharedPageCacheMock sharedCache(config);
+        const TPageLocation first = _P(1, EPage::DataPage);
+        const TPageLocation second = _P(2, EPage::DataPage);
+        const TPageLocation third = _P(3, EPage::DataPage);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { first, second, third }, EPriority::Bkgr,
+            ui64(ERequestTypeCookie::StickyPages));
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { first, second } } });
+        sharedCache.Provide(sharedCache.Collection1, { first, second }, CORE_FETCH_COOKIE);
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { third } } });
+        sharedCache.Provide(sharedCache.Collection1, { third }, CORE_FETCH_COOKIE);
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
+    }
+
+    Y_UNIT_TEST(CoreStickyQueuedDetachReportsRace) {
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        TSharedPageCacheMock sharedCache(config);
+        const TPageLocation first = _P(1, EPage::DataPage);
+        const TPageLocation second = _P(2, EPage::DataPage);
+        const TPageLocation third = _P(3, EPage::DataPage);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { first, second, third }, EPriority::Bkgr,
+            ui64(ERequestTypeCookie::StickyPages));
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { first, second } } });
+        sharedCache.Detach(sharedCache.Sender1, sharedCache.Collection1);
+        sharedCache.CheckFetches({});
+        sharedCache.Provide(sharedCache.Collection1, { first, second }, CORE_FETCH_COOKIE);
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, {} } }, NKikimrProto::RACE);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
+    }
+
+    Y_UNIT_TEST(CoreStickyBtreeWalkFailureUsesGeneration) {
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        TSharedPageCacheMock sharedCache(config);
+        const TPageLocation root = _P(0, EPage::BTreeIndexV2);
+        TEvAttach::TBtreeSeed seed;
+        seed.IndexCollectionId = sharedCache.Collection1->Label();
+        seed.DataCollectionId = sharedCache.Collection1->Label();
+        seed.Root = root;
+        seed.LevelCount = 1;
+        seed.QueueLeaves = false;
+        seed.Sticky = true;
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, { seed }, true);
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { root } } });
+        sharedCache.Fail(sharedCache.Collection1, { root }, CORE_FETCH_COOKIE);
+        sharedCache.Runtime.WaitFor("failed core walk fetch", [&] {
+            return sharedCache.Counters->InFlightPages->Val() == 0;
+        }, TDuration::Seconds(5));
+        sharedCache.CheckFetches({});
+    }
+
+    Y_UNIT_TEST(CoreStickySeedsCompactedPageBeforeRouting) {
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        TSharedPageCacheMock sharedCache(config);
+        const TPageLocation location = _P(1, EPage::DataPage);
+        auto saved = MakeHolder<TEvSaveCompactedPages>(sharedCache.Collection1);
+        auto page = MakeIntrusive<TPage>(location.Offset, location.Size, location.Type, location.Crc32, nullptr);
+        page->ProvideBody(TSharedData::Copy(TString(10, 'x')));
+        saved->Pages.push_back(page);
+        sharedCache.Send(sharedCache.Sender1, saved.Release());
+        TWaitForFirstEvent<TEvSaveCompactedPages> waiter(sharedCache.Runtime);
+        waiter.Wait();
+
+        sharedCache.Attach(
+            sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true, { location.Offset });
+        sharedCache.SetLimit(0);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { location }, EPriority::Fast,
+            ui64(ERequestTypeCookie::StickyPages));
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1) } } });
+    }
+
+    Y_UNIT_TEST(CoreRouteFallsBackWhenBelowMinimumCapacity) {
+        TSharedPageCacheMock sharedCache;
+        const TPageLocation page = _P(1, EPage::DataPage);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page }, EPriority::Fast,
+            ui64(ERequestTypeCookie::StickyPages));
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { page } } });
+        sharedCache.Provide(sharedCache.Collection1, { page }, NO_QUEUE_COOKIE);
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1) } } });
+    }
+
+    Y_UNIT_TEST(CoreStickyMigratesLoadedLegacyPage) {
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        TSharedPageCacheMock sharedCache(config);
+        const TPageLocation page = _P(1, EPage::DataPage);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { page } } });
+        sharedCache.Provide(sharedCache.Collection1, { page });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1) } } });
+
+        sharedCache.Attach(
+            sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true, { page.Offset });
+        sharedCache.SetLimit(0);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page }, EPriority::Fast,
+            ui64(ERequestTypeCookie::StickyPages));
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { _P(1) } } });
+    }
+    Y_UNIT_TEST(CoreInMemoryCollectionKeepsPages) {
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        TSharedPageCacheMock sharedCache(config);
+        const TPageLocation page = _P(1, EPage::DataPage);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory, {}, true);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { page } } });
+        sharedCache.Provide(sharedCache.Collection1, { page }, CORE_FETCH_COOKIE);
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1) } } });
+
+        // The core keeps the page for the in-memory collection, so it survives a cache that can no longer hold
+        // anything but the page itself.
+        sharedCache.SetLimit(PAGE_TOTAL_SIZE);
+        sharedCache.Wakeup();
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page });
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { _P(1) } } });
+    }
+
+    Y_UNIT_TEST(CoreInMemoryCollectionKeepsCoreRouteOnModeChange) {
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        TSharedPageCacheMock sharedCache(config);
+        const TPageLocation page = _P(1, EPage::DataPage);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory, {}, true);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { page } } });
+        sharedCache.Provide(sharedCache.Collection1, { page }, CORE_FETCH_COOKIE);
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1) } } });
+
+        // A cache mode change is applied to the core record instead of moving the collection back to this cache.
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, false);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page });
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { _P(1) } } });
+
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory, {}, false);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page });
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({ TFetch{ 3, sharedCache.Collection1, { _P(1) } } });
+    }
+
+    Y_UNIT_TEST(CoreInMemoryWalkPreloadsPagesThroughCore) {
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        TSharedPageCacheMock sharedCache(config);
+        const TPageLocation root = _P(0, EPage::DataPage);
+        TEvAttach::TBtreeSeed seed;
+        seed.IndexCollectionId = sharedCache.Collection1->Label();
+        seed.DataCollectionId = sharedCache.Collection1->Label();
+        seed.Root = root;
+        seed.LevelCount = 0; // the root of a zero-level tree is the data page itself
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory, { seed }, true);
+
+        // An in-memory collection preloads its pages through the core, without a request from the tablet.
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { root } } });
+        sharedCache.Provide(sharedCache.Collection1, { root }, CORE_FETCH_COOKIE);
+        sharedCache.Runtime.WaitFor("preloaded leaf", [&] {
+            return sharedCache.Counters->InFlightPages->Val() == 0;
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 1);
+    }
+
+    Y_UNIT_TEST(RequestCompletionSendsOneResultAfterLastPage) {
+        constexpr ui32 PageCount = 8;
+        TSharedPageCacheMock sharedCache;
+        TVector<TPageLocation> locations;
+        locations.reserve(PageCount);
+        for (ui32 index = 0; index < PageCount; ++index) {
+            locations.push_back(_P(index + 1));
+        }
+
+        TIntrusivePtr<TRequestCompletion> completion = new TRequestCompletion(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .EventCookie = 17,
+            .ExecutorGeneration = 19,
+            .RequestId = 23,
+            .PageCollection = sharedCache.Collection1,
+            .Pages = locations,
+            .Cookie = 29,
+        });
+
+        TVector<std::thread> threads;
+        threads.reserve(PageCount);
+        for (ui32 index = 0; index < PageCount; ++index) {
+            threads.emplace_back([completion, index] {
+                completion->Complete(index,
+                    TSharedPageRef::MakePrivate(TSharedData::Copy(TString(10, static_cast<char>('a' + index)))),
+                    EPageFetchCompletion::Ready);
+            });
+        }
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+
+        sharedCache.Runtime.WaitFor("request completion", [&] {
+            return sharedCache.Results.size() == 1;
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Results.size(), 1);
+        const TEvResult::TPtr& event = sharedCache.Results.front();
+        UNIT_ASSERT_VALUES_EQUAL(event->Cookie, 17);
+        UNIT_ASSERT_VALUES_EQUAL(event->Get()->Status, NKikimrProto::OK);
+        UNIT_ASSERT_VALUES_EQUAL(event->Get()->Cookie, 29);
+        UNIT_ASSERT_VALUES_EQUAL(event->Get()->ExecutorGeneration, 19);
+        UNIT_ASSERT_VALUES_EQUAL(event->Get()->RequestId, 23);
+        UNIT_ASSERT_VALUES_EQUAL(event->Get()->Pages.size(), PageCount);
+        for (ui32 index = 0; index < PageCount; ++index) {
+            UNIT_ASSERT_VALUES_EQUAL(event->Get()->Pages[index].Offset, locations[index].Offset);
+            UNIT_ASSERT_VALUES_EQUAL(event->Get()->Pages[index].Size, locations[index].Size);
+            UNIT_ASSERT(event->Get()->Pages[index].Page);
+        }
+    }
+
+    Y_UNIT_TEST(RequestPageWaiterPropagatesFailure) {
+        TSharedPageCacheMock sharedCache;
+        TIntrusivePtr<TRequestCompletion> completion = new TRequestCompletion(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .PageCollection = sharedCache.Collection1,
+            .Pages = { _P(1) },
+        });
+        TIntrusivePtr<TPageFetchWaiter> waiter = new TRequestPageWaiter(completion, 0);
+        waiter->Complete({}, EPageFetchCompletion::Failed);
+
+        sharedCache.Runtime.WaitFor("failed request completion", [&] {
+            return sharedCache.Results.size() == 1;
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Results.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Results.front()->Get()->Status, NKikimrProto::ERROR);
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->Pages.empty());
+    }
 
     Y_UNIT_TEST(Request_Basics) {
         TSharedPageCacheMock sharedCache;
-        
-        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(1), _P(2), _P(3) });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
 
-        sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.Provide(sharedCache.Collection1, { _P(1), _P(2), _P(3) });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
@@ -1700,7 +2038,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Runtime.SimulateSleep(TDuration::Seconds(1));
         UNIT_ASSERT(stickyPages.empty());
 
-        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, { seed }, true);
+        sharedCache.Attach(
+            sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, { seed }, false, {}, true);
         sharedCache.Runtime.WaitFor("replayed sticky notification", [&] {
             return !stickyPages.empty();
         });
@@ -3089,4 +3428,4 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->EvictedPages->Val(), 3);
     }
 }
-}
+} // namespace NKikimr::NSharedCache

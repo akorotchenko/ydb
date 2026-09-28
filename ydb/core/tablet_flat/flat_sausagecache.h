@@ -82,6 +82,34 @@ public:
             return CacheMode;
         }
 
+        bool RoutesToCore() const noexcept {
+            return CoreRoute;
+        }
+
+        void SetCoreRoute(bool value) noexcept {
+            CoreRoute = value;
+            if (!value) {
+                CoreCacheItem = {};
+            }
+        }
+
+        void SetCoreCacheItem(TCollectionCacheItem item) noexcept {
+            CoreCacheItem = item;
+            CoreRoute = bool(item);
+        }
+
+        TCollectionCacheItem GetCoreCacheItem() const noexcept {
+            return CoreCacheItem;
+        }
+
+        void SetPendingAttachId(ui64 attachId) noexcept {
+            PendingAttachId = attachId;
+        }
+
+        ui64 GetPendingAttachId() const noexcept {
+            return PendingAttachId;
+        }
+
         // Mutable methods can be only called on a construction stage or from a Private Cache
         // Otherwise stat counters would be out of sync
 
@@ -141,12 +169,16 @@ public:
         // storing sticky pages used refs guarantees that they won't be offload from Shared Cache
         THashMap<TPageOffset, TSharedPageRef> StickyPages;
         ECacheMode CacheMode = ECacheMode::Regular;
+        bool CoreRoute = false;
+        TCollectionCacheItem CoreCacheItem;
+        ui64 PendingAttachId = 0;
     };
 
 public:
     TPageCollection* FindPageCollection(const TLogoBlobID &id) const;
     TPageCollection* GetPageCollection(const TLogoBlobID &id) const;
     THashMap<TLogoBlobID, THashSet<TPageOffset>> AddPageCollection(TIntrusivePtr<TPageCollection> pageCollection);
+    void ClearPagesForCore(TPageCollection* pageCollection);
     void DropPageCollection(TPageCollection *pageCollection);
 
     const TStats& GetStats() const { return Stats; }
@@ -156,6 +188,7 @@ public:
     void DropPage(TPageOffset offset, TPageCollection *pageCollection);
     void AddPage(TPageOffset offset, size_t size, const TSharedPageRef& sharedBody, TPageCollection *pageCollection);
     void AddStickyPage(TPageOffset offset, size_t size, TSharedPageRef sharedBody, TPageCollection *pageCollection);
+    bool CompleteAttach(const TLogoBlobID& pageCollectionId, ui64 attachId, TCollectionCacheItem cacheItem);
     bool UpdateCacheMode(ECacheMode newCacheMode, TPageCollection *pageCollection);
 
     THashMap<TLogoBlobID, TIntrusivePtr<TPageCollection>> DetachPrivatePageCache();

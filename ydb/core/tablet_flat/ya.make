@@ -89,6 +89,11 @@ SRCS(
     shared_cache_btree_walk.cpp
     shared_cache_btree_walk.h
     shared_sausagecache_state.h
+    shared_cache.cpp
+    shared_cache_collection.cpp
+    shared_cache_events.cpp
+    shared_cache_space.cpp
+    shared_cache_table.cpp
     shared_sausagecache.cpp
     shared_sausagecache.h
     tablet_flat_executor.h
@@ -97,6 +102,20 @@ SRCS(
     tablet_flat_executed.cpp
     flat_executor.proto
 )
+
+IF (OS_LINUX OR OS_FREEBSD)
+    SRCS(
+        shared_cache_mapping_memfd.cpp
+    )
+ELSEIF (OS_WINDOWS)
+    SRCS(
+        shared_cache_mapping_win.cpp
+    )
+ELSE()
+    SRCS(
+        shared_cache_mapping_reserved.cpp
+    )
+ENDIF()
 
 GENERATE_ENUM_SERIALIZATION(flat_comp_gen.h)
 GENERATE_ENUM_SERIALIZATION(flat_executor_compaction_logic.h)

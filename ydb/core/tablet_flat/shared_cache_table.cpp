@@ -484,7 +484,7 @@ bool TSharedCacheTable::PrepareSplitMarker(const TSpaceOperation& spaceOp, TCach
     Y_ABORT_UNLESS(expected.IsFree() && expected.Refs() == 0);
     marker.Next.store(suffix.Raw(), std::memory_order_relaxed);
     const THandleState desired =
-        expected.WithState(EHandleState::BucketSplit).WithFrequency(0).WithKeep(EKeepState::None).WithRefs(1);
+        expected.WithState(EHandleState::BucketSplit).WithFrequency(0).WithSticky(EStickyState::None).WithRefs(1);
     if (!marker.State.compare_exchange_strong(
             expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
     {

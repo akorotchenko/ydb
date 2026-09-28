@@ -7,9 +7,9 @@ struct TProdTraits;
 template <class TTraits>
 class TSharedCachePageRefImpl;
 template <class TTraits>
-class TPageFetchTokenImpl;
+class TPageFetchImpl;
 
 using TSharedCachePageRef = TSharedCachePageRefImpl<TProdTraits>;
-using TPageFetchToken = TPageFetchTokenImpl<TProdTraits>;
+using TPageFetch = TPageFetchImpl<TProdTraits>;
 
 } // namespace NKikimr::NSharedCache

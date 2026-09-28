@@ -26,6 +26,10 @@ public:
         return space.NewestView().ColdSlots;
     }
 
+    static std::atomic<ui64>* KeepColdSlots(const TSharedCacheSpace& space) noexcept {
+        return space.NewestView().KeepColdSlots;
+    }
+
     static std::atomic<ui64>* FreeSlots(const TSharedCacheSpace& space) noexcept {
         return space.NewestView().FreeSlots;
     }
@@ -124,6 +128,9 @@ public:
             },
             [&](ui64) noexcept {
                 sawWord = true;
+            },
+            [&](ui64) noexcept {
+                sawWord = true;
             });
         UNIT_ASSERT(!sawWord);
         return finished;
@@ -213,14 +220,65 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(footprint.HandleCount(), 32);
         UNIT_ASSERT_VALUES_EQUAL(footprint.BucketCount(), 32);
         UNIT_ASSERT_VALUES_EQUAL(footprint.HotSlotCount(), 24);
+        UNIT_ASSERT_VALUES_EQUAL(footprint.KeepColdSlotCount(), 16);
 
         const ui64 expectedStatic = 128 + 32 * sizeof(THandle) + 32 * sizeof(std::atomic<ui64>) +
                                     24 * sizeof(std::atomic<ui64>) + 32 * sizeof(std::atomic<ui64>) +
-                                    32 * sizeof(std::atomic<ui64>) + 3 * sizeof(TSpaceHazard);
+                                    16 * sizeof(std::atomic<ui64>) + 32 * sizeof(std::atomic<ui64>) +
+                                    3 * sizeof(TSpaceHazard);
         const ui64 expectedPayload = 30 * (4096 + NActors::TSharedData::OverheadSize);
         UNIT_ASSERT_VALUES_EQUAL(footprint.StaticBytes, expectedStatic);
         UNIT_ASSERT_VALUES_EQUAL(footprint.MinimumPayloadBytes, expectedPayload);
         UNIT_ASSERT_VALUES_EQUAL(footprint.TotalBytes, expectedStatic + expectedPayload);
+    }
+
+    Y_UNIT_TEST(KeepColdRingHasHalfTheHandleSlots) {
+        TSharedCacheCapacity capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        auto space = TSharedCacheSpace::Create(capacity, capacity, 1);
+        UNIT_ASSERT(space);
+        auto hazard = space->BindThreadHazard(0);
+        auto operation = space->BeginOperation();
+        auto ring = operation.KeepCold();
+        UNIT_ASSERT_VALUES_EQUAL(ring.Capacity, 16);
+
+        for (ui64 word = 1; word <= ring.Capacity; ++word) {
+            UNIT_ASSERT_VALUES_EQUAL(ring.PutAndPop(word), 0);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(ring.PutAndPop(ring.Capacity + 1), 1);
+        UNIT_ASSERT_VALUES_EQUAL(ring.Pop(), 2);
+    }
+
+    Y_UNIT_TEST(KeepColdTailIsDrainedOnPhysicalShrink) {
+        TSharedCacheCapacity small;
+        TSharedCacheCapacity large;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 0, small));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 0, large));
+        auto space = TSharedCacheSpace::Create(large, large, 0);
+        UNIT_ASSERT(space);
+        const ui64 word = TCacheItem::Make(1, 2).Raw();
+        TSharedCacheSpaceTestAccess::KeepColdSlots(*space)[large.KeepColdSlotCount() - 1].store(word);
+
+        TTransition shrink;
+        UNIT_ASSERT(space->PrepareTransition(small, shrink));
+        UNIT_ASSERT(space->PublishMigrationView(shrink));
+        UNIT_ASSERT(space->TryDrainTransition(shrink));
+        CompleteEmptyBucketResize(*space, small.AddressBits);
+        UNIT_ASSERT(space->PublishFinalView(shrink));
+        UNIT_ASSERT(space->TryDrainTransition(shrink));
+
+        ui64 drained = 0;
+        UNIT_ASSERT(space->FinalDrain(
+            shrink,
+            [](ui32, ui64) noexcept {
+            },
+            [](ui64) noexcept {
+            },
+            [&](ui64 raw) noexcept {
+                drained = raw;
+            }));
+        UNIT_ASSERT_VALUES_EQUAL(drained, word);
+        UNIT_ASSERT(shrink.Phase() == ETransitionPhase::Release);
     }
 
     Y_UNIT_TEST(FootprintRejectsInvalidInput) {
@@ -424,6 +482,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::BucketCount(*space), 32);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::ReservedCapacity(*space).BucketCount(), 64);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).HotSlotCount, 24);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).KeepCold().Capacity, 16);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), 30);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::HazardCount(*space), 3);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::Hazard(*space, 0).State.load(), 0);
@@ -438,6 +497,9 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         }
         for (ui32 index = 0; index < current.HotSlotCount(); ++index) {
             UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::HotSlots(*space)[index].load(), 0);
+        }
+        for (ui32 index = 0; index < current.KeepColdSlotCount(); ++index) {
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::KeepColdSlots(*space)[index].load(), 0);
         }
         for (ui32 index = 2; index < current.HandleCount(); ++index) {
             const auto cacheItem =

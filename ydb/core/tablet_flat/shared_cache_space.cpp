@@ -163,11 +163,13 @@ bool TSharedCacheSpace::PrepareTransition(const TSharedCacheCapacity& target, TT
         !TryMappingSize(target.BucketCount(), sizeof(std::atomic<ui64>), view->BucketsBytes) ||
         !TryMappingSize(target.HotSlotCount(), sizeof(std::atomic<ui64>), view->HotSlotBytes) ||
         !TryMappingSize(target.HandleCount(), sizeof(std::atomic<ui64>), view->ColdSlotBytes) ||
+        !TryMappingSize(target.KeepColdSlotCount(), sizeof(std::atomic<ui64>), view->KeepColdSlotBytes) ||
         !TryMappingSize(target.HandleCount(), sizeof(std::atomic<ui64>), view->FreeSlotBytes) ||
         !HandlesMapping_.Prepare(view->HandlesBytes, view->Handles) ||
         !BucketsMapping_.Prepare(view->BucketsBytes, view->Buckets) ||
         !HotMapping_.Prepare(view->HotSlotBytes, view->HotSlots) ||
         !ColdMapping_.Prepare(view->ColdSlotBytes, view->ColdSlots) ||
+        !KeepColdMapping_.Prepare(view->KeepColdSlotBytes, view->KeepColdSlots) ||
         !FreeMapping_.Prepare(view->FreeSlotBytes, view->FreeSlots))
     {
         CancelPreparedView(*view);
@@ -195,6 +197,7 @@ void TSharedCacheSpace::CancelPreparedView(TSpaceView& view) noexcept {
     BucketsMapping_.Cancel(view.Buckets, view.BucketsBytes);
     HotMapping_.Cancel(view.HotSlots, view.HotSlotBytes);
     ColdMapping_.Cancel(view.ColdSlots, view.ColdSlotBytes);
+    KeepColdMapping_.Cancel(view.KeepColdSlots, view.KeepColdSlotBytes);
     FreeMapping_.Cancel(view.FreeSlots, view.FreeSlotBytes);
 }
 
@@ -205,6 +208,7 @@ void TSharedCacheSpace::PublishPreparedView(THolder<TSpaceView> view, THolder<TS
     BucketsMapping_.Publish(view->Buckets, view->BucketsBytes);
     HotMapping_.Publish(view->HotSlots, view->HotSlotBytes);
     ColdMapping_.Publish(view->ColdSlots, view->ColdSlotBytes);
+    KeepColdMapping_.Publish(view->KeepColdSlots, view->KeepColdSlotBytes);
     FreeMapping_.Publish(view->FreeSlots, view->FreeSlotBytes);
     NewestViewOwner_ = std::move(view);
     NewestView_.store(NewestViewOwner_.Get(), std::memory_order_release);
@@ -243,6 +247,7 @@ bool TSharedCacheSpace::InitializeGrowth(TTransition& transition) noexcept {
     const TSharedCacheCapacity& target = transition.TargetConfiguration_;
     const ui64 handleDelta = target.HandleCount() - old.HandleCount();
     const ui64 hotDelta = target.HotSlotCount() - old.HotSlotCount();
+    const ui64 keepColdDelta = target.KeepColdSlotCount() - old.KeepColdSlotCount();
     const ui64 end = Min(handleDelta, transition.NextWorkIndex_ + SharedCacheTransitionWorkBatch);
     while (transition.NextWorkIndex_ < end) {
         const ui64 offset = transition.NextWorkIndex_++;
@@ -251,6 +256,9 @@ bool TSharedCacheSpace::InitializeGrowth(TTransition& transition) noexcept {
         new (&view.Buckets[handleIndex]) std::atomic<ui64>(0);
         new (&view.ColdSlots[handleIndex]) std::atomic<ui64>(0);
         new (&view.FreeSlots[handleIndex]) std::atomic<ui64>(0);
+        if (offset < keepColdDelta) {
+            new (&view.KeepColdSlots[old.KeepColdSlotCount() + offset]) std::atomic<ui64>(0);
+        }
         if (offset < hotDelta) {
             new (&view.HotSlots[old.HotSlotCount() + offset]) std::atomic<ui64>(0);
         }
@@ -461,6 +469,13 @@ bool TSharedCacheSpace::TryReleaseOldMapping(ESpaceMap mapping, TTransition& tra
             currentPointer = newest.ColdSlots;
             currentSize = newest.ColdSlotBytes;
             break;
+        case ESpaceMap::KeepCold:
+            owner = &KeepColdMapping_;
+            oldPointer = old.KeepColdSlots;
+            oldSize = old.KeepColdSlotBytes;
+            currentPointer = newest.KeepColdSlots;
+            currentSize = newest.KeepColdSlotBytes;
+            break;
         case ESpaceMap::Free:
             owner = &FreeMapping_;
             oldPointer = old.FreeSlots;
@@ -499,6 +514,9 @@ bool TSharedCacheSpace::TryReleaseOldMapping(ESpaceMap mapping, TTransition& tra
             break;
         case ESpaceMap::Cold:
             old.ColdSlots = static_cast<std::atomic<ui64>*>(oldPointer);
+            break;
+        case ESpaceMap::KeepCold:
+            old.KeepColdSlots = static_cast<std::atomic<ui64>*>(oldPointer);
             break;
         case ESpaceMap::Free:
             old.FreeSlots = static_cast<std::atomic<ui64>*>(oldPointer);
@@ -687,6 +705,7 @@ bool TryCalculateSharedCacheFootprint(
         !TryAccumulateProduct(bucketCount, sizeof(std::atomic<ui64>), staticBytes) ||
         !TryAccumulateProduct(hotSlotCount, sizeof(std::atomic<ui64>), staticBytes) ||
         !TryAccumulateProduct(handleCount, sizeof(std::atomic<ui64>), staticBytes) ||
+        !TryAccumulateProduct(handleCount / 2, sizeof(std::atomic<ui64>), staticBytes) ||
         !TryAccumulateProduct(handleCount, sizeof(std::atomic<ui64>), staticBytes) ||
         !TryAccumulateProduct(Max<ui64>(hazardCount, 1), sizeof(TSpaceHazard), staticBytes))
     {
@@ -769,6 +788,7 @@ bool TSharedCacheSpace::Initialize(
         !TryMappingSize(current.BucketCount(), sizeof(std::atomic<ui64>), view->BucketsBytes) ||
         !TryMappingSize(current.HotSlotCount(), sizeof(std::atomic<ui64>), view->HotSlotBytes) ||
         !TryMappingSize(current.HandleCount(), sizeof(std::atomic<ui64>), view->ColdSlotBytes) ||
+        !TryMappingSize(current.KeepColdSlotCount(), sizeof(std::atomic<ui64>), view->KeepColdSlotBytes) ||
         !TryMappingSize(current.HandleCount(), sizeof(std::atomic<ui64>), view->FreeSlotBytes) ||
         !TryMappingSize(reserved.HandleCount(), sizeof(THandle), reservedHandlesBytes) ||
         !TryMappingSize(reserved.BucketCount(), sizeof(std::atomic<ui64>), reservedBucketsBytes) ||
@@ -778,6 +798,7 @@ bool TSharedCacheSpace::Initialize(
         !BucketsMapping_.Allocate(view->BucketsBytes, reservedBucketsBytes, view->Buckets) ||
         !HotMapping_.Allocate(view->HotSlotBytes, reservedHotBytes, view->HotSlots) ||
         !ColdMapping_.Allocate(view->ColdSlotBytes, reservedSlotsBytes, view->ColdSlots) ||
+        !KeepColdMapping_.Allocate(view->KeepColdSlotBytes, reservedSlotsBytes / 2, view->KeepColdSlots) ||
         !FreeMapping_.Allocate(view->FreeSlotBytes, reservedSlotsBytes, view->FreeSlots))
     {
         return false;
@@ -793,6 +814,9 @@ bool TSharedCacheSpace::Initialize(
     }
     for (ui64 index = 0; index < current.HotSlotCount(); ++index) {
         new (&view->HotSlots[index]) std::atomic<ui64>(0);
+    }
+    for (ui64 index = 0; index < current.KeepColdSlotCount(); ++index) {
+        new (&view->KeepColdSlots[index]) std::atomic<ui64>(0);
     }
 
     for (ui64 index = 2; index < current.HandleCount(); ++index) {
@@ -865,7 +889,7 @@ Y_FORCE_INLINE ui32 TSharedCacheSpace::TryAllocateHandleImpl(
         }
 
         const THandleState desired =
-            expected.WithState(EHandleState::Begin).WithFrequency(0).WithKeep(EKeepState::None);
+            expected.WithState(EHandleState::Begin).WithFrequency(0).WithSticky(EStickyState::None);
         if (handle.State.compare_exchange_strong(
                 expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed))
         {

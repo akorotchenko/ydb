@@ -19,6 +19,9 @@
 namespace NKikimr::NSharedCache {
 
 inline constexpr ui32 MaxItemVersion = (ui32{ 1 } << 31) - 1;
+// Item versions wrap inside MaxItemVersion, so the top bit of THandle::ColdVersion is free: it records whether
+// the page currently owns an entry in the KeepCold ring.
+inline constexpr ui32 KeepColdQueuedMask = ui32{ 1 } << 31;
 inline constexpr ui32 MaxHandleRefs = (ui32{ 1 } << 24) - 1;
 inline constexpr ui32 ResizeMarkerIndex = 1;
 
@@ -27,10 +30,10 @@ enum class EItemKind : ui8 {
     Collection = 1,
 };
 
-enum class EKeepState : ui8 {
+enum class EStickyState : ui8 {
     None = 0,
-    Keep = 1,
-    Unkeep = 2,
+    Sticky = 1,
+    Unsticky = 2,
     Reserved = 3,
 };
 
@@ -41,9 +44,10 @@ enum class EHandleState : ui8 {
     Requested,
     QueuedRequested,
     Completing,
+    Sticky,
     Hot,
+    KeepCold,
     Cold,
-    Keep,
     Replacing,
     Replaced,
     BucketSplit,
@@ -51,15 +55,16 @@ enum class EHandleState : ui8 {
 };
 
 static_assert(static_cast<ui8>(EItemKind::Collection) <= 0x1);
-static_assert(static_cast<ui8>(EKeepState::Reserved) <= 0x3);
-static_assert(static_cast<ui8>(EHandleState::Tombstone) <= 0xF);
+static_assert(static_cast<ui8>(EStickyState::Reserved) <= 0x3);
+static_assert(static_cast<ui8>(EHandleState::KeepCold) <= 0xF);
 
 constexpr bool IsPending(EHandleState state) noexcept {
     return state >= EHandleState::Begin && state <= EHandleState::QueuedRequested;
 }
 
 constexpr bool IsReady(EHandleState state) noexcept {
-    return state == EHandleState::Hot || state == EHandleState::Cold || state == EHandleState::Keep;
+    return state == EHandleState::Hot || state == EHandleState::Cold || state == EHandleState::KeepCold ||
+           state == EHandleState::Sticky;
 }
 
 class THandleState;
@@ -139,8 +144,8 @@ class THandleState {
 public:
     static constexpr ui64 RefsMask = 0x0000000000FFFFFFULL;
     static constexpr ui32 RefsShift = 0;
-    static constexpr ui64 KeepMask = 0x0000000003000000ULL;
-    static constexpr ui32 KeepShift = 24;
+    static constexpr ui64 StickyMask = 0x0000000003000000ULL;
+    static constexpr ui32 StickyShift = 24;
     static constexpr ui64 FrequencyMask = 0x000000000C000000ULL;
     static constexpr ui32 FrequencyShift = 26;
     static constexpr ui64 KindMask = 0x0000000010000000ULL;
@@ -153,10 +158,10 @@ public:
     constexpr THandleState() noexcept = default;
 
     static constexpr THandleState Make(
-        ui32 version, EHandleState state, EItemKind kind, ui8 frequency, EKeepState keep, ui32 refs) noexcept {
+        ui32 version, EHandleState state, EItemKind kind, ui8 frequency, EStickyState sticky, ui32 refs) noexcept {
         return FromRaw((ui64(version & MaxItemVersion) << VersionShift) | (ui64(state) << StateShift) |
                        (ui64(kind) << KindShift) | (ui64(frequency & 0x3) << FrequencyShift) |
-                       (ui64(keep) << KeepShift) | ui64(refs & MaxHandleRefs));
+                       (ui64(sticky) << StickyShift) | ui64(refs & MaxHandleRefs));
     }
 
     static constexpr THandleState FromRaw(ui64 raw) noexcept {
@@ -219,8 +224,12 @@ public:
         return State() == EHandleState::Cold;
     }
 
-    constexpr bool IsKeep() const noexcept {
-        return State() == EHandleState::Keep;
+    constexpr bool IsKeepCold() const noexcept {
+        return State() == EHandleState::KeepCold;
+    }
+
+    constexpr bool IsSticky() const noexcept {
+        return State() == EHandleState::Sticky;
     }
 
     constexpr bool IsReplacing() const noexcept {
@@ -247,28 +256,28 @@ public:
         return NSharedCache::IsReady(State());
     }
 
-    constexpr bool IsKeepNoneField() const noexcept {
-        return Keep() == EKeepState::None;
+    constexpr bool IsStickyNoneField() const noexcept {
+        return Sticky() == EStickyState::None;
     }
 
-    constexpr bool IsKeepField() const noexcept {
-        return Keep() == EKeepState::Keep;
+    constexpr bool IsStickyField() const noexcept {
+        return Sticky() == EStickyState::Sticky;
     }
 
-    constexpr bool IsUnkeepField() const noexcept {
-        return Keep() == EKeepState::Unkeep;
+    constexpr bool IsUnstickyField() const noexcept {
+        return Sticky() == EStickyState::Unsticky;
     }
 
-    constexpr bool IsKeepReservedField() const noexcept {
-        return Keep() == EKeepState::Reserved;
+    constexpr bool IsStickyReservedField() const noexcept {
+        return Sticky() == EStickyState::Reserved;
     }
 
     constexpr ui8 Frequency() const noexcept {
         return static_cast<ui8>((Raw_ & FrequencyMask) >> FrequencyShift);
     }
 
-    constexpr EKeepState Keep() const noexcept {
-        return static_cast<EKeepState>((Raw_ & KeepMask) >> KeepShift);
+    constexpr EStickyState Sticky() const noexcept {
+        return static_cast<EStickyState>((Raw_ & StickyMask) >> StickyShift);
     }
 
     constexpr ui32 Refs() const noexcept {
@@ -291,8 +300,8 @@ public:
         return Replace(FrequencyMask, FrequencyShift, value & 0x3);
     }
 
-    constexpr THandleState WithKeep(EKeepState value) const noexcept {
-        return Replace(KeepMask, KeepShift, ui64(value));
+    constexpr THandleState WithSticky(EStickyState value) const noexcept {
+        return Replace(StickyMask, StickyShift, ui64(value));
     }
 
     constexpr THandleState WithRefs(ui32 value) const noexcept {
@@ -426,7 +435,7 @@ public:
 };
 
 struct TPage;
-class TCollection;
+class TCacheCollection;
 
 template <class TTraits>
 class TSharedCacheImpl;
@@ -443,19 +452,19 @@ public:
     }
 
 private:
-    friend class TPageFetch;
+    friend class TPageFetchState;
 
     std::atomic<TPageFetchWaiter*> Next_{ nullptr };
 };
 
-class TPageFetch : public TThrRefBase {
+class TPageFetchState : public TThrRefBase {
 public:
-    explicit TPageFetch(TPageCacheItem page = {}) noexcept
+    explicit TPageFetchState(TPageCacheItem page = {}) noexcept
         : Page_(page)
     {
     }
 
-    ~TPageFetch() {
+    ~TPageFetchState() {
         CloseWaiters([this](TIntrusivePtr<TPageFetchWaiter> waiter) {
             waiter->Complete(Page_, EPageFetchCompletion::Failed);
         });
@@ -556,8 +565,8 @@ struct alignas(64) THandle {
 
     union TBody {
         NActors::TSharedData::TBuffer PageBuffer;
-        TPageFetch* Fetch;
-        TCollection* Collection;
+        TPageFetchState* Fetch;
+        TCacheCollection* Collection;
 
         constexpr TBody() noexcept {
         }

@@ -453,6 +453,7 @@ class TExecutor
     TWaitingSnaps WaitingSnapshots;
 
     ui64 BootAttempt = 0;
+    ui64 NextPageCollectionAttachId = 0;
     THolder<TExecutorBootLogic> BootLogic;
     THolder<TPrivatePageCache> PrivatePageCache;
 
@@ -571,8 +572,9 @@ class TExecutor
         const THashMap<NTable::TTag, ECacheMode>& cacheModes, const THashSet<NTable::TTag>& stickyColumns,
         bool replayStickyWalks = false);
     void AddPageCollection(const TIntrusivePtr<TPrivatePageCache::TPageCollection>& pageCollection,
-        TVector<NSharedCache::TEvAttach::TBtreeSeed> btreeSeeds = {}, bool replayStickyWalk = false);
-    void DropPartStorePageCollections(const NTable::TPart &part);
+        TVector<NSharedCache::TEvAttach::TBtreeSeed> btreeSeeds = {}, bool replayStickyWalk = false,
+        bool routeToCore = false);
+    void DropPartStorePageCollections(const NTable::TPart& part);
     void DropPageCollection(const TLogoBlobID& pageCollectionId);
     void StartNewBackup();
     void FailBackup(const TString& error);
@@ -614,10 +616,11 @@ class TExecutor
     void Handle(TEvPrivate::TEvBrokenTransaction::TPtr &ev, const TActorContext &ctx);
     void Handle(TEvents::TEvFlushLog::TPtr &ev);
     void Handle(TEvBlobStorage::TEvCollectGarbageResult::TPtr&);
-    void Handle(TEvPrivate::TEvRetryGcRequest::TPtr &ev, const TActorContext &ctx);
-    void Handle(NSharedCache::TEvResult::TPtr &ev);
-    void Handle(NSharedCache::TEvUpdated::TPtr &ev);
-    void Handle(NSharedCache::TEvStickyCollectionPages::TPtr &ev);
+    void Handle(TEvPrivate::TEvRetryGcRequest::TPtr& ev, const TActorContext& ctx);
+    void Handle(NSharedCache::TEvResult::TPtr& ev);
+    void Handle(NSharedCache::TEvAttached::TPtr& ev);
+    void Handle(NSharedCache::TEvUpdated::TPtr& ev);
+    void Handle(NSharedCache::TEvStickyCollectionPages::TPtr& ev);
     void Handle(NResourceBroker::TEvResourceBroker::TEvResourceAllocated::TPtr&);
     void Handle(NOps::TEvScanStat::TPtr &ev, const TActorContext &ctx);
     void Handle(NOps::TEvResult::TPtr &ev);

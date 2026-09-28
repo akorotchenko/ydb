@@ -1,4 +1,5 @@
 #include "flat_sausagecache.h"
+#include "shared_cache.h"
 #include <util/generic/xrange.h>
 
 namespace NKikimr {
@@ -25,7 +26,7 @@ TPrivatePageCache::TPageCollection::TPageCollection(TIntrusiveConstPtr<NPageColl
     // Do not call reserve(): Total() counts all disk pages; PageMap grows with cached pages.
 }
 
-TPrivatePageCache::TPageCollection::TPageCollection(const TPageCollection &pageCollection)
+TPrivatePageCache::TPageCollection::TPageCollection(const TPageCollection& pageCollection)
     : Id(pageCollection.Id)
     , PageCollection(pageCollection.PageCollection)
     , StickyPages(pageCollection.StickyPages)
@@ -38,7 +39,7 @@ TPrivatePageCache::TPageCollection::TPageCollection(const TPageCollection &pageC
     }
 }
 
-TPrivatePageCache::TPageCollection* TPrivatePageCache::FindPageCollection(const TLogoBlobID &id) const {
+TPrivatePageCache::TPageCollection* TPrivatePageCache::FindPageCollection(const TLogoBlobID& id) const {
     auto *pageCollection = PageCollections.FindPtr(id);
     return pageCollection ? pageCollection->Get() : nullptr;
 }
@@ -74,6 +75,31 @@ THashMap<TLogoBlobID, THashSet<TPageOffset>> TPrivatePageCache::AddPageCollectio
     return sharedCacheTouches;
 }
 
+void TPrivatePageCache::ClearPagesForCore(TPageCollection* pageCollection) {
+    for (const auto& page : pageCollection->GetPageMap()) {
+        Stats.SharedBodyBytes -= page->Size;
+        if (pageCollection->IsStickyPage(page->Offset)) {
+            Stats.StickyBytes -= page->Size;
+        }
+    }
+    pageCollection->Clear();
+}
+
+bool TPrivatePageCache::CompleteAttach(
+    const TLogoBlobID& pageCollectionId, ui64 attachId, TCollectionCacheItem cacheItem)
+{
+    TPageCollection* collection = FindPageCollection(pageCollectionId);
+    if (!collection || !attachId || collection->GetPendingAttachId() != attachId) {
+        return false;
+    }
+    if (cacheItem) {
+        ClearPagesForCore(collection);
+    }
+    collection->SetCoreCacheItem(cacheItem);
+    collection->SetPendingAttachId(0);
+    return true;
+}
+
 void TPrivatePageCache::DropPageCollection(TPageCollection *pageCollection) {
     for (const auto& page : pageCollection->GetPageMap()) {
         Y_ASSERT(page);
@@ -95,6 +121,19 @@ void TPrivatePageCache::DropPageCollection(TPageCollection *pageCollection) {
 }
 
 TSharedPageRef TPrivatePageCache::TryGetPage(TPageOffset offset, TPageCollection *pageCollection) {
+    if (pageCollection->RoutesToCore()) {
+        const TCollectionCacheItem collection = pageCollection->GetCoreCacheItem();
+        if (collection) {
+            if (TSharedCache* cache = TSharedCache::TrySharedCachePages()) {
+                auto binding = cache->BindCurrentThreadHazard();
+                TSharedCachePageRef page;
+                if (cache->Find(collection, static_cast<ui64>(offset), page) == ESharedCacheResultStatus::Hit) {
+                    return MakeSharedPageRef(std::move(page));
+                }
+            }
+        }
+        return {};
+    }
     auto page = pageCollection->FindPage(offset);
     if (!page) {
         return {};

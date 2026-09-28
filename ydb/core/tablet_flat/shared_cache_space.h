@@ -59,6 +59,10 @@ struct TSharedCacheCapacity {
     constexpr ui64 HotSlotCount() const noexcept {
         return (HandleCount() * 3) / 4;
     }
+
+    constexpr ui64 KeepColdSlotCount() const noexcept {
+        return HandleCount() / 2;
+    }
 };
 
 enum class EBucketResize : i8 {
@@ -172,6 +176,7 @@ struct TSpaceView {
     std::atomic<ui64>* Buckets = nullptr;
     std::atomic<ui64>* HotSlots = nullptr;
     std::atomic<ui64>* ColdSlots = nullptr;
+    std::atomic<ui64>* KeepColdSlots = nullptr;
     std::atomic<ui64>* FreeSlots = nullptr;
 
     ui64 HandleCount = 0;
@@ -185,6 +190,7 @@ struct TSpaceView {
     size_t BucketsBytes = 0;
     size_t HotSlotBytes = 0;
     size_t ColdSlotBytes = 0;
+    size_t KeepColdSlotBytes = 0;
     size_t FreeSlotBytes = 0;
 
     Y_FORCE_INLINE ui64 EffectiveHotSlotCount() const noexcept {
@@ -218,6 +224,11 @@ struct TSpaceView {
         return { &Rings->Cold(), ColdSlots, HandleCount };
     }
 
+    Y_FORCE_INLINE TRingView KeepCold() const noexcept {
+        Y_DEBUG_ABORT_UNLESS(Rings);
+        return { &Rings->KeepCold(), KeepColdSlots, HandleCount / 2 };
+    }
+
     Y_FORCE_INLINE TFreeRingView Free() const noexcept {
         Y_DEBUG_ABORT_UNLESS(FreeCursor);
         return { FreeCursor, FreeSlots, HandleCount };
@@ -228,11 +239,13 @@ struct TSpaceView {
         Buckets = source.Buckets;
         HotSlots = source.HotSlots;
         ColdSlots = source.ColdSlots;
+        KeepColdSlots = source.KeepColdSlots;
         FreeSlots = source.FreeSlots;
         HandlesBytes = source.HandlesBytes;
         BucketsBytes = source.BucketsBytes;
         HotSlotBytes = source.HotSlotBytes;
         ColdSlotBytes = source.ColdSlotBytes;
+        KeepColdSlotBytes = source.KeepColdSlotBytes;
         FreeSlotBytes = source.FreeSlotBytes;
     }
 };
@@ -257,6 +270,7 @@ enum class ESpaceMap : ui8 {
     Buckets,
     Hot,
     Cold,
+    KeepCold,
     Free,
     Done,
 };
@@ -582,6 +596,10 @@ public:
         return View().Cold();
     }
 
+    Y_FORCE_INLINE TRingView KeepCold() const noexcept {
+        return View().KeepCold();
+    }
+
     Y_FORCE_INLINE TCacheItem PutCold(TCacheItem cacheItem) const noexcept {
         Y_DEBUG_ABORT_UNLESS(!cacheItem.IsNull() && !cacheItem.IsFrozen());
         return TCacheItem::FromRaw(Cold().PutAndPop(cacheItem.Raw()));
@@ -804,8 +822,9 @@ public:
 
     bool TryDrainTransition(TTransition& transition) noexcept;
 
-    template <class THotRouter, class TColdRouter>
-    bool FinalDrain(TTransition& transition, THotRouter&& hotRouter, TColdRouter&& coldRouter) noexcept {
+    template <class THotRouter, class TColdRouter, class TKeepColdRouter>
+    bool FinalDrain(TTransition& transition, THotRouter&& hotRouter, TColdRouter&& coldRouter,
+        TKeepColdRouter&& keepColdRouter) noexcept {
         if (transition.Phase_ != ETransitionPhase::FinalDrain || transition.NextHazardIndex_ != HazardSlotCount_ ||
             transition.Generation_ != CurrentSpaceState().Generation() || !transition.OldView_)
         {
@@ -815,7 +834,9 @@ public:
         ui32 remainingSlots = SharedCacheTransitionWorkBatch;
         const ui64 oldHotSlotCount = transition.OldConfiguration_.HotSlotCount();
         const ui64 oldHandleCount = transition.OldConfiguration_.HandleCount();
+        const ui64 oldKeepColdSlotCount = transition.OldConfiguration_.KeepColdSlotCount();
         const ui64 targetHandleCount = transition.TargetConfiguration_.HandleCount();
+        const ui64 targetKeepColdSlotCount = transition.TargetConfiguration_.KeepColdSlotCount();
         while (remainingSlots != 0 && transition.FinalDrainStage_ != ESpaceMap::Done) {
             switch (transition.FinalDrainStage_) {
                 case ESpaceMap::Hot:
@@ -843,6 +864,21 @@ public:
                         --remainingSlots;
                     }
                     if (transition.NextWorkIndex_ == oldHandleCount) {
+                        transition.FinalDrainStage_ = ESpaceMap::KeepCold;
+                        transition.NextWorkIndex_ = targetKeepColdSlotCount;
+                    }
+                    break;
+
+                case ESpaceMap::KeepCold:
+                    while (remainingSlots != 0 && transition.NextWorkIndex_ < oldKeepColdSlotCount) {
+                        const ui64 raw = transition.OldView_->KeepColdSlots[transition.NextWorkIndex_++].exchange(
+                            0, std::memory_order_relaxed);
+                        if (raw != 0) {
+                            keepColdRouter(raw);
+                        }
+                        --remainingSlots;
+                    }
+                    if (transition.NextWorkIndex_ == oldKeepColdSlotCount) {
                         transition.FinalDrainStage_ = ESpaceMap::Free;
                         transition.NextWorkIndex_ = 0;
                     }
@@ -1004,6 +1040,7 @@ private:
     TSharedCacheMapping BucketsMapping_;
     TSharedCacheMapping HotMapping_;
     TSharedCacheMapping ColdMapping_;
+    TSharedCacheMapping KeepColdMapping_;
     TSharedCacheMapping FreeMapping_;
     THolder<TSpaceView> NewestViewOwner_;
     std::atomic<TSpaceView*> NewestView_{ nullptr };

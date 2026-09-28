@@ -833,40 +833,62 @@ void TExecutor::AddPartStorePageCollections(const NTable::TPartView &partView, c
 
     for (size_t groupIndex = 0; groupIndex < partStore->PageCollections.size(); ++groupIndex) {
         auto& cache = partStore->PageCollections[groupIndex];
-        auto seeds = groupIndex < partView->GroupsCount
-            ? MakeBtreeSeeds(*partStore, groupIndex, stickyGroups)
-            : TVector<NSharedCache::TEvAttach::TBtreeSeed>{};
-        const bool replayStickyWalk = replayStickyWalks && std::any_of(seeds.begin(), seeds.end(), [](const auto& seed) {
-            return seed.Sticky || seed.IndexCollectionSticky;
-        });
-        AddPageCollection(cache, std::move(seeds), replayStickyWalk);
+        auto seeds = groupIndex < partView->GroupsCount ? MakeBtreeSeeds(*partStore, groupIndex, stickyGroups)
+                                                        : TVector<NSharedCache::TEvAttach::TBtreeSeed>{};
+        const bool replayStickyWalk =
+            replayStickyWalks && std::any_of(seeds.begin(), seeds.end(), [](const auto& seed) {
+                return seed.Sticky || seed.IndexCollectionSticky;
+            });
+        const bool stickyCollection = groupIndex < stickyGroups.size() && stickyGroups[groupIndex];
+        const bool stickyIndexCollection =
+            groupIndex == 0 && partStore->IndexPages.HasBTree() && Find(stickyGroups, true) != stickyGroups.end();
+        // In-memory collections are served by the core as well: it holds their pages until the cache budget
+        // forces the oldest ones out. Regular collections go there when they have sticky pages.
+        const bool inMemoryCollection = cache->GetCacheMode() == ECacheMode::TryKeepInMemory;
+        const bool routeToCore = inMemoryCollection || ((stickyCollection || stickyIndexCollection) &&
+                                                           cache->GetCacheMode() == ECacheMode::Regular);
+        AddPageCollection(cache, std::move(seeds), replayStickyWalk, routeToCore);
     }
 
-    if (const auto &blobs = partStore->Pseudo)
+    if (const auto& blobs = partStore->Pseudo) {
         AddPageCollection(blobs);
+    }
 }
 
-void TExecutor::AddPageCollection(const TIntrusivePtr<TPrivatePageCache::TPageCollection> &pageCollection,
-    TVector<NSharedCache::TEvAttach::TBtreeSeed> btreeSeeds, bool replayStickyWalk)
+void TExecutor::AddPageCollection(const TIntrusivePtr<TPrivatePageCache::TPageCollection>& pageCollection,
+    TVector<NSharedCache::TEvAttach::TBtreeSeed> btreeSeeds, bool replayStickyWalk, bool routeToCore)
 {
+    const ui64 attachId = ++NextPageCollectionAttachId;
+    pageCollection->SetPendingAttachId(attachId);
+    TVector<TPageOffset> stickyOffsets;
+    // Only regular collections keep individual pages sticky; an in-memory collection is kept as a whole.
+    if (routeToCore && pageCollection->GetCacheMode() == ECacheMode::Regular) {
+        for (const auto& page : pageCollection->GetPageMap()) {
+            if (pageCollection->IsStickyPage(page->Offset)) {
+                stickyOffsets.push_back(page->Offset);
+            }
+        }
+    }
     auto syncPages = PrivatePageCache->AddPageCollection(pageCollection);
-    Send(MakeSharedPageCacheId(), new NSharedCache::TEvAttach(pageCollection->PageCollection, pageCollection->GetCacheMode(),
-        std::move(btreeSeeds), replayStickyWalk));
+    Send(MakeSharedPageCacheId(),
+        new NSharedCache::TEvAttach(pageCollection->PageCollection, pageCollection->GetCacheMode(),
+            std::move(btreeSeeds), routeToCore, std::move(stickyOffsets), replayStickyWalk), 0, attachId);
 
     if (syncPages) {
         Send(MakeSharedPageCacheId(), new NSharedCache::TEvSync(std::move(syncPages)));
     }
 }
 
-void TExecutor::DropPartStorePageCollections(const NTable::TPart &part)
+void TExecutor::DropPartStorePageCollections(const NTable::TPart& part)
 {
-    auto *partStore = CheckedCast<const NTable::TPartStore*>(&part);
+    auto* partStore = CheckedCast<const NTable::TPartStore*>(&part);
 
     {
         ui32 room = 0;
 
-        while (auto *pack = partStore->Packet(room++))
+        while (auto* pack = partStore->Packet(room++)) {
             NUtil::SubSafe(Stats->PacksMetaBytes, ui64(pack->Meta.Raw.size()));
+        }
     }
 
     for (auto &cache : partStore->PageCollections)
@@ -1631,12 +1653,17 @@ void TExecutor::UpdateCacheModesForPartStore(NTable::TPartView& partView, const 
         }
 
         auto* pageCollection = partStore->PageCollections[groupIndex].Get();
-        Send(MakeSharedPageCacheId(), new NSharedCache::TEvAttach(pageCollection->PageCollection, pageCollection->GetCacheMode(),
-            MakeBtreeSeeds(*partStore, groupIndex, stickyGroups)));
+        const ui64 attachId = ++NextPageCollectionAttachId;
+        pageCollection->SetPendingAttachId(attachId);
+        const ECacheMode cacheMode = pageCollection->GetCacheMode();
+        Send(MakeSharedPageCacheId(), new NSharedCache::TEvAttach(pageCollection->PageCollection, cacheMode,
+                                          MakeBtreeSeeds(*partStore, groupIndex, stickyGroups),
+                                          cacheMode == ECacheMode::TryKeepInMemory), 0, attachId);
     }
 }
 
-void TExecutor::RequestStickyPagesForPartStore(NTable::TPartView& partView, const THashSet<NTable::TTag>& stickyColumns) {
+void TExecutor::RequestStickyPagesForPartStore(
+    NTable::TPartView& partView, const THashSet<NTable::TTag>& stickyColumns) {
     Y_DEBUG_ABORT_UNLESS(stickyColumns);
 
     auto partStore = partView.As<NTable::TPartStore>();
@@ -1645,9 +1672,26 @@ void TExecutor::RequestStickyPagesForPartStore(NTable::TPartView& partView, cons
     // The V2 trees are not enumerable from the part, so the shared cache walks the sticky groups.
     for (size_t groupIndex : xrange(partView->GroupsCount)) {
         auto* pageCollection = partStore->PageCollections[groupIndex].Get();
-        if (auto seeds = MakeBtreeSeeds(*partStore, groupIndex, stickyGroups); seeds) {
-            Send(MakeSharedPageCacheId(), new NSharedCache::TEvAttach(pageCollection->PageCollection,
-                pageCollection->GetCacheMode(), std::move(seeds)));
+        const bool stickyIndexCollection =
+            groupIndex == 0 && partStore->IndexPages.HasBTree() && Find(stickyGroups, true) != stickyGroups.end();
+        const bool regularCollection = pageCollection->GetCacheMode() == ECacheMode::Regular;
+        const bool routeToCore = pageCollection->GetCacheMode() == ECacheMode::TryKeepInMemory ||
+                                 (regularCollection && (stickyGroups[groupIndex] || stickyIndexCollection));
+        auto seeds = MakeBtreeSeeds(*partStore, groupIndex, stickyGroups);
+        if (seeds || routeToCore) {
+            TVector<TPageOffset> stickyOffsets;
+            if (routeToCore && regularCollection) {
+                for (const auto& page : pageCollection->GetPageMap()) {
+                    if (pageCollection->IsStickyPage(page->Offset)) {
+                        stickyOffsets.push_back(page->Offset);
+                    }
+                }
+            }
+            const ui64 attachId = ++NextPageCollectionAttachId;
+            pageCollection->SetPendingAttachId(attachId);
+            Send(MakeSharedPageCacheId(),
+                new NSharedCache::TEvAttach(pageCollection->PageCollection, pageCollection->GetCacheMode(),
+                    std::move(seeds), routeToCore, std::move(stickyOffsets)), 0, attachId);
         }
 
         if (stickyGroups[groupIndex]) {
@@ -3245,6 +3289,13 @@ void TExecutor::Handle(TEvents::TEvFlushLog::TPtr &ev) {
     CompactionLogic->UpdateLogUsage(LogicRedo->GrabLogUsage());
 }
 
+void TExecutor::Handle(NSharedCache::TEvAttached::TPtr& ev) {
+    const auto* msg = ev->Get();
+    if (PrivatePageCache) {
+        PrivatePageCache->CompleteAttach(msg->PageCollectionId, ev->Cookie, msg->CacheItem);
+    }
+}
+
 void TExecutor::Handle(NSharedCache::TEvResult::TPtr &ev) {
     NSharedCache::TEvResult *msg = ev->Get();
     const bool failed = (msg->Status != NKikimrProto::OK);
@@ -3279,6 +3330,13 @@ void TExecutor::Handle(NSharedCache::TEvResult::TPtr &ev) {
                 }
 
                 return Broken(EBrokenReason::Storage);
+            }
+
+            if (msg->CoreRoute) {
+                if (requestType == ERequestTypeCookie::Transaction) {
+                    TryActivateWaitingTransaction(std::move(msg->WaitPad), std::move(msg->Pages), pageCollection);
+                }
+                return;
             }
 
             if (requestType == ERequestTypeCookie::StickyPages) {
@@ -4619,6 +4677,7 @@ STFUNC(TExecutor::StateWork) {
         HFunc(TEvents::TEvWakeup, Wakeup);
         hFunc(TEvents::TEvFlushLog, Handle);
         hFunc(NSharedCache::TEvResult, Handle);
+        hFunc(NSharedCache::TEvAttached, Handle);
         hFunc(NSharedCache::TEvUpdated, Handle);
         hFunc(NSharedCache::TEvStickyCollectionPages, Handle);
         HFunc(TEvTablet::TEvDropLease, Handle);
@@ -4656,6 +4715,7 @@ STFUNC(TExecutor::StateFollower) {
         CFunc(TEvPrivate::EvUpdateCounters, UpdateCounters);
         HFunc(TEvents::TEvWakeup, Wakeup);
         hFunc(NSharedCache::TEvResult, Handle);
+        hFunc(NSharedCache::TEvAttached, Handle);
         hFunc(NSharedCache::TEvUpdated, Handle);
         hFunc(NSharedCache::TEvStickyCollectionPages, Handle);
         HFunc(TEvBlobStorage::TEvGetResult, Handle);

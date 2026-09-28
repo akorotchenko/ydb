@@ -17,11 +17,11 @@ enum class ESharedCacheHookPoint {
     AfterBucketResizeCursorPublished, // Payload is the resize marker.
     AfterShrinkBucketClosed, // Payload is the resize marker.
     AfterBucketSplitRemoved, // Payload is the resize marker.
-    AfterKeepPageLinked, // Payload is the linked Keep page before its ready State is published.
-    AfterKeepPageListDetached, // Payload is the owning collection while the detached list is private.
-    AfterKeepPageListHeadExchanged, // Payload is the owning collection before its retained tail is connected.
+    AfterStickyPageLinked, // Payload is the linked Sticky page before its ready State is published.
+    AfterStickyPageListDetached, // Payload is the owning collection while the detached list is private.
+    AfterStickyPageListHeadExchanged, // Payload is the owning collection before its retained tail is connected.
     AfterFetchWaiterSubscribed, // Payload is the pending page while the subscriber still owns its structural ref.
-    BeforeCollectionHotPublished, // Payload is unlinked and no longer owned, but still has Keep State.
+    BeforeCollectionHotPublished, // Payload is unlinked and no longer owned, but still has Sticky State.
     AfterReplacingPublished, // Payload is the old forwarding item before its incoming link is replaced.
     AfterReplacedPublished, // Payload is the completed old replacement before its owner ref is dropped.
 };

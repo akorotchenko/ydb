@@ -106,18 +106,23 @@ using TPageId = NTable::NPage::TPageId;
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
         TIntrusivePtr<TCollectionRegistry> Registry;
         ECacheMode CacheMode;
+        bool RouteToCore = false;
         // Authoritative for the sender: an empty vector withdraws that owner's walks.
         TVector<TBtreeSeed> BtreeSeeds;
         // Revisit unchanged sticky seeds after the owner's private cache is recreated.
         bool ReplayStickyWalk = false;
+        TVector<TPageOffset> StickyOffsets;
 
         // The cache walks the seeded B-trees itself.
         TEvAttach(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, ECacheMode cacheMode,
-            TVector<TBtreeSeed> btreeSeeds = {}, bool replayStickyWalk = false)
+            TVector<TBtreeSeed> btreeSeeds, bool routeToCore = false, TVector<TPageOffset> stickyOffsets = {},
+            bool replayStickyWalk = false)
             : PageCollection(std::move(pageCollection))
             , CacheMode(cacheMode)
+            , RouteToCore(routeToCore)
             , BtreeSeeds(std::move(btreeSeeds))
             , ReplayStickyWalk(replayStickyWalk)
+            , StickyOffsets(std::move(stickyOffsets))
         {
         }
 
@@ -175,21 +180,20 @@ using TPageId = NTable::NPage::TPageId;
         using EStatus = NKikimrProto::EReplyStatus;
 
         TEvResult(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, EStatus status, ui64 cookie,
-            ui64 executorGeneration = 0, ui64 requestId = 0)
+            ui64 executorGeneration = 0, ui64 requestId = 0, bool coreRoute = false)
             : Status(status)
             , PageCollection(std::move(pageCollection))
             , Cookie(cookie)
             , ExecutorGeneration(executorGeneration)
             , RequestId(requestId)
-        { }
-
-        void Describe(IOutputStream &out) const
+            , CoreRoute(coreRoute)
         {
-            out
-                << "TEvResult{" << Pages.size() << " pages"
-                << " " << PageCollection->Label()
-                << " " << (Status == NKikimrProto::OK ? "ok" : "fail")
-                << " " << NKikimrProto::EReplyStatus_Name(Status) << "}";
+        }
+
+        void Describe(IOutputStream& out) const {
+            out << "TEvResult{" << Pages.size() << " pages"
+                << " " << PageCollection->Label() << " " << (Status == NKikimrProto::OK ? "ok" : "fail") << " "
+                << NKikimrProto::EReplyStatus_Name(Status) << "}";
         }
 
         ui64 Bytes() const
@@ -219,6 +223,7 @@ using TPageId = NTable::NPage::TPageId;
         const ui64 Cookie;
         const ui64 ExecutorGeneration;
         const ui64 RequestId;
+        const bool CoreRoute;
     };
 
     struct TRequestCompletionParams {
@@ -232,6 +237,7 @@ using TPageId = NTable::NPage::TPageId;
         TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad;
         ui64 Cookie = 0;
         NActors::TActorId Notify;
+        bool CoreRoute = false;
     };
 
     class TRequestCompletion final : public TThrRefBase {
@@ -239,6 +245,7 @@ using TPageId = NTable::NPage::TPageId;
         explicit TRequestCompletion(TRequestCompletionParams&& params) noexcept;
 
         void Complete(ui32 index, TSharedPageRef page, EPageFetchCompletion completion) noexcept;
+        void Cancel() noexcept;
 
         const TVector<TPageLocation>& Locations() const noexcept {
             return Locations_;
@@ -259,24 +266,8 @@ using TPageId = NTable::NPage::TPageId;
         TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad_;
         const ui64 Cookie_;
         const NActors::TActorId Notify_;
+        const bool CoreRoute_;
         std::atomic<TEvResult::EStatus> Status_{ NKikimrProto::OK };
-        std::atomic<ui32> Remaining_;
-    };
-
-    // In-flight accounting of one dispatched fetch: the last completed page releases it to the cache actor.
-    class TDispatchInFlight final : public TThrRefBase {
-    public:
-        TDispatchInFlight(
-            NActors::TActorSystem* actorSystem, TActorId actor, ui64 cookie, ui64 bytes, ui32 pages) noexcept;
-
-        void PageCompleted() noexcept;
-
-    private:
-        NActors::TActorSystem* const ActorSystem_;
-        const TActorId Actor_;
-        const ui64 Cookie_;
-        const ui64 Bytes_;
-        const ui32 Pages_;
         std::atomic<ui32> Remaining_;
     };
 
@@ -302,18 +293,14 @@ using TPageId = NTable::NPage::TPageId;
 
     class TRequestPageWaiter final : public TPageFetchWaiter {
     public:
-        TRequestPageWaiter(TIntrusivePtr<TRequestCompletion> completion, ui32 index) noexcept;
+        TRequestPageWaiter(TIntrusivePtr<TRequestCompletion> completion, ui32 index, bool sticky = false) noexcept;
 
         void Complete(TPageCacheItem page, EPageFetchCompletion completion) noexcept override;
 
-        void SetInFlight(TIntrusivePtr<TDispatchInFlight> inFlight) noexcept {
-            InFlight_ = std::move(inFlight);
-        }
-
     private:
         TIntrusivePtr<TRequestCompletion> Completion_;
-        TIntrusivePtr<TDispatchInFlight> InFlight_;
         const ui32 Index_;
+        const bool Sticky_;
     };
 
     struct TEvUpdated : public TEventLocal<TEvUpdated, EvUpdated> {

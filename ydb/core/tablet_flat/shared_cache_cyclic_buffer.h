@@ -120,9 +120,14 @@ public:
         return ColdCursor_;
     }
 
+    Y_FORCE_INLINE TRingCursor& KeepCold() noexcept {
+        return KeepColdCursor_;
+    }
+
 private:
     std::array<TRingCursor, 4> HotCursors_;
     TRingCursor ColdCursor_;
+    TRingCursor KeepColdCursor_;
 };
 
 struct TRingView {
