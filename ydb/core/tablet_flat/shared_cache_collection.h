@@ -51,6 +51,10 @@ public:
         return 0;
     }
 
+    ui64 KeepGeneration() const noexcept {
+        return KeepGeneration_.load(std::memory_order_acquire);
+    }
+
 public:
     TCollectionCacheItem CacheItem;
     std::atomic<ui32> StickyPageListHead{ 0 };
@@ -63,6 +67,7 @@ private:
     const TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
     std::atomic<TCollectionRegistry*> Registry_{ nullptr };
     std::atomic<ECollectionCacheMode> Mode_{ ECollectionCacheMode::Sticky };
+    std::atomic<ui64> KeepGeneration_{ 0 };
 };
 
 inline ui64 TCollectionLocation::AccountedBytes() const noexcept {

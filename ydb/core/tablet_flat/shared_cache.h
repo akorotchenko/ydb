@@ -648,9 +648,9 @@ private:
 
     bool DemoteKeepCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
 
-    static bool IsKeepColdQueued(const THandle& handle) noexcept;
+    void WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
 
-    static void MarkKeepColdQueued(THandle& handle) noexcept;
+    static bool IsKeepColdQueued(const THandle& handle) noexcept;
 
     bool MatchesKeepColdEntry(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
 
@@ -661,6 +661,9 @@ private:
     bool EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
     static void AdvanceColdMembership(THandle& handle) noexcept;
+
+    static bool AdvanceColdMembership(
+        THandle& handle, ui32 expectedVersion, bool keepColdQueued, ui32& newVersion) noexcept;
 
     void RouteCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
 

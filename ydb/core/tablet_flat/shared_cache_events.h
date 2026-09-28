@@ -39,6 +39,7 @@ using TPageId = NTable::NPage::TPageId;
         EvInFlightReleased,
         EvRequestAnswered,
         EvStickyCollectionPages,
+        EvKeepPageEvicted,
 
         EvEnd
 
@@ -277,6 +278,19 @@ using TPageId = NTable::NPage::TPageId;
         { }
 
         const ui64 Status;
+    };
+
+    struct TEvKeepPageEvicted : public TEventLocal<TEvKeepPageEvicted, EvKeepPageEvicted> {
+        TEvKeepPageEvicted(const TLogoBlobID& collectionId, ui64 generation, NTable::NPage::TPageLocation location)
+            : CollectionId(collectionId)
+            , Generation(generation)
+            , Location(std::move(location))
+        {
+        }
+
+        const TLogoBlobID CollectionId;
+        const ui64 Generation;
+        const NTable::NPage::TPageLocation Location;
     };
 
     struct TEvInFlightReleased : public TEventLocal<TEvInFlightReleased, EvInFlightReleased> {

@@ -66,6 +66,11 @@ struct TPageCollectionMock : public IPageCollection {
         return TotalPages;
     }
 
+    ui32 MetaPages() const noexcept override {
+        Y_DEBUG_ABORT_UNLESS(PageTypes.size() <= TotalPages);
+        return static_cast<ui32>(PageTypes.size());
+    }
+
     TInfo Page(ui32 page) const override {
         auto type = page < PageTypes.size() ? PageTypes[page] : NTable::NPage::EPage::Undef;
         return { 10, ui32(type) };
@@ -617,6 +622,29 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { _P(1) } } });
     }
 
+    Y_UNIT_TEST(CoreInMemoryAttachPreloadsKnownEvictedV2Page) {
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        TSharedPageCacheMock sharedCache(config);
+        const TPageLocation page = _P(1, EPage::DataPage);
+
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { page } } });
+        sharedCache.Provide(sharedCache.Collection1, { page });
+        auto usedPages = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1) } } });
+        UNIT_ASSERT(usedPages.contains(1));
+
+        sharedCache.SetLimit(0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 1);
+        sharedCache.SetLimit(128_MB);
+
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory, {}, true);
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { page } } });
+        sharedCache.Provide(sharedCache.Collection1, { page }, CORE_FETCH_COOKIE);
+        sharedCache.CheckFetches({});
+    }
+
     Y_UNIT_TEST(CoreInMemoryCollectionKeepsCoreRouteOnModeChange) {
         TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
         config.SetMemoryLimit(128_MB);
@@ -640,6 +668,32 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckResults({ TFetch{ 3, sharedCache.Collection1, { _P(1) } } });
     }
 
+    Y_UNIT_TEST(CoreInMemoryEvictionUsesPendingPages) {
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        config.SetInMemoryInFlyLimit(2 * (10 + NActors::TSharedData::OverheadSize));
+        config.SetScanQueueInFlyLimit(1_MB);
+        TSharedPageCacheMock sharedCache(config);
+        const TPageLocation page = _P(1, EPage::DataPage);
+        const TPageLocation second = _P(2, EPage::DataPage);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory, {}, true);
+
+        sharedCache.Send(sharedCache.Sender1, new TEvKeepPageEvicted(sharedCache.Collection1->Label(), 0, page));
+        sharedCache.CheckFetches({});
+
+        sharedCache.Send(sharedCache.Sender1, new TEvKeepPageEvicted(sharedCache.Collection1->Label(), 1, page));
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { page } } });
+
+        sharedCache.Send(sharedCache.Sender1, new TEvKeepPageEvicted(sharedCache.Collection1->Label(), 1, page));
+        sharedCache.CheckFetches({});
+        sharedCache.Send(sharedCache.Sender1, new TEvKeepPageEvicted(sharedCache.Collection1->Label(), 1, second));
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { second } } });
+
+        sharedCache.Provide(sharedCache.Collection1, { page }, CORE_FETCH_COOKIE);
+        sharedCache.Provide(sharedCache.Collection1, { second }, CORE_FETCH_COOKIE);
+        sharedCache.CheckFetches({});
+    }
+
     Y_UNIT_TEST(CoreInMemoryWalkPreloadsPagesThroughCore) {
         TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
         config.SetMemoryLimit(128_MB);
@@ -660,6 +714,56 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         }, TDuration::Seconds(5));
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 1);
+    }
+
+    Y_UNIT_TEST(CoreInMemoryLeafWalkWaitsForPreloadBudget) {
+        const ui64 pageBytes = 10 + NActors::TSharedData::OverheadSize;
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        config.SetInMemoryInFlyLimit(pageBytes - 1);
+        TSharedPageCacheMock sharedCache(config);
+
+        TEvAttach::TBtreeSeed seed;
+        seed.IndexCollectionId = sharedCache.Collection1->Label();
+        seed.DataCollectionId = sharedCache.Collection1->Label();
+        seed.Root = _P(0, EPage::DataPage);
+        seed.LevelCount = 0;
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory, { seed }, true);
+        sharedCache.CheckFetches({});
+
+        NKikimrConfig::TAppConfig appConfig;
+        appConfig.MutableSharedCacheConfig()->CopyFrom(config);
+        appConfig.MutableSharedCacheConfig()->SetInMemoryInFlyLimit(pageBytes);
+        sharedCache.UpdateConfig(appConfig);
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { seed.Root } } });
+        sharedCache.Provide(sharedCache.Collection1, { seed.Root }, CORE_FETCH_COOKIE);
+        sharedCache.CheckFetches({});
+    }
+
+    Y_UNIT_TEST(CoreInMemoryIndexWalkWaitsForPreloadBudget) {
+        const ui64 pageBytes = 10 + NActors::TSharedData::OverheadSize;
+        TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        config.SetInMemoryInFlyLimit(pageBytes - 1);
+        TSharedPageCacheMock sharedCache(config);
+
+        TEvAttach::TBtreeSeed seed;
+        seed.IndexCollectionId = sharedCache.Collection1->Label();
+        seed.DataCollectionId = sharedCache.Collection1->Label();
+        seed.Root = _P(0, EPage::BTreeIndexV2);
+        seed.LevelCount = 1;
+        seed.QueueLeaves = false;
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory, { seed }, true);
+        sharedCache.CheckFetches({});
+
+        NKikimrConfig::TAppConfig appConfig;
+        appConfig.MutableSharedCacheConfig()->CopyFrom(config);
+        appConfig.MutableSharedCacheConfig()->SetInMemoryInFlyLimit(pageBytes);
+        sharedCache.UpdateConfig(appConfig);
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { seed.Root } } });
+        sharedCache.Fail(sharedCache.Collection1, { seed.Root }, CORE_FETCH_COOKIE);
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, {} } }, NKikimrProto::ERROR);
+        sharedCache.CheckFetches({});
     }
 
     Y_UNIT_TEST(RequestCompletionSendsOneResultAfterLastPage) {

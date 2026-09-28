@@ -2,6 +2,10 @@
 
 #include "shared_cache_item.h"
 
+namespace NActors {
+class TActorSystem;
+}
+
 namespace NKikimr::NSharedCache {
 
 enum class ESharedCacheHookPoint {
@@ -27,11 +31,17 @@ enum class ESharedCacheHookPoint {
 };
 
 struct TProdTraits {
+    NActors::TActorSystem* KeepEvictionActorSystem = nullptr;
+    TActorId KeepEvictionActor;
+
     static void* TrySharedCachePages() noexcept;
     static bool InstallSharedCachePages(void* cache) noexcept;
     static void BindSharedCachePages(void* cache) noexcept;
     static void UnbindSharedCachePages(void* cache) noexcept;
     static ui32 CurrentWorkerIndex() noexcept;
+
+    void NotifyKeepPageEviction(
+        const TLogoBlobID& collectionId, ui64 generation, NTable::NPage::TPageLocation location) const noexcept;
 
     Y_FORCE_INLINE void Invoke(ESharedCacheHookPoint, TCacheItem) const noexcept {
     }
@@ -48,6 +58,9 @@ struct TTestTraits {
         if (Function) {
             Function(Context, point, cacheItem);
         }
+    }
+
+    void NotifyKeepPageEviction(const TLogoBlobID&, ui64, NTable::NPage::TPageLocation) const noexcept {
     }
 
     static void* TrySharedCachePages() noexcept {

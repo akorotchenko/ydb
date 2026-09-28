@@ -172,6 +172,33 @@ public:
         });
     }
 
+    static void HoldPageInKeepColdForTest(TTestSharedCache& cache, TPageCacheItem page, ui32 coldVersion) noexcept {
+        WithHandle(cache, page.Index(), [&](THandle& handle) {
+            const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
+            Y_ABORT_UNLESS(state.IsHot() && state.Refs() == 1);
+            const ui64 bytes = cache.PageBytes(handle);
+            handle.State.store(state.WithState(EHandleState::KeepCold).Raw(), std::memory_order_relaxed);
+            handle.ColdVersion.store(coldVersion, std::memory_order_relaxed);
+            cache.HotBytes_.fetch_sub(bytes, std::memory_order_relaxed);
+            cache.KeepColdBytes_.fetch_add(bytes, std::memory_order_relaxed);
+            cache.HotPages_.fetch_sub(1, std::memory_order_relaxed);
+            cache.KeepColdPages_.fetch_add(1, std::memory_order_relaxed);
+            cache.AddKeepColdOwnedBytes(bytes);
+        });
+    }
+
+    static ui32 QueueKeepColdPageForTest(TTestSharedCache& cache, TPageCacheItem page) noexcept {
+        return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
+            THandle& handle = spaceOp.Handles()[page.Index()];
+            const ui32 version =
+                AdvanceColdVersion(handle.ColdVersion.load(std::memory_order_relaxed) & MaxItemVersion) |
+                KeepColdQueuedMask;
+            handle.ColdVersion.store(version, std::memory_order_relaxed);
+            spaceOp.KeepCold().PutAndPop(TCacheItem::Make(version & MaxItemVersion, page.Index()).Raw());
+            return version;
+        });
+    }
+
     static TCacheCollection* CollectionValue(TTestSharedCache& cache, ui32 index) noexcept {
         return WithHandle(cache, index, [](THandle& handle) {
             return handle.Body.Collection;
@@ -1373,6 +1400,87 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         UNIT_ASSERT(fixture.Cache->SetCollectionKeepPages(collection, false));
         UNIT_ASSERT(fixture.Cache->RunMaintenance());
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsCold());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdOwnedBytes(), 0);
+    }
+    Y_UNIT_TEST(KeepColdLastReleaseDemotesWithdrawnEntriesOnly) {
+        TFixture fixture;
+        const TLogoBlobID id(95, 96, 105);
+        TCollectionCacheItem collection;
+        TTestSharedCacheCollectionRef collectionRef;
+        UNIT_ASSERT(
+            fixture.Cache->FindOrInsert({ .Id = id }, collection, collectionRef) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(fixture.Cache->MakeReady(collection, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->SetCollectionKeepPages(collection, true));
+
+        const ui64 pageBytes = 4096 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(2 * pageBytes));
+        std::array<TPageCacheItem, 2> pages;
+        std::array<ui32, 2> queuedVersions;
+        for (ui32 index = 0; index < pages.size(); ++index) {
+            TTestSharedCachePageRef unused;
+            UNIT_ASSERT(fixture.Cache->FindOrInsert(collection, MakePageLocation(index + 1), EStickyState::None,
+                            pages[index], unused) == ESharedCacheResultStatus::Inserted);
+            UNIT_ASSERT(fixture.Cache->MakeReady(pages[index], MakePageData(pages[index].Index())));
+            UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, pages[index]));
+            queuedVersions[index] = TSharedCacheTestAccess::ColdVersion(*fixture.Cache, pages[index].Index());
+            UNIT_ASSERT(queuedVersions[index] & KeepColdQueuedMask);
+        }
+
+        std::array<TTestSharedCachePageRef, 2> refs;
+        for (ui32 index = 0; index < pages.size(); ++index) {
+            UNIT_ASSERT(fixture.Cache->Find(collection, index + 1, refs[index]) == ESharedCacheResultStatus::Hit);
+            const ui32 coldVersion = index == 0
+                                         ? TSharedCacheTestAccess::ColdVersion(*fixture.Cache, pages[index].Index())
+                                         : queuedVersions[index];
+            TSharedCacheTestAccess::HoldPageInKeepColdForTest(*fixture.Cache, pages[index], coldVersion);
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::QueueKeepColdPageForTest(*fixture.Cache, pages[1]) & KeepColdQueuedMask);
+
+        UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(0));
+        fixture.Cache->RunMaintenance();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdOwnedBytes(), 2 * pageBytes);
+        UNIT_ASSERT(!(TSharedCacheTestAccess::ColdVersion(*fixture.Cache, pages[1].Index()) & KeepColdQueuedMask));
+
+        refs[0].Drop();
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, pages[0].Index()).IsCold());
+        refs[1].Drop();
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, pages[1].Index()).IsCold());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdOwnedBytes(), 0);
+    }
+    Y_UNIT_TEST(KeepColdLastReleaseKeepsCurrentRingEntry) {
+        TFixture fixture;
+        const TLogoBlobID id(95, 96, 106);
+        TCollectionCacheItem collection;
+        TTestSharedCacheCollectionRef collectionRef;
+        UNIT_ASSERT(
+            fixture.Cache->FindOrInsert({ .Id = id }, collection, collectionRef) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(fixture.Cache->MakeReady(collection, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->SetCollectionKeepPages(collection, true));
+
+        const ui64 pageBytes = 4096 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(pageBytes));
+        TPageCacheItem page;
+        TTestSharedCachePageRef unused;
+        UNIT_ASSERT(fixture.Cache->FindOrInsert(collection, MakePageLocation(1), EStickyState::None, page, unused) ==
+                    ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(fixture.Cache->MakeReady(page, MakePageData(page.Index())));
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        const ui32 queuedVersion = TSharedCacheTestAccess::ColdVersion(*fixture.Cache, page.Index());
+
+        TTestSharedCachePageRef ref;
+        UNIT_ASSERT(fixture.Cache->Find(collection, 1, ref) == ESharedCacheResultStatus::Hit);
+        TSharedCacheTestAccess::HoldPageInKeepColdForTest(*fixture.Cache, page, queuedVersion);
+        ref.Drop();
+
+        const THandleState state = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+        UNIT_ASSERT(state.IsKeepCold());
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 0);
+        UNIT_ASSERT(TSharedCacheTestAccess::ColdVersion(*fixture.Cache, page.Index()) & KeepColdQueuedMask);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdOwnedBytes(), pageBytes);
+
+        UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(0));
+        fixture.Cache->RunMaintenance();
         UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsCold());
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdOwnedBytes(), 0);
     }
