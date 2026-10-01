@@ -68,7 +68,7 @@ struct TPageCollectionMock : public IPageCollection {
 
     ui32 MetaPages() const noexcept override {
         Y_DEBUG_ABORT_UNLESS(PageTypes.size() <= TotalPages);
-        return static_cast<ui32>(PageTypes.size());
+        return MetaPagesOverride.value_or(PageTypes.empty() ? TotalPages : static_cast<ui32>(PageTypes.size()));
     }
 
     TInfo Page(ui32 page) const override {
@@ -110,6 +110,7 @@ struct TPageCollectionMock : public IPageCollection {
 
     TVector<NTable::NPage::EPage> PageTypes;
     bool SkipV1Shadow = false;
+    mutable std::optional<ui32> MetaPagesOverride;
 
 private:
     TLogoBlobID Id;
@@ -266,6 +267,9 @@ struct TSharedPageCacheMock {
     TSharedPageCacheMock& Attach(TActorId sender, TIntrusiveConstPtr<TPageCollectionMock> collection,
         ECacheMode cacheMode = ECacheMode::Regular, TVector<TEvAttach::TBtreeSeed> btreeSeeds = {},
         bool routeToCore = false, TVector<TPageOffset> stickyOffsets = {}, bool replayStickyWalk = false) {
+        if (routeToCore) {
+            collection->MetaPagesOverride = static_cast<ui32>(collection->PageTypes.size());
+        }
         auto attach = new TEvAttach(
             collection, cacheMode, std::move(btreeSeeds), routeToCore, std::move(stickyOffsets), replayStickyWalk);
         Send(sender, attach);
@@ -443,7 +447,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT(cache.CompleteAttach(newCollection->Id, 2, {}));
         UNIT_ASSERT(!newCollection->RoutesToCore());
     }
-    Y_UNIT_TEST(CoreStickyFetchCompletesByGeneration) {
+    Y_UNIT_TEST(CoreStickyFetchIgnoresDuplicateCompletion) {
         TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
         config.SetMemoryLimit(128_MB);
         TSharedPageCacheMock sharedCache(config);
@@ -452,15 +456,15 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page }, EPriority::Fast,
             ui64(ERequestTypeCookie::StickyPages));
         sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { page } } });
-        const ui64 generation = sharedCache.LoadRunIds[sharedCache.Collection1->Label()][page.Offset];
-        UNIT_ASSERT(generation != 0);
+        const TActorId fetchActor = sharedCache.FetchActors[sharedCache.Collection1->Label()][page.Offset];
+        UNIT_ASSERT(fetchActor);
         sharedCache.Provide(sharedCache.Collection1, { page }, CORE_FETCH_COOKIE);
         sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 1);
 
-        auto duplicate = new NBlockIO::TEvData(NKikimrProto::OK, sharedCache.Collection1, 10, generation);
+        auto duplicate = new NBlockIO::TEvData(NKikimrProto::OK, sharedCache.Collection1, 10);
         duplicate->Pages.emplace_back(page.Offset, TSharedData::Copy(TString(10, 'x')));
-        sharedCache.Send(sharedCache.BlockIoSender, duplicate, CORE_FETCH_COOKIE);
+        sharedCache.Send(fetchActor, duplicate, CORE_FETCH_COOKIE);
         sharedCache.CheckResults({});
 
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page }, EPriority::Fast,
@@ -493,7 +497,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
     }
 
-    Y_UNIT_TEST(CoreStickyAsyncQueueUsesGeneration) {
+    Y_UNIT_TEST(CoreStickyAsyncQueueCompletes) {
         TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
         config.SetMemoryLimit(128_MB);
         TSharedPageCacheMock sharedCache(config);
@@ -529,7 +533,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
     }
 
-    Y_UNIT_TEST(CoreStickyBtreeWalkFailureUsesGeneration) {
+    Y_UNIT_TEST(CoreStickyBtreeWalkFailureCompletes) {
         TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
         config.SetMemoryLimit(128_MB);
         TSharedPageCacheMock sharedCache(config);
@@ -539,7 +543,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         seed.DataCollectionId = sharedCache.Collection1->Label();
         seed.Root = root;
         seed.LevelCount = 1;
-        seed.QueueLeaves = false;
+        seed.QueueDataPages = false;
         seed.Sticky = true;
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, { seed }, true);
         sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { root } } });
@@ -625,6 +629,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
     Y_UNIT_TEST(CoreInMemoryAttachPreloadsKnownEvictedV2Page) {
         TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
         config.SetMemoryLimit(128_MB);
+        config.SetMaxLimitDecreaseStepBytes(128_MB);
         TSharedPageCacheMock sharedCache(config);
         const TPageLocation page = _P(1, EPage::DataPage);
 
@@ -752,7 +757,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         seed.DataCollectionId = sharedCache.Collection1->Label();
         seed.Root = _P(0, EPage::BTreeIndexV2);
         seed.LevelCount = 1;
-        seed.QueueLeaves = false;
+        seed.QueueDataPages = false;
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory, { seed }, true);
         sharedCache.CheckFetches({});
 
@@ -2370,7 +2375,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         seed.QueueDataPages = false;
         sharedCache.Attach(sharedCache.Sender1, collection, ECacheMode::TryKeepInMemory, { seed });
         sharedCache.CheckFetches({});
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->InFlightPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->EvictedPages->Val(), 0);
 
         sharedCache.SetLimit(5 * PAGE_TOTAL_SIZE);

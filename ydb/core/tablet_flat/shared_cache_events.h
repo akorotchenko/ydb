@@ -16,13 +16,12 @@ namespace NKikimr::NSharedCache {
 using EPriority = NTabletFlatExecutor::NBlockIO::EPriority;
 using TPageId = NTable::NPage::TPageId;
 
-    enum class EWakeupTag {
-        DoGCScheduled = 1,
-        DoGCManual = 2,
-        DoLimitDecrease = 3,
-        ContinueBTreeWalk = 4,
-        DoLimitMaintenance = 5,
-    };
+enum class EWakeupTag {
+    DoGCScheduled = 1,
+    DoGCManual = 2,
+    DoLimitMaintenance = 3,
+    ContinueBTreeWalk = 4,
+};
 
     enum EEv {
         EvBegin = EventSpaceBegin(TKikimrEvents::ES_FLAT_EXECUTOR),

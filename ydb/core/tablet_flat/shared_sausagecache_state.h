@@ -79,7 +79,8 @@ public:
     }
 };
 
-struct TCollection {
+class TCollection {
+public:
     TLogoBlobID Id;
     TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
     TSet<TActorId> InMemoryOwners;
@@ -90,6 +91,9 @@ struct TCollection {
     ui64 TotalPages = 0;
     THashMap<TPageOffset, TPendingRequests> PendingRequests;
     TDeque<TPageOffset> DroppedPages;
+    bool RouteToCore = false;
+    bool CoreKeepsPages = false;
+    ui64 CoreKeepGeneration = 0;
 
     ECacheMode GetCacheMode() {
         return InMemoryOwners ? ECacheMode::TryKeepInMemory : ECacheMode::Regular;

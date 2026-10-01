@@ -17,7 +17,7 @@
 
 namespace NKikimr::NSharedCache {
 
-struct TCollection;
+class TCollection;
 class TSharedCachePages;
 
 using TPendingInMemoryPages = THashMap<TLogoBlobID, TSet<NTable::NPage::TPageLocation>>;
@@ -75,6 +75,7 @@ public:
     virtual TCollection* FindWalkCollection(const TLogoBlobID& id) = 0;
     virtual TPendingInMemoryPages& PendingWalkPages() = 0;
     virtual TSharedCachePages* WalkCachePages() = 0;
+    virtual NActors::TSharedData FindCoreWalkPage(TCollection& collection, TPageOffset offset) = 0;
     // Regular-mode index reads; in-memory index reads go through PendingWalkPages.
     virtual void FetchWalkIndexLevel(TCollection& collection, TVector<NTable::NPage::TPageLocation>&& locations,
         const TLogoBlobID& walkCollectionId) = 0;
@@ -108,6 +109,7 @@ public:
     void FetchStarted(const TLogoBlobID& walkCollectionId);
     void InvalidateRun(const TLogoBlobID& walkCollectionId);
     void InvalidateDataCollection(const TLogoBlobID& collectionId);
+    void InvalidateIndexCollection(const TLogoBlobID& collectionId);
     void DropForIndexCollection(const TLogoBlobID& indexCollectionId);
     void RestartForIndexCollection(const TLogoBlobID& indexCollectionId);
     void DropIndexOnlyWalks(const TLogoBlobID& indexCollectionId);

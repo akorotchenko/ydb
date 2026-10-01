@@ -96,10 +96,8 @@ struct TCoreFetch {
 struct TCoreKeepPreloadRequest {
     TLogoBlobID CollectionId;
     ui64 Generation = 0;
-    ui64 WalkLoadId = 0;
     ui64 ChargedBytes = 0;
     TVector<TPageLocation> Locations;
-    bool IndexWalk = false;
     bool Admitted = false;
 };
 
@@ -176,10 +174,10 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     THashMap<TActorId, TLogoBlobID> WalkFetches;
     TPendingInMemoryPages PendingInMemoryPages;
     THashMap<TLogoBlobID, TCollectionCacheItem> CoreCollections;
-    THashMap<ui64, ui32> CoreWalkRequestsPending;
+    THashMap<ui64, TLogoBlobID> CoreWalkRequests;
     THashMap<ui64, TCoreKeepPreloadRequest> CoreKeepPreloadRequests;
     THashSet<TLogoBlobID> CoreKeepPreloadRetryBlocked;
-    THashMap<ui64, TCoreFetch> CoreFetches;
+    THashMap<TActorId, TCoreFetch> CoreFetches;
     THashMap<TActorId, THashMap<TCollection*, TIntrusiveList<TRequest>>> Owners;
     TRequestQueue AsyncRequests{ EBlockIOFetchTypeCookie::AsyncQueue };
     TRequestQueue ScanRequests{ EBlockIOFetchTypeCookie::ScanQueue };
@@ -203,7 +201,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     ui64 ActiveInMemoryBytes = 0;
     ui64 InFlyInMemoryBytes = 0;
     bool WalkContinuationScheduled = false;
-    ui64 NextCoreFetchGeneration = 1;
+    ui64 NextCoreWalkRequestId = 1;
     ui64 NextCoreKeepPreloadRequestId = 1;
 
     TCollection* FindWalkCollection(const TLogoBlobID& id) override {
@@ -224,9 +222,32 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         return SharedCachePages;
     }
 
+    NActors::TSharedData FindCoreWalkPage(TCollection& collection, TPageOffset offset) override {
+        if (!collection.RouteToCore) {
+            return {};
+        }
+        auto binding = CacheCore->BindCurrentThreadHazard();
+        TSharedCachePageRef page;
+        if (CacheCore->Find(CoreCollections.at(collection.Id), static_cast<ui64>(offset), page) ==
+            ESharedCacheResultStatus::Hit)
+        {
+            return page.ShareData();
+        }
+        return {};
+    }
+
     void FetchWalkIndexLevel(
         TCollection& collection, TVector<TPageLocation>&& locations, const TLogoBlobID& walkCollectionId) override {
         Y_DEBUG_ABORT_UNLESS(collection.GetCacheMode() == ECacheMode::Regular);
+        if (collection.RouteToCore) {
+            const ui64 requestId = NextCoreWalkRequestId++;
+            Y_ENSURE(CoreWalkRequests.emplace(requestId, walkCollectionId).second);
+            Walks.FetchStarted(walkCollectionId);
+            NSharedCache::TEvRequest request(
+                NBlockIO::EPriority::Bkgr, collection.PageCollection, std::move(locations), requestId);
+            RequestCorePages(SelfId(), CoreWalkResultCookie, request, false);
+            return;
+        }
         FetchIndexLevelInQueue(collection, std::move(locations), walkCollectionId);
     }
 
@@ -694,9 +715,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     bool RequestCorePages(TActorId sender, ui64 eventCookie, NSharedCache::TEvRequest& msg, bool sticky) {
         const TLogoBlobID id = msg.PageCollection->Label();
         const TCollectionCacheItem collection = CoreCollections.at(id);
-        if (eventCookie == CoreWalkResultCookie) {
-            ++CoreWalkRequestsPending[msg.Cookie];
-        }
         Counters.PendingRequests->Inc();
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = TActivationContext::ActorSystem(),
@@ -809,7 +827,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     void RequestCoreKeepPages(TCollection& collection,
         TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, TVector<TPageLocation>&& locations,
-        ui64 walkLoadId, bool indexWalk, NBlockIO::EPriority priority, bool sticky = false) {
+        NBlockIO::EPriority priority) {
         Y_ENSURE(locations);
         ui64 chargedBytes = 0;
         for (const auto& location : locations) {
@@ -823,26 +841,13 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             CoreKeepPreloadRequests.emplace(requestId, TCoreKeepPreloadRequest{
                                                            .CollectionId = collection.Id,
                                                            .Generation = collection.CoreKeepGeneration,
-                                                           .WalkLoadId = walkLoadId,
                                                            .ChargedBytes = chargedBytes,
                                                            .Locations = locations,
-                                                           .IndexWalk = indexWalk,
                                                        });
         Y_ENSURE(inserted);
 
-        if (walkLoadId) {
-            auto loadIt = WalkLoads.find(walkLoadId);
-            Y_ENSURE(loadIt != WalkLoads.end());
-            auto* walkCollection = Collections.FindPtr(loadIt->second);
-            Y_ENSURE(walkCollection && walkCollection->WalkRun && walkCollection->WalkRun->Id == walkLoadId);
-            ++walkCollection->WalkRun->FetchesInFlight;
-            if (indexWalk) {
-                ++CoreWalkRequestsPending[walkLoadId];
-            }
-        }
-
         NSharedCache::TEvRequest request(priority, std::move(pageCollection), std::move(locations), requestId);
-        requestIt->second.Admitted = RequestCorePages(SelfId(), CoreKeepPreloadResultCookie, request, sticky);
+        requestIt->second.Admitted = RequestCorePages(SelfId(), CoreKeepPreloadResultCookie, request, false);
     }
 
     void Handle(NSharedCache::TEvRequest::TPtr &ev, const TActorContext& ctx) {
@@ -1166,7 +1171,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             collection && collection->CoreKeepsPages && collection->InMemoryOwners &&
             collection->CoreKeepGeneration == msg->Generation)
         {
-            PendingInMemoryPages[msg->CollectionId].emplace(msg->Location, 0);
+            PendingInMemoryPages[msg->CollectionId].emplace(msg->Location);
         }
     }
 
@@ -1286,82 +1291,54 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             TCoreKeepPreloadRequest request = std::move(requestIt->second);
             CoreKeepPreloadRequests.erase(requestIt);
 
-            TCollection* walkCollection = nullptr;
-            if (request.WalkLoadId) {
-                auto loadIt = WalkLoads.find(request.WalkLoadId);
-                Y_ENSURE(loadIt != WalkLoads.end());
-                walkCollection = Collections.FindPtr(loadIt->second);
-                Y_ENSURE(
-                    walkCollection && walkCollection->WalkRun && walkCollection->WalkRun->Id == request.WalkLoadId);
-                if (request.IndexWalk) {
-                    auto pendingIt = CoreWalkRequestsPending.find(request.WalkLoadId);
-                    Y_ENSURE(pendingIt != CoreWalkRequestsPending.end() && pendingIt->second != 0);
-                    if (--pendingIt->second == 0) {
-                        CoreWalkRequestsPending.erase(pendingIt);
+            if (auto* collection = Collections.FindPtr(request.CollectionId);
+                collection && collection->CoreKeepsPages && request.Generation == collection->CoreKeepGeneration)
+            {
+                if (ev->Get()->Status == NKikimrProto::OK) {
+                    Walks.IndexPagesChanged(collection->Id);
+                } else if (!request.Admitted) {
+                    auto& pending = PendingInMemoryPages[collection->Id];
+                    pending.insert(request.Locations.begin(), request.Locations.end());
+                    CoreKeepPreloadRetryBlocked.insert(collection->Id);
+                } else {
+                    if (auto pendingIt = PendingInMemoryPages.find(collection->Id);
+                        pendingIt != PendingInMemoryPages.end())
+                    {
+                        for (const auto& location : request.Locations) {
+                            pendingIt->second.erase(location);
+                        }
+                        if (pendingIt->second.empty()) {
+                            PendingInMemoryPages.erase(pendingIt);
+                        }
+                    }
+                    Walks.InvalidateDataCollection(collection->Id);
+                    Walks.InvalidateIndexCollection(collection->Id);
+                    for (const auto& owner : collection->InMemoryOwners) {
+                        NotifyInMemOwnerAboutError(collection->PageCollection, ev->Get()->Status, owner);
                     }
                 }
             }
-
-            if (ev->Get()->Status != NKikimrProto::OK) {
-                if (auto* collection = Collections.FindPtr(request.CollectionId);
-                    collection && collection->CoreKeepsPages && request.Generation == collection->CoreKeepGeneration &&
-                    (!walkCollection || walkCollection->WalkRun->State != EWalkRunState::Cancelled))
-                {
-                    if (!request.Admitted) {
-                        if (!request.IndexWalk) {
-                            for (const auto& location : request.Locations) {
-                                PendingInMemoryPages[collection->Id].emplace(location, request.WalkLoadId);
-                            }
-                            if (walkCollection) {
-                                walkCollection->WalkRun->PendingCollections.insert(collection->Id);
-                            }
-                        }
-                        CoreKeepPreloadRetryBlocked.insert(collection->Id);
-                    } else {
-                        if (auto pendingIt = PendingInMemoryPages.find(collection->Id);
-                            pendingIt != PendingInMemoryPages.end())
-                        {
-                            for (const auto& location : request.Locations) {
-                                pendingIt->second.erase(location);
-                            }
-                            if (pendingIt->second.empty()) {
-                                PendingInMemoryPages.erase(pendingIt);
-                            }
-                        }
-                        if (walkCollection) {
-                            InvalidateWalkRun(*walkCollection);
-                        }
-                        for (const auto& [owner, pageCollection] : collection->InMemoryOwners) {
-                            NotifyInMemOwnerAboutError(pageCollection, ev->Get()->Status, owner);
-                        }
-                    }
-                }
-            }
-            FinishWalkFetch(request.WalkLoadId);
             return;
         }
+
         Y_ENSURE(ev->Cookie == CoreWalkResultCookie);
-        const ui64 loadRunId = ev->Get()->Cookie;
-        auto pendingIt = CoreWalkRequestsPending.find(loadRunId);
-        Y_ENSURE(pendingIt != CoreWalkRequestsPending.end() && pendingIt->second != 0);
-        if (--pendingIt->second == 0) {
-            CoreWalkRequestsPending.erase(pendingIt);
-        }
+        const ui64 requestId = ev->Get()->Cookie;
+        auto requestIt = CoreWalkRequests.find(requestId);
+        Y_ENSURE(requestIt != CoreWalkRequests.end());
+        const TLogoBlobID walkCollectionId = requestIt->second;
+        CoreWalkRequests.erase(requestIt);
         if (ev->Get()->Status != NKikimrProto::OK) {
-            auto loadIt = WalkLoads.find(loadRunId);
-            if (loadIt != WalkLoads.end()) {
-                if (auto* collection = Collections.FindPtr(loadIt->second)) {
-                    InvalidateWalkRun(*collection);
-                }
-            }
+            Walks.InvalidateRun(walkCollectionId);
+        } else {
+            Walks.IndexPagesChanged(ev->Get()->PageCollection->Label());
         }
-        FinishWalkFetch(loadRunId);
+        Walks.FinishFetch(walkCollectionId);
     }
 
     void Handle(NBlockIO::TEvData::TPtr &ev, const TActorContext& ctx) {
         auto *msg = ev->Get();
         if (static_cast<EBlockIOFetchTypeCookie>(ev->Cookie) == EBlockIOFetchTypeCookie::CoreFetch) {
-            CompleteCoreFetch(*msg);
+            CompleteCoreFetch(ev->Sender, *msg);
             return;
         }
         TLogoBlobID walkCollectionId;
@@ -1815,9 +1792,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         TVector<TPageFetch>&& pages, NBlockIO::EPriority priority, const TActorId& statActor, NWilson::TTraceId traceId,
         EBlockIOFetchTypeCookie queueCookie = EBlockIOFetchTypeCookie::NoQueue) {
         Y_ENSURE(pages);
-        const ui64 generation = NextCoreFetchGeneration++;
-        Y_ENSURE(generation != 0 && NextCoreFetchGeneration != 0);
-
         TVector<TPageLocation> locations;
         locations.reserve(pages.size());
         ui64 bytes = 0;
@@ -1828,24 +1802,25 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             locations.push_back(location);
             Y_ENSURE(page.Dispatch());
         }
-        auto* request = new NBlockIO::TEvFetch(priority, pageCollection, std::move(locations), bytes, generation);
+        auto* request = new NBlockIO::TEvFetch(priority, pageCollection, std::move(locations), bytes);
         request->TraceId = std::move(traceId);
         const TLogoBlobID collectionId = pageCollection->Label();
         const ui32 pageCount = pages.size();
+        Counters.InFlightPages->Add(pageCount);
+        Counters.InFlightBytes->Add(bytes);
+        const TActorId fetchActor =
+            NBlockIO::Start(this, statActor, static_cast<ui64>(EBlockIOFetchTypeCookie::CoreFetch), request);
         Y_ENSURE(CoreFetches
-                     .emplace(generation,
+                     .emplace(fetchActor,
                          TCoreFetch{ .CollectionId = collectionId, .Bytes = bytes, .QueueCookie = queueCookie,
                              .Pages = std::move(pages) })
                      .second);
-        Counters.InFlightPages->Add(pageCount);
-        Counters.InFlightBytes->Add(bytes);
-        NBlockIO::Start(this, statActor, static_cast<ui64>(EBlockIOFetchTypeCookie::CoreFetch), request);
     }
 
-    void CompleteCoreFetch(NBlockIO::TEvData& data) {
-        auto fetchIt = CoreFetches.find(data.LoadRunId);
+    void CompleteCoreFetch(const TActorId& fetchActor, NBlockIO::TEvData& data) {
+        auto fetchIt = CoreFetches.find(fetchActor);
         if (fetchIt == CoreFetches.end()) {
-            return; // stale or duplicate completion for an already resolved generation
+            return; // stale or duplicate completion from an already resolved fetch actor
         }
         TCoreFetch fetch = std::move(fetchIt->second);
         CoreFetches.erase(fetchIt);
@@ -2017,8 +1992,14 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         TargetInMemoryBytes -= collection.TotalSize;
         Counters.TargetInMemoryBytes->Set(TargetInMemoryBytes);
         if (!collection.RouteToCore) {
-            Y_ENSURE(AliveInMemoryBytes >= collection.AliveBytes);
-            AliveInMemoryBytes -= collection.AliveBytes;
+            ui64 bytesToMove = 0;
+            for (const auto& ptr : collection.PageSet) {
+                if (ptr->CacheMode == ECacheMode::TryKeepInMemory) {
+                    bytesToMove += TPageTraits::GetSize(ptr.Get());
+                }
+            }
+            Y_ENSURE(AliveInMemoryBytes >= bytesToMove);
+            AliveInMemoryBytes -= bytesToMove;
         }
         ActualizeCacheSizeLimit();
 
@@ -2082,7 +2063,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 if (NPageCollection::IsDeadPage(type, skipBTreeIndexV1Shadow)) {
                     continue;
                 }
-                pagesToLoad.emplace(pageCollection->GetLocation(pageId), 0);
+                pagesToLoad.emplace(pageCollection->GetLocation(pageId));
             }
             if (pageCollection->Total() != pageCollection->MetaPages()) {
                 for (const auto& ptr : collection.PageSet) {
@@ -2090,7 +2071,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                     if (page->State == PageStateEvicted &&
                         !NPageCollection::IsDeadPage(page->Type, skipBTreeIndexV1Shadow))
                     {
-                        pagesToLoad.emplace(TPageLocation(page->Offset, page->Size, page->Type, page->Crc32), 0);
+                        pagesToLoad.emplace(TPageLocation(page->Offset, page->Size, page->Type, page->Crc32));
                     }
                 }
             }
@@ -2120,19 +2101,17 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
         ActualizeCacheSizeLimit();
 
-        TVector<TPage*> loadedPages;
-        auto& pagesToLoad = PendingInMemoryPages[collection.Id];
         auto processPage = [&](TPage* page) {
             TryChangeCacheMode(page, ECacheMode::TryKeepInMemory);
 
             switch (page->State) {
-            case PageStateLoaded:
-                loadedPages.push_back(page);
-                break;
-            case PageStateEvicted:
-                ReloadEvictedPage(page);
-                loadedPages.push_back(page);
-                break;
+                case PageStateLoaded:
+                    loadedPages.push_back(page);
+                    break;
+                case PageStateEvicted:
+                    ReloadEvictedPage(page);
+                    loadedPages.push_back(page);
+                    break;
             }
         };
 
@@ -2267,30 +2246,12 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 }
 
                 TVector<TPageLocation> pagesToRequest;
-                ui64 walkLoadId = 0;
                 bool budgetBlocked = false;
                 auto locationIt = pagesToLoad.begin();
-                while (locationIt != pagesToLoad.end() && pagesToRequest.size() < MaxBatchLocations) {
-                    const TPageLocation location = locationIt->first;
-                    const ui64 locationWalkLoadId = locationIt->second;
-                    if (pagesToRequest && locationWalkLoadId != walkLoadId) {
-                        break;
-                    }
-                    if (locationWalkLoadId) {
-                        auto loadIt = WalkLoads.find(locationWalkLoadId);
-                        if (loadIt == WalkLoads.end()) {
-                            locationIt = pagesToLoad.erase(locationIt);
-                            continue;
-                        }
-                        auto* walkCollection = Collections.FindPtr(loadIt->second);
-                        if (!walkCollection || !walkCollection->WalkRun ||
-                            walkCollection->WalkRun->State == EWalkRunState::Cancelled ||
-                            walkCollection->WalkRun->Id != locationWalkLoadId)
-                        {
-                            locationIt = pagesToLoad.erase(locationIt);
-                            continue;
-                        }
-                    }
+                while (locationIt != pagesToLoad.end() &&
+                       pagesToRequest.size() < TEvStickyCollectionPages::MaxBatchLocations)
+                {
+                    const TPageLocation location = *locationIt;
                     ESharedCacheResultStatus status;
                     {
                         auto binding = CacheCore->BindCurrentThreadHazard();
@@ -2300,6 +2261,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                     }
                     if (status == ESharedCacheResultStatus::Hit) {
                         locationIt = pagesToLoad.erase(locationIt);
+                        Walks.IndexPagesChanged(collectionId);
+                        ScheduleWalkContinuation();
                         continue;
                     }
                     if (status == ESharedCacheResultStatus::Pending ||
@@ -2313,7 +2276,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                         budgetBlocked = true;
                         break;
                     }
-                    walkLoadId = locationWalkLoadId;
                     coreRemainBytes -= pageBytes;
                     pagesToRequest.push_back(location);
                     locationIt = pagesToLoad.erase(locationIt);
@@ -2321,8 +2283,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
                 const bool submitted = bool(pagesToRequest);
                 if (submitted) {
-                    RequestCoreKeepPages(*collection, pageCollection, std::move(pagesToRequest), walkLoadId, false,
-                        NBlockIO::EPriority::Bulk);
+                    RequestCoreKeepPages(
+                        *collection, collection->PageCollection, std::move(pagesToRequest), NBlockIO::EPriority::Bulk);
                 }
 
                 if (pagesToLoad) {
@@ -2372,12 +2334,12 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 request.PageCollection = collection->PageCollection;
                 request.Sender = owner;
                 request.Priority = NBlockIO::EPriority::Bulk;
-                LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TABLET_SAUSAGECACHE, "Request page collection " << request.PageCollection->Label()
-                    << " owner " << owner
-                    << " class " << request.Priority
-                    << " pages " << pagesToRequest);
+                LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TABLET_SAUSAGECACHE,
+                    "Request page collection " << request.PageCollection->Label() << " owner " << owner << " class "
+                                               << request.Priority << " pages " << pagesToRequest);
 
-                SendRequest(request, std::move(pagesToRequest), pagesToRequestBytes, EBlockIOFetchTypeCookie::TryKeepInMemoryPreload);
+                SendRequest(request, std::move(pagesToRequest), pagesToRequestBytes,
+                    EBlockIOFetchTypeCookie::TryKeepInMemoryPreload);
             }
 
             // some pages out of limit, try continue loading on next call

@@ -205,6 +205,12 @@ void TCacheBTreeWalkController::InvalidateDataCollection(const TLogoBlobID& coll
     }
 }
 
+void TCacheBTreeWalkController::InvalidateIndexCollection(const TLogoBlobID& collectionId) {
+    for (const TLogoBlobID& id : GetWalkCollections(collectionId)) {
+        InvalidateDataCollection(id);
+    }
+}
+
 void TCacheBTreeWalkController::AdvanceWalk(TCacheBTreeWalk& walk, const TLogoBlobID& walkCollectionId) {
     auto* indexCollection = Host.FindWalkCollection(walk.Seed.IndexCollectionId);
     auto* dataCollection = Host.FindWalkCollection(walk.Seed.DataCollectionId);
@@ -270,13 +276,19 @@ void TCacheBTreeWalkController::AdvanceWalk(TCacheBTreeWalk& walk, const TLogoBl
         }
 
         const TPageLocation location = walk.CurrentLevel[walk.Next];
-        auto* page = indexCollection->PageSet.FindPage(location.Offset);
-        if (!page || page->State == PageStateNo) {
+        const bool coreRoute = indexCollection->RouteToCore;
+        auto* page = coreRoute ? nullptr : indexCollection->PageSet.FindPage(location.Offset);
+        NActors::TSharedData coreData;
+        if (coreRoute) {
+            coreData = Host.FindCoreWalkPage(*indexCollection, location.Offset);
+        }
+        if (coreRoute ? !coreData : (!page || page->State == PageStateNo)) {
             TVector<TPageLocation> toRequest;
             for (size_t i = walk.Next; i < walk.BatchEnd; ++i) {
                 const auto& batchLocation = walk.CurrentLevel[i];
-                auto* batchPage = indexCollection->PageSet.FindPage(batchLocation.Offset);
-                if (!batchPage || batchPage->State == PageStateNo) {
+                auto* batchPage = coreRoute ? nullptr : indexCollection->PageSet.FindPage(batchLocation.Offset);
+                if (coreRoute ? !Host.FindCoreWalkPage(*indexCollection, batchLocation.Offset)
+                              : (!batchPage || batchPage->State == PageStateNo)) {
                     toRequest.push_back(batchLocation);
                 }
             }
@@ -291,7 +303,7 @@ void TCacheBTreeWalkController::AdvanceWalk(TCacheBTreeWalk& walk, const TLogoBl
             return; // wait for the pages to arrive, the next drive continues the walk
         }
 
-        if (page->State != PageStateLoaded && page->State != PageStateEvicted) {
+        if (!coreRoute && page->State != PageStateLoaded && page->State != PageStateEvicted) {
             return;
         }
         ++walk.Next;
@@ -302,9 +314,15 @@ void TCacheBTreeWalkController::AdvanceWalk(TCacheBTreeWalk& walk, const TLogoBl
             continue;
         }
 
-        auto ref = TSharedPageRef::MakeUsed(page, Host.WalkCachePages()->GCList, page->Type);
-        Y_DEBUG_ABORT_UNLESS(ref.IsUsed(), "walked B-tree page cannot be used");
-        NTable::NPage::TBtreeIndexNode node(TPinnedPageRef(ref).GetData(), /*v2Format=*/true);
+        TPinnedPageRef pinned;
+        if (coreRoute) {
+            pinned = TPinnedPageRef(std::move(coreData));
+        } else {
+            auto ref = TSharedPageRef::MakeUsed(page, Host.WalkCachePages()->GCList, page->Type);
+            Y_DEBUG_ABORT_UNLESS(ref.IsUsed(), "walked B-tree page cannot be used");
+            pinned = TPinnedPageRef(ref);
+        }
+        NTable::NPage::TBtreeIndexNode node(pinned.GetData(), /*v2Format=*/true);
 
         TVector<TPageLocation> children;
         children.reserve(node.GetChildrenCount());
@@ -342,7 +360,7 @@ bool TCacheBTreeWalkController::QueueInMemoryPages(TCollection& collection, TArr
     bool queued = false;
     for (const auto& location : locations) {
         auto* page = collection.PageSet.FindPage(location.Offset);
-        if (!page || page->State == PageStateNo) {
+        if (collection.RouteToCore || !page || page->State == PageStateNo) {
             if (queue.emplace(location).second) {
                 queued = true;
             }

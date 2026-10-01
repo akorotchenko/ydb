@@ -65,6 +65,7 @@ namespace {
     public:
         TCollection Collection;
         TPendingInMemoryPages PendingPages;
+        THashMap<TPageOffset, TSharedData> CorePages;
         TIntrusivePtr<TSharedCachePages> CachePages = new TSharedCachePages;
         TVector<TVector<TPageLocation>> StickyBatches;
         ui32 CancelledRequests = 0;
@@ -90,6 +91,13 @@ namespace {
 
         TSharedCachePages* WalkCachePages() override {
             return CachePages.Get();
+        }
+
+        NActors::TSharedData FindCoreWalkPage(TCollection&, TPageOffset offset) override {
+            if (const auto* page = CorePages.FindPtr(offset)) {
+                return *page;
+            }
+            return {};
         }
 
         void FetchWalkIndexLevel(TCollection&, TVector<TPageLocation>&&, const TLogoBlobID& walkCollectionId) override {
@@ -150,6 +158,60 @@ namespace {
 } // namespace
 
 Y_UNIT_TEST_SUITE(TCacheBTreeWalkController) {
+    Y_UNIT_TEST(CoreKeepIndexUsesPendingQueueAndParsesReadyPage) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        host.Collection.RouteToCore = true;
+        host.Collection.InMemoryOwners.insert(owner);
+
+        const auto dataPage1 = TPageLocation::FromByteOffset(2000, 10, EPage::DataPage, 1);
+        const auto dataPage2 = TPageLocation::FromByteOffset(3000, 10, EPage::DataPage, 2);
+        auto body = MakeNode(dataPage1, dataPage2);
+        auto seed = MakeSeed(host, 0);
+        seed.IndexCollectionId = host.Collection.Id;
+        seed.Root = TPageLocation::FromByteOffset(1000, body.size(), EPage::BTreeIndexV2, 3);
+
+        walks.UpdateSeeds(host.Collection, owner, { seed });
+        walks.Advance();
+        UNIT_ASSERT(host.PendingPages.at(host.Collection.Id).contains(seed.Root));
+
+        host.CorePages.emplace(seed.Root.Offset, std::move(body));
+        host.PendingPages.at(host.Collection.Id).erase(seed.Root);
+        walks.IndexPagesChanged(host.Collection.Id);
+        walks.Advance();
+        const auto& pending = host.PendingPages.at(host.Collection.Id);
+        UNIT_ASSERT(pending.contains(dataPage1));
+        UNIT_ASSERT(pending.contains(dataPage2));
+    }
+
+    Y_UNIT_TEST(CoreRegularIndexUsesCoreFetchAndParsesReadyPage) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        host.Collection.RouteToCore = true;
+        host.AllowFetch = true;
+
+        const auto dataPage1 = TPageLocation::FromByteOffset(2000, 10, EPage::DataPage, 1);
+        const auto dataPage2 = TPageLocation::FromByteOffset(3000, 10, EPage::DataPage, 2);
+        auto body = MakeNode(dataPage1, dataPage2);
+        auto seed = MakeSeed(host, 0);
+        seed.IndexCollectionId = host.Collection.Id;
+        seed.Root = TPageLocation::FromByteOffset(1000, body.size(), EPage::BTreeIndexV2, 3);
+
+        walks.UpdateSeeds(host.Collection, owner, { seed });
+        walks.Advance();
+        UNIT_ASSERT_VALUES_EQUAL(host.FetchWalkCollectionId, host.Collection.Id);
+        UNIT_ASSERT(host.PendingPages.empty());
+
+        host.CorePages.emplace(seed.Root.Offset, std::move(body));
+        walks.IndexPagesChanged(host.Collection.Id);
+        walks.Advance();
+        walks.FinishReady();
+        UNIT_ASSERT(host.PendingPages.empty());
+        UNIT_ASSERT_VALUES_EQUAL(host.ExpiredChecks, 1);
+    }
+
     Y_UNIT_TEST(MissingInMemoryIndexUsesPendingQueue) {
         TWalkHostMock host;
         TCacheBTreeWalkController walks(host);
