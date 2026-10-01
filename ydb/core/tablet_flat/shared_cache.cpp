@@ -244,10 +244,13 @@ TIntrusivePtr<TSharedCache> TSharedCache::Create(THolder<TSharedCacheSpace> spac
         return {};
     }
     Y_DEBUG_ABORT_UNLESS(Policy_.CurrentLimitGap >= 0.0 && Policy_.CurrentLimitGap < 1.0 && Policy_.ColdMin >= 0.0 &&
-                         Policy_.ColdMin < Policy_.Grow && Policy_.Grow <= 1.0 && Policy_.ResizeStep > 0.0 &&
-                         Policy_.ResizeStep <= 1.0 && Policy_.MinHotSlots > 0 && Policy_.MinResizeStep > 0 &&
+                         Policy_.ColdMin < Policy_.Grow && Policy_.Grow <= 1.0 && Policy_.HotMin > 0.0 &&
+                         Policy_.HotMin < 1.0 && Policy_.ResizeStep > 0.0 && Policy_.ResizeStep <= 1.0 &&
+                         Policy_.MinHotSlots > 0 && Policy_.MinHotSlotsUnderPressure <= Policy_.MinHotSlots &&
+                         Policy_.MinResizeStep > 0 &&
                          Policy_.MinHotSlots <= space->CurrentConfiguration().HotSlotCount() &&
-                         SharedCacheHotLayoutIsValid(Policy_.MinHotSlots));
+                         SharedCacheHotLayoutIsValid(Policy_.MinHotSlots) &&
+                         SharedCacheHotLayoutIsValid(Policy_.MinHotSlotsUnderPressure));
     TSharedCacheCapacity capacity;
     if (!TryCalculateSharedCacheCapacity(hardLimit, space->CurrentConfiguration().ExpectedPageSize,
             space->CurrentConfiguration().FixedBytes, space->HazardCount(), capacity) ||
@@ -3222,10 +3225,23 @@ bool TSharedCache::DrainHotResize(TSpaceOperation& spaceOp) noexcept {
 
 SHARED_CACHE_TEMPLATE
 ui32 TSharedCache::ShrinkHotTarget(ui32 effectiveHotSlots, ui32 step) const noexcept {
-    if (effectiveHotSlots <= Policy_.MinHotSlots) {
+    // A fixed slot floor may retain more than the byte budget when pages are larger than expected.
+    // Keep roughly HotMin of the payload budget in Hot while allowing Cold to refill.
+    const ui64 hotPages = HotPages_.load(std::memory_order_relaxed);
+    const ui64 hotBytes = LoadEstimatedBytes(HotBytes_);
+    const ui64 meanPageBytes =
+        hotPages ? Max<ui64>(1, hotBytes / hotPages) : Max<ui64>(1, Space_->CurrentConfiguration().ExpectedPageSize);
+    const ui64 currentLimit = CurrentLimit_.load(std::memory_order_relaxed);
+    const ui64 staticBytes = StaticBytes_.load(std::memory_order_relaxed);
+    const ui64 pageBudget = currentLimit > staticBytes ? currentLimit - staticBytes : 0;
+    const ui64 hotMinBytes = FractionCeil(pageBudget, Policy_.HotMin);
+    const ui64 byteMinimumSlots = hotMinBytes / meanPageBytes + (hotMinBytes % meanPageBytes != 0);
+    const ui32 minimum = static_cast<ui32>(
+        Min<ui64>(Policy_.MinHotSlots, Max<ui64>(Policy_.MinHotSlotsUnderPressure, byteMinimumSlots)));
+    if (effectiveHotSlots <= minimum) {
         return 0;
     }
-    return effectiveHotSlots - Policy_.MinHotSlots > step ? effectiveHotSlots - step : Policy_.MinHotSlots;
+    return effectiveHotSlots - minimum > step ? effectiveHotSlots - step : minimum;
 }
 
 SHARED_CACHE_TEMPLATE

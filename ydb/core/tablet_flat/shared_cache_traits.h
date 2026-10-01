@@ -91,8 +91,10 @@ struct TSharedCachePolicy {
     ui64 MinCurrentLimitGap = ui64{ 100 } << 20;
     double ColdMin = 0.20;
     double Grow = 0.30;
+    double HotMin = 0.25;
     double ResizeStep = 0.05;
     ui32 MinHotSlots = 1024;
+    ui32 MinHotSlotsUnderPressure = 15;
     ui32 MinResizeStep = 256;
 };
 
