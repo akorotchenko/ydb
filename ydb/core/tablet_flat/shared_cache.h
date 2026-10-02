@@ -465,7 +465,7 @@ private:
     bool PreparePageBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection,
         TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests, TVector<TPageInsertCandidate>& candidates,
         ui64& reservedBytes) noexcept;
-    bool AllocatePageBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection, TCacheCollection* owner,
+    bool AllocatePageBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection,
         TVector<TPageInsertCandidate>& candidates, ui64 reservedBytes) noexcept;
     ESharedCacheResultStatus FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
         const TCollectionLocation& collection, TCollectionCacheItem& inserted,

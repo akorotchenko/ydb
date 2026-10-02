@@ -2705,8 +2705,9 @@ bool TSharedCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollectionCacheIt
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection, TCacheCollection* owner,
+bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection,
     TVector<TPageInsertCandidate>& candidates, ui64 reservedBytes) noexcept {
+    TCacheCollection& owner = *spaceOp.Handles()[collection.Index()].Body.Collection;
     ui64 preparedPages = 0;
     for (const TPageInsertCandidate& candidate : candidates) {
         preparedPages += candidate.Prepare ? 1 : 0;
@@ -2732,7 +2733,7 @@ bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollectionCacheI
             ReleaseReservation(reservedBytes - initializedBytes, preparedPages - initializedPages);
             return false;
         }
-        candidate.Sticky = owner && owner->Mode_.load(std::memory_order_acquire) == ECollectionCacheMode::Sticky
+        candidate.Sticky = owner.Mode_.load(std::memory_order_acquire) == ECollectionCacheMode::Sticky
                                ? EStickyState::Sticky
                                : EStickyState::None;
         InitializePage(spaceOp, cacheItem, collection, candidate.Key.Word(1), candidate.Size, candidate.Type,
@@ -2760,11 +2761,19 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
 
     auto spaceOp = BeginOperation();
     TOperationItemRef collectionRef(spaceOp, TryAcquireStructural(spaceOp, collection.CacheItem()));
-    TCacheCollection* owner = collectionRef ? spaceOp.Handles()[collection.Index()].Body.Collection : nullptr;
+    if (!collectionRef) {
+        return false;
+    }
+    THandle& collectionHandle = spaceOp.Handles()[collection.Index()];
+    const THandleState collectionState = THandleState::FromRaw(collectionHandle.State.load(std::memory_order_acquire));
+    if (!collectionState.IsCollectionKind() || !collectionState.IsReady() || !collectionHandle.Body.Collection) {
+        return false;
+    }
+    TCacheCollection& owner = *collectionHandle.Body.Collection;
     if (!PreparePageBatch(spaceOp, collection, requests, candidates, reservedBytes)) {
         return false;
     }
-    if (!AllocatePageBatch(spaceOp, collection, owner, candidates, reservedBytes)) {
+    if (!AllocatePageBatch(spaceOp, collection, candidates, reservedBytes)) {
         return false;
     }
 
@@ -2774,7 +2783,7 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
         TSharedCachePageRequestImpl<TTraits>& request = requests[index];
         request.Status =
             FindOrInsertPage(spaceOp, candidates[index], std::move(request.Waiter), request.Page, request.Fetch);
-        if (owner && owner->Mode_.load(std::memory_order_acquire) == ECollectionCacheMode::Sticky &&
+        if (owner.Mode_.load(std::memory_order_acquire) == ECollectionCacheMode::Sticky &&
             request.Status == ESharedCacheResultStatus::Hit)
         {
             MakePageSticky(spaceOp, request.Page.CacheItem().CacheItem());

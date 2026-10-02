@@ -1082,7 +1082,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
     }
     Y_UNIT_TEST(PageBatchOvershootsTheCurrentLimit) {
         TFixture fixture;
-        const TCollectionCacheItem collection = MakeCollectionCacheItem(83, 84);
+        const TLogoBlobID id(83, 84, 85);
+        const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(collection);
+        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
         std::atomic<ui64> completedItem = 0;
@@ -1162,7 +1165,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
     }
     Y_UNIT_TEST(PageBatchOverflowLeavesOutputsUntouched) {
         TFixture fixture;
-        const TCollectionCacheItem collection = MakeCollectionCacheItem(89, 90);
+        const TLogoBlobID id(89, 90, 91);
+        const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(collection);
+        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
         std::atomic<ui64> completedItem = 0;
@@ -1186,7 +1192,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
     }
     Y_UNIT_TEST(PageBatchHandleClaimRollsBack) {
         TFixture fixture;
-        const TCollectionCacheItem collection = MakeCollectionCacheItem(87, 88);
+        const TLogoBlobID id(87, 88, 89);
+        const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(collection);
+        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
         std::atomic<ui64> completedItem = 0;
@@ -1213,7 +1222,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
     }
     Y_UNIT_TEST(PageBatchCoalescesDuplicateCandidates) {
         TFixture fixture;
-        const TCollectionCacheItem collection = MakeCollectionCacheItem(85, 86);
+        const TLogoBlobID id(85, 86, 87);
+        const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(collection);
+        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
         const auto location = MakePageLocation(3);
         const ui64 pageBytes = location.Size + NActors::TSharedData::OverheadSize;
         std::atomic<ui32> completed = 0;
