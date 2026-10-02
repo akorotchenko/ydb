@@ -535,7 +535,6 @@ private:
     bool LinkStickyPage(
         TSpaceOperation& spaceOp, TCacheItem page, TSharedCacheItemRefImpl<TTraits>& collectionRef) noexcept;
     void RestoreStickyPageList(TSpaceOperation& spaceOp, TCacheCollection& collection, ui32 detachedHead) noexcept;
-    ui32 UnstickyPage(TSpaceOperation& spaceOp, TCollectionCacheItem collection, ui32 pageIndex) noexcept;
     void DrainStickyPages(TSpaceOperation& spaceOp, TCollectionCacheItem collection, TCacheCollection& value) noexcept;
     static void PublishPageUnsticky(THandle& page, THandleState state) noexcept;
     void MergeRetainedStickyPages(TSpaceOperation& spaceOp, TCollectionCacheItem collectionItem,

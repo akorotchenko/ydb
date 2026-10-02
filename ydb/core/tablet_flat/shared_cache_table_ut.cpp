@@ -3751,6 +3751,47 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyOwnedBytes(), pageBytes);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::StickyPageListHead(*fixture.Cache, collection), kept.Index());
     }
+    Y_UNIT_TEST(StickyPageLinkedAfterSinglePassDrain) {
+        TFixture fixture;
+        const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(31, 32, 33));
+        const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, collectionKey);
+        UNIT_ASSERT(collection);
+        UNIT_ASSERT(
+            fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+
+        const TPageCacheItem existing = AllocatePage(*fixture.Cache, TSharedCacheKey::Page(collection, 1), 4096,
+            NTable::NPage::EPage::DataPage, 0, EStickyState::Sticky);
+        const TPageCacheItem pending = AllocatePage(*fixture.Cache, TSharedCacheKey::Page(collection, 2), 4096,
+            NTable::NPage::EPage::DataPage, 0, EStickyState::Sticky);
+        UNIT_ASSERT(existing && pending);
+        UNIT_ASSERT(fixture.Cache->MakeReady(existing, MakePageData(existing.Index())));
+
+        TSharedCacheGate gate;
+        gate.Slots[0].Arm(ESharedCacheHookPoint::BeforeStickyPageListLink, pending.CacheItem());
+        TSharedCacheHookGuard hookGuard(*fixture.Cache, gate.Hooks);
+        auto cache = fixture.Cache;
+        bool ready = false;
+        TGateThread completer(gate, [&] {
+            auto binding = cache->BindThreadHazard(0);
+            ready = cache->MakeReady(pending, MakePageData(pending.Index()));
+        });
+        gate.Slots[0].Wait();
+
+        UNIT_ASSERT(fixture.Cache->SetCollectionStickyPages(collection, false));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::StickyPageListHead(*fixture.Cache, collection), 0);
+
+        gate.Slots[0].Release();
+        completer.Join();
+        UNIT_ASSERT(ready);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::StickyPageListHead(*fixture.Cache, collection), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyOwnedBytes(), 0);
+        for (TPageCacheItem page : { existing, pending }) {
+            const THandleState state = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+            UNIT_ASSERT(state.IsHot());
+            UNIT_ASSERT(state.IsStickyNoneField());
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::NextInOwner(*fixture.Cache, page.Index()), 0);
+        }
+    }
     Y_UNIT_TEST(StickyListDetachRetainsPendingInsertion) {
         TFixture fixture;
         const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(13, 14, 15));

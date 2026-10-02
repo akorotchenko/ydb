@@ -21,6 +21,7 @@ enum class ESharedCacheHookPoint {
     AfterBucketResizeCursorPublished, // Payload is the resize marker.
     AfterShrinkBucketClosed, // Payload is the resize marker.
     AfterBucketSplitRemoved, // Payload is the resize marker.
+    BeforeStickyPageListLink, // Payload is the page after its collection mode check, before list publication.
     AfterStickyPageLinked, // Payload is the linked Sticky page before its ready State is published.
     AfterStickyPageListDetached, // Payload is the owning collection while the detached list is private.
     AfterStickyPageListHeadExchanged, // Payload is the owning collection before its retained tail is connected.
