@@ -361,8 +361,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             data.push_back(page->Pin());
             page->UnPin();
             pages.push_back(page);
-            requests.push_back({ .Location = TPageLocation(page->Offset, page->Size, page->Type, page->Crc32),
-                .Waiter = new TSeedWaiter });
+            requests.emplace_back(TPageLocation(page->Offset, page->Size, page->Type, page->Crc32), new TSeedWaiter);
         }
 
         auto binding = CacheCore->BindCurrentThreadHazard();
@@ -370,9 +369,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             return false;
         }
         for (ui32 index = 0; index < requests.size(); ++index) {
-            switch (requests[index].Status) {
+            switch (requests[index].Status()) {
                 case ESharedCacheResultStatus::Inserted:
-                    Y_ENSURE(requests[index].Fetch.MakeReady(std::move(data[index])));
+                    Y_ENSURE(requests[index].Fetch().MakeReady(std::move(data[index])));
                     break;
                 case ESharedCacheResultStatus::Hit:
                     break;
@@ -728,7 +727,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         TVector<TSharedCachePageRequest> requests;
         requests.reserve(locations.size());
         for (ui32 index = 0; index < locations.size(); ++index) {
-            requests.push_back({ .Location = locations[index], .Waiter = new TRequestPageWaiter(completion, index) });
+            requests.emplace_back(locations[index], new TRequestPageWaiter(completion, index));
         }
 
         auto binding = CacheCore->BindCurrentThreadHazard();
@@ -745,15 +744,15 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             const ui64 bytes = locations[index].Size;
             Counters.RequestedPages->Inc();
             Counters.RequestedBytes->Add(bytes);
-            switch (request.Status) {
+            switch (request.Status()) {
                 case ESharedCacheResultStatus::Hit:
                     Counters.CacheHitPages->Inc();
                     Counters.CacheHitBytes->Add(bytes);
                     completion->Complete(
-                        index, MakeSharedPageRef(std::move(request.Page)), EPageFetchCompletion::Ready);
+                        index, MakeSharedPageRef(std::move(request.Page())), EPageFetchCompletion::Ready);
                     break;
                 case ESharedCacheResultStatus::Inserted:
-                    toFetch.push_back(std::move(request.Fetch));
+                    toFetch.push_back(std::move(request.Fetch()));
                     [[fallthrough]];
                 case ESharedCacheResultStatus::Pending:
                     Counters.CacheMissPages->Inc();

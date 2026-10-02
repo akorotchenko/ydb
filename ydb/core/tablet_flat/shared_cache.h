@@ -5,6 +5,8 @@
 
 #include <util/generic/noncopyable.h>
 
+#include <new>
+
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
@@ -117,9 +119,107 @@ template <class TTraits = TProdTraits>
 struct TSharedCachePageRequestImpl {
     NTable::NPage::TPageLocation Location;
     TIntrusivePtr<TPageFetchWaiter> Waiter;
-    ESharedCacheResultStatus Status = ESharedCacheResultStatus::Miss;
-    TSharedCachePageRefImpl<TTraits> Page;
-    TPageFetchImpl<TTraits> Fetch;
+
+    TSharedCachePageRequestImpl(NTable::NPage::TPageLocation location, TIntrusivePtr<TPageFetchWaiter> waiter) noexcept
+        : Location(std::move(location))
+        , Waiter(std::move(waiter))
+    {
+        new (&Storage_.Page) TSharedCachePageRefImpl<TTraits>();
+    }
+
+    TSharedCachePageRequestImpl(TSharedCachePageRequestImpl&& other) noexcept
+        : TSharedCachePageRequestImpl(std::move(other.Location), std::move(other.Waiter))
+    {
+        MoveResult(other);
+    }
+
+    TSharedCachePageRequestImpl& operator=(TSharedCachePageRequestImpl&& other) noexcept {
+        if (this != &other) {
+            Location = std::move(other.Location);
+            Waiter = std::move(other.Waiter);
+            MoveResult(other);
+        }
+        return *this;
+    }
+
+    ~TSharedCachePageRequestImpl() {
+        Destroy();
+    }
+
+    ESharedCacheResultStatus Status() const noexcept {
+        return Status_;
+    }
+
+    TSharedCachePageRefImpl<TTraits>& Page() noexcept {
+        Y_ABORT_UNLESS(Status_ == ESharedCacheResultStatus::Hit);
+        return Storage_.Page;
+    }
+
+    const TSharedCachePageRefImpl<TTraits>& Page() const noexcept {
+        Y_ABORT_UNLESS(Status_ == ESharedCacheResultStatus::Hit);
+        return Storage_.Page;
+    }
+
+    TPageFetchImpl<TTraits>& Fetch() noexcept {
+        Y_ABORT_UNLESS(Status_ == ESharedCacheResultStatus::Inserted);
+        return Storage_.Fetch;
+    }
+
+    void SetHit(TSharedCachePageRefImpl<TTraits>&& page) noexcept {
+        Destroy();
+        new (&Storage_.Page) TSharedCachePageRefImpl<TTraits>(std::move(page));
+        Status_ = ESharedCacheResultStatus::Hit;
+    }
+
+    void SetInserted(TPageFetchImpl<TTraits>&& fetch) noexcept {
+        Destroy();
+        new (&Storage_.Fetch) TPageFetchImpl<TTraits>(std::move(fetch));
+        Status_ = ESharedCacheResultStatus::Inserted;
+    }
+
+    void SetPending() noexcept {
+        Reset();
+        Status_ = ESharedCacheResultStatus::Pending;
+    }
+
+    void Reset() noexcept {
+        Destroy();
+        new (&Storage_.Page) TSharedCachePageRefImpl<TTraits>();
+        Status_ = ESharedCacheResultStatus::Miss;
+    }
+
+private:
+    void Destroy() noexcept {
+        if (Status_ == ESharedCacheResultStatus::Inserted) {
+            Storage_.Fetch.~TPageFetchImpl<TTraits>();
+        } else {
+            Storage_.Page.~TSharedCachePageRefImpl<TTraits>();
+        }
+    }
+
+    void MoveResult(TSharedCachePageRequestImpl& other) noexcept {
+        Destroy();
+        if (other.Status_ == ESharedCacheResultStatus::Inserted) {
+            new (&Storage_.Fetch) TPageFetchImpl<TTraits>(std::move(other.Storage_.Fetch));
+        } else {
+            new (&Storage_.Page) TSharedCachePageRefImpl<TTraits>(std::move(other.Storage_.Page));
+        }
+        Status_ = other.Status_;
+    }
+
+    // Fetch is active only for Inserted; Page is active for every other status.
+    ESharedCacheResultStatus Status_ = ESharedCacheResultStatus::Miss;
+
+    union TStorage {
+        TStorage() noexcept {
+        }
+
+        ~TStorage() {
+        }
+
+        TSharedCachePageRefImpl<TTraits> Page;
+        TPageFetchImpl<TTraits> Fetch;
+    } Storage_;
 };
 
 class TSharedCacheTestAccess;
@@ -166,8 +266,6 @@ public:
     bool MakeReady(
         TCollectionRegistry& registry, TCollectionCacheItem collection, THolder<TCacheCollection>&& value) noexcept;
 
-    bool MakeReady(TCollectionCacheItem collection, THolder<TCacheCollection>&& value) noexcept;
-
     bool DetachCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
 
     bool UnlinkCollectionRegistry(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
@@ -188,21 +286,11 @@ public:
 
     ESharedCacheResultStatus Find(const TLogoBlobID& id, TSharedCacheCollectionRefImpl<TTraits>& collection) noexcept;
 
-    ESharedCacheResultStatus FindOrInsert(TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page,
-        EStickyState sticky, TIntrusivePtr<TPageFetchWaiter> waiter, TSharedCachePageRefImpl<TTraits>& hit,
-        TPageFetchImpl<TTraits>& fetch) noexcept;
-
     bool FindOrInsertBatch(TCollectionCacheItem collection, TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests,
         bool recordStats = true) noexcept;
 
-    ESharedCacheResultStatus FindOrInsert(TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page,
-        EStickyState sticky, TPageCacheItem& inserted, TSharedCachePageRefImpl<TTraits>& hit) noexcept;
-
     ESharedCacheResultStatus FindOrInsert(TCollectionRegistry& registry, const TCollectionLocation& collection,
         TCollectionCacheItem& inserted, TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
-
-    ESharedCacheResultStatus FindOrInsert(const TCollectionLocation& collection, TCollectionCacheItem& inserted,
-        TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
 
     bool ReclaimCold() noexcept;
 
@@ -459,6 +547,14 @@ private:
     static TPageInsertCandidate BuildPageInsertCandidate(
         TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page, EStickyState sticky) noexcept;
 
+    ESharedCacheResultStatus FindOrInsert(TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page,
+        EStickyState sticky, TPageCacheItem& inserted, TSharedCachePageRefImpl<TTraits>& hit) noexcept;
+    ESharedCacheResultStatus FindOrInsert(TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page,
+        EStickyState sticky, TIntrusivePtr<TPageFetchWaiter> waiter, TSharedCachePageRefImpl<TTraits>& hit,
+        TPageFetchImpl<TTraits>& fetch) noexcept;
+    ESharedCacheResultStatus FindOrInsert(const TCollectionLocation& collection, TCollectionCacheItem& inserted,
+        TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
+
     ESharedCacheResultStatus FindOrInsertPage(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate,
         TIntrusivePtr<TPageFetchWaiter> waiter, TSharedCachePageRefImpl<TTraits>& hit,
         TPageFetchImpl<TTraits>& fetch) noexcept;
@@ -532,11 +628,12 @@ private:
     bool LinkStickyPage(
         TSpaceOperation& spaceOp, TCacheItem page, TSharedCacheItemRefImpl<TTraits>& collectionRef) noexcept;
     void RestoreStickyPageList(TSpaceOperation& spaceOp, TCacheCollection& collection, ui32 detachedHead) noexcept;
-    void DrainStickyPages(TSpaceOperation& spaceOp, TCollectionCacheItem collection, TCacheCollection& value) noexcept;
+    void DrainStickyPages(TSpaceOperation& spaceOp, TCacheCollection& collection) noexcept;
     static void PublishPageUnsticky(THandle& page, THandleState state) noexcept;
-    void MergeRetainedStickyPages(TSpaceOperation& spaceOp, TCollectionCacheItem collectionItem,
-        TCacheCollection& collection, ui32 retainedHead, ui32 retainedTail) noexcept;
+    void MergeRetainedStickyPages(
+        TSpaceOperation& spaceOp, TCacheCollection& collection, ui32 retainedHead, ui32 retainedTail) noexcept;
     bool SetCollectionStickyPages(TSpaceOperation& spaceOp, TCacheItem collection, bool sticky) noexcept;
+    bool SetCollectionStickyPages(TSpaceOperation& spaceOp, TCacheCollection& collection, bool sticky) noexcept;
     bool MakePageSticky(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
     bool UnstickyCutPages(TSpaceOperation& spaceOp, TCacheItem page, ui64 allocationLimit) noexcept;
 
