@@ -11,6 +11,7 @@
 #include <util/generic/cast.h>
 
 #include <cmath>
+#include <type_traits>
 #include <utility>
 
 namespace NKikimr::NSharedCache {
@@ -601,8 +602,6 @@ void TSharedCache::AddStats(const TStats& stats) noexcept {
     HitBytes_.fetch_add(stats.HitBytes, std::memory_order_relaxed);
     MissPages_.fetch_add(stats.MissPages, std::memory_order_relaxed);
     MissBytes_.fetch_add(stats.MissBytes, std::memory_order_relaxed);
-    StickyMissPages_.fetch_add(stats.StickyMissPages, std::memory_order_relaxed);
-    StickyMissBytes_.fetch_add(stats.StickyMissBytes, std::memory_order_relaxed);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -2587,6 +2586,10 @@ bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandida
     }
     InitializePage(spaceOp, cacheItem, TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(candidate.Key.Word(0))),
         candidate.Key.Word(1), candidate.Size, candidate.Type, candidate.Crc32, candidate.Sticky);
+    candidate.StickyBudgetDenied =
+        candidate.Sticky == EStickyState::Sticky &&
+        !THandleState::FromRaw(spaceOp.Handles()[cacheItem.Index()].State.load(std::memory_order_relaxed))
+             .IsStickyField();
     candidate.CacheItem = cacheItem;
     return true;
 }
@@ -2652,7 +2655,7 @@ ESharedCacheResultStatus TSharedCache::FindOrInsert(TCollectionCacheItem collect
     TPageInsertCandidate candidate = BuildPageInsertCandidate(collection, page, sticky);
     const ESharedCacheResultStatus status = FindOrInsertPage(spaceOp, candidate, std::move(waiter), hit, fetch);
     TStats stats;
-    stats.AddAdmission(status, page.Size, sticky);
+    stats.AddAdmission(status, page.Size);
     AddStats(stats);
     return status;
 }
@@ -2755,6 +2758,10 @@ bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollectionCacheI
         }
         InitializePage(spaceOp, cacheItem, collection, candidate.Key.Word(1), candidate.Size, candidate.Type,
             candidate.Crc32, candidate.Sticky);
+        candidate.StickyBudgetDenied =
+            candidate.Sticky == EStickyState::Sticky &&
+            !THandleState::FromRaw(spaceOp.Handles()[cacheItem.Index()].State.load(std::memory_order_relaxed))
+                 .IsStickyField();
         candidate.CacheItem = cacheItem;
         initializedBytes += AccountedPageBytes(candidate.Size);
         ++initializedPages;
@@ -2787,8 +2794,7 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection, EStickySta
         TSharedCachePageRequestImpl<TTraits>& request = requests[index];
         request.Status =
             FindOrInsertPage(spaceOp, candidates[index], std::move(request.Waiter), request.Page, request.Fetch);
-        stats.AddAdmission(request.Status, request.Location.Size,
-            request.Sticky == EStickyState::Sticky ? EStickyState::Sticky : sticky);
+        stats.AddAdmission(request.Status, request.Location.Size);
     }
     if (recordStats) {
         AddStats(stats);
@@ -2890,6 +2896,11 @@ ESharedCacheResultStatus TSharedCache::FindOrInsert(
         Y_DEBUG_ABORT_UNLESS(acquireStatus == EAcquireStatus::Pending || acquireStatus == EAcquireStatus::Ready);
 
         if (inserted) {
+            if constexpr (std::is_same_v<TKeyedCandidate, TPageInsertCandidate>) {
+                if (candidate.StickyBudgetDenied) {
+                    StickyAdmissionFailures_.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             RefillSpareItem(spaceOp);
             ref = acquired.Take();
             return ESharedCacheResultStatus::Inserted;

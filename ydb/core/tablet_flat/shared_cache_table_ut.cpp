@@ -1220,7 +1220,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
     }
     Y_UNIT_TEST(PageBatchTelemetryCountsAdmissionOutcomes) {
         TFixture fixture;
-        const TCollectionCacheItem collection = MakeCollectionCacheItem(93, 94);
+        const TLogoBlobID id(93, 94, 95);
+        const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(collection);
+        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
         const auto first = MakePageLocation(1, 4096);
         const auto second = MakePageLocation(2, 8192);
         const ui64 requestedBytes = first.Size + second.Size;
@@ -1259,7 +1262,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(admitted.HitBytes, 0);
         UNIT_ASSERT_VALUES_EQUAL(admitted.MissPages, 2);
         UNIT_ASSERT_VALUES_EQUAL(admitted.MissBytes, requestedBytes);
-        UNIT_ASSERT_VALUES_EQUAL(admitted.StickyMissPages, 0);
+        UNIT_ASSERT_VALUES_EQUAL(admitted.StickyAdmissionFailures, 0);
 
         TVector<TTestSharedCachePageRequest> resident;
         addRequest(resident, first);
@@ -1277,29 +1280,46 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(served.MissPages, 2);
         UNIT_ASSERT_VALUES_EQUAL(served.MissBytes, requestedBytes);
 
+        UNIT_ASSERT(fixture.Cache->UpdateStickyLimit(fixture.Cache->HardLimit()));
         TVector<TTestSharedCachePageRequest> keepRequest;
         addRequest(keepRequest, MakePageLocation(3, 4096));
         UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, EStickyState::Sticky, keepRequest));
         UNIT_ASSERT(keepRequest[0].Status == ESharedCacheResultStatus::Inserted);
+        const TPageCacheItem sticky = keepRequest[0].Fetch.CacheItem();
+        UNIT_ASSERT(keepRequest[0].Fetch.MakeReady(MakePageData(sticky.Index(), keepRequest[0].Location.Size)));
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, sticky.Index()).IsSticky());
 
         const TTestSharedCache::TStats kept = fixture.Cache->Stats();
         UNIT_ASSERT_VALUES_EQUAL(kept.RequestedPages, 5);
         UNIT_ASSERT_VALUES_EQUAL(kept.MissPages, 3);
-        UNIT_ASSERT_VALUES_EQUAL(kept.StickyMissPages, 1);
-        UNIT_ASSERT_VALUES_EQUAL(kept.StickyMissBytes, 4096);
+        UNIT_ASSERT_VALUES_EQUAL(kept.StickyAdmissionFailures, 0);
+
+        UNIT_ASSERT(fixture.Cache->UpdateStickyLimit(0));
+        TVector<TTestSharedCachePageRequest> failedSticky;
+        addRequest(failedSticky, MakePageLocation(4, 4096));
+        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, EStickyState::Sticky, failedSticky));
+        UNIT_ASSERT(failedSticky[0].Status == ESharedCacheResultStatus::Inserted);
+        const TPageCacheItem ordinary = failedSticky[0].Fetch.CacheItem();
+        UNIT_ASSERT(failedSticky[0].Fetch.MakeReady(MakePageData(ordinary.Index(), failedSticky[0].Location.Size)));
+        UNIT_ASSERT(!TSharedCacheTestAccess::HandleState(*fixture.Cache, ordinary.Index()).IsSticky());
+
+        const TTestSharedCache::TStats fallback = fixture.Cache->Stats();
+        UNIT_ASSERT_VALUES_EQUAL(fallback.RequestedPages, 6);
+        UNIT_ASSERT_VALUES_EQUAL(fallback.MissPages, 4);
+        UNIT_ASSERT_VALUES_EQUAL(fallback.StickyAdmissionFailures, 1);
 
         TVector<TTestSharedCachePageRequest> rejected;
-        addRequest(rejected, MakePageLocation(4, Max<ui64>() / 2));
         addRequest(rejected, MakePageLocation(5, Max<ui64>() / 2));
-        UNIT_ASSERT(!fixture.Cache->FindOrInsertBatch(collection, EStickyState::None, rejected));
+        addRequest(rejected, MakePageLocation(6, Max<ui64>() / 2));
+        UNIT_ASSERT(!fixture.Cache->FindOrInsertBatch(collection, EStickyState::Sticky, rejected));
 
         const TTestSharedCache::TStats unchanged = fixture.Cache->Stats();
-        UNIT_ASSERT_VALUES_EQUAL(unchanged.RequestedPages, kept.RequestedPages);
-        UNIT_ASSERT_VALUES_EQUAL(unchanged.RequestedBytes, kept.RequestedBytes);
-        UNIT_ASSERT_VALUES_EQUAL(unchanged.HitPages, kept.HitPages);
-        UNIT_ASSERT_VALUES_EQUAL(unchanged.MissPages, kept.MissPages);
-        UNIT_ASSERT_VALUES_EQUAL(unchanged.MissBytes, kept.MissBytes);
-        UNIT_ASSERT_VALUES_EQUAL(unchanged.StickyMissPages, kept.StickyMissPages);
+        UNIT_ASSERT_VALUES_EQUAL(unchanged.RequestedPages, fallback.RequestedPages);
+        UNIT_ASSERT_VALUES_EQUAL(unchanged.RequestedBytes, fallback.RequestedBytes);
+        UNIT_ASSERT_VALUES_EQUAL(unchanged.HitPages, fallback.HitPages);
+        UNIT_ASSERT_VALUES_EQUAL(unchanged.MissPages, fallback.MissPages);
+        UNIT_ASSERT_VALUES_EQUAL(unchanged.MissBytes, fallback.MissBytes);
+        UNIT_ASSERT_VALUES_EQUAL(unchanged.StickyAdmissionFailures, fallback.StickyAdmissionFailures);
     }
     Y_UNIT_TEST(PageCountersFollowResidency) {
         TFixture fixture;

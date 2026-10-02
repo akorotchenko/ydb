@@ -322,10 +322,9 @@ public:
         ui64 HitBytes = 0;
         ui64 MissPages = 0;
         ui64 MissBytes = 0;
-        ui64 StickyMissPages = 0;
-        ui64 StickyMissBytes = 0;
+        ui64 StickyAdmissionFailures = 0; // page insertions that requested Sticky but fell back to ordinary on budget
 
-        void AddAdmission(ESharedCacheResultStatus status, ui64 bytes, EStickyState sticky) noexcept {
+        void AddAdmission(ESharedCacheResultStatus status, ui64 bytes) noexcept {
             ++RequestedPages;
             RequestedBytes += bytes;
             if (status == ESharedCacheResultStatus::Hit) {
@@ -335,10 +334,6 @@ public:
             }
             ++MissPages;
             MissBytes += bytes;
-            if (sticky == EStickyState::Sticky) {
-                ++StickyMissPages;
-                StickyMissBytes += bytes;
-            }
         }
     };
 
@@ -350,8 +345,7 @@ public:
             .HitBytes = HitBytes_.load(std::memory_order_relaxed),
             .MissPages = MissPages_.load(std::memory_order_relaxed),
             .MissBytes = MissBytes_.load(std::memory_order_relaxed),
-            .StickyMissPages = StickyMissPages_.load(std::memory_order_relaxed),
-            .StickyMissBytes = StickyMissBytes_.load(std::memory_order_relaxed),
+            .StickyAdmissionFailures = StickyAdmissionFailures_.load(std::memory_order_relaxed),
         };
     }
 
@@ -405,6 +399,7 @@ private:
         EStickyState Sticky = EStickyState::None;
         TCacheItem CacheItem;
         bool Prepare = false; // the page is absent from the table and needs an allocated pending item
+        bool StickyBudgetDenied = false; // count only if this prepared page wins table insertion
     };
 
     struct TCollectionInsertCandidate {
@@ -732,8 +727,7 @@ private:
     std::atomic<ui64> HitBytes_{ 0 };
     std::atomic<ui64> MissPages_{ 0 };
     std::atomic<ui64> MissBytes_{ 0 };
-    std::atomic<ui64> StickyMissPages_{ 0 };
-    std::atomic<ui64> StickyMissBytes_{ 0 };
+    std::atomic<ui64> StickyAdmissionFailures_{ 0 };
     ui64 ReservationLimit_ = 0;
     THotResize HotResize_;
     TSharedCacheCapacity HardTarget_;
