@@ -860,19 +860,10 @@ void TExecutor::AddPageCollection(const TIntrusivePtr<TPrivatePageCache::TPageCo
 {
     const ui64 attachId = ++NextPageCollectionAttachId;
     pageCollection->SetPendingAttachId(attachId);
-    TVector<TPageOffset> stickyOffsets;
-    // Only regular collections keep individual pages sticky; an in-memory collection is kept as a whole.
-    if (routeToCore && pageCollection->GetCacheMode() == ECacheMode::Regular) {
-        for (const auto& page : pageCollection->GetPageMap()) {
-            if (pageCollection->IsStickyPage(page->Offset)) {
-                stickyOffsets.push_back(page->Offset);
-            }
-        }
-    }
     auto syncPages = PrivatePageCache->AddPageCollection(pageCollection);
     Send(MakeSharedPageCacheId(),
         new NSharedCache::TEvAttach(pageCollection->PageCollection, pageCollection->GetCacheMode(),
-            std::move(btreeSeeds), routeToCore, std::move(stickyOffsets), replayStickyWalk), 0, attachId);
+            std::move(btreeSeeds), routeToCore, replayStickyWalk), 0, attachId);
 
     if (syncPages) {
         Send(MakeSharedPageCacheId(), new NSharedCache::TEvSync(std::move(syncPages)));
@@ -1679,19 +1670,11 @@ void TExecutor::RequestStickyPagesForPartStore(
                                  (regularCollection && (stickyGroups[groupIndex] || stickyIndexCollection));
         auto seeds = MakeBtreeSeeds(*partStore, groupIndex, stickyGroups);
         if (seeds || routeToCore) {
-            TVector<TPageOffset> stickyOffsets;
-            if (routeToCore && regularCollection) {
-                for (const auto& page : pageCollection->GetPageMap()) {
-                    if (pageCollection->IsStickyPage(page->Offset)) {
-                        stickyOffsets.push_back(page->Offset);
-                    }
-                }
-            }
             const ui64 attachId = ++NextPageCollectionAttachId;
             pageCollection->SetPendingAttachId(attachId);
             Send(MakeSharedPageCacheId(),
                 new NSharedCache::TEvAttach(pageCollection->PageCollection, pageCollection->GetCacheMode(),
-                    std::move(seeds), routeToCore, std::move(stickyOffsets)), 0, attachId);
+                    std::move(seeds), routeToCore), 0, attachId);
         }
 
         if (stickyGroups[groupIndex]) {

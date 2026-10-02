@@ -245,7 +245,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             Walks.FetchStarted(walkCollectionId);
             NSharedCache::TEvRequest request(
                 NBlockIO::EPriority::Bkgr, collection.PageCollection, std::move(locations), requestId);
-            RequestCorePages(SelfId(), CoreWalkResultCookie, request, false);
+            RequestCorePages(SelfId(), CoreWalkResultCookie, request);
             return;
         }
         FetchIndexLevelInQueue(collection, std::move(locations), walkCollectionId);
@@ -343,10 +343,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         return hit.CacheItem();
     }
 
-    bool SeedCoreCollection(
-        TCollection& collection, TCollectionCacheItem coreItem, TArrayRef<const TPageOffset> stickyOffsets) {
-        THashSet<TPageOffset> selected;
-        selected.insert(stickyOffsets.begin(), stickyOffsets.end());
+    bool SeedCoreCollection(TCollection& collection, TCollectionCacheItem coreItem) {
         TVector<TPage*> pages;
         TVector<TSharedData> data;
         TVector<TSharedCachePageRequest> requests;
@@ -365,12 +362,11 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             page->UnPin();
             pages.push_back(page);
             requests.push_back({ .Location = TPageLocation(page->Offset, page->Size, page->Type, page->Crc32),
-                .Waiter = new TSeedWaiter,
-                .Sticky = selected.contains(page->Offset) ? EStickyState::Sticky : EStickyState::None });
+                .Waiter = new TSeedWaiter });
         }
 
         auto binding = CacheCore->BindCurrentThreadHazard();
-        if (!CacheCore->FindOrInsertBatch(coreItem, EStickyState::None, requests, false)) {
+        if (!CacheCore->FindOrInsertBatch(coreItem, requests, false)) {
             return false;
         }
         for (ui32 index = 0; index < requests.size(); ++index) {
@@ -379,11 +375,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                     Y_ENSURE(requests[index].Fetch.MakeReady(std::move(data[index])));
                     break;
                 case ESharedCacheResultStatus::Hit:
-                    if (requests[index].Sticky == EStickyState::Sticky) {
-                        // Seeding tolerates a full sticky budget: the page is admitted as an ordinary one, just
-                        // like a page that had to be inserted with StickyNone at admission.
-                        CacheCore->MakePageSticky(requests[index].Page.CacheItem());
-                    }
                     break;
                 case ESharedCacheResultStatus::Pending:
                     break; // an earlier core fetch already owns completion for this immutable page
@@ -658,7 +649,12 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (msg->RouteToCore && coreCacheMode && !collection.RouteToCore && !collection.PendingRequests)
         {
             const TCollectionCacheItem coreItem = EnsureCoreCollection(msg->PageCollection);
-            if (coreItem && SeedCoreCollection(collection, coreItem, msg->StickyOffsets)) {
+            bool modeReady = bool(coreItem);
+            if (modeReady && msg->CacheMode == ECacheMode::TryKeepInMemory) {
+                auto binding = CacheCore->BindCurrentThreadHazard();
+                modeReady = CacheCore->SetCollectionKeepPages(coreItem, true);
+            }
+            if (modeReady && SeedCoreCollection(collection, coreItem)) {
                 LOG_NOTICE_S(ctx, NKikimrServices::TABLET_SAUSAGECACHE,
                     "Route page collection " << pageCollectionId << " to core with " << collection.PageSet.size()
                                              << " seeded pages");
@@ -678,8 +674,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 TryMoveToTryKeepInMemoryCache(collection, std::move(msg->PageCollection), ev->Sender);
                 break;
         }
-        ApplyCoreCollectionMode(collection, ctx);
-        Walks.UpdateSeeds(collection, ev->Sender, std::move(msg->BtreeSeeds), msg->ReplayStickyWalk);
+        const bool resumedSticky = ApplyCoreCollectionMode(collection, ctx);
+        Walks.UpdateSeeds(collection, ev->Sender, std::move(msg->BtreeSeeds), msg->ReplayStickyWalk || resumedSticky);
         const TCollectionCacheItem coreItem =
             collection.RouteToCore ? CoreCollections.at(pageCollectionId) : TCollectionCacheItem{};
         Send(ev->Sender, new NSharedCache::TEvAttached(pageCollectionId, coreItem), 0, ev->Cookie);
@@ -712,7 +708,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             << " than collection " << pageCollectionId << " declares " << collection.TotalPages);
     }
 
-    bool RequestCorePages(TActorId sender, ui64 eventCookie, NSharedCache::TEvRequest& msg, bool sticky) {
+    bool RequestCorePages(TActorId sender, ui64 eventCookie, NSharedCache::TEvRequest& msg) {
         const TLogoBlobID id = msg.PageCollection->Label();
         const TCollectionCacheItem collection = CoreCollections.at(id);
         Counters.PendingRequests->Inc();
@@ -732,13 +728,11 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         TVector<TSharedCachePageRequest> requests;
         requests.reserve(locations.size());
         for (ui32 index = 0; index < locations.size(); ++index) {
-            requests.push_back(
-                { .Location = locations[index], .Waiter = new TRequestPageWaiter(completion, index, sticky) });
+            requests.push_back({ .Location = locations[index], .Waiter = new TRequestPageWaiter(completion, index) });
         }
 
         auto binding = CacheCore->BindCurrentThreadHazard();
-        if (!CacheCore->FindOrInsertBatch(collection, sticky ? EStickyState::Sticky : EStickyState::None, requests))
-        {
+        if (!CacheCore->FindOrInsertBatch(collection, requests)) {
             for (ui32 index = 0; index < locations.size(); ++index) {
                 completion->Complete(index, {}, EPageFetchCompletion::Failed);
             }
@@ -755,10 +749,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 case ESharedCacheResultStatus::Hit:
                     Counters.CacheHitPages->Inc();
                     Counters.CacheHitBytes->Add(bytes);
-                    // A page that does not fit the sticky budget is a valid hit admitted as an ordinary page.
-                    if (sticky) {
-                        CacheCore->MakePageSticky(request.Page.CacheItem());
-                    }
                     completion->Complete(
                         index, MakeSharedPageRef(std::move(request.Page)), EPageFetchCompletion::Ready);
                     break;
@@ -847,7 +837,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         Y_ENSURE(inserted);
 
         NSharedCache::TEvRequest request(priority, std::move(pageCollection), std::move(locations), requestId);
-        requestIt->second.Admitted = RequestCorePages(SelfId(), CoreKeepPreloadResultCookie, request, false);
+        requestIt->second.Admitted = RequestCorePages(SelfId(), CoreKeepPreloadResultCookie, request);
     }
 
     void Handle(NSharedCache::TEvRequest::TPtr &ev, const TActorContext& ctx) {
@@ -861,8 +851,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             collection.PageCollection = msg->PageCollection;
         }
         if (collection.RouteToCore) {
-            RequestCorePages(ev->Sender, ev->Cookie, *msg,
-                ev->Cookie == ui64(ERequestTypeCookie::StickyPages));
+            RequestCorePages(ev->Sender, ev->Cookie, *msg);
             return;
         }
         ECacheMode cacheMode = collection.GetCacheMode();
@@ -1227,9 +1216,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             Counters.PageCollectionOwners->Dec();
 
             TryMoveToRegularCache(*collection, ev->Sender);
-            ApplyCoreCollectionMode(*collection, ctx);
+            const bool resumedSticky = ApplyCoreCollectionMode(*collection, ctx);
             const TLogoBlobID pageCollectionId = collection->Id;
-            Walks.UpdateSeeds(*collection, ev->Sender, {});
+            Walks.UpdateSeeds(*collection, ev->Sender, {}, resumedSticky);
 
             if (auto* current = Collections.FindPtr(pageCollectionId)) {
                 if (current->RouteToCore && current->Owners.empty()) {
@@ -1272,8 +1261,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         Counters.PageCollectionOwners->Dec();
 
         TryMoveToRegularCache(*collection, ev->Sender);
-        ApplyCoreCollectionMode(*collection, ctx);
-        Walks.UpdateSeeds(*collection, ev->Sender, {});
+        const bool resumedSticky = ApplyCoreCollectionMode(*collection, ctx);
+        Walks.UpdateSeeds(*collection, ev->Sender, {}, resumedSticky);
 
         if (auto* current = Collections.FindPtr(pageCollectionId)) {
             if (current->RouteToCore && current->Owners.empty()) {
@@ -1945,14 +1934,14 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         TryDropExpiredCollection(collection);
     }
 
-    void ApplyCoreCollectionMode(TCollection& collection, const TActorContext& ctx) {
+    bool ApplyCoreCollectionMode(TCollection& collection, const TActorContext& ctx) {
         if (!collection.RouteToCore) {
-            return;
+            return false;
         }
 
         const bool keepPages = bool(collection.InMemoryOwners);
         if (keepPages == collection.CoreKeepsPages) {
-            return;
+            return false;
         }
 
         const TCollectionCacheItem coreItem = CoreCollections.at(collection.Id);
@@ -1971,10 +1960,12 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             collection.CoreKeepsPages = keepPages;
             ++collection.CoreKeepGeneration;
             CoreKeepPreloadRetryBlocked.erase(collection.Id);
+            return !keepPages;
         } else {
             LOG_WARN_S(ctx, NKikimrServices::TABLET_SAUSAGECACHE,
                 "Cannot apply cache mode " << (keepPages ? ECacheMode::TryKeepInMemory : ECacheMode::Regular)
                                            << " to core page collection " << collection.Id);
+            return false;
         }
     }
 

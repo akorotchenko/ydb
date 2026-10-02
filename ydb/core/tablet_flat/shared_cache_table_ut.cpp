@@ -38,6 +38,15 @@ using TItemResult = TTestResult<TTestSharedCacheItemRef>;
 
 class TSharedCacheTestAccess {
 public:
+    static bool MakePageSticky(TTestSharedCache& cache, TPageCacheItem page) noexcept {
+        TTestSharedCachePageRef held;
+        if (!cache.AcquirePage(page, held)) {
+            return false;
+        }
+        auto spaceOp = cache.BeginOperation();
+        return cache.MakePageSticky(spaceOp, page.CacheItem());
+    }
+
     static TPageCacheItem AllocatePage(TTestSharedCache& cache, TCollectionCacheItem collection, ui64 offset, ui64 size,
         NTable::NPage::EPage type, ui32 crc32, EStickyState sticky) noexcept {
         return cache.AllocatePage(collection, offset, size, type, crc32, sticky);
@@ -1088,7 +1097,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(fixture.Cache->StaticBytes()));
         // The budget never refuses admission: the batch overshoots the current limit and lets maintenance
         // reclaim the excess later. Only the owner of an inserted page keeps its reservation.
-        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, EStickyState::None, requests));
+        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, requests));
         UNIT_ASSERT(requests[0].Status == ESharedCacheResultStatus::Inserted);
         UNIT_ASSERT(requests[1].Status == ESharedCacheResultStatus::Inserted);
         UNIT_ASSERT_VALUES_EQUAL(
@@ -1096,7 +1105,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::FreeCount(*fixture.Cache) < freeBefore);
         UNIT_ASSERT_VALUES_EQUAL(completed.load(std::memory_order_relaxed), 0);
     }
-    Y_UNIT_TEST(PageBatchCanSeedSelectedStickyPages) {
+    Y_UNIT_TEST(PageBatchUsesCollectionStickyMode) {
         TFixture fixture;
         const TLogoBlobID id(85, 86, 87);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
@@ -1108,12 +1117,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         std::atomic<ui64> completedItem = 0;
         TVector<TTestSharedCachePageRequest> requests;
         requests.push_back(
-            { .Location = MakePageLocation(1), .Waiter = new TTestPageFetchWaiter(completed, ready, completedItem),
-                .Sticky = EStickyState::Sticky });
+            { .Location = MakePageLocation(1), .Waiter = new TTestPageFetchWaiter(completed, ready, completedItem) });
         requests.push_back(
             { .Location = MakePageLocation(2), .Waiter = new TTestPageFetchWaiter(completed, ready, completedItem) });
 
-        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, EStickyState::None, requests, false));
+        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, requests, false));
         std::array<TPageCacheItem, 2> pageItems;
         for (ui32 index = 0; index < requests.size(); ++index) {
             auto& request = requests[index];
@@ -1122,12 +1130,35 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(request.Fetch.MakeReady(MakePageData(pageItems[index].Index())));
         }
         const auto stickyState = TSharedCacheTestAccess::HandleState(*fixture.Cache, pageItems[0].Index());
-        const auto regularState = TSharedCacheTestAccess::HandleState(*fixture.Cache, pageItems[1].Index());
+        const auto secondState = TSharedCacheTestAccess::HandleState(*fixture.Cache, pageItems[1].Index());
         UNIT_ASSERT(stickyState.IsSticky());
-        UNIT_ASSERT(regularState.IsHot());
+        UNIT_ASSERT(secondState.IsSticky());
         UNIT_ASSERT_VALUES_EQUAL(
-            fixture.Cache->StickyOwnedBytes(), requests[0].Location.Size + NActors::TSharedData::OverheadSize);
+            fixture.Cache->StickyOwnedBytes(), 2 * (requests[0].Location.Size + NActors::TSharedData::OverheadSize));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->Stats().RequestedPages, 0);
+
+        UNIT_ASSERT(fixture.Cache->SetCollectionStickyPages(collection, false));
+        TVector<TTestSharedCachePageRequest> regular;
+        regular.push_back(
+            { .Location = MakePageLocation(3), .Waiter = new TTestPageFetchWaiter(completed, ready, completedItem) });
+        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, regular));
+        UNIT_ASSERT(regular[0].Status == ESharedCacheResultStatus::Inserted);
+        const TPageCacheItem ordinary = regular[0].Fetch.CacheItem();
+        UNIT_ASSERT(regular[0].Fetch.MakeReady(MakePageData(ordinary.Index())));
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, ordinary.Index()).IsHot());
+
+        UNIT_ASSERT(fixture.Cache->SetCollectionStickyPages(collection, true));
+        TVector<TTestSharedCachePageRequest> hits;
+        hits.push_back(
+            { .Location = requests[0].Location, .Waiter = new TTestPageFetchWaiter(completed, ready, completedItem) });
+        hits.push_back(
+            { .Location = regular[0].Location, .Waiter = new TTestPageFetchWaiter(completed, ready, completedItem) });
+        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, hits));
+        UNIT_ASSERT(hits[0].Status == ESharedCacheResultStatus::Hit);
+        UNIT_ASSERT(hits[1].Status == ESharedCacheResultStatus::Hit);
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, pageItems[0].Index()).IsSticky());
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, ordinary.Index()).IsSticky());
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, pageItems[1].Index()).IsHot());
     }
     Y_UNIT_TEST(PageBatchOverflowLeavesOutputsUntouched) {
         TFixture fixture;
@@ -1147,7 +1178,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             .Status = ESharedCacheResultStatus::Pending,
         });
 
-        UNIT_ASSERT(!fixture.Cache->FindOrInsertBatch(collection, EStickyState::None, requests));
+        UNIT_ASSERT(!fixture.Cache->FindOrInsertBatch(collection, requests));
         UNIT_ASSERT(requests[0].Status == ESharedCacheResultStatus::Hit);
         UNIT_ASSERT(requests[1].Status == ESharedCacheResultStatus::Pending);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
@@ -1169,7 +1200,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         }
         const ui64 availableBefore = AvailableFreeHandles(*fixture.Cache);
 
-        UNIT_ASSERT(!fixture.Cache->FindOrInsertBatch(collection, EStickyState::None, requests));
+        UNIT_ASSERT(!fixture.Cache->FindOrInsertBatch(collection, requests));
         UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), availableBefore);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Cache->StaticBytes());
@@ -1196,7 +1227,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             });
         }
 
-        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, EStickyState::None, requests));
+        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, requests));
         ui32 inserted = 0;
         ui32 owner = 0;
         for (ui32 index = 0; index < requests.size(); ++index) {
@@ -1247,7 +1278,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TVector<TTestSharedCachePageRequest> misses;
         addRequest(misses, first);
         addRequest(misses, second);
-        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, EStickyState::None, misses));
+        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, misses));
         for (TTestSharedCachePageRequest& request : misses) {
             UNIT_ASSERT(request.Status == ESharedCacheResultStatus::Inserted);
             UNIT_ASSERT(request.Fetch);
@@ -1267,7 +1298,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TVector<TTestSharedCachePageRequest> resident;
         addRequest(resident, first);
         addRequest(resident, second);
-        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, EStickyState::None, resident));
+        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, resident));
         for (const TTestSharedCachePageRequest& request : resident) {
             UNIT_ASSERT(request.Status == ESharedCacheResultStatus::Hit);
             UNIT_ASSERT(request.Page);
@@ -1283,7 +1314,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->UpdateStickyLimit(fixture.Cache->HardLimit()));
         TVector<TTestSharedCachePageRequest> keepRequest;
         addRequest(keepRequest, MakePageLocation(3, 4096));
-        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, EStickyState::Sticky, keepRequest));
+        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, keepRequest));
         UNIT_ASSERT(keepRequest[0].Status == ESharedCacheResultStatus::Inserted);
         const TPageCacheItem sticky = keepRequest[0].Fetch.CacheItem();
         UNIT_ASSERT(keepRequest[0].Fetch.MakeReady(MakePageData(sticky.Index(), keepRequest[0].Location.Size)));
@@ -1297,7 +1328,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->UpdateStickyLimit(0));
         TVector<TTestSharedCachePageRequest> failedSticky;
         addRequest(failedSticky, MakePageLocation(4, 4096));
-        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, EStickyState::Sticky, failedSticky));
+        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, failedSticky));
         UNIT_ASSERT(failedSticky[0].Status == ESharedCacheResultStatus::Inserted);
         const TPageCacheItem ordinary = failedSticky[0].Fetch.CacheItem();
         UNIT_ASSERT(failedSticky[0].Fetch.MakeReady(MakePageData(ordinary.Index(), failedSticky[0].Location.Size)));
@@ -1311,7 +1342,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TVector<TTestSharedCachePageRequest> rejected;
         addRequest(rejected, MakePageLocation(5, Max<ui64>() / 2));
         addRequest(rejected, MakePageLocation(6, Max<ui64>() / 2));
-        UNIT_ASSERT(!fixture.Cache->FindOrInsertBatch(collection, EStickyState::Sticky, rejected));
+        UNIT_ASSERT(!fixture.Cache->FindOrInsertBatch(collection, rejected));
 
         const TTestSharedCache::TStats unchanged = fixture.Cache->Stats();
         UNIT_ASSERT_VALUES_EQUAL(unchanged.RequestedPages, fallback.RequestedPages);
@@ -3568,11 +3599,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const ui64 pageBytes = 4096 + NActors::TSharedData::OverheadSize;
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyOwnedBytes(), 0);
 
-        UNIT_ASSERT(fixture.Cache->MakePageSticky(page));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakePageSticky(*fixture.Cache, page));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyOwnedBytes(), pageBytes);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::StickyPageListHead(*fixture.Cache, collection), page.Index());
         UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsSticky());
-        UNIT_ASSERT(fixture.Cache->MakePageSticky(page));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakePageSticky(*fixture.Cache, page));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyOwnedBytes(), pageBytes);
 
         UNIT_ASSERT(fixture.Cache->SetCollectionStickyPages(collection, false));
@@ -3601,7 +3632,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         bool promoted = true;
         TGateThread promoter(gate, [&] {
             auto binding = cache->BindThreadHazard(0);
-            promoted = cache->MakePageSticky(page);
+            promoted = TSharedCacheTestAccess::MakePageSticky(*cache, page);
         });
         gate.Slots[0].Wait();
         UNIT_ASSERT(fixture.Cache->SetCollectionStickyPages(collection, false));

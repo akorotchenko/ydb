@@ -266,12 +266,11 @@ struct TSharedPageCacheMock {
 
     TSharedPageCacheMock& Attach(TActorId sender, TIntrusiveConstPtr<TPageCollectionMock> collection,
         ECacheMode cacheMode = ECacheMode::Regular, TVector<TEvAttach::TBtreeSeed> btreeSeeds = {},
-        bool routeToCore = false, TVector<TPageOffset> stickyOffsets = {}, bool replayStickyWalk = false) {
+        bool routeToCore = false, bool replayStickyWalk = false) {
         if (routeToCore) {
             collection->MetaPagesOverride = static_cast<ui32>(collection->PageTypes.size());
         }
-        auto attach = new TEvAttach(
-            collection, cacheMode, std::move(btreeSeeds), routeToCore, std::move(stickyOffsets), replayStickyWalk);
+        auto attach = new TEvAttach(collection, cacheMode, std::move(btreeSeeds), routeToCore, replayStickyWalk);
         Send(sender, attach);
 
         TWaitForFirstEvent<TEvAttach> waiter(Runtime);
@@ -567,8 +566,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         TWaitForFirstEvent<TEvSaveCompactedPages> waiter(sharedCache.Runtime);
         waiter.Wait();
 
-        sharedCache.Attach(
-            sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true, { location.Offset });
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true);
         sharedCache.SetLimit(0);
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { location }, EPriority::Fast,
             ui64(ERequestTypeCookie::StickyPages));
@@ -598,8 +596,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection1, { page });
         sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1) } } });
 
-        sharedCache.Attach(
-            sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true, { page.Offset });
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true);
         sharedCache.SetLimit(0);
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page }, EPriority::Fast,
             ui64(ERequestTypeCookie::StickyPages));
@@ -2147,8 +2144,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Runtime.SimulateSleep(TDuration::Seconds(1));
         UNIT_ASSERT(stickyPages.empty());
 
-        sharedCache.Attach(
-            sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, { seed }, false, {}, true);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, { seed }, false, true);
         sharedCache.Runtime.WaitFor("replayed sticky notification", [&] {
             return !stickyPages.empty();
         });

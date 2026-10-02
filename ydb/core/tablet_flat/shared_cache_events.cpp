@@ -69,10 +69,9 @@ void TRequestCompletion::SendResult() noexcept {
     ActorSystem_->Send(ReplyTo_, result.Release(), 0, EventCookie_);
 }
 
-TRequestPageWaiter::TRequestPageWaiter(TIntrusivePtr<TRequestCompletion> completion, ui32 index, bool sticky) noexcept
+TRequestPageWaiter::TRequestPageWaiter(TIntrusivePtr<TRequestCompletion> completion, ui32 index) noexcept
     : Completion_(std::move(completion))
     , Index_(index)
-    , Sticky_(sticky)
 {
     Y_DEBUG_ABORT_UNLESS(Completion_);
 }
@@ -83,12 +82,6 @@ void TRequestPageWaiter::Complete(TPageCacheItem page, EPageFetchCompletion comp
         TSharedCachePageRef cachePage;
         if (TSharedCache* cache = TSharedCache::TrySharedCachePages()) {
             auto binding = cache->BindCurrentThreadHazard();
-            // A page that does not fit the sticky budget is admitted as an ordinary page: a fetched page must not
-            // turn into a failed request -- which the executor answers by killing the tablet -- just because it
-            // cannot be pinned.
-            if (Sticky_) {
-                cache->MakePageSticky(page);
-            }
             if (cache->AcquirePage(page, cachePage)) {
                 result = MakeSharedPageRef(std::move(cachePage));
             } else {

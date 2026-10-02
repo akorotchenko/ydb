@@ -117,7 +117,6 @@ template <class TTraits = TProdTraits>
 struct TSharedCachePageRequestImpl {
     NTable::NPage::TPageLocation Location;
     TIntrusivePtr<TPageFetchWaiter> Waiter;
-    EStickyState Sticky = EStickyState::None;
     ESharedCacheResultStatus Status = ESharedCacheResultStatus::Miss;
     TSharedCachePageRefImpl<TTraits> Page;
     TPageFetchImpl<TTraits> Fetch;
@@ -184,8 +183,6 @@ public:
 
     bool SetCollectionKeepPages(TCollectionCacheItem collection, bool enabled) noexcept;
 
-    bool MakePageSticky(TPageCacheItem page) noexcept;
-
     ESharedCacheResultStatus Find(
         TCollectionCacheItem collection, ui64 offset, TSharedCachePageRefImpl<TTraits>& page) noexcept;
 
@@ -195,8 +192,8 @@ public:
         EStickyState sticky, TIntrusivePtr<TPageFetchWaiter> waiter, TSharedCachePageRefImpl<TTraits>& hit,
         TPageFetchImpl<TTraits>& fetch) noexcept;
 
-    bool FindOrInsertBatch(TCollectionCacheItem collection, EStickyState sticky,
-        TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests, bool recordStats = true) noexcept;
+    bool FindOrInsertBatch(TCollectionCacheItem collection, TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests,
+        bool recordStats = true) noexcept;
 
     ESharedCacheResultStatus FindOrInsert(TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page,
         EStickyState sticky, TPageCacheItem& inserted, TSharedCachePageRefImpl<TTraits>& hit) noexcept;
@@ -465,10 +462,10 @@ private:
     ESharedCacheResultStatus FindOrInsertPage(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate,
         TIntrusivePtr<TPageFetchWaiter> waiter, TSharedCachePageRefImpl<TTraits>& hit,
         TPageFetchImpl<TTraits>& fetch) noexcept;
-    bool PreparePageBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection, EStickyState sticky,
+    bool PreparePageBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection,
         TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests, TVector<TPageInsertCandidate>& candidates,
         ui64& reservedBytes) noexcept;
-    bool AllocatePageBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection,
+    bool AllocatePageBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection, TCacheCollection* owner,
         TVector<TPageInsertCandidate>& candidates, ui64 reservedBytes) noexcept;
     ESharedCacheResultStatus FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
         const TCollectionLocation& collection, TCollectionCacheItem& inserted,

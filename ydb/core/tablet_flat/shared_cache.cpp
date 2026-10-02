@@ -1237,16 +1237,6 @@ bool TSharedCache::SetCollectionKeepPages(TCollectionCacheItem collection, bool 
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::MakePageSticky(TPageCacheItem page) noexcept {
-    auto spaceOp = BeginOperation();
-    TOperationItemRef pageRef(spaceOp);
-    if (TryAcquire(spaceOp, page.CacheItem(), false, pageRef.Get()) != EAcquireStatus::Ready) {
-        return false;
-    }
-    return MakePageSticky(spaceOp, page.CacheItem());
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::MatchesPendingFetch(
     const THandle& handle, THandleState state, TCacheItem cacheItem, const TPageFetchState& fetch) noexcept {
     return cacheItem.Matches(state) && state.IsPageKind() && state.IsPending() && handle.Body.Fetch == &fetch &&
@@ -2684,7 +2674,7 @@ ESharedCacheResultStatus TSharedCache::FindOrInsertPage(TSpaceOperation& spaceOp
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection, EStickyState sticky,
+bool TSharedCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection,
     TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests, TVector<TPageInsertCandidate>& candidates,
     ui64& reservedBytes) noexcept {
     if (requests.size() > Max<ui32>()) {
@@ -2697,8 +2687,7 @@ bool TSharedCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollectionCacheIt
             request.Location && request.Location.Type != NTable::NPage::EPage::Undef && request.Waiter);
         Y_DEBUG_ABORT_UNLESS(request.Location.Size <= Max<ui64>() - NActors::TSharedData::OverheadSize);
 
-        TPageInsertCandidate candidate = BuildPageInsertCandidate(
-            collection, request.Location, request.Sticky == EStickyState::Sticky ? EStickyState::Sticky : sticky);
+        TPageInsertCandidate candidate = BuildPageInsertCandidate(collection, request.Location, EStickyState::None);
         // Only pages that are absent from the table need admission budget: a page that is already resident is
         // a hit or a pending subscription and must be admitted even when the cache is at its limit.
         TCacheItem resident;
@@ -2716,7 +2705,7 @@ bool TSharedCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollectionCacheIt
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection,
+bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection, TCacheCollection* owner,
     TVector<TPageInsertCandidate>& candidates, ui64 reservedBytes) noexcept {
     ui64 preparedPages = 0;
     for (const TPageInsertCandidate& candidate : candidates) {
@@ -2743,6 +2732,9 @@ bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollectionCacheI
             ReleaseReservation(reservedBytes - initializedBytes, preparedPages - initializedPages);
             return false;
         }
+        candidate.Sticky = owner && owner->Mode_.load(std::memory_order_acquire) == ECollectionCacheMode::Sticky
+                               ? EStickyState::Sticky
+                               : EStickyState::None;
         InitializePage(spaceOp, cacheItem, collection, candidate.Key.Word(1), candidate.Size, candidate.Type,
             candidate.Crc32, candidate.Sticky);
         candidate.StickyBudgetDenied =
@@ -2757,9 +2749,8 @@ bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollectionCacheI
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection, EStickyState sticky,
+bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
     TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests, bool recordStats) noexcept {
-    Y_DEBUG_ABORT_UNLESS(sticky == EStickyState::None || sticky == EStickyState::Sticky);
     if (requests.empty()) {
         return true;
     }
@@ -2768,10 +2759,12 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection, EStickySta
     ui64 reservedBytes;
 
     auto spaceOp = BeginOperation();
-    if (!PreparePageBatch(spaceOp, collection, sticky, requests, candidates, reservedBytes)) {
+    TOperationItemRef collectionRef(spaceOp, TryAcquireStructural(spaceOp, collection.CacheItem()));
+    TCacheCollection* owner = collectionRef ? spaceOp.Handles()[collection.Index()].Body.Collection : nullptr;
+    if (!PreparePageBatch(spaceOp, collection, requests, candidates, reservedBytes)) {
         return false;
     }
-    if (!AllocatePageBatch(spaceOp, collection, candidates, reservedBytes)) {
+    if (!AllocatePageBatch(spaceOp, collection, owner, candidates, reservedBytes)) {
         return false;
     }
 
@@ -2781,6 +2774,11 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection, EStickySta
         TSharedCachePageRequestImpl<TTraits>& request = requests[index];
         request.Status =
             FindOrInsertPage(spaceOp, candidates[index], std::move(request.Waiter), request.Page, request.Fetch);
+        if (owner && owner->Mode_.load(std::memory_order_acquire) == ECollectionCacheMode::Sticky &&
+            request.Status == ESharedCacheResultStatus::Hit)
+        {
+            MakePageSticky(spaceOp, request.Page.CacheItem().CacheItem());
+        }
         stats.AddAdmission(request.Status, request.Location.Size);
     }
     if (recordStats) {

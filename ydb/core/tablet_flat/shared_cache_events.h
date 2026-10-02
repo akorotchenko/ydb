@@ -111,18 +111,15 @@ enum class EWakeupTag {
         TVector<TBtreeSeed> BtreeSeeds;
         // Revisit unchanged sticky seeds after the owner's private cache is recreated.
         bool ReplayStickyWalk = false;
-        TVector<TPageOffset> StickyOffsets;
 
         // The cache walks the seeded B-trees itself.
         TEvAttach(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, ECacheMode cacheMode,
-            TVector<TBtreeSeed> btreeSeeds, bool routeToCore = false, TVector<TPageOffset> stickyOffsets = {},
-            bool replayStickyWalk = false)
+            TVector<TBtreeSeed> btreeSeeds, bool routeToCore = false, bool replayStickyWalk = false)
             : PageCollection(std::move(pageCollection))
             , CacheMode(cacheMode)
             , RouteToCore(routeToCore)
             , BtreeSeeds(std::move(btreeSeeds))
             , ReplayStickyWalk(replayStickyWalk)
-            , StickyOffsets(std::move(stickyOffsets))
         {
         }
 
@@ -306,14 +303,13 @@ enum class EWakeupTag {
 
     class TRequestPageWaiter final : public TPageFetchWaiter {
     public:
-        TRequestPageWaiter(TIntrusivePtr<TRequestCompletion> completion, ui32 index, bool sticky = false) noexcept;
+        TRequestPageWaiter(TIntrusivePtr<TRequestCompletion> completion, ui32 index) noexcept;
 
         void Complete(TPageCacheItem page, EPageFetchCompletion completion) noexcept override;
 
     private:
         TIntrusivePtr<TRequestCompletion> Completion_;
         const ui32 Index_;
-        const bool Sticky_;
     };
 
     struct TEvUpdated : public TEventLocal<TEvUpdated, EvUpdated> {
