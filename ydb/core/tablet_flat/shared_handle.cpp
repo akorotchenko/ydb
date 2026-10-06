@@ -12,6 +12,10 @@ namespace {
             Initialize(Page_.ShareData());
         }
 
+        bool IsSticky() const noexcept override {
+            return Page_.IsSticky();
+        }
+
     private:
         TSharedCachePageRef Page_;
     };

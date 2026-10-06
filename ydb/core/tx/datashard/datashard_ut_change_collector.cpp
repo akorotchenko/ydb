@@ -1,5 +1,6 @@
 #include "change_record.h"
 #include <ydb/core/tx/datashard/ut_common/datashard_ut_common.h>
+#include <ydb/core/base/memory_controller_iface.h>
 
 #include <ydb/core/protos/change_exchange.pb.h>
 #include <ydb/core/scheme/scheme_tablecell.h>
@@ -761,8 +762,9 @@ Y_UNIT_TEST_SUITE(CdcStreamChangeCollector) {
 
     template <typename SK = ui32>
     void Run(const NSharedCache::TSharedCacheConfig& sharedCacheConfig, const TString& path,
-            const TShardedTableOptions& opts, TIntrusivePtr<NACLib::TUserContext> userCtx, const TVector<TCdcStream>& streams,
-            const TVector<TString>& queries, const TStructRecords<SK>& expectedRecords)
+        const TShardedTableOptions& opts, TIntrusivePtr<NACLib::TUserContext> userCtx,
+        const TVector<TCdcStream>& streams, const TVector<TString>& queries, const TStructRecords<SK>& expectedRecords,
+        bool disableCacheRetention = false)
     {
         const auto pathParts = SplitPath(path);
         UNIT_ASSERT(pathParts.size() > 1);
@@ -782,6 +784,15 @@ Y_UNIT_TEST_SUITE(CdcStreamChangeCollector) {
 
         TServer::TPtr server = new TServer(serverSettings);
         auto& runtime = *server->GetRuntime();
+        auto cacheAllocation = runtime.AddObserver<NMemory::TEvConsumerLimit>([disableCacheRetention](const auto& ev) {
+            if (disableCacheRetention && ev->Get()->MaxLimitBytes) {
+                ev->Get()->LimitBytes = 0;
+            }
+        });
+        if (disableCacheRetention) {
+            runtime.Send(new IEventHandle(NSharedCache::MakeSharedPageCacheId(), TActorId{},
+                new NMemory::TEvConsumerLimit(0, sharedCacheConfig.GetMemoryLimit())));
+        }
         const TActorId sender = runtime.AllocateEdgeActor();
 
         runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_DEBUG);
@@ -866,22 +877,17 @@ Y_UNIT_TEST_SUITE(CdcStreamChangeCollector) {
 
     template <typename SK = ui32>
     void Run(const NSharedCache::TSharedCacheConfig& sharedCacheConfig, const TString& path,
-            const TShardedTableOptions& opts,
-            const TVector<TCdcStream>& streams,
-            const TVector<TString>& queries, const TStructRecords<SK>& expectedRecords)
+        const TShardedTableOptions& opts, const TVector<TCdcStream>& streams, const TVector<TString>& queries,
+        const TStructRecords<SK>& expectedRecords, bool disableCacheRetention = false)
     {
-        Run(sharedCacheConfig, path, opts, NACLib::TUserContextBuilder().WithUserSID(BUILTIN_ACL_CDC_WITHOUT_USER_SID).Build(), streams, queries, expectedRecords);
+        Run(sharedCacheConfig, path, opts,
+            NACLib::TUserContextBuilder().WithUserSID(BUILTIN_ACL_CDC_WITHOUT_USER_SID).Build(), streams, queries,
+                expectedRecords, disableCacheRetention);
     }
 
     const NSharedCache::TSharedCacheConfig DefaultCacheParams() {
         NSharedCache::TSharedCacheConfig config;
         config.SetMemoryLimit(32_MB);
-        return config;
-    }
-
-    const NSharedCache::TSharedCacheConfig TinyCacheParams() {
-        NSharedCache::TSharedCacheConfig config;
-        config.SetMemoryLimit(0);
         return config;
     }
 
@@ -1130,14 +1136,14 @@ Y_UNIT_TEST_SUITE(CdcStreamChangeCollector) {
         expectedRecords.push_back(TStructRecord(NTable::ERowOp::Upsert, {{"key", 1}}, {}, {{"value", 1}}, {{"value", 10}}));
         expectedRecords.push_back(TStructRecord(NTable::ERowOp::Upsert, {{"key", 1000}}, {}, {{"value", 1000}}, {{"value", 10000}}));
 
-        Run(TinyCacheParams(), "/Root/path", TinyCacheTable(), TVector<TCdcStream>{NewAndOldImages()}, TVector<TString>{
-            bigUpsert,
-            "COMPACT TABLE `/Root/path`;",
-            "SELECT * FROM `/Root/path` WHERE key = 1;",
-            "UPSERT INTO `/Root/path` (key, value) VALUES (1, 10), (1000, 10000);",
-        }, {
-            {"new_and_old_images", expectedRecords},
-        });
+        Run(DefaultCacheParams(), "/Root/path", TinyCacheTable(), TVector<TCdcStream>{ NewAndOldImages() },
+            TVector<TString>{
+                bigUpsert, "COMPACT TABLE `/Root/path`;", "SELECT * FROM `/Root/path` WHERE key = 1;",
+                "UPSERT INTO `/Root/path` (key, value) VALUES (1, 10), (1000, 10000);",
+            },
+            {
+                { "new_and_old_images", expectedRecords },
+            }, true);
     }
 
     Y_UNIT_TEST(NewImage) {

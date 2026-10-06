@@ -289,6 +289,9 @@ struct TExecutorStatsImpl : public TExecutorStats {
 struct TTransactionWaitPad : public NPageCollection::TPagesWaitPad {
     TSeat* Seat;
     NWilson::TSpan WaitingSpan;
+    bool WaitingForResources = false;
+    bool MemoryReady = false;
+    bool CacheReady = false;
 
     TTransactionWaitPad(TSeat* seat);
     ~TTransactionWaitPad();
@@ -560,20 +563,22 @@ class TExecutor
     void CommitTransactionLog(std::unique_ptr<TSeat>, TPageCollectionTxEnv&, TAutoPtr<NTable::TChange>,
                               THPTimer &bookkeepingTimer);
     void UnpinTransactionPages(TSeat &seat);
-    void ReleaseTxData(TSeat &seat, ui64 requested);
-    void PostponeTransaction(TSeat*, TPageCollectionTxEnv&, TAutoPtr<NTable::TChange>, THPTimer &bookkeepingTimer);
+    void ReleaseTxData(TSeat& seat, ui64 requested);
+    void PostponeForMemory(TSeat& seat, ui64 desired, ui64 requestedMemory);
+    void PostponeTransaction(TSeat*, TPageCollectionTxEnv&, TAutoPtr<NTable::TChange>, THPTimer& bookkeepingTimer);
     void EnqueueActivation(TSeat* seat, bool activate);
     void PlanTransactionActivation();
     void MakeLogSnapshot();
-    void TryActivateWaitingTransaction(TIntrusivePtr<NPageCollection::TPagesWaitPad>&& waitPad, TVector<NSharedCache::TEvResult::TLoaded>&& pages, TPrivatePageCache::TPageCollection* collectionInfo);
+    void TryActivateWaitingTransaction(TIntrusivePtr<NPageCollection::TPagesWaitPad>&& waitPad,
+        TVector<NSharedCache::TEvResult::TLoaded>&& pages, TPrivatePageCache::TPageCollection* collectionInfo);
     void ActivateWaitingTransaction(TTransactionWaitPad& transaction);
+    void TryActivateResourceWaitingTransaction(TTransactionWaitPad& transaction);
     void LogWaitingTransaction(const TTransactionWaitPad& transaction);
     void AddPartStorePageCollections(const NTable::TPartView& partView,
         const THashMap<NTable::TTag, ECacheMode>& cacheModes, const THashSet<NTable::TTag>& stickyColumns,
         bool replayStickyWalks = false);
     void AddPageCollection(const TIntrusivePtr<TPrivatePageCache::TPageCollection>& pageCollection,
-        TVector<NSharedCache::TEvAttach::TBtreeSeed> btreeSeeds = {}, bool replayStickyWalk = false,
-        bool routeToCore = false);
+        TVector<NSharedCache::TEvAttach::TBtreeSeed> btreeSeeds = {}, bool replayStickyWalk = false);
     void DropPartStorePageCollections(const NTable::TPart& part);
     void DropPageCollection(const TLogoBlobID& pageCollectionId);
     void StartNewBackup();

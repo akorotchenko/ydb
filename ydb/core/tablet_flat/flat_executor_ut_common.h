@@ -1,10 +1,15 @@
 #pragma once
 
 #include <ydb/core/tablet_flat/test/libs/exec/runner.h>
+#include <ydb/core/base/memory_controller_iface.h>
+
+#include <optional>
 #include <ydb/core/tablet_flat/test/libs/exec/world.h>
 #include <ydb/core/tablet_flat/test/libs/exec/dummy.h>
 #include <ydb/core/tablet_flat/ut/flat_database_ut_common.h>
 #include <ydb/core/tablet_flat/flat_executor_compaction_logic.h>
+#include <ydb/core/tablet_flat/shared_cache.h>
+#include <ydb/core/tablet_flat/shared_cache_pages.h>
 #include <ydb/core/tablet/tablet_impl.h>
 #include <ydb/library/yverify_stream/yverify_stream.h>
 #include <library/cpp/testing/unittest/registar.h>
@@ -15,11 +20,27 @@ namespace NKikimr {
 namespace NTabletFlatExecutor {
 
     struct TMyEnvBase : public NFake::TRunner {
-
-        TMyEnvBase()
-            : Edge(Env.AllocateEdgeActor())
+        explicit TMyEnvBase(ui64 sharedCacheLimit = 8_MB, std::optional<ui64> softLimit = std::nullopt)
+            : NFake::TRunner(sharedCacheLimit)
+            , Edge(Env.AllocateEdgeActor())
         {
             Env.SetLogPriority(NKikimrServices::TABLET_SAUSAGECACHE, NActors::NLog::PRI_INFO);
+            if (softLimit) {
+                Env.WaitFor("shared-cache service registration", [&] {
+                    return bool(Env.SingleSys()->LookupLocalService(NSharedCache::MakeSharedPageCacheId()));
+                }, TDuration::Seconds(5));
+                Env.Send(NSharedCache::MakeSharedPageCacheId(), TActorId{},
+                    new NMemory::TEvConsumerLimit(*softLimit, sharedCacheLimit));
+                TDispatchOptions allocation;
+                allocation.FinalEvents.emplace_back(NMemory::EvConsumerLimit, 1);
+                Env.DispatchEvents(allocation);
+            }
+            CoreAttachObserver = Env.AddObserver<NSharedCache::TEvAttached>([this](const auto&) {
+                BindSharedCache();
+            });
+            CoreResultObserver = Env.AddObserver<NSharedCache::TEvResult>([this](const auto&) {
+                BindSharedCache();
+            });
 
             if (false) {
                 Env.SetLogPriority(NKikimrServices::TABLET_EXECUTOR, NActors::NLog::PRI_INFO);
@@ -136,6 +157,21 @@ namespace NTabletFlatExecutor {
 
         ui64 Tablet = MakeTabletID(false, 1) & 0xFFFF'FFFF;
         const TActorId Edge;
+
+    private:
+        void BindSharedCache() {
+            if (!CacheBinding) {
+                if (auto* core =
+                        static_cast<NSharedCache::TSharedCache*>(Env.GetAppData().SharedCachePages->Cache.Get())) {
+                    CacheBinding.emplace(core->BindCurrentThreadHazard());
+                }
+            }
+        }
+
+        // The fake runtime can destroy delivered page refs after leaving an actor context.
+        std::optional<NSharedCache::TSharedCacheThreadBinding<NSharedCache::TProdTraits>> CacheBinding;
+        NActors::TTestActorRuntimeBase::TEventObserverHolder CoreAttachObserver;
+        NActors::TTestActorRuntimeBase::TEventObserverHolder CoreResultObserver;
     };
 
 } // namespace NTabletFlatExecutor

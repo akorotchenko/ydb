@@ -1,4 +1,5 @@
 #include <ydb/core/tx/datashard/ut_common/datashard_ut_common.h>
+#include <ydb/core/base/memory_controller_iface.h>
 #include "datashard_ut_common_kqp.h"
 #include "datashard_active_transaction.h"
 #include "datashard_failpoints.h"
@@ -4208,10 +4209,17 @@ Y_UNIT_TEST_SUITE(DataShardReadIteratorPageFaults) {
         TServerSettings serverSettings(pm.GetPort(2134));
         serverSettings.SetDomainName("Root")
             .SetUseRealThreads(false);
-        serverSettings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(0);
+        serverSettings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(32_MB);
         TServer::TPtr server = new TServer(serverSettings);
 
         auto& runtime = *server->GetRuntime();
+        auto cacheAllocation = runtime.AddObserver<NMemory::TEvConsumerLimit>([](const auto& ev) {
+            if (ev->Get()->MaxLimitBytes) {
+                ev->Get()->LimitBytes = 0;
+            }
+        });
+        runtime.Send(new IEventHandle(
+            NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 32_MB)));
         auto sender = runtime.AllocateEdgeActor();
 
         runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
@@ -4296,10 +4304,17 @@ Y_UNIT_TEST_SUITE(DataShardReadIteratorPageFaults) {
         TServerSettings serverSettings(pm.GetPort(2134));
         serverSettings.SetDomainName("Root")
             .SetUseRealThreads(false);
-        serverSettings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(0);
+        serverSettings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(32_MB);
         TServer::TPtr server = new TServer(serverSettings);
 
         auto& runtime = *server->GetRuntime();
+        auto cacheAllocation = runtime.AddObserver<NMemory::TEvConsumerLimit>([](const auto& ev) {
+            if (ev->Get()->MaxLimitBytes) {
+                ev->Get()->LimitBytes = 0;
+            }
+        });
+        runtime.Send(new IEventHandle(
+            NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 32_MB)));
         auto sender = runtime.AllocateEdgeActor();
 
         runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);

@@ -31,6 +31,7 @@ TPrivatePageCache::TPageCollection::TPageCollection(const TPageCollection& pageC
     , PageCollection(pageCollection.PageCollection)
     , StickyPages(pageCollection.StickyPages)
     , CacheMode(pageCollection.CacheMode)
+    , StickyCollection(pageCollection.StickyCollection)
 {
     PageMap.reserve(pageCollection.PageMap.size());
     for (const auto& page : pageCollection.PageMap) {
@@ -68,7 +69,7 @@ THashMap<TLogoBlobID, THashSet<TPageOffset>> TPrivatePageCache::AddPageCollectio
         sharedCacheTouches[page->PageCollection->Id].insert(page->Offset);
     }
 
-    if (pageCollection->GetCacheMode() == ECacheMode::TryKeepInMemory) {
+    if (pageCollection->CacheMode == ECacheMode::TryKeepInMemory) {
         Stats.TryKeepInMemoryBytes += pageCollection->PageCollection->BackingSize();
     }
 
@@ -110,7 +111,7 @@ void TPrivatePageCache::DropPageCollection(TPageCollection *pageCollection) {
         }
     }
 
-    if (pageCollection->GetCacheMode() == ECacheMode::TryKeepInMemory) {
+    if (pageCollection->CacheMode == ECacheMode::TryKeepInMemory) {
         Stats.TryKeepInMemoryBytes -= pageCollection->PageCollection->BackingSize();
     }
 
@@ -174,7 +175,7 @@ void TPrivatePageCache::AddStickyPage(TPageOffset offset, size_t size, TSharedPa
 
 bool TPrivatePageCache::UpdateCacheMode(ECacheMode newCacheMode, TPageCollection *pageCollection)
 {
-    auto oldCacheMode = pageCollection->GetCacheMode();
+    auto oldCacheMode = pageCollection->CacheMode;
     if (oldCacheMode == newCacheMode) {
         return false;
     }

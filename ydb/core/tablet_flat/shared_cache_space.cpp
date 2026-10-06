@@ -162,7 +162,7 @@ bool TSharedCacheSpace::PrepareTransition(const TSharedCacheCapacity& target, TT
     if (!TryMappingSize(target.HandleCount(), sizeof(THandle), view->HandlesBytes) ||
         !TryMappingSize(target.BucketCount(), sizeof(std::atomic<ui64>), view->BucketsBytes) ||
         !TryMappingSize(target.HotSlotCount(), sizeof(std::atomic<ui64>), view->HotSlotBytes) ||
-        !TryMappingSize(target.HandleCount(), sizeof(std::atomic<ui64>), view->ColdSlotBytes) ||
+        !TryMappingSize(target.ColdSlotCount(), sizeof(std::atomic<ui64>), view->ColdSlotBytes) ||
         !TryMappingSize(target.KeepColdSlotCount(), sizeof(std::atomic<ui64>), view->KeepColdSlotBytes) ||
         !TryMappingSize(target.HandleCount(), sizeof(std::atomic<ui64>), view->FreeSlotBytes) ||
         !HandlesMapping_.Prepare(view->HandlesBytes, view->Handles) ||
@@ -218,6 +218,9 @@ void TSharedCacheSpace::PrepareView(ui32 generation, TSpaceView view) noexcept {
     Y_DEBUG_ABORT_UNLESS(S5FifoRings_ && FreeRingCursor_);
     view.Space = this;
     view.Generation = generation;
+    const ui64 usableHandles = view.AllocationLimit - 2;
+    view.ColdMinHandles = (usableHandles + 4) / 5;
+    view.ColdGrowHandles = (usableHandles * 3 + 9) / 10;
     view.Rings = S5FifoRings_.Get();
     view.FreeCursor = FreeRingCursor_.Get();
     view.EffectiveHotSlots = &EffectiveHotSlots_;
@@ -247,6 +250,7 @@ bool TSharedCacheSpace::InitializeGrowth(TTransition& transition) noexcept {
     const TSharedCacheCapacity& target = transition.TargetConfiguration_;
     const ui64 handleDelta = target.HandleCount() - old.HandleCount();
     const ui64 hotDelta = target.HotSlotCount() - old.HotSlotCount();
+    const ui64 coldDelta = target.ColdSlotCount() - old.ColdSlotCount();
     const ui64 keepColdDelta = target.KeepColdSlotCount() - old.KeepColdSlotCount();
     const ui64 end = Min(handleDelta, transition.NextWorkIndex_ + SharedCacheTransitionWorkBatch);
     while (transition.NextWorkIndex_ < end) {
@@ -254,8 +258,10 @@ bool TSharedCacheSpace::InitializeGrowth(TTransition& transition) noexcept {
         const ui64 handleIndex = old.HandleCount() + offset;
         new (&view.Handles[handleIndex]) THandle();
         new (&view.Buckets[handleIndex]) std::atomic<ui64>(0);
-        new (&view.ColdSlots[handleIndex]) std::atomic<ui64>(0);
         new (&view.FreeSlots[handleIndex]) std::atomic<ui64>(0);
+        if (offset < coldDelta) {
+            new (&view.ColdSlots[old.ColdSlotCount() + offset]) std::atomic<ui64>(0);
+        }
         if (offset < keepColdDelta) {
             new (&view.KeepColdSlots[old.KeepColdSlotCount() + offset]) std::atomic<ui64>(0);
         }
@@ -704,7 +710,7 @@ bool TryCalculateSharedCacheFootprint(
     if (!TryAccumulateProduct(handleCount, sizeof(THandle), staticBytes) ||
         !TryAccumulateProduct(bucketCount, sizeof(std::atomic<ui64>), staticBytes) ||
         !TryAccumulateProduct(hotSlotCount, sizeof(std::atomic<ui64>), staticBytes) ||
-        !TryAccumulateProduct(handleCount, sizeof(std::atomic<ui64>), staticBytes) ||
+        !TryAccumulateProduct(handleCount / 2, sizeof(std::atomic<ui64>), staticBytes) ||
         !TryAccumulateProduct(handleCount / 2, sizeof(std::atomic<ui64>), staticBytes) ||
         !TryAccumulateProduct(handleCount, sizeof(std::atomic<ui64>), staticBytes) ||
         !TryAccumulateProduct(Max<ui64>(hazardCount, 1), sizeof(TSpaceHazard), staticBytes))
@@ -787,7 +793,7 @@ bool TSharedCacheSpace::Initialize(
     if (!TryMappingSize(current.HandleCount(), sizeof(THandle), view->HandlesBytes) ||
         !TryMappingSize(current.BucketCount(), sizeof(std::atomic<ui64>), view->BucketsBytes) ||
         !TryMappingSize(current.HotSlotCount(), sizeof(std::atomic<ui64>), view->HotSlotBytes) ||
-        !TryMappingSize(current.HandleCount(), sizeof(std::atomic<ui64>), view->ColdSlotBytes) ||
+        !TryMappingSize(current.ColdSlotCount(), sizeof(std::atomic<ui64>), view->ColdSlotBytes) ||
         !TryMappingSize(current.KeepColdSlotCount(), sizeof(std::atomic<ui64>), view->KeepColdSlotBytes) ||
         !TryMappingSize(current.HandleCount(), sizeof(std::atomic<ui64>), view->FreeSlotBytes) ||
         !TryMappingSize(reserved.HandleCount(), sizeof(THandle), reservedHandlesBytes) ||
@@ -797,7 +803,7 @@ bool TSharedCacheSpace::Initialize(
         !HandlesMapping_.Allocate(view->HandlesBytes, reservedHandlesBytes, view->Handles) ||
         !BucketsMapping_.Allocate(view->BucketsBytes, reservedBucketsBytes, view->Buckets) ||
         !HotMapping_.Allocate(view->HotSlotBytes, reservedHotBytes, view->HotSlots) ||
-        !ColdMapping_.Allocate(view->ColdSlotBytes, reservedSlotsBytes, view->ColdSlots) ||
+        !ColdMapping_.Allocate(view->ColdSlotBytes, reservedSlotsBytes / 2, view->ColdSlots) ||
         !KeepColdMapping_.Allocate(view->KeepColdSlotBytes, reservedSlotsBytes / 2, view->KeepColdSlots) ||
         !FreeMapping_.Allocate(view->FreeSlotBytes, reservedSlotsBytes, view->FreeSlots))
     {
@@ -806,8 +812,10 @@ bool TSharedCacheSpace::Initialize(
 
     for (ui64 index = 0; index < current.HandleCount(); ++index) {
         new (&view->Handles[index]) THandle();
-        new (&view->ColdSlots[index]) std::atomic<ui64>(0);
         new (&view->FreeSlots[index]) std::atomic<ui64>(0);
+    }
+    for (ui64 index = 0; index < current.ColdSlotCount(); ++index) {
+        new (&view->ColdSlots[index]) std::atomic<ui64>(0);
     }
     for (ui64 index = 0; index < current.BucketCount(); ++index) {
         new (&view->Buckets[index]) std::atomic<ui64>(0);

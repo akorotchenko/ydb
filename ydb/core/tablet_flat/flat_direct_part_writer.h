@@ -258,12 +258,14 @@ namespace NTabletFlatExecutor {
                     auto resultingPageCollection = MakeIntrusive<NTable::TLoader::TPageCollection>(pageCollection.PageCollection);
                     auto saveCompactedPages = MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);
                     auto gcList = SharedCachePages->GCList;
-                    auto addPage = [&saveCompactedPages, &resultingPageCollection, &gcList]
-                        (NPageCollection::TLoadedPage& loadedPage, bool sticky) {
+                    auto addPage = [&saveCompactedPages, &resultingPageCollection, &gcList](
+                                       NPageCollection::TLoadedPage& loadedPage, bool sticky) {
                         auto& location = loadedPage.Location;
-                        auto sharedPage = MakeIntrusive<TPage>(location.Offset, location.Size,
-                            location.Type, location.Crc32, nullptr);
+                        auto sharedPage = MakeIntrusive<TPage>(
+                            location.Offset, location.Size, location.Type, location.Crc32, nullptr);
                         sharedPage->ProvideBody(std::move(loadedPage.Data));
+                        sharedPage->CacheMode =
+                            sticky ? NTable::NPage::ECacheMode::Sticky : NTable::NPage::ECacheMode::Regular;
                         saveCompactedPages->Pages.push_back(sharedPage);
                         if (sticky) {
                             resultingPageCollection->AddStickyPage(location.Offset, location.Size,

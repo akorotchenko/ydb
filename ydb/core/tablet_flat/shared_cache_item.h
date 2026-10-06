@@ -33,8 +33,8 @@ enum class EItemKind : ui8 {
 enum class EStickyState : ui8 {
     None = 0,
     Sticky = 1,
-    Unsticky = 2,
-    Reserved = 3,
+    // Page: withdrawn from the Sticky list for relocation. Collection: attachment/detachment in progress.
+    Transition = 2,
 };
 
 enum class EHandleState : ui8 {
@@ -52,14 +52,16 @@ enum class EHandleState : ui8 {
     Replaced,
     BucketSplit,
     Tombstone,
+    WaitingForMemory,
 };
 
 static_assert(static_cast<ui8>(EItemKind::Collection) <= 0x1);
-static_assert(static_cast<ui8>(EStickyState::Reserved) <= 0x3);
-static_assert(static_cast<ui8>(EHandleState::KeepCold) <= 0xF);
+static_assert(static_cast<ui8>(EStickyState::Transition) <= 0x3);
+static_assert(static_cast<ui8>(EHandleState::WaitingForMemory) <= 0xF);
 
 constexpr bool IsPending(EHandleState state) noexcept {
-    return state >= EHandleState::Begin && state <= EHandleState::QueuedRequested;
+    return (state >= EHandleState::Begin && state <= EHandleState::QueuedRequested) ||
+           state == EHandleState::WaitingForMemory;
 }
 
 constexpr bool IsReady(EHandleState state) noexcept {
@@ -252,6 +254,14 @@ public:
         return NSharedCache::IsPending(State());
     }
 
+    constexpr bool IsWaitingForMemory() const noexcept {
+        return State() == EHandleState::WaitingForMemory;
+    }
+
+    constexpr bool IsInFlight() const noexcept {
+        return State() >= EHandleState::Queued && State() <= EHandleState::QueuedRequested;
+    }
+
     constexpr bool IsReady() const noexcept {
         return NSharedCache::IsReady(State());
     }
@@ -264,12 +274,8 @@ public:
         return Sticky() == EStickyState::Sticky;
     }
 
-    constexpr bool IsUnstickyField() const noexcept {
-        return Sticky() == EStickyState::Unsticky;
-    }
-
-    constexpr bool IsStickyReservedField() const noexcept {
-        return Sticky() == EStickyState::Reserved;
+    constexpr bool IsTransitionField() const noexcept {
+        return Sticky() == EStickyState::Transition;
     }
 
     constexpr ui8 Frequency() const noexcept {
@@ -357,7 +363,7 @@ public:
     }
 
     constexpr bool Matches(THandleState state) const noexcept {
-        return CacheItem_.Matches(state);
+        return CacheItem_.Matches(state) && state.IsPageKind();
     }
 
     constexpr explicit operator bool() const noexcept {
@@ -401,7 +407,7 @@ public:
     }
 
     constexpr bool Matches(THandleState state) const noexcept {
-        return CacheItem_.Matches(state);
+        return CacheItem_.Matches(state) && state.IsCollectionKind();
     }
 
     constexpr explicit operator bool() const noexcept {
@@ -507,6 +513,9 @@ public:
     }
 
 private:
+    template <class>
+    friend class TSharedCacheImpl;
+
     template <class>
     friend class TSharedCacheImpl;
 

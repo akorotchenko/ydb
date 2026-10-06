@@ -1003,8 +1003,8 @@ struct TRecoveryStarter : public NFake::TStarter {
 }; // TRecoveryStarter
 
 struct TEnv : public TMyEnvBase {
-    TEnv()
-        : TMyEnvBase()
+    explicit TEnv(ui64 sharedCacheLimit = 8_MB, std::optional<ui64> softLimit = std::nullopt)
+        : TMyEnvBase(sharedCacheLimit, softLimit)
     {
         Env.SetLogPriority(NKikimrServices::LOCAL_DB_BACKUP, NActors::NLog::PRI_TRACE);
         Env.GetAppData().SystemTabletBackupConfig.MutableFilesystem()->SetPath(Env.GetTempDir());
@@ -1594,7 +1594,7 @@ Y_UNIT_TEST_SUITE(Backup) {
     }
 
     Y_UNIT_TEST(SnapshotLargeData) {
-        TEnv env;
+        TEnv env(64_MB, 8_MB);
 
         Cerr << "...starting tablet" << Endl;
         env.FireDummyTablet(TestTabletFlags);
@@ -1797,7 +1797,7 @@ Y_UNIT_TEST_SUITE(Backup) {
     }
 
     Y_UNIT_TEST(ChangelogLargeData) {
-        TEnv env;
+        TEnv env(64_MB, 8_MB);
 
         Cerr << "...starting tablet" << Endl;
         env.FireDummyTablet(TestTabletFlags);

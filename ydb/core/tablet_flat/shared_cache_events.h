@@ -7,6 +7,7 @@
 #include "shared_page.h"
 #include <ydb/core/protos/shared_cache.pb.h>
 
+#include <util/system/mutex.h>
 #include <util/generic/map.h>
 #include <util/generic/set.h>
 #include <util/generic/hash.h>
@@ -21,29 +22,31 @@ enum class EWakeupTag {
     DoGCManual = 2,
     DoLimitMaintenance = 3,
     ContinueBTreeWalk = 4,
+    RetryResources = 5,
 };
 
-    enum EEv {
-        EvBegin = EventSpaceBegin(TKikimrEvents::ES_FLAT_EXECUTOR),
+enum EEv {
+    EvBegin = EventSpaceBegin(TKikimrEvents::ES_FLAT_EXECUTOR),
 
-        EvTouch = EvBegin + 512,
-        EvUnregister,
-        EvDetach,
-        EvAttach,
-        EvAttached,
-        EvSaveCompactedPages,
-        EvRequest,
-        EvResult,
-        EvUpdated,
-        EvInFlightReleased,
-        EvRequestAnswered,
-        EvStickyCollectionPages,
-        EvKeepPageEvicted,
+    EvTouch = EvBegin + 512,
+    EvUnregister,
+    EvDetach,
+    EvAttach,
+    EvAttached,
+    EvSaveCompactedPages,
+    EvRequest,
+    EvResult,
+    EvUpdated,
+    EvInFlightReleased,
+    EvRequestAnswered,
+    EvStickyCollectionPages,
+    EvKeepPageEvicted,
+    EvResourcesAvailable,
 
-        EvEnd
+    EvEnd
 
-        /* +1024 range is reserved for scan events */
-    };
+    /* +1024 range is reserved for scan events */
+};
 
     enum class ERequestTypeCookie : ui64 {
         Undefined = 0,
@@ -106,7 +109,6 @@ enum class EWakeupTag {
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
         TIntrusivePtr<TCollectionRegistry> Registry;
         ECacheMode CacheMode;
-        bool RouteToCore = false;
         // Authoritative for the sender: an empty vector withdraws that owner's walks.
         TVector<TBtreeSeed> BtreeSeeds;
         // Revisit unchanged sticky seeds after the owner's private cache is recreated.
@@ -114,10 +116,9 @@ enum class EWakeupTag {
 
         // The cache walks the seeded B-trees itself.
         TEvAttach(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, ECacheMode cacheMode,
-            TVector<TBtreeSeed> btreeSeeds, bool routeToCore = false, bool replayStickyWalk = false)
+            TVector<TBtreeSeed> btreeSeeds, bool replayStickyWalk = false)
             : PageCollection(std::move(pageCollection))
             , CacheMode(cacheMode)
-            , RouteToCore(routeToCore)
             , BtreeSeeds(std::move(btreeSeeds))
             , ReplayStickyWalk(replayStickyWalk)
         {
@@ -168,6 +169,7 @@ enum class EWakeupTag {
         const EPriority Priority;
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
         TVector<TPageLocation> Pages;
+        TVector<bool> Sticky; // Optional per-page admission hints supplied by the requester.
         TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad;
         NWilson::TTraceId TraceId;
         const ui64 Cookie;
@@ -213,6 +215,8 @@ enum class EWakeupTag {
             TSharedPageRef Page;
         };
 
+        bool ResourcePressure = false;
+        bool ResourcesReady = false;
         const EStatus Status;
         const TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
         TVector<TLoaded> Pages;
@@ -235,6 +239,7 @@ enum class EWakeupTag {
         ui64 Cookie = 0;
         NActors::TActorId Notify;
         bool CoreRoute = false;
+        ui64 CompletionId = 0;
     };
 
     class TRequestCompletion final : public TThrRefBase {
@@ -242,7 +247,14 @@ enum class EWakeupTag {
         explicit TRequestCompletion(TRequestCompletionParams&& params) noexcept;
 
         void Complete(ui32 index, TSharedPageRef page, EPageFetchCompletion completion) noexcept;
-        void Cancel() noexcept;
+        void Cancel(bool replyImmediately = false) noexcept;
+        void PostponeForResources() noexcept;
+        void NotifyResourcesReady() noexcept;
+        bool HasReadyPages() const noexcept;
+
+        const TIntrusivePtr<NPageCollection::TPagesWaitPad>& WaitPad() const noexcept {
+            return WaitPad_;
+        }
 
         const TVector<TPageLocation>& Locations() const noexcept {
             return Locations_;
@@ -264,27 +276,39 @@ enum class EWakeupTag {
         const ui64 Cookie_;
         const NActors::TActorId Notify_;
         const bool CoreRoute_;
+        const ui64 CompletionId_;
+        mutable TMutex Mutex_;
+        bool ResourcePressure_ = false;
         std::atomic<TEvResult::EStatus> Status_{ NKikimrProto::OK };
         std::atomic<ui32> Remaining_;
+        std::atomic<bool> ResultSent_{ false };
     };
 
+    struct TEvResourcesAvailable : public TEventLocal<TEvResourcesAvailable, EvResourcesAvailable> {};
+
     struct TEvRequestAnswered : public TEventLocal<TEvRequestAnswered, EvRequestAnswered> {
-        explicit TEvRequestAnswered(ui64 status) noexcept
+        explicit TEvRequestAnswered(ui64 status, ui64 completionId = 0) noexcept
             : Status(status)
-        { }
+            , CompletionId(completionId)
+        {
+        }
 
         const ui64 Status;
+        const ui64 CompletionId;
     };
 
     struct TEvKeepPageEvicted : public TEventLocal<TEvKeepPageEvicted, EvKeepPageEvicted> {
-        TEvKeepPageEvicted(const TLogoBlobID& collectionId, ui64 generation, NTable::NPage::TPageLocation location)
+        TEvKeepPageEvicted(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem, ui64 generation,
+            NTable::NPage::TPageLocation location)
             : CollectionId(collectionId)
+            , CacheItem(cacheItem)
             , Generation(generation)
             , Location(std::move(location))
         {
         }
 
         const TLogoBlobID CollectionId;
+        const TCollectionCacheItem CacheItem;
         const ui64 Generation;
         const NTable::NPage::TPageLocation Location;
     };

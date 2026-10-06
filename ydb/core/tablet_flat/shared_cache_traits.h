@@ -9,6 +9,7 @@ class TActorSystem;
 namespace NKikimr::NSharedCache {
 
 enum class ESharedCacheHookPoint {
+    AfterPageBatchPrepared, // Payload is the collection after the batch presence checks.
     AfterInsertPositionFound, // Payload is the link owner, before candidate preparation or publication.
     BeforeTableLinkCas, // Payload is the link owner, may be null.
     AfterTableLinkCas, // Payload is the link owner, may be null.
@@ -16,13 +17,17 @@ enum class ESharedCacheHookPoint {
     AfterTombstoneHelperClaim, // Payload is the claimed item.
     BeforeTombstoneFinalCas, // Payload is the item at its final CAS.
     BeforeHotExchange, // Payload is the Hot item; the target slot has been reserved but not exchanged.
+    BeforeColdExchange, // Payload is the Cold membership after occupancy accounting, before ring publication.
+    BeforeColdRingPop, // No item payload; an occupied Cold ring is about to be probed.
     AfterGrowthBucketPublished, // Payload is the resize marker.
     AfterBucketSplitActivated, // Payload is the resize marker.
     AfterBucketResizeCursorPublished, // Payload is the resize marker.
     AfterShrinkBucketClosed, // Payload is the resize marker.
     AfterBucketSplitRemoved, // Payload is the resize marker.
     BeforeStickyPageListLink, // Payload is the page after its collection mode check, before list publication.
-    AfterStickyPageLinked, // Payload is the linked Sticky page before its ready State is published.
+    AfterStickyPageLinked, // Payload is the linked Sticky page, including pending admissions.
+    BeforePageReadyState, // Payload is the completing page before its payload is published.
+    BeforeReadyStatePublication, // Payload is the accounted item before the common ready CAS.
     AfterStickyPageListDetached, // Payload is the owning collection while the detached list is private.
     AfterStickyPageListHeadExchanged, // Payload is the owning collection before its retained tail is connected.
     AfterFetchWaiterSubscribed, // Payload is the pending page while the subscriber still owns its structural ref.
@@ -41,8 +46,10 @@ struct TProdTraits {
     static void UnbindSharedCachePages(void* cache) noexcept;
     static ui32 CurrentWorkerIndex() noexcept;
 
-    void NotifyKeepPageEviction(
-        const TLogoBlobID& collectionId, ui64 generation, NTable::NPage::TPageLocation location) const noexcept;
+    void NotifyResourcesAvailable() const noexcept;
+
+    void NotifyKeepPageEviction(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem, ui64 generation,
+        NTable::NPage::TPageLocation location) const noexcept;
 
     Y_FORCE_INLINE void Invoke(ESharedCacheHookPoint, TCacheItem) const noexcept {
     }
@@ -61,7 +68,11 @@ struct TTestTraits {
         }
     }
 
-    void NotifyKeepPageEviction(const TLogoBlobID&, ui64, NTable::NPage::TPageLocation) const noexcept {
+    void NotifyKeepPageEviction(
+        const TLogoBlobID&, TCollectionCacheItem, ui64, NTable::NPage::TPageLocation) const noexcept {
+    }
+
+    void NotifyResourcesAvailable() const noexcept {
     }
 
     static void* TrySharedCachePages() noexcept {
@@ -88,13 +99,14 @@ struct TTestTraits {
 };
 
 struct TSharedCachePolicy {
-    double CurrentLimitGap = 0.10;
-    ui64 MinCurrentLimitGap = ui64{ 100 } << 20;
+    double CurrentLimitGap = 0.15;
+    ui64 MinCurrentLimitGap = 0; // An absolute floor would drain the payload of a small cache on pressure.
     double ColdMin = 0.20;
     double Grow = 0.30;
-    double HotMin = 0.25;
+    double HotMin = 0.60;
+    double HotMinUnderPressure = 0.25;
     double ResizeStep = 0.05;
-    ui32 MinHotSlots = 1024;
+    ui32 MinHotSlots = 25;
     ui32 MinHotSlotsUnderPressure = 15;
     ui32 MinResizeStep = 256;
 };

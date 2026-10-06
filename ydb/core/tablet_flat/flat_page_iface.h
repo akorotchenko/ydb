@@ -263,6 +263,7 @@ namespace NPage {
     enum class ECacheMode : ui32 {
         Regular = 0,
         TryKeepInMemory = 1,
+        Sticky = 2,
     };
 
     /** Hash functor for TPageLocation — uses only Offset for hashing */

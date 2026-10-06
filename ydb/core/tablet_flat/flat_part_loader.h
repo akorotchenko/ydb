@@ -30,6 +30,7 @@ namespace NTable {
         struct TFetch : TMoveOnly {
             TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
             TVector<TPageLocation> Pages;
+            TVector<bool> Sticky;
 
             explicit operator bool() const {
                 return bool(Pages);
@@ -94,10 +95,13 @@ namespace NTable {
                 if (NeedPages) {
                     TVector<TPageLocation> pages(NeedPages.begin(), NeedPages.end());
                     std::sort(pages.begin(), pages.end());
-                    return {
-                        .PageCollection = PageCollection->PageCollection,
-                        .Pages = std::move(pages)
-                    };
+                    TVector<bool> sticky;
+                    sticky.reserve(pages.size());
+                    for (const auto& page : pages) {
+                        sticky.push_back(NeedIn(page.Type) || page.Type == EPage::FlatIndex);
+                    }
+                    return { .PageCollection = PageCollection->PageCollection, .Pages = std::move(pages),
+                        .Sticky = std::move(sticky) };
                 } else {
                     return {};
                 }

@@ -361,9 +361,9 @@ private:
     bool SchemaReady = false;
 };
 
-void RunTest(IActor *test)
+void RunTest(IActor* test, ui64 sharedCacheLimit = 8_MB)
 {
-    NFake::TRunner env;
+    NFake::TRunner env(sharedCacheLimit);
 
     env->SetLogPriority(NKikimrServices::TABLET_MAIN, NActors::NLog::PRI_CRIT);
     env->SetLogPriority(NKikimrServices::TABLET_EXECUTOR, NActors::NLog::PRI_INFO);
@@ -415,7 +415,7 @@ Y_UNIT_TEST_SUITE(TExecutorDb) {
             [&fuzzy](ITestDb& testDb, TTransactionContext &txc){ return fuzzy.ReadTx(testDb, txc, 2); }
         };
 
-        RunTest(new TDbTestPlayerActor(tx));
+        RunTest(new TDbTestPlayerActor(tx), 32_MB);
     }
 
     Y_UNIT_TEST(EncodedPage)

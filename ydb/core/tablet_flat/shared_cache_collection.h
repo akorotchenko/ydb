@@ -7,7 +7,7 @@
 
 namespace NKikimr::NSharedCache {
 
-// The cache collection owns its page metadata and Sticky list. Legacy actor bookkeeping stays in the legacy actor.
+// The cache collection owns its page metadata, Sticky list, and resident-byte estimates.
 
 struct TCollectionLocation {
     TLogoBlobID Id;
@@ -19,11 +19,7 @@ struct TCollectionLocation {
 template <class TTraits>
 class TSharedCacheImpl;
 
-enum class ECollectionCacheMode : ui8 {
-    Regular,
-    Sticky,
-    Keep,
-};
+using ECacheMode = NTable::NPage::ECacheMode;
 
 class TCacheCollection {
 public:
@@ -55,6 +51,28 @@ public:
         return KeepGeneration_.load(std::memory_order_acquire);
     }
 
+    ui64 ResidentPageBytes() const noexcept {
+        return ResidentPageBytes_.load(std::memory_order_relaxed);
+    }
+
+    ui64 ActivePageBytes() const noexcept {
+        const i64 bytes = ActivePageBytes_.load(std::memory_order_relaxed);
+        return bytes > 0 ? static_cast<ui64>(bytes) : 0;
+    }
+
+    bool IsKeepAllowedPage(NTable::NPage::EPage type) const noexcept {
+        return !NPageCollection::IsDeadPage(type, PageCollection_->SkipBTreeIndexV1Shadow());
+    }
+
+    ui64 KeepResidentPageBytes() const noexcept {
+        return KeepResidentPageBytes_.load(std::memory_order_relaxed);
+    }
+
+    ui64 KeepActivePageBytes() const noexcept {
+        const i64 bytes = KeepActivePageBytes_.load(std::memory_order_relaxed);
+        return bytes > 0 ? static_cast<ui64>(bytes) : 0;
+    }
+
 public:
     TCollectionCacheItem CacheItem;
     std::atomic<ui32> StickyPageListHead{ 0 };
@@ -66,8 +84,20 @@ private:
 
     const TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
     std::atomic<TCollectionRegistry*> Registry_{ nullptr };
-    std::atomic<ECollectionCacheMode> Mode_{ ECollectionCacheMode::Sticky };
+    std::atomic<ECacheMode> CacheMode_{ ECacheMode::Sticky };
     std::atomic<ui64> KeepGeneration_{ 0 };
+    std::atomic<ui64> ResidentPageBytes_{ 0 };
+    // Ring transitions update this estimate after publishing their page state.
+    std::atomic<i64> ActivePageBytes_{ 0 };
+    std::atomic<ui64> KeepResidentPageBytes_{ 0 };
+    std::atomic<i64> KeepActivePageBytes_{ 0 };
+
+    void AddActivePageBytes(NTable::NPage::EPage type, i64 bytes) noexcept {
+        ActivePageBytes_.fetch_add(bytes, std::memory_order_relaxed);
+        if (IsKeepAllowedPage(type)) {
+            KeepActivePageBytes_.fetch_add(bytes, std::memory_order_relaxed);
+        }
+    }
 };
 
 inline ui64 TCollectionLocation::AccountedBytes() const noexcept {

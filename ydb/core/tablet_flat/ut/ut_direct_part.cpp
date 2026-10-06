@@ -410,6 +410,7 @@ private:
 };
 
 struct TDirectWriteEnv : public TMyEnvBase {
+    using TMyEnvBase::TMyEnvBase;
     void FireWriteTablet() {
         FireTablet(Edge, Tablet, [this](const TActorId& tablet, TTabletStorageInfo* info) {
             return new TDirectWriteTablet(tablet, info, Edge);
@@ -606,7 +607,7 @@ Y_UNIT_TEST_SUITE(TDirectPartWrite) {
     }
 
     Y_UNIT_TEST(BackpressureThrottlesFeeding) {
-        TDirectWriteEnv env;
+        TDirectWriteEnv env(32_MB, 32_MB);
         env.FireWriteTablet();
 
         env.SendSync(new NFake::TEvExecute{ new TTxInitSchema({ 101 }) });

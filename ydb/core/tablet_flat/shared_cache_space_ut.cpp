@@ -220,10 +220,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(footprint.HandleCount(), 32);
         UNIT_ASSERT_VALUES_EQUAL(footprint.BucketCount(), 32);
         UNIT_ASSERT_VALUES_EQUAL(footprint.HotSlotCount(), 24);
+        UNIT_ASSERT_VALUES_EQUAL(footprint.ColdSlotCount(), 16);
         UNIT_ASSERT_VALUES_EQUAL(footprint.KeepColdSlotCount(), 16);
 
         const ui64 expectedStatic = 128 + 32 * sizeof(THandle) + 32 * sizeof(std::atomic<ui64>) +
-                                    24 * sizeof(std::atomic<ui64>) + 32 * sizeof(std::atomic<ui64>) +
+                                    24 * sizeof(std::atomic<ui64>) + 16 * sizeof(std::atomic<ui64>) +
                                     16 * sizeof(std::atomic<ui64>) + 32 * sizeof(std::atomic<ui64>) +
                                     3 * sizeof(TSpaceHazard);
         const ui64 expectedPayload = 30 * (4096 + NActors::TSharedData::OverheadSize);
@@ -482,6 +483,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::BucketCount(*space), 32);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::ReservedCapacity(*space).BucketCount(), 64);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).HotSlotCount, 24);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).Cold().Capacity, 16);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).KeepCold().Capacity, 16);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), 30);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::HazardCount(*space), 3);
@@ -490,6 +492,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(reinterpret_cast<uintptr_t>(TSharedCacheSpaceTestAccess::Handles(*space)) % 64, 0);
         for (ui32 index = 0; index < current.HandleCount(); ++index) {
             UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::Handles(*space)[index].State.load(), 0);
+        }
+        for (ui32 index = 0; index < current.ColdSlotCount(); ++index) {
             UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::ColdSlots(*space)[index].load(), 0);
         }
         for (ui32 index = 0; index < current.BucketCount(); ++index) {

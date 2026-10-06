@@ -66,7 +66,6 @@ namespace {
         TCollection Collection;
         TPendingInMemoryPages PendingPages;
         THashMap<TPageOffset, TSharedData> CorePages;
-        TIntrusivePtr<TSharedCachePages> CachePages = new TSharedCachePages;
         TVector<TVector<TPageLocation>> StickyBatches;
         ui32 CancelledRequests = 0;
         ui32 ScheduledContinuations = 0;
@@ -87,10 +86,6 @@ namespace {
 
         TPendingInMemoryPages& PendingWalkPages() override {
             return PendingPages;
-        }
-
-        TSharedCachePages* WalkCachePages() override {
-            return CachePages.Get();
         }
 
         NActors::TSharedData FindCoreWalkPage(TCollection&, TPageOffset offset) override {
@@ -123,10 +118,7 @@ namespace {
 
         void AddLoadedNode(const TPageLocation& location, TSharedData body) {
             UNIT_ASSERT_VALUES_EQUAL(location.Size, body.size());
-            auto page =
-                MakeIntrusive<TPage>(location.Offset, location.Size, location.Type, location.Crc32, &Collection);
-            page->ProvideBody(std::move(body));
-            UNIT_ASSERT(Collection.PageSet.insert(std::move(page)).second);
+            UNIT_ASSERT(CorePages.emplace(location.Offset, std::move(body)).second);
         }
     };
 
@@ -162,7 +154,6 @@ Y_UNIT_TEST_SUITE(TCacheBTreeWalkController) {
         TWalkHostMock host;
         TCacheBTreeWalkController walks(host);
         const TActorId owner(1, TStringBuf("owner"));
-        host.Collection.RouteToCore = true;
         host.Collection.InMemoryOwners.insert(owner);
 
         const auto dataPage1 = TPageLocation::FromByteOffset(2000, 10, EPage::DataPage, 1);
@@ -189,7 +180,6 @@ Y_UNIT_TEST_SUITE(TCacheBTreeWalkController) {
         TWalkHostMock host;
         TCacheBTreeWalkController walks(host);
         const TActorId owner(1, TStringBuf("owner"));
-        host.Collection.RouteToCore = true;
         host.AllowFetch = true;
 
         const auto dataPage1 = TPageLocation::FromByteOffset(2000, 10, EPage::DataPage, 1);

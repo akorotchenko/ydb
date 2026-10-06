@@ -3,6 +3,7 @@
 #include "dynamic_nameserver_impl.h"
 
 #include <ydb/core/cms/console/console.h>
+#include <ydb/core/base/memory_controller_iface.h>
 
 #include <ydb/core/testlib/basics/appdata.h>
 #include <ydb/core/testlib/basics/storage.h>
@@ -186,7 +187,7 @@ void SetupServices(TTestActorRuntime &runtime,
         SetupTabletResolver(runtime, nodeIndex);
         SetupResourceBroker(runtime, nodeIndex, {});
         NSharedCache::TSharedCacheConfig sharedCacheConfig;
-        sharedCacheConfig.SetMemoryLimit(0);
+        sharedCacheConfig.SetMemoryLimit(32_MB);
         SetupSharedPageCache(runtime, nodeIndex, sharedCacheConfig);
         SetupSchemeCache(runtime, nodeIndex, DOMAIN_NAME);
     }
@@ -204,6 +205,10 @@ void SetupServices(TTestActorRuntime &runtime,
 
     SetupPDiskSubsystem(&runtime, STRAND_PDISK);
     runtime.Initialize(app.Unwrap());
+    for (ui32 nodeIndex = 0; nodeIndex < runtime.GetNodeCount(); ++nodeIndex) {
+        runtime.Send(new IEventHandle(NSharedCache::MakeSharedPageCacheId(), TActorId{},
+                         new NMemory::TEvConsumerLimit(0, 32_MB)), nodeIndex);
+    }
 
     runtime.GetAppData().DynamicNameserviceConfig = new TDynamicNameserviceConfig;
     auto dnConfig = runtime.GetAppData().DynamicNameserviceConfig;

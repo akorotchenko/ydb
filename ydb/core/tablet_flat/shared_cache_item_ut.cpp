@@ -23,18 +23,19 @@ Y_UNIT_TEST_SUITE(TSharedCacheItemTest) {
 
     Y_UNIT_TEST(HandleStateFields) {
         constexpr auto state = THandleState::Make(
-            MaxItemVersion, EHandleState::Tombstone, EItemKind::Collection, 3, EStickyState::Reserved, MaxHandleRefs);
+            MaxItemVersion, EHandleState::Tombstone, EItemKind::Collection, 3, EStickyState::Transition, MaxHandleRefs);
 
         static_assert(state.Version() == MaxItemVersion);
         static_assert(state.State() == EHandleState::Tombstone);
         static_assert(state.Kind() == EItemKind::Collection);
         static_assert(state.Frequency() == 3);
-        static_assert(state.Sticky() == EStickyState::Reserved);
+        static_assert(state.Sticky() == EStickyState::Transition);
         static_assert(state.Refs() == MaxHandleRefs);
 
-        constexpr ui64 expected = THandleState::VersionMask |
-                                  (ui64(EHandleState::Tombstone) << THandleState::StateShift) | THandleState::KindMask |
-                                  THandleState::FrequencyMask | THandleState::StickyMask | THandleState::RefsMask;
+        constexpr ui64 expected =
+            THandleState::VersionMask | (ui64(EHandleState::Tombstone) << THandleState::StateShift) |
+            THandleState::KindMask | THandleState::FrequencyMask |
+            (ui64(EStickyState::Transition) << THandleState::StickyShift) | THandleState::RefsMask;
         UNIT_ASSERT_VALUES_EQUAL(state.Raw(), expected);
     }
 
@@ -46,14 +47,14 @@ Y_UNIT_TEST_SUITE(TSharedCacheItemTest) {
                                      .WithState(EHandleState::Cold)
                                      .WithKind(EItemKind::Collection)
                                      .WithFrequency(1)
-                                     .WithSticky(EStickyState::Unsticky)
+                                     .WithSticky(EStickyState::Transition)
                                      .WithRefs(24);
 
         static_assert(updated.Version() == 765432);
         static_assert(updated.State() == EHandleState::Cold);
         static_assert(updated.Kind() == EItemKind::Collection);
         static_assert(updated.Frequency() == 1);
-        static_assert(updated.Sticky() == EStickyState::Unsticky);
+        static_assert(updated.Sticky() == EStickyState::Transition);
         static_assert(updated.Refs() == 24);
 
         UNIT_ASSERT_VALUES_EQUAL(state.Version(), 123456);
@@ -106,8 +107,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheItemTest) {
         static_assert(make(EHandleState::Tombstone).IsTombstone());
         static_assert(make(EHandleState::Begin).IsStickyNoneField());
         static_assert(make(EHandleState::Begin, EStickyState::Sticky).IsStickyField());
-        static_assert(make(EHandleState::Begin, EStickyState::Unsticky).IsUnstickyField());
-        static_assert(make(EHandleState::Begin, EStickyState::Reserved).IsStickyReservedField());
+        static_assert(make(EHandleState::Begin, EStickyState::Transition).IsTransitionField());
     }
 
     Y_UNIT_TEST(VersionWrap) {
@@ -128,6 +128,18 @@ Y_UNIT_TEST_SUITE(TSharedCacheItemTest) {
 
         static_assert(first.CacheItem() == TCacheItem::Make(11, 42));
         static_assert(first != second);
+        constexpr auto page = TPageCacheItem::FromValidated(first.CacheItem());
+        constexpr auto collectionState =
+            THandleState::Make(11, EHandleState::Hot, EItemKind::Collection, 0, EStickyState::None, 1);
+        constexpr auto pageState = collectionState.WithKind(EItemKind::Page);
+        static_assert(first.Matches(collectionState));
+        static_assert(!first.Matches(pageState));
+        static_assert(!first.Matches(collectionState.WithVersion(12)));
+        static_assert(page.Matches(pageState));
+        static_assert(!page.Matches(collectionState));
+        static_assert(!page.Matches(pageState.WithVersion(12)));
+        static_assert(first.CacheItem().Matches(pageState));
+        static_assert(first.CacheItem().Matches(collectionState));
         UNIT_ASSERT_VALUES_UNEQUAL(first.Raw(), second.Raw());
     }
 

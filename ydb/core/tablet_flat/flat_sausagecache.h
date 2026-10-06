@@ -79,7 +79,16 @@ public:
         }
 
         ECacheMode GetCacheMode() const noexcept {
-            return CacheMode;
+            if (CacheMode == ECacheMode::TryKeepInMemory) {
+                return ECacheMode::TryKeepInMemory;
+            }
+            return StickyCollection ? ECacheMode::Sticky : ECacheMode::Regular;
+        }
+
+        bool SetStickyCollection(bool sticky) noexcept {
+            const bool changed = StickyCollection != sticky;
+            StickyCollection = sticky;
+            return changed;
         }
 
         bool RoutesToCore() const noexcept {
@@ -152,6 +161,8 @@ public:
         TPageCollection(const TPageCollection &pageCollection);
 
     private:
+        friend class TPrivatePageCache;
+
         struct TPageByOffsetHash {
             size_t operator()(const THolder<TPage>& page) const { return THash<TPageOffset>()(page->Offset); }
             size_t operator()(TPageOffset offset) const { return THash<TPageOffset>()(offset); }
@@ -169,6 +180,7 @@ public:
         // storing sticky pages used refs guarantees that they won't be offload from Shared Cache
         THashMap<TPageOffset, TSharedPageRef> StickyPages;
         ECacheMode CacheMode = ECacheMode::Regular;
+        bool StickyCollection = false;
         bool CoreRoute = false;
         TCollectionCacheItem CoreCacheItem;
         ui64 PendingAttachId = 0;

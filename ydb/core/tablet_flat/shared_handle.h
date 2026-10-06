@@ -17,6 +17,10 @@ class TSharedPageHandle : public TThrRefBase {
     friend class TSharedPageGCList;
 
 public:
+    virtual bool IsSticky() const noexcept {
+        return false;
+    }
+
     /**
      * Returns true if handle is initialized
      *
@@ -325,15 +329,15 @@ public:
         , Used(false)
     { }
 
-    TSharedPageRef(
-            TIntrusivePtr<TSharedPageHandle> handle,
-            TIntrusivePtr<TSharedPageGCList> gcList,
-            NTable::NPage::EPage type = NTable::NPage::EPage::Undef) noexcept
+    TSharedPageRef(TIntrusivePtr<TSharedPageHandle> handle, TIntrusivePtr<TSharedPageGCList> gcList,
+        NTable::NPage::EPage type = NTable::NPage::EPage::Undef, bool sticky = false) noexcept
         : Handle(std::move(handle))
         , GCList(std::move(gcList))
         , Used(false)
         , Type(type)
-    { }
+        , Sticky(sticky)
+    {
+    }
 
     ~TSharedPageRef() {
         Drop();
@@ -344,6 +348,7 @@ public:
         , GCList(ref.GCList)
         , Used(false)
         , Type(ref.Type)
+        , Sticky(ref.Sticky)
     {
         if (ref.Used) {
             Y_ENSURE(Use());
@@ -355,7 +360,9 @@ public:
         , GCList(std::move(ref.GCList))
         , Used(std::exchange(ref.Used, false))
         , Type(ref.Type)
-    { }
+        , Sticky(ref.Sticky)
+    {
+    }
 
     TSharedPageRef& operator=(const TSharedPageRef& ref) {
         if (this != &ref) {
@@ -363,6 +370,7 @@ public:
             Handle = ref.Handle;
             GCList = ref.GCList;
             Type = ref.Type;
+            Sticky = ref.Sticky;
             if (ref.Used) {
                 Y_ENSURE(Use());
             }
@@ -378,17 +386,15 @@ public:
             GCList = std::move(ref.GCList);
             Used = std::exchange(ref.Used, false);
             Type = ref.Type;
+            Sticky = ref.Sticky;
         }
 
         return *this;
     }
 
-    static TSharedPageRef MakeUsed(
-        TIntrusivePtr<TSharedPageHandle> handle,
-        TIntrusivePtr<TSharedPageGCList> gcList,
-        NTable::NPage::EPage type = NTable::NPage::EPage::Undef) noexcept
-    {
-        TSharedPageRef ref(std::move(handle), std::move(gcList), type);
+    static TSharedPageRef MakeUsed(TIntrusivePtr<TSharedPageHandle> handle, TIntrusivePtr<TSharedPageGCList> gcList,
+        NTable::NPage::EPage type = NTable::NPage::EPage::Undef, bool sticky = false) noexcept {
+        TSharedPageRef ref(std::move(handle), std::move(gcList), type, sticky);
         ref.Use();
         return ref;
     }
@@ -412,6 +418,10 @@ public:
     NTable::NPage::EPage GetType() const noexcept {
         Y_DEBUG_ABORT_UNLESS(Type != NTable::NPage::EPage::Undef);
         return Type;
+    }
+
+    bool IsSticky() const noexcept {
+        return Sticky || (Handle && Handle->IsSticky());
     }
 
     void SetType(NTable::NPage::EPage type) noexcept {
@@ -475,6 +485,7 @@ private:
     TIntrusivePtr<TSharedPageGCList> GCList;
     bool Used;
     NTable::NPage::EPage Type = NTable::NPage::EPage::Undef;
+    bool Sticky = false;
 };
 
 TSharedPageRef MakeSharedPageRef(TSharedCachePageRef&& page);

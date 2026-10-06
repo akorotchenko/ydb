@@ -111,7 +111,7 @@ namespace NTabletFlatExecutor {
             auto& pinnedBody = emplaced.first->second.PinnedBody;
 
             Stats.NewlyPinnedPages++;
-            if (!pageCollection->IsStickyPage(location.Offset)) {
+            if (!pageCollection->IsStickyPage(location.Offset) && !emplaced.first->second.SharedBody.IsSticky()) {
                 Stats.NewlyPinnedBytes += pinnedBody.size();
             }
 

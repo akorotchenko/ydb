@@ -48,6 +48,7 @@ public:
     size_t size() const noexcept;
     NActors::TSharedData ShareData() const noexcept;
     NTable::NPage::EPage GetType() const noexcept;
+    bool IsSticky() const noexcept;
     void Drop() noexcept;
 
 private:
@@ -102,6 +103,7 @@ public:
     TPageCacheItem CacheItem() const noexcept;
     NTable::NPage::TPageLocation Location() const noexcept;
     ui64 Size() const noexcept;
+    bool TryReserveMemory() noexcept;
     bool Dispatch() noexcept;
     bool MakeReady(NActors::TSharedData&& data) noexcept;
     bool FailReady() noexcept;
@@ -119,16 +121,19 @@ template <class TTraits = TProdTraits>
 struct TSharedCachePageRequestImpl {
     NTable::NPage::TPageLocation Location;
     TIntrusivePtr<TPageFetchWaiter> Waiter;
+    bool Sticky = false;
 
-    TSharedCachePageRequestImpl(NTable::NPage::TPageLocation location, TIntrusivePtr<TPageFetchWaiter> waiter) noexcept
+    TSharedCachePageRequestImpl(
+        NTable::NPage::TPageLocation location, TIntrusivePtr<TPageFetchWaiter> waiter, bool sticky = false) noexcept
         : Location(std::move(location))
         , Waiter(std::move(waiter))
+        , Sticky(sticky)
     {
         new (&Storage_.Page) TSharedCachePageRefImpl<TTraits>();
     }
 
     TSharedCachePageRequestImpl(TSharedCachePageRequestImpl&& other) noexcept
-        : TSharedCachePageRequestImpl(std::move(other.Location), std::move(other.Waiter))
+        : TSharedCachePageRequestImpl(std::move(other.Location), std::move(other.Waiter), other.Sticky)
     {
         MoveResult(other);
     }
@@ -137,6 +142,7 @@ struct TSharedCachePageRequestImpl {
         if (this != &other) {
             Location = std::move(other.Location);
             Waiter = std::move(other.Waiter);
+            Sticky = other.Sticky;
             MoveResult(other);
         }
         return *this;
@@ -277,9 +283,7 @@ public:
     bool MoveCollectionRegistry(
         TCollectionRegistry& source, TCollectionRegistry& destination, TCollectionCacheItem collection) noexcept;
 
-    bool SetCollectionStickyPages(TCollectionCacheItem collection, bool sticky) noexcept;
-
-    bool SetCollectionKeepPages(TCollectionCacheItem collection, bool enabled) noexcept;
+    bool SetCollectionPagesCacheMode(TCollectionCacheItem collection, ECacheMode mode) noexcept;
 
     ESharedCacheResultStatus Find(
         TCollectionCacheItem collection, ui64 offset, TSharedCachePageRefImpl<TTraits>& page) noexcept;
@@ -287,7 +291,7 @@ public:
     ESharedCacheResultStatus Find(const TLogoBlobID& id, TSharedCacheCollectionRefImpl<TTraits>& collection) noexcept;
 
     bool FindOrInsertBatch(TCollectionCacheItem collection, TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests,
-        bool recordStats = true) noexcept;
+        bool recordStats = true, bool waitForMemory = false) noexcept;
 
     ESharedCacheResultStatus FindOrInsert(TCollectionRegistry& registry, const TCollectionLocation& collection,
         TCollectionCacheItem& inserted, TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
@@ -295,9 +299,24 @@ public:
     bool ReclaimCold() noexcept;
 
     bool UpdateCurrentLimit(ui64 limit) noexcept;
+    // Max<ui64>() restores the calculated default; zero is an explicit target.
+    bool UpdateSoftLimit(ui64 limit) noexcept;
     bool UpdateHardLimit(ui64 limit) noexcept;
+
+    ui64 ResourceGeneration() const noexcept {
+        return ResourceGeneration_.load(std::memory_order_acquire);
+    }
+
+    void ArmResourceWait(ui64 generation) noexcept;
+    bool TryReserveFetchBatch(TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept;
+    bool CanAdmitWorkingSet(ui64 bytes) noexcept;
+
+    void DisarmResourceWait() noexcept {
+        ResourceWaitArmed_.store(false, std::memory_order_release);
+    }
+
     bool EnforceCurrentLimit() noexcept;
-    bool EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes = 0) noexcept;
+    bool EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes = 0, bool forceShrinkHot = false) noexcept;
     bool RunMaintenance() noexcept;
 
     ui64 CurrentLimit() const noexcept {
@@ -310,6 +329,19 @@ public:
 
     ui64 HardLimit() const noexcept {
         return HardLimit_.load(std::memory_order_relaxed);
+    }
+
+    // Serialized controller access, like UpdateHardLimit and RunMaintenance.
+    bool NeedsCapacityMaintenance() const noexcept {
+        return HardTransition_.Phase() != ETransitionPhase::Idle || PhysicalHandleCount() != TargetHandleCount();
+    }
+
+    ui64 TargetHandleCount() const noexcept {
+        return TargetHandleCount_.load(std::memory_order_relaxed);
+    }
+
+    ui64 PhysicalHandleCount() const noexcept {
+        return Space_->CurrentConfiguration().HandleCount();
     }
 
     ui64 ReservationLimit() const noexcept {
@@ -332,6 +364,10 @@ public:
         return ColdPages_.load(std::memory_order_relaxed);
     }
 
+    ui64 ColdRingEntries() const noexcept {
+        return ColdRingEntries_.load(std::memory_order_relaxed);
+    }
+
     ui64 StickyPages() const noexcept {
         return StickyPages_.load(std::memory_order_relaxed);
     }
@@ -348,6 +384,14 @@ public:
         return LoadEstimatedBytes(ColdBytes_);
     }
 
+    ui64 ColdReclaimableBytes() const noexcept {
+        return LoadEstimatedBytes(ColdReclaimableBytes_);
+    }
+
+    ui64 ColdReclaimableItems() const noexcept {
+        return static_cast<ui64>(Max<i64>(0, ColdReclaimableItems_.load(std::memory_order_relaxed)));
+    }
+
     ui64 StickyBytes() const noexcept {
         return LoadEstimatedBytes(StickyBytes_);
     }
@@ -362,6 +406,14 @@ public:
 
     ui64 OverallUsage() const noexcept {
         return OverallUsage_.load(std::memory_order_relaxed);
+    }
+
+    ui64 PageUsage() const noexcept {
+        return PageUsage_.load(std::memory_order_relaxed);
+    }
+
+    ui64 RetainedBytes() const noexcept {
+        return RetainedBytes_.load(std::memory_order_relaxed);
     }
 
     ui64 ReservedBytes() const noexcept {
@@ -383,6 +435,19 @@ public:
     bool UpdateStickyLimit(ui64 limit) noexcept;
 
     bool UpdateKeepColdLimit(ui64 limit) noexcept;
+
+    ui64 EvictableByteBudget() const noexcept {
+        const ui64 softLimit = SoftLimit();
+        return softLimit - Min(softLimit, StickyBytes());
+    }
+
+    ui64 KeepColdLimit() const noexcept {
+        const ui64 budget = EvictableByteBudget();
+        // KeepCold uses the remainder after the normal Hot minimum (40% with HotMin = 60%).
+        const ui64 maximum = budget - FractionCeil(budget, Policy_.HotMin);
+        return Min(Min(KeepColdLimit_.load(std::memory_order_relaxed),
+                       KeepColdMaxBytes_.load(std::memory_order_relaxed)), maximum);
+    }
 
     ui64 KeepColdOwnedBytes() const noexcept {
         return KeepColdOwnedBytes_.load(std::memory_order_relaxed);
@@ -484,6 +549,7 @@ private:
         EStickyState Sticky = EStickyState::None;
         TCacheItem CacheItem;
         bool Prepare = false; // the page is absent from the table and needs an allocated pending item
+        bool WaitForMemory = false;
         bool StickyBudgetDenied = false; // count only if this prepared page wins table insertion
     };
 
@@ -530,11 +596,12 @@ private:
     bool MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* registry, TCacheItem cacheItem,
         THolder<TCacheCollection>&& value) noexcept;
 
-    void MakeReadyState(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
+    void MakeReadyState(TSpaceOperation& spaceOp, TCacheItem cacheItem, EHandleState readyState = EHandleState::Hot,
+        TCacheCollection* pageOwner = nullptr) noexcept;
 
-    void FinishFetch(TOperationItemRef<TTraits>& finalizerRef, TPageFetchState& fetch) noexcept;
-    void FinishFailedFetch(
-        TOperationItemRef<TTraits>& finalizerRef, TPageFetchState& fetch, TPageFetchWaiter* waiters) noexcept;
+    void FinishFetch(TOperationItemRef<TTraits>& finalizerRef, TPageFetchState& fetch, bool reserved) noexcept;
+    void FinishFailedFetch(TOperationItemRef<TTraits>& finalizerRef, TPageFetchState& fetch, TPageFetchWaiter* waiters,
+        bool reserved) noexcept;
     void ReleaseFetchRef(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept;
     static void DeletePendingFetch(THandle& handle) noexcept;
 
@@ -562,7 +629,7 @@ private:
         TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests, TVector<TPageInsertCandidate>& candidates,
         ui64& reservedBytes) noexcept;
     bool AllocatePageBatch(TSpaceOperation& spaceOp, TCacheCollection& collection,
-        TVector<TPageInsertCandidate>& candidates, ui64 reservedBytes) noexcept;
+        TVector<TPageInsertCandidate>& candidates, ui64 reservedBytes, bool waitForMemory) noexcept;
     ESharedCacheResultStatus FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
         const TCollectionLocation& collection, TCollectionCacheItem& inserted,
         TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
@@ -581,6 +648,7 @@ private:
     bool EraseCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
 
     bool ReclaimCold(TSpaceOperation& spaceOp) noexcept;
+    bool DemoteKeepColdForSoftLimit(TSpaceOperation& spaceOp) noexcept;
     // Cooperative reclamation: takes a cold entry and, when cold is empty, lets EnforceCurrentLimit move the
     // hot/cold boundary so that the coldest hot entries become reclaimable.
     bool Reclaim(TSpaceOperation& spaceOp, ui64 bytes = 0) noexcept;
@@ -588,6 +656,8 @@ private:
     bool AdvanceBucketResize() noexcept;
 
     bool TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages = 0) noexcept;
+    bool ReserveFetchMemory(TSpaceOperation& spaceOp, TCacheItem item, TPageFetchState& fetch) noexcept;
+    void NotifyResourcesAvailable() noexcept;
     void ReleaseReservation(ui64 bytes, ui64 pages = 0) noexcept;
 
     bool PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept;
@@ -610,7 +680,7 @@ private:
         TSpaceOperation& spaceOp, TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes = 0) noexcept;
 
     void InitializePage(TSpaceOperation& spaceOp, TCacheItem cacheItem, TCollectionCacheItem collection, ui64 offset,
-        ui64 size, NTable::NPage::EPage type, ui32 crc32, EStickyState sticky) noexcept;
+        ui64 size, NTable::NPage::EPage type, ui32 crc32, EStickyState sticky, bool reserved = true) noexcept;
 
     void InitializeCollection(
         TSpaceOperation& spaceOp, TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept;
@@ -627,13 +697,13 @@ private:
 
     bool LinkStickyPage(
         TSpaceOperation& spaceOp, TCacheItem page, TSharedCacheItemRefImpl<TTraits>& collectionRef) noexcept;
+    void UnlinkPendingStickyPage(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
     void RestoreStickyPageList(TSpaceOperation& spaceOp, TCacheCollection& collection, ui32 detachedHead) noexcept;
     void DrainStickyPages(TSpaceOperation& spaceOp, TCacheCollection& collection) noexcept;
     static void PublishPageUnsticky(THandle& page, THandleState state) noexcept;
     void MergeRetainedStickyPages(
         TSpaceOperation& spaceOp, TCacheCollection& collection, ui32 retainedHead, ui32 retainedTail) noexcept;
-    bool SetCollectionStickyPages(TSpaceOperation& spaceOp, TCacheItem collection, bool sticky) noexcept;
-    bool SetCollectionStickyPages(TSpaceOperation& spaceOp, TCacheCollection& collection, bool sticky) noexcept;
+    bool SetCollectionPagesCacheMode(TSpaceOperation& spaceOp, TCacheCollection& collection, ECacheMode mode) noexcept;
     bool MakePageSticky(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
     bool UnstickyCutPages(TSpaceOperation& spaceOp, TCacheItem page, ui64 allocationLimit) noexcept;
 
@@ -660,6 +730,7 @@ private:
         EHandleState expectedState) noexcept;
     void UnlinkCollectionRegistry(TCollectionRegistry& registry, TOperationItemRef<TTraits>& collection) noexcept;
 
+    bool IsPageSticky(TPageCacheItem page) const noexcept;
     TSharedCachePageRefImpl<TTraits> BuildPageRef(
         const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
 
@@ -677,7 +748,7 @@ private:
 
     void ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
-    void DeletePayload(THandle& handle, EItemKind kind, EHandleState state) noexcept;
+    void DeletePayload(THandle& handle, EItemKind kind, EHandleState state, TCacheCollection* owner = nullptr) noexcept;
 
     static void DeleteReplacedPage(THandle& handle) noexcept;
 
@@ -695,6 +766,7 @@ private:
     }
 
     static TCacheCollection* PageCollection(TSpaceOperation& spaceOp, const THandle& page) noexcept;
+    static TCacheCollection* PageCollection(TSpaceOperation& spaceOp, TCollectionCacheItem collection) noexcept;
     static void AddReference(TCacheCollection& owner) noexcept;
     void DropPageItemRef(TSpaceOperation& spaceOp, THandle& page) noexcept;
     static bool DropReference(TCacheCollection& owner) noexcept;
@@ -712,12 +784,6 @@ private:
     static void SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept;
 
     // The sticky budget covers pages only: collection records move through the sticky estimate but never consume it.
-    void AddStickyOwnedBytes(EItemKind kind, ui64 bytes) noexcept {
-        if (kind == EItemKind::Page) {
-            StickyOwnedBytes_.fetch_add(bytes, std::memory_order_relaxed);
-        }
-    }
-
     void SubStickyOwnedBytes(EItemKind kind, ui64 bytes) noexcept {
         if (kind == EItemKind::Page) {
             SubtractExactBytes(StickyOwnedBytes_, bytes);
@@ -725,12 +791,18 @@ private:
     }
 
     bool TryAddStickyOwnedBytes(ui64 bytes) noexcept;
+    bool TryAddRetainedBytes(ui64 bytes) noexcept;
+    bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool force = false) noexcept;
+    bool ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept;
 
     void AddKeepColdOwnedBytes(ui64 bytes) noexcept;
 
     bool TrimKeepCold(TSpaceOperation& spaceOp) noexcept;
+    bool ShrinkKeepCold(TSpaceOperation& spaceOp) noexcept;
+    bool GrowKeepCold() noexcept;
 
     bool WantsKeepCold(TSpaceOperation& spaceOp, const THandle& page) noexcept;
+    static bool WantsStickyPage(const TCacheCollection& collection) noexcept;
 
     void RouteKeepCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
 
@@ -748,6 +820,8 @@ private:
 
     bool EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
+    void UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept;
+
     static void AdvanceColdMembership(THandle& handle) noexcept;
 
     static bool AdvanceColdMembership(
@@ -762,17 +836,22 @@ private:
     static Y_FORCE_INLINE bool TakeHotFrequency(
         THandle& handle, TCacheItem cacheItem, THandleState& state, ui8& frequency) noexcept;
     Y_FORCE_INLINE void CompleteHotEviction(
-        TSpaceOperation& spaceOp, TCacheItem cacheItem, THandle& handle, THandleState coldState) noexcept;
+        TSpaceOperation& spaceOp, TCacheItem cacheItem, THandle& handle, THandleState coldState, ui64 bytes) noexcept;
 
     void ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept;
 
+    bool ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept;
+
     bool DrainHotResize() noexcept;
     bool DrainHotResize(TSpaceOperation& spaceOp) noexcept;
-    ui32 ShrinkHotTarget(ui32 effectiveHotSlots, ui32 step) const noexcept;
+    ui32 MinimumHotSlots(bool underPressure = false) const noexcept;
+    ui32 ShrinkHotTarget(ui32 effectiveHotSlots, ui32 step, bool underPressure) const noexcept;
     ui32 GrowHotTarget(ui32 effectiveHotSlots, ui32 step) const noexcept;
     ui32 HotResizeStep(ui32 effectiveHotSlots) const noexcept;
     ui64 CalculateSoftLimit(ui64 currentLimit) const noexcept;
-    bool ReclaimColdToLimit(ui64 softLimit, ui32 step, TSpaceOperation& spaceOp, ui64 bytes = 0) noexcept;
+    void RefreshSoftLimit() noexcept;
+    void RefreshEvictableByteBudget() noexcept;
+    bool ReclaimToLimits(ui64 softLimit, ui32 step, TSpaceOperation& spaceOp, ui64 bytes = 0) noexcept;
 
     bool StartHardTransition() noexcept;
     TSharedCacheItemRefImpl<TTraits> TryAcquirePageForRelocation(TSpaceOperation& spaceOp, ui32 index) noexcept;
@@ -789,8 +868,13 @@ private:
     TSharedCacheTableImpl<TTraits> Table_;
     std::atomic<ui64> ResidentBytes_{ 0 };
     std::atomic<i64> HotBytes_{ 0 };
-    std::atomic<i64> ColdBytes_{ 0 };
+    std::atomic<i64> ColdBytes_{ 0 }; // All Cold storage, including held and retiring payloads
+    std::atomic<i64> ColdReclaimableBytes_{ 0 }; // Unreferenced ordinary Cold payloads
+    std::atomic<i64> ColdReclaimableItems_{ 0 }; // Unreferenced ordinary Cold items
+    std::atomic<i64> ColdItems_{ 0 }; // All Cold-state items, including held items
+    std::atomic<ui64> ColdRingEntries_{ 0 }; // Occupied ring slots, including stale entries until popped
     std::atomic<i64> KeepColdBytes_{ 0 };
+    ui64 ColdByteBudget_ = Max<ui64>(); // Protected by HotResize_; watermark calculation input.
     std::atomic<i64> StickyBytes_{ 0 };
     std::atomic<ui64> HotPages_{ 0 };
     std::atomic<ui64> ColdPages_{ 0 };
@@ -801,19 +885,26 @@ private:
     std::atomic<ui64> StaticBytes_{ 0 };
     std::atomic<ui64> StaticDeltaBytes_{ 0 };
     std::atomic<ui64> OverallUsage_{ 0 };
+    std::atomic<ui64> PageUsage_{ 0 };
+    std::atomic<ui64> RetainedBytes_{ 0 };
     std::atomic<ui64> ReservedBytes_{ 0 };
     std::atomic<ui64> ReservedPages_{ 0 };
     std::atomic<ui64> StickyLimit_{ Max<ui64>() };
     std::atomic<ui64> StickyOwnedBytes_{ 0 };
-    std::atomic<ui64> KeepColdLimit_{ 0 };
+    std::atomic<ui64> KeepColdMaxBytes_{ 0 }; // Configured ceiling; repeated updates preserve pressure shrinkage.
+    std::atomic<ui64> KeepColdLimit_{ 0 }; // Effective budget, resized according to Cold+Free headroom.
     std::atomic<ui64> KeepColdOwnedBytes_{ 0 };
-    std::atomic<bool> KeepColdTrimActive_{ false };
     std::atomic<ui64> KeepColdTrimScanRemaining_{ 0 };
     std::atomic<ui64> KeepModeSweepRemaining_{ 0 };
     std::atomic<ui64> CurrentLimit_{ 0 };
+    std::atomic<ui64> ResourceGeneration_{ 0 };
+    std::atomic<ui64> ColdMinBytes_{ 0 };
+    std::atomic<ui64> ColdTargetBytes_{ 0 };
+    std::atomic<ui64> ColdGrowBytes_{ 0 };
+    std::atomic<ui64> SoftLimitOverride_{ Max<ui64>() };
     std::atomic<ui64> SoftLimit_{ 0 };
-    std::atomic<bool> SoftLimitPressure_{ false };
     std::atomic<ui64> HardLimit_{ 0 };
+    std::atomic<ui64> TargetHandleCount_{ 0 };
     std::atomic<ui64> RequestedPages_{ 0 };
     std::atomic<ui64> RequestedBytes_{ 0 };
     std::atomic<ui64> HitPages_{ 0 };
@@ -821,6 +912,10 @@ private:
     std::atomic<ui64> MissPages_{ 0 };
     std::atomic<ui64> MissBytes_{ 0 };
     std::atomic<ui64> StickyAdmissionFailures_{ 0 };
+    std::atomic<bool> KeepColdPressure_{ false };
+    std::atomic<bool> KeepColdTrimActive_{ false };
+    std::atomic<bool> ResourceWaitArmed_{ false };
+    std::atomic<bool> SoftLimitPressure_{ false };
     ui64 ReservationLimit_ = 0;
     THotResize HotResize_;
     TSharedCacheCapacity HardTarget_;

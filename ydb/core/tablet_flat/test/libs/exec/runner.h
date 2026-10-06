@@ -26,7 +26,7 @@ namespace NFake {
     struct TRunner {
         using ELnLev = NUtil::ELnLev;
 
-        TRunner()
+        explicit TRunner(ui64 sharedCacheLimit = 8_MB)
             : Time(TAppData::TimeProvider.Get())
             , NodeId(Env.GetNodeId())
             , Names(MakeComponentsNames())
@@ -53,7 +53,7 @@ namespace NFake {
 
             Leader = Env.Register(new NFake::TLeader(8, Stopped), 0);
 
-            SetupModelServices();
+            SetupModelServices(sharedCacheLimit);
         }
 
         TTestActorRuntime& operator*() noexcept
@@ -174,7 +174,7 @@ namespace NFake {
             }
         }
 
-        void SetupModelServices()
+        void SetupModelServices(ui64 sharedCacheLimit)
         {
             { /*_ Blob storage proxies mock factory */
                 auto *actor = new NFake::TWarden(StorageGroupCount);
@@ -184,7 +184,7 @@ namespace NFake {
 
             { /*_ Shared page collection cache service, used by executor */
                 NSharedCache::TSharedCacheConfig config;
-                config.SetMemoryLimit(8_MB);
+                config.SetMemoryLimit(sharedCacheLimit);
                 config.SetScanQueueInFlyLimit(256_KB);
                 config.SetAsyncQueueInFlyLimit(256_KB);
 

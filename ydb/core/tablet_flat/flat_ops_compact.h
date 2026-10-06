@@ -848,14 +848,20 @@ namespace NTabletFlatExecutor {
                     auto resultingPageCollection = MakeIntrusive<NTable::TLoader::TPageCollection>(pageCollection.PageCollection);
                     auto saveCompactedPages = MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);
                     auto gcList = SharedCachePages->GCList;
-                    auto addPage = [&saveCompactedPages, &resultingPageCollection, &gcList](NPageCollection::TLoadedPage& loadedPage, bool sticky) {
-                        auto sharedPage = MakeIntrusive<TPage>(loadedPage.Location.Offset, loadedPage.Location.Size, loadedPage.Location.Type, loadedPage.Location.Crc32, nullptr);
+                    auto addPage = [&saveCompactedPages, &resultingPageCollection, &gcList](
+                                       NPageCollection::TLoadedPage& loadedPage, bool sticky) {
+                        auto sharedPage = MakeIntrusive<TPage>(loadedPage.Location.Offset, loadedPage.Location.Size,
+                            loadedPage.Location.Type, loadedPage.Location.Crc32, nullptr);
                         sharedPage->ProvideBody(std::move(loadedPage.Data));
+                        sharedPage->CacheMode =
+                            sticky ? NTable::NPage::ECacheMode::Sticky : NTable::NPage::ECacheMode::Regular;
                         saveCompactedPages->Pages.push_back(sharedPage);
                         if (sticky) {
-                            resultingPageCollection->AddStickyPage(loadedPage.Location.Offset, loadedPage.Location.Size, TSharedPageRef::MakeUsed(std::move(sharedPage), gcList, loadedPage.Location.Type));
+                            resultingPageCollection->AddStickyPage(loadedPage.Location.Offset, loadedPage.Location.Size,
+                                TSharedPageRef::MakeUsed(std::move(sharedPage), gcList, loadedPage.Location.Type));
                         } else {
-                            resultingPageCollection->AddPage(loadedPage.Location.Offset, loadedPage.Location.Size, TSharedPageRef::MakeUsed(std::move(sharedPage), gcList, loadedPage.Location.Type));
+                            resultingPageCollection->AddPage(loadedPage.Location.Offset, loadedPage.Location.Size,
+                                TSharedPageRef::MakeUsed(std::move(sharedPage), gcList, loadedPage.Location.Type));
                         }
                     };
                     for (auto &page : pageCollection.StickyPages) {

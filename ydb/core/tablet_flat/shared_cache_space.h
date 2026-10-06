@@ -60,6 +60,10 @@ struct TSharedCacheCapacity {
         return (HandleCount() * 3) / 4;
     }
 
+    constexpr ui64 ColdSlotCount() const noexcept {
+        return HandleCount() / 2;
+    }
+
     constexpr ui64 KeepColdSlotCount() const noexcept {
         return HandleCount() / 2;
     }
@@ -181,6 +185,8 @@ struct TSpaceView {
 
     ui64 HandleCount = 0;
     ui64 AllocationLimit = 0;
+    ui64 ColdMinHandles = 0;
+    ui64 ColdGrowHandles = 0;
     ui64 HotSlotCount = 0;
     TS5FifoRings* Rings = nullptr;
     TFreeRingCursor* FreeCursor = nullptr;
@@ -221,7 +227,7 @@ struct TSpaceView {
 
     Y_FORCE_INLINE TRingView Cold() const noexcept {
         Y_DEBUG_ABORT_UNLESS(Rings);
-        return { &Rings->Cold(), ColdSlots, HandleCount };
+        return { &Rings->Cold(), ColdSlots, HandleCount / 2 };
     }
 
     Y_FORCE_INLINE TRingView KeepCold() const noexcept {
@@ -834,8 +840,10 @@ public:
         ui32 remainingSlots = SharedCacheTransitionWorkBatch;
         const ui64 oldHotSlotCount = transition.OldConfiguration_.HotSlotCount();
         const ui64 oldHandleCount = transition.OldConfiguration_.HandleCount();
+        const ui64 oldColdSlotCount = transition.OldConfiguration_.ColdSlotCount();
         const ui64 oldKeepColdSlotCount = transition.OldConfiguration_.KeepColdSlotCount();
         const ui64 targetHandleCount = transition.TargetConfiguration_.HandleCount();
+        const ui64 targetColdSlotCount = transition.TargetConfiguration_.ColdSlotCount();
         const ui64 targetKeepColdSlotCount = transition.TargetConfiguration_.KeepColdSlotCount();
         while (remainingSlots != 0 && transition.FinalDrainStage_ != ESpaceMap::Done) {
             switch (transition.FinalDrainStage_) {
@@ -850,12 +858,12 @@ public:
                     }
                     if (transition.NextWorkIndex_ == oldHotSlotCount) {
                         transition.FinalDrainStage_ = ESpaceMap::Cold;
-                        transition.NextWorkIndex_ = targetHandleCount;
+                        transition.NextWorkIndex_ = targetColdSlotCount;
                     }
                     break;
 
                 case ESpaceMap::Cold:
-                    while (remainingSlots != 0 && transition.NextWorkIndex_ < oldHandleCount) {
+                    while (remainingSlots != 0 && transition.NextWorkIndex_ < oldColdSlotCount) {
                         const ui64 raw = transition.OldView_->ColdSlots[transition.NextWorkIndex_++].exchange(
                             0, std::memory_order_relaxed);
                         if (raw != 0) {
@@ -863,7 +871,7 @@ public:
                         }
                         --remainingSlots;
                     }
-                    if (transition.NextWorkIndex_ == oldHandleCount) {
+                    if (transition.NextWorkIndex_ == oldColdSlotCount) {
                         transition.FinalDrainStage_ = ESpaceMap::KeepCold;
                         transition.NextWorkIndex_ = targetKeepColdSlotCount;
                     }
