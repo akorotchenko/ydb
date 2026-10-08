@@ -46,9 +46,8 @@ namespace NTest {
                 pass ? TTestEnv::Locate(part, ref, lob) : TResult{need, nullptr };
         }
 
-        const TSharedData* TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
-        {
-            return Pages ? TTestEnv::TryGetPage(part, location, groupId) : nullptr;
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+            return Pages ? TTestEnv::TryGetPage(part, location, groupId) : TSharedCachePageRef();
         }
 
         bool Pages = false;
@@ -107,13 +106,12 @@ namespace NTest {
             }
         }
 
-        const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
-        {
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto pass = ShouldPass((const void*)part,
                 static_cast<ui64>(THash<TPageOffset>()(location.Offset)) ^ (ui64(groupId.Raw()) << 48),
                 location.Type == EPage::FlatIndex || location.Type == EPage::BTreeIndex || location.Type == EPage::BTreeIndexV2);
 
-            return pass ? TTestEnv::TryGetPage(part, location, groupId) : nullptr;
+            return pass ? TTestEnv::TryGetPage(part, location, groupId) : TSharedCachePageRef();
         }
 
         bool ShouldPass(const void *token, ui64 id, bool isIndex)
@@ -182,7 +180,7 @@ namespace NTest {
             {
             }
 
-            TResult DoLoad(NFwd::TPageOffset offset, EPage type, ui64 lower, ui64 upper)
+            NFwd::IPageLoadingLogic::TResult DoLoad(NFwd::TPageOffset offset, EPage type, ui64 lower, ui64 upper)
             {
                 if (std::exchange(Grow, false)) {
                     PageLoadingLogic->Forward(this, upper);
@@ -191,17 +189,17 @@ namespace NTest {
                 {
                     for (auto &fetchEntry: IndexFetch) {
                         auto* pageData = Store->GetPage(IndexRoom, fetchEntry.Offset);
-                        NPageCollection::TLoadedPage page(
-                            TPageLocation(fetchEntry.Offset, pageData->size(), fetchEntry.Type),
-                            *pageData);
-                        PageLoadingLogic->Fill(page, {}, fetchEntry.Type);
+                        auto ref =
+                            TSharedCachePages::Get().AdmitPage(IndexPageCollection, fetchEntry, TSharedData(*pageData));
+                        PageLoadingLogic->Fill(std::move(ref), fetchEntry.Type);
                     }
                 }
                 {
                     for (auto &fetchEntry: GroupFetch) {
                         auto* pageData = Store->GetPage(GroupRoom, fetchEntry.Offset);
-                        NPageCollection::TLoadedPage page(fetchEntry, *pageData);
-                        PageLoadingLogic->Fill(page, {}, fetchEntry.Type);
+                        auto ref =
+                            TSharedCachePages::Get().AdmitPage(GroupPageCollection, fetchEntry, TSharedData(*pageData));
+                        PageLoadingLogic->Fill(std::move(ref), fetchEntry.Type);
                     }
                 }
 
@@ -212,7 +210,7 @@ namespace NTest {
 
                 Y_ENSURE((Grow = got.Grow) || IndexFetch || GroupFetch || got.Page);
 
-                return { got.Need, got.Page };
+                return got;
             }
 
         private:
@@ -277,15 +275,14 @@ namespace NTest {
                 Y_TABLET_ERROR("Invalid ref ELargeObj{" << int(lob) << ", " << ref << "}");
             }
 
-            const auto room = (lob == ELargeObj::Extern)
-                ? partStore->Store->GetExternRoom()
-                : partStore->Store->GetOuterRoom();
+            const auto room =
+                (lob == ELargeObj::Extern) ? partStore->Store->GetExternRoom() : partStore->Store->GetOuterRoom();
 
-            return Get(part, room).DoLoad(TPageOffset::FromPageIndex(ref), EPage::Opaque, AheadLo, AheadHi);
+            auto got = Get(part, room).DoLoad(TPageOffset::FromPageIndex(ref), EPage::Opaque, AheadLo, AheadHi);
+            return got.Page ? TResult(got.Need, got.Page->BuildSharedData()) : TResult(got.Need, nullptr);
         }
 
-        const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
-        {
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             InitPart(part);
 
             auto* partStore = CheckedCast<const TPartStore*>(part);
@@ -301,7 +298,8 @@ namespace NTest {
                 queueIndex = (groupId.Historic ? partStore->Store->GetRoomCount() : 0) + groupId.Index;
             }
 
-            return Get(part, queueIndex).DoLoad(location.Offset, type, AheadLo, AheadHi).Page;
+            auto got = Get(part, queueIndex).DoLoad(location.Offset, type, AheadLo, AheadHi);
+            return got.Page ? got.Page->Acquire() : TSharedCachePageRef();
         }
 
     private:

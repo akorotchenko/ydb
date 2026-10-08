@@ -3,7 +3,7 @@
 #include "flat_page_iface.h"
 #include "flat_sausage_fetch.h"
 #include "flat_fwd_misc.h"
-#include "shared_handle.h"
+#include "shared_cache.h"
 
 namespace NKikimr {
 namespace NTable {
@@ -27,7 +27,7 @@ namespace NFwd {
     class IPageLoadingLogic {
     public:
         struct TResult {
-            const TSharedData *Page;
+            const TSharedCachePageRef* Page;
             bool Grow; /* Should give more pages on Forward() */
             bool Need; /* Is vital to client to make progress */
         };
@@ -36,7 +36,7 @@ namespace NFwd {
 
         virtual TResult Get(IPageLoadingQueue *head, TPageOffset offset, EPage type, ui64 lower) = 0;
         virtual void Forward(IPageLoadingQueue *head, ui64 upper) = 0;
-        virtual void Fill(NPageCollection::TLoadedPage& page, NSharedCache::TSharedPageRef sharedPageRef, EPage type) = 0;
+        virtual void Fill(TSharedCachePageRef&& page, EPage type) = 0;
 
         IPageLoadingQueue* Head = nullptr; /* will be set outside of IPageLoadingLogic impl */
         TStat Stat;

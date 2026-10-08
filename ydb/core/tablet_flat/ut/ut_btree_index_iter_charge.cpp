@@ -18,8 +18,7 @@ namespace {
     using TChild = TBtreeIndexNode::TChild;
 
     struct TTouchEnv : public NTest::TTestEnv {
-        const TSharedData* TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
-        {
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto pageId = ResolvePageId(part, location, groupId);
             if (Sticky[groupId].contains(pageId)) {
                 Loaded[groupId].insert(pageId);
@@ -29,7 +28,7 @@ namespace {
             if (Loaded[groupId].contains(pageId)) {
                 return NTest::TTestEnv::TryGetPage(part, location, groupId);
             }
-            return nullptr;
+            return {};
         }
 
         void LoadTouched() {
@@ -326,8 +325,8 @@ namespace {
         explicit TTouchEnvV2(const TPartStore* part)
             : Part(part) {}
 
-        const TSharedData* TryGetPage(const TPart* part, const NPage::TPageLocation& location,
-                NPage::TGroupId groupId) override {
+        TSharedCachePageRef TryGetPage(
+            const TPart* part, const NPage::TPageLocation& location, NPage::TGroupId groupId) override {
             Y_UNUSED(part);
             const ui32 room = groupId.Index;
             // Type-aware on every access, cache hits included: the store knows the
@@ -345,11 +344,11 @@ namespace {
                 << " room " << room
                 << ": charger asked " << static_cast<ui16>(location.Type)
                 << " store says " << static_cast<ui16>(trueType));
-            if (auto* p = Loaded[room].FindPtr(location.Offset)) {
-                return p;
+            if (Loaded[room].contains(location.Offset)) {
+                return NTest::TTestEnv::TryGetPage(Part, location, groupId);
             }
             Touched[room].push_back(location);
-            return nullptr;
+            return {};
         }
 
         // Simulate ObtainToLoad -> fetch -> save: every miss becomes available.

@@ -8,7 +8,7 @@
 #include "flat_part_laid.h"
 #include "flat_part_screen.h"
 #include "flat_part_store.h"
-#include "flat_sausagecache.h"
+#include "flat_page_collection.h"
 #include "flat_sausage_chop.h"
 #include "shared_cache_pages.h"
 #include "shared_sausagecache.h"
@@ -253,33 +253,16 @@ namespace NTabletFlatExecutor {
             for (auto &res : Results) {
                 Y_ENSURE(res.PageCollections, "Direct write produced a part without page collections");
 
-                TVector<TIntrusivePtr<TPrivatePageCache::TPageCollection>> pageCollections;
+                TVector<TSharedCacheCollectionRef> pageCollections;
                 for (auto& pageCollection : res.PageCollections) {
-                    auto resultingPageCollection = MakeIntrusive<NTable::TLoader::TPageCollection>(pageCollection.PageCollection);
-                    auto saveCompactedPages = MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);
-                    auto gcList = SharedCachePages->GCList;
-                    auto addPage = [&saveCompactedPages, &resultingPageCollection, &gcList](
-                                       NPageCollection::TLoadedPage& loadedPage, bool sticky) {
-                        auto& location = loadedPage.Location;
-                        auto sharedPage = MakeIntrusive<TPage>(
-                            location.Offset, location.Size, location.Type, location.Crc32, nullptr);
-                        sharedPage->ProvideBody(std::move(loadedPage.Data));
-                        sharedPage->CacheMode =
-                            sticky ? NTable::NPage::ECacheMode::Sticky : NTable::NPage::ECacheMode::Regular;
-                        saveCompactedPages->Pages.push_back(sharedPage);
-                        if (sticky) {
-                            resultingPageCollection->AddStickyPage(location.Offset, location.Size,
-                                TSharedPageRef::MakeUsed(std::move(sharedPage), gcList, location.Type));
-                        } else {
-                            resultingPageCollection->AddPage(location.Offset, location.Size,
-                                TSharedPageRef::MakeUsed(std::move(sharedPage), gcList, location.Type));
-                        }
-                    };
-                    for (auto &page : pageCollection.StickyPages) {
-                        addPage(page, true);
+                    auto resultingPageCollection = SharedCachePages->AdmitCollection(pageCollection.PageCollection);
+                    auto saveCompactedPages =
+                        MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);
+                    for (auto& page : pageCollection.StickyPages) {
+                        saveCompactedPages->AddPage(*SharedCachePages, std::move(page), true);
                     }
-                    for (auto &page : pageCollection.RegularPages) {
-                        addPage(page, false);
+                    for (auto& page : pageCollection.RegularPages) {
+                        saveCompactedPages->AddPage(*SharedCachePages, std::move(page), false);
                     }
 
                     ctx.Send(MakeSharedPageCacheId(), saveCompactedPages.Release());

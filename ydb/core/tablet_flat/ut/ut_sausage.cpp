@@ -1,3 +1,4 @@
+#include "shared_cache_pages.h"
 #include <ydb/core/tablet_flat/flat_sausage_align.h>
 #include <ydb/core/tablet_flat/flat_sausage_meta.h>
 #include <ydb/core/tablet_flat/flat_sausage_writer.h>
@@ -646,20 +647,29 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         // — no page-index conversion, no CRC32 check (delegated to Verify)
         struct TByteOffsetStore : public IPages {
             THashMap<TPageOffset, TSharedData> Map;
+            TIntrusiveConstPtr<IPageCollection> Collection;
+
+            explicit TByteOffsetStore(TIntrusiveConstPtr<IPageCollection> collection)
+                : Collection(std::move(collection))
+            {
+            }
 
             void Add(const TPageLocation& loc, TSharedData data)
             {
                 Map[loc.Offset] = std::move(data);
             }
 
-            const TSharedData* TryGetPage(const TPart*, const TPageLocation& location, TGroupId) override
-            {
+            TSharedCachePageRef TryGetPage(const TPart*, const TPageLocation& location, TGroupId) override {
                 auto it = Map.find(location.Offset);
-                return it != Map.end() ? &it->second : nullptr;
+                if (it == Map.end()) {
+                    return {};
+                }
+                auto page = location;
+                page.Type = NTable::NPage::EPage::DataPage;
+                return TSharedCachePages::Get().AdmitPage(Collection, page, TSharedData(it->second));
             }
 
-            TResult Locate(const TMemTable*, ui64, ui32) override
-            {
+            TResult Locate(const TMemTable*, ui64, ui32) override {
                 return {false, nullptr};
             }
 
@@ -674,9 +684,9 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         // Build TPageCollection — production path for IPageCollection::Verify
         auto metaBlob = MakeMeta();
         TLargeGlobId largeGlobId(0, TLogoBlobID(10, 20, 30, 1, metaBlob.size(), 0), metaBlob.size());
-        const TPageCollection pageCollection(largeGlobId, metaBlob);
+        auto pageCollection = MakeIntrusiveConst<TPageCollection>(largeGlobId, metaBlob);
 
-        TByteOffsetStore store;
+        TByteOffsetStore store(pageCollection);
 
         // Phase 1: fill with same '9'-filled data as MakeMeta — CRC32 matches TMeta
         for (ui32 i = 0; i < 9; i++) {
@@ -695,11 +705,10 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         // — the same production path as flat_bio_actor.cpp
         for (ui32 i = 0; i < 9; i++) {
             auto loc = meta.GetLocation(i);
-            const TSharedData* page = store.TryGetPage(nullptr, loc, {});
+            auto page = store.TryGetPage(nullptr, loc, {});
             UNIT_ASSERT(page);
-            UNIT_ASSERT_VALUES_EQUAL(page->size(), loc.Size);
-            UNIT_ASSERT(pageCollection.Verify(loc,
-                TArrayRef<const char>(page->data(), page->size())));
+            UNIT_ASSERT_VALUES_EQUAL(page.size(), loc.Size);
+            UNIT_ASSERT(pageCollection->Verify(loc, TArrayRef<const char>(page.data(), page.size())));
         }
 
         // Phase 3: unknown byte-offset location → nullptr
@@ -711,12 +720,15 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         auto loc0 = meta.GetLocation(0);
         TString badData(loc0.Size, 'X');               // different content → different CRC32
         UNIT_ASSERT(Crc32c(badData.data(), badData.size()) != loc0.Crc32);
+        // Cache entries are immutable; the replacement body belongs to a new collection generation.
+        TLargeGlobId replacementGlobId(0, TLogoBlobID(10, 21, 30, 1, metaBlob.size(), 0), metaBlob.size());
+        store.Collection = MakeIntrusiveConst<TPageCollection>(replacementGlobId, metaBlob);
         store.Add(loc0, TSharedData::Copy(badData.data(), badData.size()));
         {
-            const TSharedData* page = store.TryGetPage(nullptr, loc0, {});
+            auto page = store.TryGetPage(nullptr, loc0, {});
             UNIT_ASSERT(page);                          // lookup succeeds (no CRC32 inside TryGetPage)
-            UNIT_ASSERT(!pageCollection.Verify(loc0,    // but Verify catches the mismatch
-                TArrayRef<const char>(page->data(), page->size())));
+            UNIT_ASSERT(!pageCollection->Verify(loc0, // but Verify catches the mismatch
+                TArrayRef<const char>(page.data(), page.size())));
         }
     }
 

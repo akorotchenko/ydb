@@ -1,5 +1,7 @@
 #pragma once
 
+#include "shared_cache.h"
+
 #include <variant>
 
 #include <ydb/core/base/defs.h>
@@ -449,7 +451,24 @@ namespace NKikimr::NTable::NPage {
             : Raw(std::move(raw))
             , IsV2Format(v2Format)
         {
-            const auto data = NPage::TLabelWrapper().Read(Raw, v2Format ? EPage::BTreeIndexV2 : EPage::BTreeIndex);
+            Parse();
+        }
+
+        TBtreeIndexNode(TSharedCachePageRef&& ref, bool v2Format)
+            : Ref(std::move(ref))
+            , IsV2Format(v2Format)
+        {
+            Parse();
+        }
+
+    private:
+        TArrayRef<const char> Bytes() const noexcept {
+            return Ref ? TArrayRef<const char>(Ref.data(), Ref.size()) : TArrayRef<const char>(Raw);
+        }
+
+        void Parse() {
+            const auto data =
+                NPage::TLabelWrapper().Read(Bytes(), IsV2Format ? EPage::BTreeIndexV2 : EPage::BTreeIndex);
 
             Y_ENSURE(data == ECodec::Plain && data.Version == FormatVersion);
 
@@ -460,7 +479,7 @@ namespace NKikimr::NTable::NPage {
                 Y_ENSURE(Header->KeysSize == static_cast<TPgSize>(Header->KeysCount) * Header->FixedKeySize);
                 Keys = TDeref<const TRecordsEntry>::At(Header, offset);
             } else {
-                Keys = Raw.data();
+                Keys = Bytes().data();
                 Offsets = TDeref<const TRecordsEntry>::At(Header, offset);
                 offset += Header->KeysCount * sizeof(TRecordsEntry);
             }
@@ -472,9 +491,14 @@ namespace NKikimr::NTable::NPage {
             Y_ENSURE(offset == data.Page.size());
         }
 
+    public:
+        TSharedCachePageRef&& TakePageRef() noexcept {
+            return std::move(Ref);
+        }
+
         NPage::TLabel Label() const noexcept
         {
-            return ReadUnaligned<NPage::TLabel>(Raw.data());
+            return ReadUnaligned<NPage::TLabel>(Bytes().data());
         }
 
         bool IsShortChildFormat() const noexcept
@@ -797,6 +821,7 @@ namespace NKikimr::NTable::NPage {
         }
 
     private:
+        TSharedCachePageRef Ref;
         TSharedData Raw;
         const THeader* Header = nullptr;
         const void* Keys = nullptr;

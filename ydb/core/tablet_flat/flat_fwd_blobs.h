@@ -61,20 +61,21 @@ namespace NFwd {
             Preload(head, upper);
         }
 
-        void Fill(NPageCollection::TLoadedPage& page, NSharedCache::TSharedPageRef sharedPageRef, EPage) override
-        {
-            if (!Pages || page.Location.Offset < Pages.front().Offset) {
+        void Fill(TSharedCachePageRef&& page, EPage) override {
+            const auto location = page.GetLocation();
+            const ui64 loadedSize = location.Size;
+            if (!Pages || location.Offset < Pages.front().Offset) {
                 Y_TABLET_ERROR("Blobs fwd cache got page below queue");
-            } else if (page.Location.Offset > Pages.back().Offset) {
+            } else if (location.Offset > Pages.back().Offset) {
                 Y_TABLET_ERROR("Blobs fwd cache got page above queue");
-            } else if (page.Data.size() > OnFetch) {
+            } else if (loadedSize > OnFetch) {
                 Y_TABLET_ERROR("Blobs fwd cache ahead counters is out of sync");
             }
 
-            Stat.Saved += page.Data.size();
-            OnFetch -= page.Data.size();
+            Stat.Saved += loadedSize;
+            OnFetch -= loadedSize;
             // blob pages are always page-index-addressed
-            OnHold += Lookup(page.Location.Offset.AsPageIndex()).Settle(page, std::move(sharedPageRef));
+            OnHold += Lookup(location.Offset.AsPageIndex()).Settle(std::move(page));
 
             Shrink(false /* do not drop loading pages */);
         }
@@ -202,7 +203,7 @@ namespace NFwd {
                     break;
                 } else if (page.Size == 0) {
                     Y_TABLET_ERROR("Dropping page that hasn't been propagated");
-                } else if (auto size = page.Release().size()) {
+                } else if (auto size = page.Release()) {
                     OnHold -= size;
 
                     if (page.Usage == EUsage::None)

@@ -85,7 +85,7 @@ public:
                     ready = false;
                     continue; // continue requesting other nodes
                 }
-                TBtreeIndexNode node(*page, Meta.HasRootV2());
+                TBtreeIndexNode node(std::move(page), Meta.HasRootV2());
 
                 bool isLeafLevel = (height + 1 == Meta.LevelCount());
 

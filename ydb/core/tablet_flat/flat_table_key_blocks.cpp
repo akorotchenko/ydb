@@ -183,11 +183,11 @@ public:
         return Inner->Locate(part, ref, lob);
     }
 
-    const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         const auto type = location.Type;
         Y_ENSURE(type == EPage::FlatIndex || type == EPage::BTreeIndex || type == EPage::BTreeIndexV2,
             "key-block iterator requested a non-index page");
-        const TSharedData* page = Inner->TryGetPage(part, location, groupId);
+        auto page = Inner->TryGetPage(part, location, groupId);
         if (page) {
             Seen.insert({ part->Label, groupId.Raw(), location.Offset });
         }

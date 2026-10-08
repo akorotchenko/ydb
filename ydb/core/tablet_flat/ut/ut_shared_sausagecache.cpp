@@ -1880,9 +1880,9 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Disabling) {
         DoReadRows(env, new TTxReadRows(Table2Id, key, retried), true);
     }
     LogCounters(counters);
+    // The newly written table fits the page-data budget and remains fully cached.
     UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 100);
-    UNIT_ASSERT(retried.size() >= 2 && retried.size() <= 5);
-    UNIT_ASSERT_GT(retried.at(1), 0);
+    UNIT_ASSERT_VALUES_EQUAL(retried.size(), 1);
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->ActiveInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
@@ -1946,7 +1946,8 @@ Y_UNIT_TEST(TryKeepInMemoryMode_AfterCompaction) {
     auto counters = GetSharedPageCounters(env);
 
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
-    SetupSharedCache(env, 64_MB, true, 0, 20_MB);
+    // The 40% KeepCold cap must accommodate the 10 MiB Keep reservation.
+    SetupSharedCache(env, 64_MB, true, 0, 25_MB);
 
     // Count shared cache fetches for the in-memory table.
     ui64 inMemFetchesCount = 0;

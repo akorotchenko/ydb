@@ -117,8 +117,8 @@ namespace {
                 << " |  Page     Row    Bytes  (";
             return;
         }
-        
-        auto index = NPage::TFlatIndex(*indexPage);
+
+        auto index = NPage::TFlatIndex(std::move(indexPage));
         auto label = index.Label();
 
         Out
@@ -144,8 +144,8 @@ namespace {
                 << " | " << (Printf(Out, " %4u", record->GetPageId()), " ")
                 << (Printf(Out, " %6lu", record->GetRowId()), " ");
 
-            if (auto *page = Env->TryGetPage(&part, part.GetPageLocation(record->GetPageId(), {}), {})) {
-                Printf(Out, " %6zub  ", page->size());
+            if (auto page = Env->TryGetPage(&part, part.GetPageLocation(record->GetPageId(), {}), {})) {
+                Printf(Out, " %6zub  ", page.size());
             } else {
                 Out << "~none~  ";
             }
@@ -252,13 +252,13 @@ namespace {
                         Out << "nof";
                     }
 
-                    if (auto bytes = (blob ? blob.Page->size() : 0)) {
+                    if (auto bytes = (blob ? (*blob)->size() : 0)) {
                         Out << " raw " << bytes << "b";
                     } else {
                         Out << " -";
                     }
 
-                    if (frame.Size && blob && frame.Size != blob.Page->size()) {
+                    if (frame.Size && blob && frame.Size != (*blob)->size()) {
                         Out << " **"; /* error indicator */
                     }
 
@@ -325,7 +325,7 @@ namespace {
             return;
         }
 
-        auto node = NPage::TBtreeIndexNode(*page, v2Format);
+        auto node = NPage::TBtreeIndexNode(std::move(page), v2Format);
 
         auto label = node.Label();
 

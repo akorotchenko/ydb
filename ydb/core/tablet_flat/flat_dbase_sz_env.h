@@ -9,8 +9,6 @@ namespace NKikimr {
 namespace NTable {
 
     struct TSizeEnv : public IPages {
-        using TPageCollection = NTabletFlatExecutor::TPrivatePageCache::TPageCollection;
-
         TSizeEnv(IPages* env)
             : Env(env)
         {
@@ -31,8 +29,7 @@ namespace NTable {
             return { true, nullptr };
         }
 
-        const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
-        {
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto *partStore = CheckedCast<const NTable::TPartStore*>(part);
             auto *collection = partStore->PageCollections.at(groupId.Index).Get();
 
@@ -47,7 +44,7 @@ namespace NTable {
                     return Env->TryGetPage(part, location, groupId);
                 default:
                     AddPageSize(collection, location);
-                    return nullptr;
+                    return {};
             }
         }
 
@@ -56,7 +53,7 @@ namespace NTable {
         }
 
     private:
-        void AddPageSize(const TPageCollection *collection, const TPageLocation& location)
+        void AddPageSize(const NSharedCache::TCacheCollection* collection, const TPageLocation& location)
         {
             if (Touched[collection].insert(location.Offset).second) {
                 Pages++;
@@ -66,7 +63,7 @@ namespace NTable {
 
     private:
         IPages* Env;
-        THashMap<const TPageCollection*, THashSet<TPageOffset>> Touched;
+        THashMap<const NSharedCache::TCacheCollection*, THashSet<TPageOffset>> Touched;
         ui64 Pages = 0;
         ui64 Bytes = 0;
     };

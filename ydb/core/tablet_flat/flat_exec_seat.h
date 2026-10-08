@@ -2,8 +2,9 @@
 
 #include "defs.h"
 #include "tablet_flat_executor.h"
-#include "flat_sausagecache.h"
+#include "flat_page_collection.h"
 
+#include <util/generic/hash_set.h>
 #include <util/generic/intrlist.h>
 #include <util/generic/ptr.h>
 #include <util/system/hp_timer.h>
@@ -24,6 +25,18 @@ namespace NTabletFlatExecutor {
     };
 
     struct TSeat : public TIntrusiveListItem<TSeat> {
+        struct TPageRefHash {
+            size_t operator()(const TSharedCachePageRef& page) const noexcept {
+                return THash<ui64>()(page.CacheItem().CacheItem().Raw());
+            }
+        };
+
+        struct TPageRefEqual {
+            bool operator()(const TSharedCachePageRef& a, const TSharedCachePageRef& b) const noexcept {
+                return a.CacheItem() == b.CacheItem();
+            }
+        };
+
         TSeat(const TSeat&) = delete;
 
         TSeat(ui64 uniqId, TAutoPtr<ITransaction> self)
@@ -71,7 +84,7 @@ namespace NTabletFlatExecutor {
         const TTxType TxType;
         NWilson::TSpan WaitingSpan;
         ui64 Retries = 0;
-        THashMap<TLogoBlobID, THashMap<TPageOffset, TPrivatePageCache::TPinnedPage>> Pinned;
+        THashSet<TSharedCachePageRef, TPageRefHash, TPageRefEqual> Pinned;
 
         THPTimer LatencyTimer;
         THPTimer CommitTimer;

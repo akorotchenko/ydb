@@ -53,8 +53,7 @@ namespace {
             , Sticky(std::move(sticky))
             { }
 
-        const TSharedData* TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
-        {
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto pageId = ResolvePageId(part, location, groupId);
             Touched[groupId].insert(pageId);
 
@@ -63,7 +62,7 @@ namespace {
             }
 
             ToLoad[groupId].insert(pageId);
-            return nullptr;
+            return {};
         }
 
         const bool Fail = false;

@@ -38,7 +38,6 @@ namespace NBoot {
         TAutoPtr<TExecutorBorrowLogic> Loans;
         THashMap<ui32, NTable::TRowVersionRanges> RemovedRowVersions;
 
-        TVector<TIntrusivePtr<TPrivatePageCache::TPageCollection>> PageCollections;
         bool ShouldSnapshotScheme = false;
     };
 }

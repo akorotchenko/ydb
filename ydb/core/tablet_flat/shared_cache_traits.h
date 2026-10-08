@@ -9,6 +9,7 @@ class TActorSystem;
 namespace NKikimr::NSharedCache {
 
 enum class ESharedCacheHookPoint {
+    BeforeKeepBytesPublished, // Payload is the collection whose contribution is being published.
     AfterPageBatchPrepared, // Payload is the collection after the batch presence checks.
     AfterInsertPositionFound, // Payload is the link owner, before candidate preparation or publication.
     BeforeTableLinkCas, // Payload is the link owner, may be null.
@@ -42,11 +43,11 @@ struct TProdTraits {
 
     static void* TrySharedCachePages() noexcept;
     static bool InstallSharedCachePages(void* cache) noexcept;
-    static void BindSharedCachePages(void* cache) noexcept;
-    static void UnbindSharedCachePages(void* cache) noexcept;
     static ui32 CurrentWorkerIndex() noexcept;
 
     void NotifyResourcesAvailable() const noexcept;
+    void NotifyCollectionReleased(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem) const noexcept;
+    void NotifyCollectionBytesChanged(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem) const noexcept;
 
     void NotifyKeepPageEviction(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem, ui64 generation,
         NTable::NPage::TPageLocation location) const noexcept;
@@ -73,6 +74,12 @@ struct TTestTraits {
     }
 
     void NotifyResourcesAvailable() const noexcept {
+    }
+
+    void NotifyCollectionReleased(const TLogoBlobID&, TCollectionCacheItem) const noexcept {
+    }
+
+    void NotifyCollectionBytesChanged(const TLogoBlobID&, TCollectionCacheItem) const noexcept {
     }
 
     static void* TrySharedCachePages() noexcept {

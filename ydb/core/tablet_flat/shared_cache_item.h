@@ -454,6 +454,10 @@ enum class EPageFetchCompletion {
 
 class TPageFetchWaiter : public TThrRefBase {
 public:
+    virtual bool IsActive() const noexcept {
+        return true;
+    }
+
     virtual void Complete(TPageCacheItem, EPageFetchCompletion) noexcept {
     }
 
@@ -517,7 +521,37 @@ private:
     friend class TSharedCacheImpl;
 
     template <class>
+    friend class TPageFetchImpl;
+
+    template <class>
     friend class TSharedCacheImpl;
+
+    bool HasActiveWaiters() const noexcept {
+        // The move-only fetch owner holds a pending item ref, preventing waiter-list closure and reclamation.
+        // Subscribers only prepend nodes; existing links remain unchanged until that owner releases its ref.
+        TPageFetchWaiter* waiter = Waiters_.load(std::memory_order_acquire);
+        Y_DEBUG_ABORT_UNLESS(waiter != Sealed);
+        while (waiter) {
+            if (waiter->IsActive()) {
+                return true;
+            }
+            waiter = waiter->Next_.load(std::memory_order_relaxed);
+        }
+        return false;
+    }
+
+    template <class TVisitor>
+    void ForEachActiveWaiter(TVisitor&& visitor) const noexcept {
+        // The fetch owner keeps this list alive even when a visitor cancels a request.
+        TPageFetchWaiter* waiter = Waiters_.load(std::memory_order_acquire);
+        Y_DEBUG_ABORT_UNLESS(waiter != Sealed);
+        while (waiter) {
+            if (waiter->IsActive()) {
+                visitor(*waiter);
+            }
+            waiter = waiter->Next_.load(std::memory_order_relaxed);
+        }
+    }
 
     void SetReady(NActors::TSharedData&& data) noexcept {
         Y_DEBUG_ABORT_UNLESS(data && Completion_.load(std::memory_order_relaxed) == EPageFetchCompletion::Pending);

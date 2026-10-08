@@ -43,7 +43,7 @@ ui64 GetPrevDataSize(const TPart* part, TGroupId groupId, TRowId rowId, IPages* 
             ready = false;
             return prevDataSize;
         }
-        auto node = TBtreeIndexNode(*page, meta.HasRootV2());
+        auto node = TBtreeIndexNode(std::move(page), meta.HasRootV2());
         auto pos = node.Seek(rowId);
 
         bool isLeafLevel = (height + 1 == meta.LevelCount());
@@ -90,7 +90,7 @@ ui64 GetPrevHistoricDataSize(const TPart* part, TGroupId groupId, TRowId rowId, 
             ready = false;
             return prevDataSize;
         }
-        auto node = TBtreeIndexNode(*page, meta.HasRootV2());
+        auto node = TBtreeIndexNode(std::move(page), meta.HasRootV2());
         auto pos = node.Seek(ESeek::Lower, key1, part->Scheme->HistoryGroup.ColsKeyIdx, part->Scheme->HistoryKeys.Get());
 
         bool isLeafLevel = (height + 1 == meta.LevelCount());

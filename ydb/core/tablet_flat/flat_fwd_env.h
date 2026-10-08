@@ -129,8 +129,7 @@ namespace NFwd {
             return Pending == 0;
         }
 
-        const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
-        {
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto type = location.Type;
 
             if (groupId.IsMain() && IsIndexPage(type)) {
@@ -138,7 +137,8 @@ namespace NFwd {
                 groupId = PartIndexPageLocator[part].GetGroup(location.Offset);
             }
 
-            return Get(GetQueue(part, groupId), location.Offset, type).Page;
+            auto got = Get(GetQueue(part, groupId), location.Offset, type);
+            return got.Page ? got.Page->Acquire() : TSharedCachePageRef();
         }
 
         TResult Locate(const TMemTable *memTable, ui64 ref, ui32 tag) override
@@ -155,7 +155,8 @@ namespace NFwd {
             ui32 room = part->GroupsCount + (lob == ELargeObj::Extern ? 1 : 0);
 
             // Blob fwd cache is keyed by page-index; TMeta::Bounds handles it as page-index too with the condition
-            return Get(GetQueue(part, room), TPageOffset::FromPageIndex(static_cast<ui32>(ref)), EPage::Opaque);
+            auto got = Get(GetQueue(part, room), TPageOffset::FromPageIndex(static_cast<ui32>(ref)), EPage::Opaque);
+            return got.Page ? TResult(got.Need, got.Page->BuildSharedData()) : TResult(got.Need, nullptr);
         }
 
         void Save(TIntrusiveConstPtr<IPageCollection> pageCollection, ui64 cookie, TVector<NSharedCache::TEvResult::TLoaded> pages)
@@ -174,16 +175,13 @@ namespace NFwd {
             Pending -= pages.size();
 
             for (auto& page : pages) {
-                auto type = page.Page.GetType();
-                auto data = NSharedCache::TPinnedPageRef(page.Page).GetData();
-                NPageCollection::TLoadedPage loadedPage{ TPageLocation(page.Offset, data.size(), type), std::move(data) };
+                const auto type = page.Page.GetType();
                 if (IsIndexPage(type)) {
                     Y_ENSURE(queue.IndexPageCollection->Label() == pageCollection->Label(), "TPart head storage doesn't match with fetch result");
-                    queue->Fill(loadedPage, std::move(page.Page), type);
                 } else {
                     Y_ENSURE(queue.GroupPageCollection->Label() == pageCollection->Label(), "TPart head storage doesn't match with fetch result");
-                    queue->Fill(loadedPage, std::move(page.Page), type);
                 }
+                queue->Fill(std::move(page.Page), type);
             }
         }
 
@@ -279,7 +277,7 @@ namespace NFwd {
         }
 
     private:
-        TResult Get(TPartGroupLoadingQueue &queue, TPageOffset offset, EPage type)
+        IPageLoadingLogic::TResult Get(TPartGroupLoadingQueue& queue, TPageOffset offset, EPage type)
         {
             auto got = queue->Get(&queue, offset, type, Conf.AheadLo);
 
@@ -292,7 +290,7 @@ namespace NFwd {
                 Y_ENSURE(!(got.Need && got.Page == nullptr), "Cache line head don't want to do fetch but should");
             }
 
-            return { got.Need, got.Page };
+            return got;
         }
 
         void AddPartView(const TPartView& partView)
@@ -356,11 +354,11 @@ namespace NFwd {
 
             Y_ENSURE(groupId.Index < partStore->PageCollections.size(), "Got part without enough page collections");
 
-            return {CreateCache(part, PartIndexPageLocator[part], groupId, slices,
-                    partStore->PageCollections[groupId.Index]->PageCollection,
-                    partStore->PageCollections[0]->PageCollection),
-                partStore->PageCollections[0]->PageCollection,
-                partStore->PageCollections[groupId.Index]->PageCollection};
+            return { CreateCache(part, PartIndexPageLocator[part], groupId, slices,
+                         partStore->PageCollections[groupId.Index]->PageCollection(),
+                         partStore->PageCollections[0]->PageCollection()),
+                partStore->PageCollections[0]->PageCollection(),
+                partStore->PageCollections[groupId.Index]->PageCollection() };
         }
 
         TGroupPages MakeExtern(const TPart *part, TIntrusiveConstPtr<TSlices> bounds) const
@@ -399,7 +397,7 @@ namespace NFwd {
 
                 TVector<ui32> edge(small->Stats().Tags.size(), Max<ui32>());
 
-                auto pageCollection = partStore->PageCollections.at(partStore->GroupsCount)->PageCollection;
+                auto pageCollection = partStore->PageCollections.at(partStore->GroupsCount)->PageCollection();
 
                 return {MakeHolder<TBlobs>(small, std::move(bounds), edge, false, pageCollection), nullptr, pageCollection};
             } else {

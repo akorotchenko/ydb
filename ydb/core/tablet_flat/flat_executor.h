@@ -3,7 +3,7 @@
 #include "tablet_flat_executor.h"
 #include "flat_database.h"
 #include "flat_dbase_change.h"
-#include "flat_sausagecache.h"
+#include "flat_page_collection.h"
 #include "flat_part_store.h"
 #include "flat_part_outset.h"
 #include "flat_part_loader.h"
@@ -302,7 +302,6 @@ struct TTransactionWaitPad : public NPageCollection::TPagesWaitPad {
 struct TCompactionChangesCtx;
 
 struct TExecutorCaches {
-    THashMap<TLogoBlobID, TIntrusivePtr<TPrivatePageCache::TPageCollection>> PageCollections;
     THashMap<TLogoBlobID, TSharedData> TxStatusCaches;
 };
 
@@ -456,9 +455,9 @@ class TExecutor
     TWaitingSnaps WaitingSnapshots;
 
     ui64 BootAttempt = 0;
-    ui64 NextPageCollectionAttachId = 0;
     THolder<TExecutorBootLogic> BootLogic;
-    THolder<TPrivatePageCache> PrivatePageCache;
+    bool PageCollectionsInitialized = false;
+    TIntrusivePtr<TCollectionOwnerStats> PageCollectionStats = new TCollectionOwnerStats;
 
     THolder<TExecutorCounters> Counters;
     THolder<TTabletCountersBase> AppCounters;
@@ -533,7 +532,7 @@ class TExecutor
     void Broken(EBrokenReason reason);
     void Active(const TActorContext &ctx);
     void ActivateFollower(const TActorContext &ctx);
-    void RecreatePrivateCache();
+    void RecreatePageCollections();
     void ReflectSchemeSettings();
     void OnYellowChannels(TVector<ui32> yellowMoveChannels, TVector<ui32> yellowStopChannels) override;
     void CheckYellow(TVector<ui32> &&yellowMoveChannels, TVector<ui32> &&yellowStopChannels, bool terminal = false);
@@ -569,18 +568,22 @@ class TExecutor
     void EnqueueActivation(TSeat* seat, bool activate);
     void PlanTransactionActivation();
     void MakeLogSnapshot();
-    void TryActivateWaitingTransaction(TIntrusivePtr<NPageCollection::TPagesWaitPad>&& waitPad,
-        TVector<NSharedCache::TEvResult::TLoaded>&& pages, TPrivatePageCache::TPageCollection* collectionInfo);
+    void TryActivateWaitingTransaction(
+        TIntrusivePtr<NPageCollection::TPagesWaitPad>&& waitPad, TVector<NSharedCache::TEvResult::TLoaded>&& pages);
     void ActivateWaitingTransaction(TTransactionWaitPad& transaction);
     void TryActivateResourceWaitingTransaction(TTransactionWaitPad& transaction);
     void LogWaitingTransaction(const TTransactionWaitPad& transaction);
     void AddPartStorePageCollections(const NTable::TPartView& partView,
         const THashMap<NTable::TTag, ECacheMode>& cacheModes, const THashSet<NTable::TTag>& stickyColumns,
         bool replayStickyWalks = false);
-    void AddPageCollection(const TIntrusivePtr<TPrivatePageCache::TPageCollection>& pageCollection,
+    void AddPageCollection(const TSharedCacheCollectionRef& pageCollection, ECacheMode cacheMode,
         TVector<NSharedCache::TEvAttach::TBtreeSeed> btreeSeeds = {}, bool replayStickyWalk = false);
     void DropPartStorePageCollections(const NTable::TPart& part);
     void DropPageCollection(const TLogoBlobID& pageCollectionId);
+    TSharedCacheCollectionRef FindPageCollection(const TLogoBlobID& id) const;
+    TVector<ECacheMode> GetPartStoreCacheModes(const NTable::TPartView& partView,
+        const THashMap<NTable::TTag, ECacheMode>& cacheModes, const THashSet<NTable::TTag>& stickyColumns) const;
+    TPageCollectionStats GetPageCollectionStats() const;
     void StartNewBackup();
     void FailBackup(const TString& error);
     void ScheduleRetryBackup();
@@ -590,11 +593,13 @@ class TExecutor
     void UpdateCacheModesForPartStore(NTable::TPartView& partView, const THashMap<NTable::TTag, ECacheMode>& cacheModes,
         const THashSet<NTable::TTag>& stickyColumns);
     void UpdateCachePagesForDatabase(bool pendingOnly = false);
-    void RequestStickyPagesForPartStore(NTable::TPartView& partView, const THashSet<NTable::TTag>& stickyColumns);
+    void RequestStickyPagesForPartStore(NTable::TPartView& partView,
+        const THashMap<NTable::TTag, ECacheMode>& cacheModes, const THashSet<NTable::TTag>& stickyColumns);
 
-    THashSet<NTable::TTag> GetStickyColumns(ui32 tableId);
-    THashMap<NTable::TTag, ECacheMode> GetCacheModes(ui32 tableId);
-    ECacheMode GetCacheMode(const TVector<NTable::TPartScheme::TColumn>& columns, const THashMap<NTable::TTag, ECacheMode>& cacheModes);
+    THashSet<NTable::TTag> GetStickyColumns(ui32 tableId) const;
+    THashMap<NTable::TTag, ECacheMode> GetCacheModes(ui32 tableId) const;
+    static ECacheMode GetCacheMode(
+        const TVector<NTable::TPartScheme::TColumn>& columns, const THashMap<NTable::TTag, ECacheMode>& cacheModes);
     THolder<TScanSnapshot> PrepareScanSnapshot(ui32 table,
         const NTable::TCompactionParams* params, TRowVersion snapshot = TRowVersion::Max());
     void ReleaseScanLocks(TIntrusivePtr<TBarrier>, const NTable::TSubset&);
@@ -623,9 +628,6 @@ class TExecutor
     void Handle(TEvBlobStorage::TEvCollectGarbageResult::TPtr&);
     void Handle(TEvPrivate::TEvRetryGcRequest::TPtr& ev, const TActorContext& ctx);
     void Handle(NSharedCache::TEvResult::TPtr& ev);
-    void Handle(NSharedCache::TEvAttached::TPtr& ev);
-    void Handle(NSharedCache::TEvUpdated::TPtr& ev);
-    void Handle(NSharedCache::TEvStickyCollectionPages::TPtr& ev);
     void Handle(NResourceBroker::TEvResourceBroker::TEvResourceAllocated::TPtr&);
     void Handle(NOps::TEvScanStat::TPtr &ev, const TActorContext &ctx);
     void Handle(NOps::TEvResult::TPtr &ev);

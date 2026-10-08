@@ -39,12 +39,13 @@ namespace NBoot {
             Prebuilt.resize(LargeGlobIds.size());
             Components.resize(LargeGlobIds.size());
 
+            auto* cache = TSharedCache::TrySharedCachePages();
+            auto binding = cache ? cache->BindCurrentThreadHazard() : TSharedCacheThreadBinding<TProdTraits>{};
             for (auto slot: xrange(LargeGlobIds.size())) {
-                if (auto *cached = Back->PageCollections.FindPtr(LargeGlobIds[slot].Lead)) {
-                    // Use existing cached collection as prebuilt
-                    Prebuilt[slot] = *cached;
-                } else {
-                    Prebuilt[slot] = nullptr;
+                if (cache) {
+                    cache->Find(LargeGlobIds[slot].Lead, Prebuilt[slot]);
+                }
+                if (!Prebuilt[slot]) {
                     LeftMetas += Spawn<TLoadBlobs>(LargeGlobIds[slot], slot);
                 }
             }
@@ -83,7 +84,7 @@ namespace NBoot {
             } else if (Prebuilt[load->Cookie]) {
                 Y_TABLET_ERROR("Page collection is already loaded at room " << load->Cookie);
             } else {
-                // StageParseMeta constructs both NPageCollection::TPageCollection and TPrivatePageCache::TPageCollection
+                // StageParseMeta constructs both NPageCollection::TPageCollection and TCacheCollection
                 Components[load->Cookie].LargeGlobId = load->LargeGlobId;
                 Components[load->Cookie].RawMeta = load->PlainData();
             }
@@ -127,37 +128,25 @@ namespace NBoot {
                         << " part loaded, page collections [";
 
                     for (auto &cache : partView.As<NTable::TPartStore>()->PageCollections)
-                        logl << " " << cache->Id;
+                        logl << " " << cache->Id();
 
                     logl << " ]";
                 }
 
-                PropagateSideEffects(partView);
                 Back->DatabaseImpl->Merge(Table, std::move(partView));
 
                 Env->Finish(this); /* return self to owner */
             }
         }
 
-        void PropagateSideEffects(const NTable::TPartView &partView)
-        {
-            for (auto &pageCollection : partView.As<NTable::TPartStore>()->PageCollections)
-                Logic->Result().PageCollections.push_back(pageCollection);
-
-            if (auto &pageCollection = partView.As<NTable::TPartStore>()->Pseudo)
-                Logic->Result().PageCollections.push_back(pageCollection);
-        }
-
     private:
-        using TPageCollection = TPrivatePageCache::TPageCollection;
-
         const ui32 Table = Max<ui32>();
 
         TAutoPtr<NTable::TLoader> Loader;
         TVector<NPageCollection::TLargeGlobId> LargeGlobIds;
         TVector<NTable::TPageCollectionComponents> Components;
-        // Pre-built TPrivatePageCache::TPageCollection for slots found in Back->PageCollections cache
-        TVector<TIntrusivePtr<TPageCollection>> Prebuilt;
+        // Native metadata refs acquired directly from core for this bundle's slots.
+        TVector<TSharedCacheCollectionRef> Prebuilt;
         TString Legacy;
         TString Opaque;
         TVector<TString> Deltas;

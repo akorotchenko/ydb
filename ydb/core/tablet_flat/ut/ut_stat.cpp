@@ -20,8 +20,7 @@ namespace {
     using namespace NTest;
 
     struct TTouchEnv : public NTest::TTestEnv {
-        const TSharedData* TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
-        {
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto page = NTest::TTestEnv::TryGetPage(part, location, groupId);
 
             bool newTouch = Touched[{part, groupId}].insert(location.Offset).second;
@@ -32,22 +31,23 @@ namespace {
                     type = part->GetPageType(location.Offset.AsPageIndex(), groupId);
                 }
                 if (type == EPage::DataPage) {
-                    auto dataPage = NPage::TDataPage(page);
+                    auto dataPage = NPage::TDataPage(page.Acquire());
 
-                    TouchedBytes += page->size();
+                    TouchedBytes += page.size();
                     if (groupId.IsMain()) {
                         TouchedRows += dataPage->Count;
                     }
                 }
                 if (type == EPage::FlatIndex || type == EPage::BTreeIndex || type == EPage::BTreeIndexV2) {
                     TouchedIndexPages++;
-                    TouchedIndexBytes += page->size();
+                    TouchedIndexBytes += page.size();
                 }
             }
 
-            return newTouch && Faulty
-                ? nullptr
-                : page;
+            if (newTouch && Faulty) {
+                return {};
+            }
+            return page;
         }
 
         TMap<std::pair<const TPart*, TGroupId>, TSet<TPageOffset>> Touched;

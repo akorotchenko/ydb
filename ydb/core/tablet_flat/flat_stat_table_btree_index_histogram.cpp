@@ -570,7 +570,7 @@ private:
         }
 
         bool v2Format = parent.Part->IndexPages.GetBTree({}).HasRootV2();
-        LoadedBTreeNodes.emplace_back(*page, v2Format);
+        LoadedBTreeNodes.emplace_back(std::move(page), v2Format);
         auto &bTreeNode = LoadedBTreeNodes.back();
         auto& groupInfo = parent.Part->Scheme->GetLayout({});
 

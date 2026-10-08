@@ -622,6 +622,8 @@ void TSpaceHazardBinding::Reset() noexcept {
         Y_ABORT_UNLESS(TSharedCacheSpace::TlsHazard_ == Hazard_);
         Y_IF_DEBUG(TSharedCacheSpace::TlsSpace_ = nullptr;)
         TSharedCacheSpace::TlsHazard_ = nullptr;
+        Y_ABORT_UNLESS(!SpaceHazardIsActive(Hazard_->State.load(std::memory_order_relaxed)));
+        Hazard_->Bound.store(false, std::memory_order_release);
         Space_ = nullptr;
         Hazard_ = nullptr;
     }
@@ -629,7 +631,19 @@ void TSpaceHazardBinding::Reset() noexcept {
 
 TSpaceHazardBinding TSharedCacheSpace::BindThreadHazard(ui32 index) const noexcept {
     Y_ABORT_UNLESS(index < HazardSlotCount_);
+    bool unbound = false;
+    Y_ABORT_UNLESS(Hazards_[index].Bound.compare_exchange_strong(unbound, true, std::memory_order_acquire));
     return TSpaceHazardBinding(this, &Hazards_[index]);
+}
+
+TSpaceHazardBinding TSharedCacheSpace::BindAnyThreadHazard() const noexcept {
+    for (ui32 index = 0; index < HazardSlotCount_; ++index) {
+        bool unbound = false;
+        if (Hazards_[index].Bound.compare_exchange_strong(unbound, true, std::memory_order_acquire)) {
+            return TSpaceHazardBinding(this, &Hazards_[index]);
+        }
+    }
+    Y_ABORT("Shared-cache hazard slots exhausted");
 }
 
 TCacheItem TSharedCacheSpace::TakeCutSpare(ui64 allocationLimit) noexcept {

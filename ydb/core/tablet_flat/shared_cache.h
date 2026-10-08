@@ -4,6 +4,7 @@
 #include "shared_cache_table.h"
 
 #include <util/generic/noncopyable.h>
+#include <util/generic/function_ref.h>
 
 #include <new>
 
@@ -46,7 +47,11 @@ public:
     TPageCacheItem CacheItem() const noexcept;
     const char* data() const noexcept;
     size_t size() const noexcept;
-    NActors::TSharedData ShareData() const noexcept;
+    NActors::TSharedData BuildSharedData() const noexcept;
+    // Construct an independent owner only when moving or borrowing cannot preserve the required lifetime.
+    TSharedCachePageRefImpl Acquire() const& noexcept;
+    NTable::NPage::TPageOffset GetOffset() const noexcept;
+    NTable::NPage::TPageLocation GetLocation() const noexcept;
     NTable::NPage::EPage GetType() const noexcept;
     bool IsSticky() const noexcept;
     void Drop() noexcept;
@@ -54,13 +59,13 @@ public:
 private:
     friend class TSharedCacheImpl<TTraits>;
 
-    TSharedCachePageRefImpl(
-        TSharedCacheItemRefImpl<TTraits>&& ref, NActors::TSharedData&& data, NTable::NPage::EPage type) noexcept;
+    explicit TSharedCachePageRefImpl(TSharedCacheItemRefImpl<TTraits>&& ref) noexcept;
+
+    template <class TCallback>
+    decltype(auto) WithHandle(TCallback&& callback) const noexcept;
 
 private:
     TSharedCacheItemRefImpl<TTraits> Ref_;
-    NActors::TSharedData Data_;
-    NTable::NPage::EPage Type_ = NTable::NPage::EPage::Undef;
 };
 
 template <class TTraits = TProdTraits>
@@ -75,17 +80,30 @@ public:
     }
 
     TCollectionCacheItem CacheItem() const noexcept;
-    TCacheCollection& GetCollection() noexcept;
+    TCacheCollection& GetCollection() const noexcept;
+    TSharedCacheCollectionRefImpl Acquire() const& noexcept;
+    bool IsSoleReference() const noexcept;
+
+    TCacheCollection* Get() const noexcept {
+        return Ref_ ? &GetCollection() : nullptr;
+    }
+
+    TCacheCollection* operator->() const noexcept {
+        return &GetCollection();
+    }
+
+    TCacheCollection& operator*() const noexcept {
+        return GetCollection();
+    }
     void Drop() noexcept;
 
 private:
     friend class TSharedCacheImpl<TTraits>;
 
-    TSharedCacheCollectionRefImpl(TSharedCacheItemRefImpl<TTraits>&& ref, TCacheCollection* collection) noexcept;
+    explicit TSharedCacheCollectionRefImpl(TSharedCacheItemRefImpl<TTraits>&& ref) noexcept;
 
 private:
     TSharedCacheItemRefImpl<TTraits> Ref_;
-    TCacheCollection* Collection_ = nullptr;
 };
 
 template <class TTraits = TProdTraits>
@@ -103,6 +121,8 @@ public:
     TPageCacheItem CacheItem() const noexcept;
     NTable::NPage::TPageLocation Location() const noexcept;
     ui64 Size() const noexcept;
+    bool HasActiveWaiters() const noexcept;
+    void ForEachActiveWaiter(TFunctionRef<void(const TPageFetchWaiter&)> visitor) const noexcept;
     bool TryReserveMemory() noexcept;
     bool Dispatch() noexcept;
     bool MakeReady(NActors::TSharedData&& data) noexcept;
@@ -230,6 +250,7 @@ private:
 
 class TSharedCacheTestAccess;
 class TRequestPageWaiter;
+class TCompactedPageWaiter;
 
 template <class TTraits = TProdTraits>
 class TSharedCacheImpl : public TThrRefBase, private TTraits {
@@ -262,7 +283,11 @@ public:
         if (Space_->ThreadHazardBound()) {
             return {};
         }
-        return BindThreadHazard(TTraits::CurrentWorkerIndex());
+        const ui32 worker = TTraits::CurrentWorkerIndex();
+        if (worker != Max<ui32>()) {
+            return BindThreadHazard(worker);
+        }
+        return { const_cast<TSharedCacheImpl*>(this), Space_->BindAnyThreadHazard() };
     }
 
     bool MakeReady(TPageCacheItem page, NActors::TSharedData&& data) noexcept;
@@ -284,11 +309,16 @@ public:
         TCollectionRegistry& source, TCollectionRegistry& destination, TCollectionCacheItem collection) noexcept;
 
     bool SetCollectionPagesCacheMode(TCollectionCacheItem collection, ECacheMode mode) noexcept;
+    bool SetCollectionSkipBTreeIndexV1Shadow(TCollectionCacheItem collection, bool skip) noexcept;
+    bool AcknowledgeCollectionBytes(TCollectionCacheItem collection) noexcept;
 
     ESharedCacheResultStatus Find(
         TCollectionCacheItem collection, ui64 offset, TSharedCachePageRefImpl<TTraits>& page) noexcept;
 
     ESharedCacheResultStatus Find(const TLogoBlobID& id, TSharedCacheCollectionRefImpl<TTraits>& collection) noexcept;
+
+    // The callback may detach the current collection. Registry mutations remain serialized by its owner.
+    void ForEachCollection(TCollectionRegistry& registry, TFunctionRef<void(TCacheCollection&)> callback) noexcept;
 
     bool FindOrInsertBatch(TCollectionCacheItem collection, TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests,
         bool recordStats = true, bool waitForMemory = false) noexcept;
@@ -400,6 +430,14 @@ public:
         return LoadEstimatedBytes(KeepColdBytes_);
     }
 
+    ui64 KeepResidentPageBytes() const noexcept {
+        return KeepResidentPageBytes_.load(std::memory_order_relaxed);
+    }
+
+    ui64 KeepActivePageBytes() const noexcept {
+        return KeepActivePageBytes_.load(std::memory_order_relaxed);
+    }
+
     ui64 CollectionBytes() const noexcept {
         return CollectionBytes_.load(std::memory_order_relaxed);
     }
@@ -501,13 +539,14 @@ public:
 
 private:
     friend class TSharedCacheTestAccess;
+    friend class TCacheCollection;
     friend class TSharedCacheItemRefImpl<TTraits>;
     friend class TSharedCacheTableImpl<TTraits>;
     friend class TSharedCachePageRefImpl<TTraits>;
     friend class TSharedCacheCollectionRefImpl<TTraits>;
     friend class TPageFetchImpl<TTraits>;
     friend class TRequestPageWaiter;
-
+    friend class TCompactedPageWaiter;
     Y_FORCE_INLINE void InvokeHook(ESharedCacheHookPoint point, TCacheItem cacheItem) noexcept {
         TTraits::Invoke(point, cacheItem);
     }
@@ -733,6 +772,8 @@ private:
     bool IsPageSticky(TPageCacheItem page) const noexcept;
     TSharedCachePageRefImpl<TTraits> BuildPageRef(
         const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
+    TSharedCachePageRefImpl<TTraits> AcquireHeldPage(TCacheItem item) noexcept;
+    TSharedCacheCollectionRefImpl<TTraits> AcquireHeldCollection(TCacheItem item) noexcept;
 
     bool AcquirePage(TPageCacheItem page, TSharedCachePageRefImpl<TTraits>& result) noexcept;
 
@@ -770,6 +811,10 @@ private:
     static void AddReference(TCacheCollection& owner) noexcept;
     void DropPageItemRef(TSpaceOperation& spaceOp, THandle& page) noexcept;
     static bool DropReference(TCacheCollection& owner) noexcept;
+    void AddResidentPageBytes(TCacheCollection& owner, NTable::NPage::EPage type, i64 bytes) noexcept;
+    void AddActivePageBytes(TCacheCollection& owner, NTable::NPage::EPage type, i64 bytes) noexcept;
+    void PublishKeepPageBytes(TCacheCollection& owner) noexcept;
+    void SetCollectionSkipBTreeIndexV1Shadow(TCacheCollection& owner, bool skip) noexcept;
     void DropOwnerReference(TSpaceOperation& spaceOp, TCacheCollection& owner) noexcept;
     static ui64 PayloadBytes(const THandle& handle, EItemKind kind) noexcept;
     static ui64 AccountedPageBytes(ui64 size) noexcept;
@@ -874,6 +919,8 @@ private:
     std::atomic<i64> ColdItems_{ 0 }; // All Cold-state items, including held items
     std::atomic<ui64> ColdRingEntries_{ 0 }; // Occupied ring slots, including stale entries until popped
     std::atomic<i64> KeepColdBytes_{ 0 };
+    std::atomic<ui64> KeepResidentPageBytes_{ 0 };
+    std::atomic<ui64> KeepActivePageBytes_{ 0 };
     ui64 ColdByteBudget_ = Max<ui64>(); // Protected by HotResize_; watermark calculation input.
     std::atomic<i64> StickyBytes_{ 0 };
     std::atomic<ui64> HotPages_{ 0 };
@@ -924,7 +971,6 @@ private:
     inline static constexpr TSharedCachePolicy Policy_ = SharedCachePolicyFor<TTraits>;
 };
 
-using TSharedCacheCollectionRef = TSharedCacheCollectionRefImpl<>;
 using TPageFetch = TPageFetchImpl<>;
 using TSharedCachePageRequest = TSharedCachePageRequestImpl<>;
 using TSharedCache = TSharedCacheImpl<>;

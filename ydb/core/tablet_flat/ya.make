@@ -50,8 +50,8 @@ SRCS(
     flat_iterator.h
     flat_load_blob_queue.cpp
     flat_mem_warm.cpp
-    flat_sausagecache.cpp
-    flat_sausagecache.h
+    flat_page_collection.cpp
+    flat_page_collection.h
     flat_sausage_meta.cpp
     flat_part_charge_create.cpp
     flat_part_charge_range.cpp
@@ -84,7 +84,6 @@ SRCS(
     flat_table_committed.h
     flat_update_op.h
     probes.cpp
-    shared_handle.cpp
     shared_cache_counters.cpp
     shared_cache_btree_walk.cpp
     shared_cache_btree_walk.h

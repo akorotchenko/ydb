@@ -1,5 +1,7 @@
 #pragma once
 
+#include "shared_cache.h"
+
 #include "flat_page_base.h"
 #include "flat_page_label.h"
 #include "flat_row_nulls.h"
@@ -219,6 +221,10 @@ namespace NPage {
             Set(raw);
         }
 
+        explicit TDataPage(TSharedCachePageRef&& ref) {
+            Set(std::move(ref));
+        }
+
         NPage::TLabel Label() const noexcept
         {
             return ReadUnaligned<NPage::TLabel>(Decoded.data());
@@ -239,13 +245,23 @@ namespace NPage {
             return BaseRow_;
         }
 
-        TDataPage& Set(const TSharedData *raw = nullptr)
-        {
+        TDataPage& Set(const TSharedData* raw = nullptr) {
+            return Parse(raw ? *raw : TSharedData());
+        }
+
+        TDataPage& Set(TSharedCachePageRef&& ref) {
+            TSharedData raw = ref ? ref.BuildSharedData() : TSharedData();
+            ref.Drop();
+            return Parse(std::move(raw));
+        }
+
+    private:
+        TDataPage& Parse(TSharedData raw) {
             Page = { };
 
             if (raw) {
-                const void* base = raw->data();
-                auto data = NPage::TLabelWrapper().Read(*raw, EPage::DataPage);
+                const void* base = raw.data();
+                auto data = NPage::TLabelWrapper().Read(raw, EPage::DataPage);
 
                 Y_ENSURE(data.Version == 1, "Unknown EPage::DataPage version");
 
@@ -270,7 +286,7 @@ namespace NPage {
                     base = Decoded.begin();
                     data.Page = { Decoded.begin() + labelSize, Decoded.end() };
                 } else {
-                    Decoded = *raw;
+                    Decoded = std::move(raw);
                 }
 
                 auto *recordsHeader = TDeref<TRecordsHeader>::At(data.Page.data(), 0);
@@ -289,6 +305,7 @@ namespace NPage {
             return *this;
         }
 
+    public:
         const TSharedData& GetData() const noexcept {
             return Decoded;
         }

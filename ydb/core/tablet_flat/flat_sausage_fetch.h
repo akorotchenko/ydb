@@ -7,6 +7,7 @@
 #include <ydb/library/actors/util/shared_data.h>
 
 #include <util/generic/xrange.h>
+#include "shared_cache.h"
 
 namespace NKikimr {
 namespace NPageCollection {
@@ -14,19 +15,18 @@ namespace NPageCollection {
     struct TPagesWaitPad : public TThrRefBase {
         ui64 PendingRequests = 0;
         ui64 WorkingSetBytes = 0; // Immutable page budget for retry after releasing this attempt's pins.
-        // Executor writes this flag for non-Sticky pins; the cache never reads the mutable seat.
+        // Set by the executor or fetch completions for non-Sticky pins; stays set for this attempt.
         std::atomic<bool> HasPinnedPages{ false };
         bool PostponedForResources = false; // Cache-actor-owned; closes late requests of the abandoned attempt.
     };
 
-    struct TLoadedPage {
-        TLoadedPage() = default;
+    struct TPageData {
+        TPageData() = default;
 
-        TLoadedPage(TPageLocation location, TSharedData data)
+        TPageData(TPageLocation location, TSharedData data)
             : Location(location)
             , Data(std::move(data))
         {
-
         }
 
         explicit operator bool() const noexcept
@@ -38,7 +38,7 @@ namespace NPageCollection {
         TSharedData Data;
     };
 
-    // Lightweight: offset+data only; Size/Type/Crc32 are authoritative in the cache's PageSet.
+    // Lightweight: offset+data only; Size/Type/Crc32 come from the fetch location.
     struct TLoadedPageData {
         TLoadedPageData() = default;
 

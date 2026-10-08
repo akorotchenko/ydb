@@ -1,39 +1,42 @@
 #pragma once
 
 #include <shared_cache_s3fifo.h>
-#include <shared_page.h>
+#include <flat_page_iface.h>
 
 namespace NKikimr::NSharedCache::NTest {
 
-    struct TPage : public TIntrusiveListItem<TPage> {
-        ui32 Id;
-        size_t Size;
+using ECacheMode = NTable::NPage::ECacheMode;
 
-        TPage(ui32 id, size_t size) 
-            : Id(id), Size(size)
-        {}
-        
-        ui32 GetFrequency() const noexcept {
-            return Frequency.load(std::memory_order_relaxed);
+struct TPage : public TIntrusiveListItem<TPage> {
+    ui32 Id;
+    size_t Size;
+
+    TPage(ui32 id, size_t size)
+        : Id(id)
+        , Size(size)
+    {
+    }
+
+    ui32 GetFrequency() const noexcept {
+        return Frequency.load(std::memory_order_relaxed);
+    }
+
+    void IncrementFrequency() noexcept {
+        ui32 value = Frequency.load(std::memory_order_relaxed);
+        if (value < 3) { // S3FIFO frequency is capped to 3
+            Frequency.compare_exchange_weak(value, value + 1, std::memory_order_acq_rel, std::memory_order_relaxed);
         }
+    }
 
-        void IncrementFrequency() noexcept {
-            ui32 value = Frequency.load(std::memory_order_relaxed);
-            if (value < 3) { // S3FIFO frequency is capped to 3
-                Frequency.compare_exchange_weak(value, value + 1,
-                    std::memory_order_acq_rel, std::memory_order_relaxed);
-            }
-        }
-    
-        void SetFrequency(ui32 frequency) noexcept {
-            Frequency.store(frequency, std::memory_order_release);
-        }
+    void SetFrequency(ui32 frequency) noexcept {
+        Frequency.store(frequency, std::memory_order_release);
+    }
 
-        ECacheMode CacheMode : 2 = ECacheMode::Regular;
+    ECacheMode CacheMode: 2 = ECacheMode::Regular;
 
-        ES3FIFOPageLocation Location : 4 = ES3FIFOPageLocation::None;
-        std::atomic<ui32> Frequency;
-    };
+    ES3FIFOPageLocation Location: 4 = ES3FIFOPageLocation::None;
+    std::atomic<ui32> Frequency;
+};
 
     struct TPageTraits {
         struct TPageKey {

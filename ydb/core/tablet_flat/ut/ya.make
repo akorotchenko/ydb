@@ -32,7 +32,6 @@ SRCS(
     shared_cache_space_ut.cpp
     shared_cache_table_ut.cpp
     shared_cache_tiered_ut.cpp
-    shared_handle_ut.cpp
     ut_btree_index_nodes.cpp
     ut_btree_index_iter_charge.cpp
     ut_self.cpp

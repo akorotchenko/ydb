@@ -1,6 +1,6 @@
 #pragma once
 
-#include "flat_sausagecache.h"
+#include "flat_page_collection.h"
 #include "flat_sausage_packet.h"
 #include "flat_sausage_writer.h"
 #include "flat_sausage_solid.h"
@@ -19,12 +19,11 @@ namespace NWriter {
         using TPageId = NTable::NPage::TPageId;
         using TPageOffset = NTable::NPage::TPageOffset;
         using TPageLocation = NTable::NPage::TPageLocation;
-        using TPageCollection = TPrivatePageCache::TPageCollection;
 
         struct TResult : TMoveOnly {
             TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
-            TVector<NPageCollection::TLoadedPage> RegularPages;
-            TVector<NPageCollection::TLoadedPage> StickyPages;
+            TVector<NPageCollection::TPageData> RegularPages;
+            TVector<NPageCollection::TPageData> StickyPages;
         };
 
         TBlocks(ICone *cone, ui8 channel, ECache cache, ECacheMode cacheMode, ui32 block, bool stickyFlatIndex, bool isOuter = false, bool v2Only = false)

@@ -506,6 +506,7 @@ bool TryCalculateSharedCacheCapacity(
 struct alignas(64) TSpaceHazard {
     std::atomic<ui64> State{ 0 }; // {generation:32, active-count:32}
     std::atomic<ui64> SpareItem{ 0 };
+    std::atomic<bool> Bound{ false }; // One thread owns this slot while its binding exists.
 };
 
 static_assert(sizeof(TSpaceHazard) == 64);
@@ -816,6 +817,7 @@ public:
     bool FinishBucketResize() noexcept;
 
     TSpaceHazardBinding BindThreadHazard(ui32 index) const noexcept;
+    TSpaceHazardBinding BindAnyThreadHazard() const noexcept;
 
     TCacheItem TakeCutSpare(ui64 allocationLimit) noexcept;
 

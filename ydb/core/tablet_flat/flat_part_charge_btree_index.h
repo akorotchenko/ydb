@@ -43,9 +43,9 @@ class TChargeBTreeIndex : public ICharge {
     };
 
     struct TNodeState : TChildState, TBtreeIndexNode {
-        TNodeState(TSharedData data, TChildState child, bool v2Format)
+        TNodeState(TSharedCachePageRef&& data, TChildState child, bool v2Format)
             : TChildState(std::move(child))
-            , TBtreeIndexNode(data, v2Format)
+            , TBtreeIndexNode(std::move(data), v2Format)
         {
         }
     };
@@ -172,9 +172,9 @@ public:
 
             if (hasValidRowsRange && (child.Ref == key1Ref || child.Ref == key2Ref)) {
                 auto location = NTable::ResolvePageLocation(Part, child.Ref, {});
-                const auto page = TryGetDataPage(location, { });
+                auto page = TryGetDataPage(location, {});
                 if (page) {
-                    auto data = NPage::TDataPage(page);
+                    auto data = NPage::TDataPage(std::move(page));
                     if (child.Ref == key1Ref) {
                         TRowId key1RowId = data.BaseRow() + data.LookupKey(key1, Scheme.Groups[0], ESeek::Lower, &keyDefaults).Off();
                         beginRowId = Max(beginRowId, key1RowId);
@@ -342,9 +342,9 @@ public:
 
             if (hasValidRowsRange && (child.Ref == key1Ref || child.Ref == key2Ref)) {
                 auto location = NTable::ResolvePageLocation(Part, child.Ref, {});
-                const auto page = TryGetDataPage(location, { });
+                auto page = TryGetDataPage(location, {});
                 if (page) {
-                    auto data = NPage::TDataPage(page);
+                    auto data = NPage::TDataPage(std::move(page));
                     if (child.Ref == key1Ref) {
                         auto iter = data.LookupKeyReverse(key1, Scheme.Groups[0], ESeek::Lower, &keyDefaults);
                         if (iter) {
@@ -693,9 +693,9 @@ private:
         const auto tryHandleDataPage = [&](const TChildState& child, bool /*isDataBelow*/ = false) -> bool {
             if (Groups && (child.Ref == key1Ref || child.Ref == key2Ref)) {
                 auto location = NTable::ResolvePageLocation(Part, child.Ref, groupId);
-                const auto page = TryGetDataPage(location, groupId);
+                auto page = TryGetDataPage(location, groupId);
                 if (page) {
-                    auto data = NPage::TDataPage(page);
+                    auto data = NPage::TDataPage(std::move(page));
                     if (child.Ref == key1Ref) {
                         TRowId key1RowId = data.BaseRow() + data.LookupKey(key1, scheme, ESeek::Lower, keyDefaults).Off();
                         beginRowId = Max(beginRowId, key1RowId);
@@ -762,7 +762,7 @@ private:
             if (!page) {
                 return result;
             }
-            auto node = TBtreeIndexNode(*page, meta.HasRootV2());
+            auto node = TBtreeIndexNode(std::move(page), meta.HasRootV2());
             auto pos = node.Seek(rowId);
             location = ResolvePageLocation(Part, node.GetChild( pos, isDataPage), isDataPage ? groupId : TGroupId{});
             if (pos) {
@@ -785,7 +785,7 @@ private:
             if (!page) {
                 return result;
             }
-            auto node = TBtreeIndexNode(*page, meta.HasRootV2());
+            auto node = TBtreeIndexNode(std::move(page), meta.HasRootV2());
             auto pos = node.Seek(rowId);
             location = ResolvePageLocation(Part, node.GetChild( pos, isDataPage), isDataPage ? groupId : TGroupId{});
             result = node.GetChildDataSize(pos);
@@ -795,7 +795,7 @@ private:
     }
 
 private:
-    const TSharedData* TryGetDataPage(const NPage::TPageLocation& location, TGroupId groupId) const {
+    TSharedCachePageRef TryGetDataPage(const NPage::TPageLocation& location, TGroupId groupId) const {
         return Env->TryGetPage(Part, location, groupId);
     }
 
@@ -810,7 +810,7 @@ private:
             return false;
         }
 
-        level.emplace_back(*page, child, v2Format);
+        level.emplace_back(std::move(page), child, v2Format);
         return true;
     }
 

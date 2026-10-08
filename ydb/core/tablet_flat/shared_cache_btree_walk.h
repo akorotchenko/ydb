@@ -17,7 +17,9 @@
 
 namespace NKikimr::NSharedCache {
 
-class TCollection;
+class TCacheCollection;
+
+inline constexpr size_t MaxPreloadBatchLocations = 1024;
 
 using TPendingInMemoryPages = THashMap<TLogoBlobID, TSet<NTable::NPage::TPageLocation>>;
 
@@ -63,6 +65,7 @@ struct TWalkRun {
 struct TWalkCollectionState {
     TMap<TActorId, TVector<TEvAttach::TBtreeSeed>> SeedsByOwner;
     TLogoBlobID IndexCollectionId;
+    ui64 IndexOnlySeedCount = 0;
     std::optional<TWalkRun> Run;
     EWalkControllerState ControllerState = EWalkControllerState::Idle;
 };
@@ -71,16 +74,16 @@ class ICacheBTreeWalkHost {
 public:
     virtual ~ICacheBTreeWalkHost() = default;
 
-    virtual TCollection* FindWalkCollection(const TLogoBlobID& id) = 0;
+    virtual TCacheCollection* FindWalkCollection(const TLogoBlobID& id) = 0;
     virtual TPendingInMemoryPages& PendingWalkPages() = 0;
-    virtual NActors::TSharedData FindCoreWalkPage(TCollection& collection, TPageOffset offset) = 0;
+    virtual NActors::TSharedData FindCoreWalkPage(TCacheCollection& collection, TPageOffset offset) = 0;
     // Regular-mode index reads; in-memory index reads go through PendingWalkPages.
-    virtual void FetchWalkIndexLevel(TCollection& collection, TVector<NTable::NPage::TPageLocation>&& locations,
+    virtual void FetchWalkIndexLevel(TCacheCollection& collection, TVector<NTable::NPage::TPageLocation>&& locations,
         const TLogoBlobID& walkCollectionId) = 0;
-    virtual void SendWalkStickyPages(
-        TCollection& collection, const TActorId& owner, const TVector<NTable::NPage::TPageLocation>& locations) = 0;
+    virtual void RequestWalkStickyPages(TCacheCollection& collection, const TActorId& owner,
+        const TVector<NTable::NPage::TPageLocation>& locations) = 0;
     virtual void CancelQueuedWalkRequestsAndPump(const TLogoBlobID& walkCollectionId) = 0;
-    virtual void TryDropExpiredCollection(TCollection& collection) = 0;
+    virtual void TryDropExpiredCollection(TCacheCollection& collection) = 0;
     virtual void ScheduleWalkContinuation() = 0;
 };
 
@@ -91,7 +94,7 @@ public:
     {
     }
 
-    void UpdateSeeds(TCollection& collection, const TActorId& owner, TVector<TEvAttach::TBtreeSeed> seeds,
+    void UpdateSeeds(TCacheCollection& collection, const TActorId& owner, TVector<TEvAttach::TBtreeSeed> seeds,
         bool replayStickyWalk = false);
 
     bool HasActiveWalks() const {
@@ -121,19 +124,19 @@ private:
     };
 
     TWalkCollectionState& State(const TLogoBlobID& collectionId);
-    void UpdateWalkIndex(TCollection& collection);
+    void UpdateWalkIndex(TCacheCollection& collection);
     TVector<TLogoBlobID> GetWalkCollections(const TLogoBlobID& indexCollectionId) const;
-    void StartWalkRun(TCollection& collection);
-    void FinishWalkRun(TCollection& collection);
-    bool FinishWalkRunIfDrained(TCollection& collection);
-    void CancelWalkRun(TCollection& collection);
-    void RestartWalkRun(TCollection& collection);
-    void InvalidateWalkRun(TCollection& collection);
-    bool QueueInMemoryPages(TCollection& collection, TArrayRef<const TPageLocation> locations);
+    void StartWalkRun(TCacheCollection& collection);
+    void FinishWalkRun(TCacheCollection& collection);
+    bool FinishWalkRunIfDrained(TCacheCollection& collection);
+    void CancelWalkRun(TCacheCollection& collection);
+    void RestartWalkRun(TCacheCollection& collection);
+    void InvalidateWalkRun(TCacheCollection& collection);
+    bool QueueInMemoryPages(TCacheCollection& collection, TArrayRef<const TPageLocation> locations);
     void AdvanceWalk(TCacheBTreeWalk& walk, const TLogoBlobID& walkCollectionId);
     void HandOverIndexLevel(TCacheBTreeWalk& walk, TArrayRef<const NTable::NPage::TPageLocation> locations, ui32 level);
-    EBatchResult FlushDataPageBatch(TCacheBTreeWalk& walk, TCollection& dataCollection);
-    bool AddNodeDataPagesToBatch(TCacheBTreeWalk& walk, TCollection& dataCollection);
+    EBatchResult FlushDataPageBatch(TCacheBTreeWalk& walk, TCacheCollection& dataCollection);
+    bool AddNodeDataPagesToBatch(TCacheBTreeWalk& walk, TCacheCollection& dataCollection);
     void AppendPageToNotify(
         TCacheBTreeWalk& walk, const TLogoBlobID& collectionId, const NTable::NPage::TPageLocation& location);
     void FlushPagesToNotify(TCacheBTreeWalk& walk);

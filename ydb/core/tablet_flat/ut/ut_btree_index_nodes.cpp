@@ -157,7 +157,7 @@ namespace {
             intend += " |";
         }
 
-        auto dumpChild = [&] (TBtreeIndexNode node, TRecIdx pos) {
+        auto dumpChild = [&](const TBtreeIndexNode& node, TRecIdx pos) {
             auto ref = node.GetChild(pos, /* isDataPage */ false);
             TChild child{
                 std::holds_alternative<TPageId>(ref) ? std::get<TPageId>(ref) : Max<TPageId>(),
@@ -1652,7 +1652,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexV2Specific) {
         UNIT_ASSERT_C(rootPage, "Failed to load V2 root page");
 
         // V2 format is determined by root metadata — pass v2Format=true
-        TBtreeIndexNode rootNode(*rootPage, /*v2Format=*/true);
+        TBtreeIndexNode rootNode(std::move(rootPage), /*v2Format=*/true);
 
         // All children in the root node must have byte-offset locations
         for (TRecIdx i : xrange(rootNode.GetChildrenCount())) {
@@ -2309,7 +2309,7 @@ Y_UNIT_TEST_SUITE(TBTreePartWalker) {
         const auto& meta = part->IndexPages.BTreeGroups[0];
         UNIT_ASSERT(meta.LevelCount() > 0);
 
-        struct TMockPages : public IPages {
+        struct TMockPages : public NTest::TTestEnv {
             const TPartStore* Part;
             THashSet<ui64>& Loaded;
             TVector<TPageLocation> Missed;
@@ -2323,13 +2323,15 @@ Y_UNIT_TEST_SUITE(TBTreePartWalker) {
             TResult Locate(const TPart*, ui64, ELargeObj) override {
                 Y_TABLET_ERROR("Unused");
             }
-            const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+
+            TSharedCachePageRef TryGetPage(
+                const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 Y_UNUSED(part);
                 if (Loaded.count(location.GetByteOffset())) {
-                    return Part->Store->GetPage(groupId.Index, location.Offset);
+                    return NTest::TTestEnv::TryGetPage(Part, location, groupId);
                 }
                 Missed.push_back(location);
-                return nullptr;
+                return {};
             }
         };
 

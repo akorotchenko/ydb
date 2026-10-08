@@ -35,13 +35,6 @@ namespace NTabletFlatExecutor {
                 allocation.FinalEvents.emplace_back(NMemory::EvConsumerLimit, 1);
                 Env.DispatchEvents(allocation);
             }
-            CoreAttachObserver = Env.AddObserver<NSharedCache::TEvAttached>([this](const auto&) {
-                BindSharedCache();
-            });
-            CoreResultObserver = Env.AddObserver<NSharedCache::TEvResult>([this](const auto&) {
-                BindSharedCache();
-            });
-
             if (false) {
                 Env.SetLogPriority(NKikimrServices::TABLET_EXECUTOR, NActors::NLog::PRI_INFO);
                 Env.SetLogPriority(NKikimrServices::TABLET_OPS_HOST, NActors::NLog::PRI_INFO);
@@ -158,20 +151,6 @@ namespace NTabletFlatExecutor {
         ui64 Tablet = MakeTabletID(false, 1) & 0xFFFF'FFFF;
         const TActorId Edge;
 
-    private:
-        void BindSharedCache() {
-            if (!CacheBinding) {
-                if (auto* core =
-                        static_cast<NSharedCache::TSharedCache*>(Env.GetAppData().SharedCachePages->Cache.Get())) {
-                    CacheBinding.emplace(core->BindCurrentThreadHazard());
-                }
-            }
-        }
-
-        // The fake runtime can destroy delivered page refs after leaving an actor context.
-        std::optional<NSharedCache::TSharedCacheThreadBinding<NSharedCache::TProdTraits>> CacheBinding;
-        NActors::TTestActorRuntimeBase::TEventObserverHolder CoreAttachObserver;
-        NActors::TTestActorRuntimeBase::TEventObserverHolder CoreResultObserver;
     };
 
 } // namespace NTabletFlatExecutor

@@ -3,7 +3,7 @@
 #include "flat_part_iface.h"
 #include "flat_sausage_fetch.h"
 #include "flat_fwd_misc.h"
-#include "shared_handle.h"
+#include "shared_cache.h"
 #include "util_fmt_abort.h"
 
 namespace NKikimr {
@@ -36,13 +36,9 @@ namespace NFwd {
         {
         }
 
-        ~TPage()
-        {
-        }
-
         explicit operator bool() const
         {
-            return bool(Data) && bool(Offset);
+            return bool(SharedPageRef) && bool(Offset);
         }
 
         bool Ready() const noexcept
@@ -55,34 +51,28 @@ namespace NFwd {
             return Offset < offset;
         }
 
-        const TSharedData* Plain() const noexcept
-        {
-            return Data ? &Data : nullptr;
-        }
-
-        ui32 Settle(NPageCollection::TLoadedPage &page, NSharedCache::TSharedPageRef ref)
+        ui32 Settle(TSharedCachePageRef&& page)
         {
             const auto was = std::exchange(Fetch, EFetch::Done);
 
-            if (Offset != page.Location.Offset) {
+            if (Offset != page.GetOffset()) {
                 Y_TABLET_ERROR("Settling page with different reference offset");
-            } else if (Size != page.Data.size()) {
+            } else if (Size != page.size()) {
                 Y_TABLET_ERROR("Requested and obtained page sizes are not the same");
             } else if (was == EFetch::Drop) {
-                std::exchange(page.Data, { });
+                page.Drop();
             } else if (was != EFetch::Wait) {
                 Y_TABLET_ERROR("Settling page that is not waiting for any data");
             } else {
-                Data = std::move(page.Data);
-                SharedPageRef = ref;
+                SharedPageRef = std::move(page);
             }
 
-            return Data.size();
+            return SharedPageRef.size();
         }
 
-        const TSharedData* Touch(TPageOffset offset, TStat &stat)
+        const TSharedCachePageRef* Touch(TPageOffset offset, TStat& stat)
         {
-            if (Offset != offset || (!Data && Fetch == EFetch::Done)) {
+            if (Offset != offset || (!SharedPageRef && Fetch == EFetch::Done)) {
                 Y_TABLET_ERROR("Touching page that doesn't fit to this action");
             } else {
                 auto to = Fetch == EFetch::None ? EUsage::Seen : EUsage::Keep;
@@ -91,21 +81,20 @@ namespace NFwd {
                     stat.Usage += Size;
             }
 
-            return Plain();
+            return SharedPageRef ? &SharedPageRef : nullptr;
         }
 
-        TSharedData Release()
+        ui64 Release()
         {
             Fetch = Max(Fetch, EFetch::Drop);
-
+            const ui64 bytes = SharedPageRef.size();
             SharedPageRef.Drop();
-
-            return std::exchange(Data, { });
+            return bytes;
         }
 
         bool Released() const noexcept
         {
-            return !Data && !SharedPageRef;
+            return !SharedPageRef;
         }
 
         const ui64 Size = 0;
@@ -115,8 +104,7 @@ namespace NFwd {
         const ui16 Tag  = Max<ui16>();
         EUsage Usage    = EUsage::None;
         EFetch Fetch    = EFetch::None;
-        TSharedData Data;
-        NSharedCache::TSharedPageRef SharedPageRef;
+        TSharedCachePageRef SharedPageRef;
     };
 
 }

@@ -375,7 +375,6 @@ namespace NOps {
             hFunc(TEvPrivate::TEvPartLoaded, Handle);
             hFunc(TEvPrivate::TEvPartFailed, Handle);
             hFunc(NSharedCache::TEvResult, Handle);
-            IgnoreFunc(NSharedCache::TEvUpdated);
             cFunc(TEvents::TEvUndelivered::EventType, HandleUndelivered);
             cFunc(TEvents::TEvPoison::EventType, HandlePoison);
         });

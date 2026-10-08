@@ -1,5 +1,6 @@
 #include "tabletdb.h"
 
+#include <ydb/core/base/appdata.h>
 #include <ydb/core/tablet_flat/flat_boot_cookie.h>
 #include <ydb/core/tablet_flat/flat_boot_switch.h>
 #include <ydb/core/tablet_flat/flat_database.h>
@@ -16,27 +17,30 @@
 
 #include <library/cpp/blockcodecs/codecs.h>
 
+#include <ydb/library/actors/core/actorsystem.h>
+#include <ydb/library/actors/core/executor_thread.h>
+
 namespace NKikimr::NPDiskTool {
 
 namespace {
 
-using namespace NKikimr::NTabletFlatExecutor;
+    using namespace NActors;
+    using namespace NKikimr::NTabletFlatExecutor;
 
-using NBoot::TCookie;
-using NBoot::TSwitch;
-using EIdx = TCookie::EIdx;
-using TPrivateCollection = TPrivatePageCache::TPageCollection;
+    using NBoot::TCookie;
+    using NBoot::TSwitch;
+    using EIdx = TCookie::EIdx;
 
-// One page of a part, and one commit body, always stay well below this; a larger length has been read
-// off a damaged blob and must not become an allocation.
-constexpr ui64 MaxBody = NTable::MaxDecompressedBlobSize;
+    // One page of a part, and one commit body, always stay well below this; a larger length has been read
+    // off a damaged blob and must not become an allocation.
+    constexpr ui64 MaxBody = NTable::MaxDecompressedBlobSize;
 
-// A commit body, either external or embedded, in log order.
-struct TCommit {
-    NTable::TTxStamp Stamp = 0;
-    NPageCollection::TLargeGlobId LargeGlobId;
-    TString Body;
-};
+    // A commit body, either external or embedded, in log order.
+    struct TCommit {
+        NTable::TTxStamp Stamp = 0;
+        NPageCollection::TLargeGlobId LargeGlobId;
+        TString Body;
+    };
 
 // A scheme change log body, resolved lazily.
 struct TMeta {
@@ -71,6 +75,46 @@ bool PlausibleMeta(TStringBuf raw) {
     return index[header->Pages - 1].Inplace <= raw.size() - tables;
 }
 
+// The offline application uses normal AppData owner resolution without starting actor workers.
+class TApplicationContext {
+public:
+    TApplicationContext()
+        : AppData_(0, 0, 0, 0, {}, nullptr, nullptr, nullptr, nullptr)
+    {
+        THolder<TActorSystemSetup> setup = MakeHolder<TActorSystemSetup>();
+        System_ = MakeHolder<TActorSystem>(setup, &AppData_);
+        Thread_ = MakeHolder<TExecutorThread>(0, System_.Get(), nullptr, "pdisktool");
+        Context_ = MakeHolder<TActorContext>(Mailbox_, *Thread_, GetCycleCountFast(), TActorId{});
+        Previous_ = TlsActivationContext;
+        TlsActivationContext = Context_.Get();
+
+        try {
+            NSharedCache::TSharedCacheCapacity capacity;
+            constexpr ui32 hazards = NActors::MaxWorkers;
+            Y_ENSURE(NSharedCache::TryCalculateSharedCacheCapacity(
+                128_MB, NSharedCache::TSharedCache::ExpectedPageSize, 0, hazards, capacity));
+            auto core = NSharedCache::TSharedCache::Create(
+                NSharedCache::TSharedCacheSpace::Create(capacity, capacity, hazards), capacity.Limit);
+            Y_ENSURE(core);
+        } catch (...) {
+            TlsActivationContext = Previous_;
+            throw;
+        }
+    }
+
+    ~TApplicationContext() {
+        TlsActivationContext = Previous_;
+    }
+
+private:
+    TAppData AppData_;
+    THolder<TActorSystem> System_;
+    TMailbox Mailbox_;
+    THolder<TExecutorThread> Thread_;
+    THolder<TActorContext> Context_;
+    TActivationContext* Previous_ = nullptr;
+};
+
 // Pages read straight out of the blob store. This backs both NTable::TLoader while the parts are being
 // built and the iterators while the tables are being dumped, so what has been read is kept: a page is
 // touched again and again during a scan, and IPages hands out plain pointers that have to stay valid.
@@ -81,6 +125,27 @@ public:
         , Stats(stats)
         , Repeated(repeated)
     {}
+
+    ~TOfflinePages() override {
+        auto& pages = TSharedCachePages::Get();
+        auto* core = static_cast<NSharedCache::TSharedCache*>(pages.Cache.Get());
+        auto binding = core->BindCurrentThreadHazard();
+        for (auto& [_, entry] : Cache) {
+            entry.Pages.clear();
+            if (entry.Collection) {
+                core->DetachCollection(*pages.Registry, entry.Collection.CacheItem());
+            }
+        }
+    }
+
+    TSharedCacheCollectionRef AdmitCollection(NPageCollection::TLargeGlobId id, TSharedData meta) {
+        auto& entry = Cache[id.Lead];
+        if (!entry.Collection) {
+            entry.Collection = TSharedCachePages::Get().AdmitCollection(
+                MakeIntrusiveConst<NPageCollection::TPageCollection>(std::move(id), std::move(meta)));
+        }
+        return entry.Collection.Acquire();
+    }
 
     TResult Locate(const NTable::TMemTable* memTable, ui64 ref, ui32 tag) override {
         try {
@@ -113,48 +178,61 @@ public:
             return {true, nullptr};
         }
         auto* collection = partStore->Locate(lob, ref);
-        if (!collection || !collection->PageCollection) {
+        if (!collection || !collection->PageCollection()) {
             return {true, nullptr};
         }
         // Extern and outer pages are addressed by page index: those collections have no byte offsets
         // to be addressed by, so the reference is turned into a location by the collection itself.
-        return {true, GetPage(collection, collection->PageCollection->GetLocation(ref))};
+        return { true, GetPage(collection, collection->PageCollection()->GetLocation(ref)) };
     }
 
-    const TSharedData* TryGetPage(const NTable::TPart* part, const TPageLocation& location,
-            TGroupId groupId) override
-    {
+    TSharedCachePageRef TryGetPage(
+        const NTable::TPart* part, const TPageLocation& location, TGroupId groupId) override {
         const auto* partStore = dynamic_cast<const NTable::TPartStore*>(part);
         if (!partStore || groupId.Index >= partStore->PageCollections.size()) {
-            return nullptr;
+            return {};
         }
         return GetPage(partStore->PageCollections[groupId.Index].Get(), location);
     }
 
-    const TSharedData* GetPage(const TPrivateCollection* collection, const TPageLocation& location) {
-        if (!collection || !collection->PageCollection) {
-            return nullptr;
+    TSharedCachePageRef GetPage(const TCacheCollection* collection, const TPageLocation& location) {
+        if (!collection || !collection->PageCollection()) {
+            return {};
         }
-        return GetPage(collection->Id, *collection->PageCollection, location);
+        return GetPage(collection->Id(), collection->PageCollection(), location);
     }
 
-    const TSharedData* GetPage(const TLogoBlobID& label,
-            const NPageCollection::IPageCollection& pageCollection, const TPageLocation& location)
+    TSharedCachePageRef GetPage(const TLogoBlobID& label,
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, const TPageLocation& location)
     {
-        auto& perCollection = Cache[label];
-        if (const auto it = perCollection.find(location.Offset); it != perCollection.end()) {
-            return it->second ? &it->second : nullptr;
+        auto& slot = Cache[label].Pages[location.Offset];
+        if (slot.Ref) {
+            return slot.Ref.Acquire();
+        }
+        if (slot.Failed) {
+            return {};
         }
 
-        TSharedData page;
-        const bool ok = Read(pageCollection, label, location, page);
-        auto& slot = perCollection[location.Offset];
-        if (!ok) {
-            return nullptr; // the empty slot remembers that this page is not coming
+        auto& pages = TSharedCachePages::Get();
+        auto* core = static_cast<NSharedCache::TSharedCache*>(pages.Cache.Get());
+        auto binding = core->BindCurrentThreadHazard();
+        NSharedCache::TSharedCacheCollectionRef collection;
+        if (core->Find(label, collection) == NSharedCache::ESharedCacheResultStatus::Hit &&
+            core->Find(collection.CacheItem(), static_cast<ui64>(location.Offset), slot.Ref) ==
+                NSharedCache::ESharedCacheResultStatus::Hit) {
+            return slot.Ref.Acquire();
         }
-        slot = std::move(page);
+
+        TSharedData data;
+        if (!Read(*pageCollection, label, location, data)) {
+            slot.Failed = true;
+            return {};
+        }
+        slot.Ref = pages.AdmitPage(std::move(pageCollection), location, std::move(data),
+            NTable::TLoader::NeedIn(location.Type) || location.Type == EPage::FlatIndex);
+        Y_ENSURE(slot.Ref, "Cannot admit offline page " << location.Offset);
         ++Stats.PagesRead;
-        return &slot;
+        return slot.Ref.Acquire();
     }
 
 private:
@@ -232,7 +310,17 @@ private:
     TTabletBootStats& Stats;
     TRepeatedIssues& Repeated;
     // Node based, so the pointers handed out through IPages survive later insertions.
-    THashMap<TLogoBlobID, THashMap<TPageOffset, TSharedData>> Cache;
+    struct TPageEntry {
+        TSharedCachePageRef Ref;
+        bool Failed = false;
+    };
+
+    struct TCollectionEntry {
+        TSharedCacheCollectionRef Collection;
+        THashMap<TPageOffset, TPageEntry> Pages;
+    };
+
+    THashMap<TLogoBlobID, TCollectionEntry> Cache;
 };
 
 } // namespace
@@ -282,6 +370,8 @@ private:
     // always are. A length read off a damaged blob is refused before it becomes an allocation.
     bool Decode(bool packed, const TString& in, TString& out, const TString& what);
 
+    // Created first and destroyed last, after every database/environment native ref is released.
+    TApplicationContext ApplicationContext;
     TBlobStore& Store;
     const ui64 TabletId;
     TIssueLog& Issues;
@@ -730,7 +820,7 @@ void TTabletBoot::TImpl::FoldSwitches() {
 }
 
 bool TTabletBoot::TImpl::LoadBundle(ui32 table, TSwitch::TBundle& bundle) {
-    TVector<TIntrusivePtr<TPrivateCollection>> collections;
+    TVector<TSharedCacheCollectionRef> collections;
     for (auto& largeGlobId : bundle.LargeGlobIds) {
         if (largeGlobId.Group == NPageCollection::TLargeGlobId::InvalidGroup) {
             // Storage groups mean nothing without BlobStorage, but a page collection refuses to be
@@ -748,8 +838,7 @@ bool TTabletBoot::TImpl::LoadBundle(ui32 table, TSwitch::TBundle& bundle) {
                 largeGlobId.Lead.ToString());
             return false;
         }
-        collections.emplace_back(new TPrivateCollection(new NPageCollection::TPageCollection(
-            largeGlobId, TSharedData::Copy(meta.data(), meta.size()))));
+        collections.emplace_back(Env.AdmitCollection(largeGlobId, TSharedData::Copy(meta.data(), meta.size())));
     }
     if (collections.empty()) {
         return false;
@@ -776,15 +865,13 @@ bool TTabletBoot::TImpl::LoadBundle(ui32 table, TSwitch::TBundle& bundle) {
         TVector<NSharedCache::TEvResult::TLoaded> loaded;
         loaded.reserve(fetch.Pages.size());
         for (const auto& location : fetch.Pages) {
-            const TSharedData* page = Env.GetPage(fetch.PageCollection->Label(), *fetch.PageCollection,
-                location);
+            auto page = Env.GetPage(fetch.PageCollection->Label(), fetch.PageCollection, location);
             if (!page) {
                 Repeated.Add("A part cannot be read far enough to be usable, so it is dropped whole",
                     bundle.LargeGlobIds[0].Lead.ToString());
                 return false;
             }
-            loaded.emplace_back(location.Offset, location.Size,
-                NSharedCache::TSharedPageRef::MakePrivate(*page));
+            loaded.emplace_back(location.Offset, location.Size, std::move(page));
         }
         loader.Save(std::move(loaded));
     }
@@ -907,7 +994,7 @@ void TTabletBoot::TImpl::LoadAnnex() {
             if (!size) {
                 continue;
             }
-            TVector<NPageCollection::TLoadedPage> pages(size);
+            TVector<TSharedData> pages(size);
             ui32 page = 0;
             bool complete = true;
             for (auto blob = blobs->Iterator(); blob.IsValid(); blob.Next()) {
@@ -923,9 +1010,7 @@ void TTabletBoot::TImpl::LoadAnnex() {
                     complete = false;
                     break;
                 }
-                pages[page].Data = TSharedData::Copy(body->data(), body->size());
-                // Annex pages are addressed by page index: the memtable looks the blob up by it.
-                pages[page].Location = TPageLocation::FromPageIndex(page, pages[page].Data.size());
+                pages[page] = TSharedData::Copy(body->data(), body->size());
                 ++page;
                 ++Stats_.AnnexBlobs;
             }

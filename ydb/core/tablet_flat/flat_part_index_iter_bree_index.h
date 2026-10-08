@@ -361,7 +361,7 @@ private:
 
         auto page = Env->TryGetPage(Part, state.Location, {});
         if (page) {
-            state.Node.emplace(*page, Meta.HasRootV2());
+            state.Node.emplace(std::move(page), Meta.HasRootV2());
             return true;
         }
         return false;

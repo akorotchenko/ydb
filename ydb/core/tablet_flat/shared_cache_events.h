@@ -2,9 +2,8 @@
 
 #include "defs.h"
 #include "flat_bio_events.h"
-#include "shared_handle.h"
+#include "shared_cache.h"
 #include "shared_cache_item.h"
-#include "shared_page.h"
 #include <ydb/core/protos/shared_cache.pb.h>
 
 #include <util/system/mutex.h>
@@ -14,8 +13,12 @@
 #include <util/generic/hash_set.h>
 
 namespace NKikimr::NSharedCache {
+class TSharedCachePages;
 using EPriority = NTabletFlatExecutor::NBlockIO::EPriority;
 using TPageId = NTable::NPage::TPageId;
+using TPageOffset = NTable::NPage::TPageOffset;
+using TPageLocation = NTable::NPage::TPageLocation;
+using EPage = NTable::NPage::EPage;
 
 enum class EWakeupTag {
     DoGCScheduled = 1,
@@ -36,12 +39,12 @@ enum EEv {
     EvSaveCompactedPages,
     EvRequest,
     EvResult,
-    EvUpdated,
     EvInFlightReleased,
     EvRequestAnswered,
-    EvStickyCollectionPages,
     EvKeepPageEvicted,
     EvResourcesAvailable,
+    EvCollectionReleased,
+    EvCollectionBytesChanged,
 
     EvEnd
 
@@ -109,10 +112,13 @@ enum EEv {
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
         TIntrusivePtr<TCollectionRegistry> Registry;
         ECacheMode CacheMode;
+        TIntrusivePtr<TCollectionOwnerStats> OwnerStats;
         // Authoritative for the sender: an empty vector withdraws that owner's walks.
         TVector<TBtreeSeed> BtreeSeeds;
         // Revisit unchanged sticky seeds after the owner's private cache is recreated.
         bool ReplayStickyWalk = false;
+
+        // A nonzero event cookie requests TEvAttached; ordinary executor registration needs no reply.
 
         // The cache walks the seeded B-trees itself.
         TEvAttach(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, ECacheMode cacheMode,
@@ -150,7 +156,10 @@ enum EEv {
     // and it will send TEvAttach itself when it have happened
     struct TEvSaveCompactedPages : public TEventLocal<TEvSaveCompactedPages, EvSaveCompactedPages> {
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
-        TVector<TIntrusivePtr<TPage>> Pages;
+        TVector<TPageLocation> Pages;
+        TCollectionCacheItem CacheItem;
+
+        TSharedCachePageRef AddPage(TSharedCachePages& cachePages, NPageCollection::TPageData&& page, bool sticky);
 
         TEvSaveCompactedPages(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection)
             : PageCollection(std::move(pageCollection))
@@ -204,15 +213,16 @@ enum EEv {
         }
 
         struct TLoaded {
-            TLoaded(NTable::NPage::TPageOffset offset, size_t size, TSharedPageRef page)
+            TLoaded(NTable::NPage::TPageOffset offset, size_t size, TSharedCachePageRef page)
                 : Offset(offset)
                 , Size(size)
                 , Page(std::move(page))
-            { }
+            {
+            }
 
             NTable::NPage::TPageOffset Offset;
             size_t Size;
-            TSharedPageRef Page;
+            TSharedCachePageRef Page;
         };
 
         bool ResourcePressure = false;
@@ -246,11 +256,14 @@ enum EEv {
     public:
         explicit TRequestCompletion(TRequestCompletionParams&& params) noexcept;
 
-        void Complete(ui32 index, TSharedPageRef page, EPageFetchCompletion completion) noexcept;
+        void Complete(ui32 index, TSharedCachePageRef page, EPageFetchCompletion completion) noexcept;
         void Cancel(bool replyImmediately = false) noexcept;
         void PostponeForResources() noexcept;
         void NotifyResourcesReady() noexcept;
-        bool HasReadyPages() const noexcept;
+
+        bool IsCancelled() const noexcept {
+            return Status_.load(std::memory_order_acquire) == NKikimrProto::RACE;
+        }
 
         const TIntrusivePtr<NPageCollection::TPagesWaitPad>& WaitPad() const noexcept {
             return WaitPad_;
@@ -271,7 +284,7 @@ enum EEv {
         const ui64 RequestId_;
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
         TVector<TPageLocation> Locations_;
-        TVector<TSharedPageRef> Pages_;
+        TVector<TSharedCachePageRef> Pages_;
         TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad_;
         const ui64 Cookie_;
         const NActors::TActorId Notify_;
@@ -295,6 +308,29 @@ enum EEv {
 
         const ui64 Status;
         const ui64 CompletionId;
+    };
+
+    struct TEvCollectionBytesChanged : public TEventLocal<TEvCollectionBytesChanged, EvCollectionBytesChanged> {
+        TLogoBlobID CollectionId;
+        TCollectionCacheItem CacheItem;
+
+        TEvCollectionBytesChanged(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem)
+            : CollectionId(collectionId)
+            , CacheItem(cacheItem)
+        {
+        }
+    };
+
+    // Page items drained, or the collection metadata was reclaimed; recheck this generation.
+    struct TEvCollectionReleased : public TEventLocal<TEvCollectionReleased, EvCollectionReleased> {
+        TLogoBlobID CollectionId;
+        TCollectionCacheItem CacheItem;
+
+        TEvCollectionReleased(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem)
+            : CollectionId(collectionId)
+            , CacheItem(cacheItem)
+        {
+        }
     };
 
     struct TEvKeepPageEvicted : public TEventLocal<TEvKeepPageEvicted, EvKeepPageEvicted> {
@@ -329,6 +365,12 @@ enum EEv {
     public:
         TRequestPageWaiter(TIntrusivePtr<TRequestCompletion> completion, ui32 index) noexcept;
 
+        bool IsActive() const noexcept override;
+
+        const TRequestCompletion& GetCompletion() const noexcept {
+            return *Completion_;
+        }
+
         void Complete(TPageCacheItem page, EPageFetchCompletion completion) noexcept override;
 
     private:
@@ -336,22 +378,6 @@ enum EEv {
         const ui32 Index_;
     };
 
-    struct TEvUpdated : public TEventLocal<TEvUpdated, EvUpdated> {
-        THashMap<TLogoBlobID, THashSet<TPageOffset>> DroppedPages;
-    };
-
-    // The pages of a sticky collection, for the owner to fetch and keep.
-    struct TEvStickyCollectionPages : public TEventLocal<TEvStickyCollectionPages, EvStickyCollectionPages> {
-        static constexpr size_t MaxBatchLocations = 1024;
-
-        TEvStickyCollectionPages(TLogoBlobID collectionId, TVector<TPageLocation> locations)
-            : CollectionId(std::move(collectionId))
-            , Locations(std::move(locations))
-        {}
-
-        const TLogoBlobID CollectionId;
-        TVector<TPageLocation> Locations;
-    };
     } // namespace NKikimr::NSharedCache
 
 template<> inline

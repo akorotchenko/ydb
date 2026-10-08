@@ -12,9 +12,6 @@ namespace NTable {
         NPageCollection::TLargeGlobId LargeGlobId;
         // raw serialized meta blob (parsed by StageParseMeta)
         TSharedData RawMeta;
-        // Optional pre-populated pages (compaction path only)
-        TVector<NPageCollection::TLoadedPage> RegularPages;
-        TVector<NPageCollection::TLoadedPage> StickyPages;
     };
 
     struct TPartComponents {
