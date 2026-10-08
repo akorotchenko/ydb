@@ -2,7 +2,7 @@
 
 #include "defs.h"
 #include "tablet_flat_executor.h"
-#include "flat_page_collection.h"
+#include "flat_sausagecache.h"
 
 #include <util/generic/hash_set.h>
 #include <util/generic/intrlist.h>

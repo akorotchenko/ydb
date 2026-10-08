@@ -364,7 +364,7 @@ private:
     bool SchemaReady = false;
 };
 
-void RunTest(IActor* test, ui64 sharedCacheLimit = 8_MB, ui64 sharedCacheSoftLimit = Max<ui64>())
+void RunTest(IActor *test, ui64 sharedCacheLimit = 8_MB, ui64 sharedCacheSoftLimit = Max<ui64>())
 {
     NFake::TRunner env(sharedCacheLimit);
     if (sharedCacheSoftLimit != Max<ui64>()) {

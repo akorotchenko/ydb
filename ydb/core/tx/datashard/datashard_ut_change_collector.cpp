@@ -762,8 +762,8 @@ Y_UNIT_TEST_SUITE(CdcStreamChangeCollector) {
 
     template <typename SK = ui32>
     void Run(const NSharedCache::TSharedCacheConfig& sharedCacheConfig, const TString& path,
-        const TShardedTableOptions& opts, TIntrusivePtr<NACLib::TUserContext> userCtx,
-        const TVector<TCdcStream>& streams, const TVector<TString>& queries, const TStructRecords<SK>& expectedRecords,
+            const TShardedTableOptions& opts, TIntrusivePtr<NACLib::TUserContext> userCtx, const TVector<TCdcStream>& streams,
+            const TVector<TString>& queries, const TStructRecords<SK>& expectedRecords,
         bool disableCacheRetention = false)
     {
         const auto pathParts = SplitPath(path);
@@ -877,12 +877,11 @@ Y_UNIT_TEST_SUITE(CdcStreamChangeCollector) {
 
     template <typename SK = ui32>
     void Run(const NSharedCache::TSharedCacheConfig& sharedCacheConfig, const TString& path,
-        const TShardedTableOptions& opts, const TVector<TCdcStream>& streams, const TVector<TString>& queries,
-        const TStructRecords<SK>& expectedRecords, bool disableCacheRetention = false)
+            const TShardedTableOptions& opts,
+            const TVector<TCdcStream>& streams,
+            const TVector<TString>& queries, const TStructRecords<SK>& expectedRecords, bool disableCacheRetention = false)
     {
-        Run(sharedCacheConfig, path, opts,
-            NACLib::TUserContextBuilder().WithUserSID(BUILTIN_ACL_CDC_WITHOUT_USER_SID).Build(), streams, queries,
-                expectedRecords, disableCacheRetention);
+        Run(sharedCacheConfig, path, opts, NACLib::TUserContextBuilder().WithUserSID(BUILTIN_ACL_CDC_WITHOUT_USER_SID).Build(), streams, queries, expectedRecords, disableCacheRetention);
     }
 
     const NSharedCache::TSharedCacheConfig DefaultCacheParams() {
@@ -1136,14 +1135,14 @@ Y_UNIT_TEST_SUITE(CdcStreamChangeCollector) {
         expectedRecords.push_back(TStructRecord(NTable::ERowOp::Upsert, {{"key", 1}}, {}, {{"value", 1}}, {{"value", 10}}));
         expectedRecords.push_back(TStructRecord(NTable::ERowOp::Upsert, {{"key", 1000}}, {}, {{"value", 1000}}, {{"value", 10000}}));
 
-        Run(DefaultCacheParams(), "/Root/path", TinyCacheTable(), TVector<TCdcStream>{ NewAndOldImages() },
-            TVector<TString>{
-                bigUpsert, "COMPACT TABLE `/Root/path`;", "SELECT * FROM `/Root/path` WHERE key = 1;",
-                "UPSERT INTO `/Root/path` (key, value) VALUES (1, 10), (1000, 10000);",
-            },
-            {
-                { "new_and_old_images", expectedRecords },
-            }, true);
+        Run(DefaultCacheParams(), "/Root/path", TinyCacheTable(), TVector<TCdcStream>{NewAndOldImages()}, TVector<TString>{
+            bigUpsert,
+            "COMPACT TABLE `/Root/path`;",
+            "SELECT * FROM `/Root/path` WHERE key = 1;",
+            "UPSERT INTO `/Root/path` (key, value) VALUES (1, 10), (1000, 10000);",
+        }, {
+            {"new_and_old_images", expectedRecords},
+        }, true);
     }
 
     Y_UNIT_TEST(NewImage) {

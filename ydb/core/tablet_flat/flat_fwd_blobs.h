@@ -61,7 +61,8 @@ namespace NFwd {
             Preload(head, upper);
         }
 
-        void Fill(TSharedCachePageRef&& page, EPage) override {
+        void Fill(TSharedCachePageRef&& page, EPage) override
+        {
             const auto location = page.GetLocation();
             const ui64 loadedSize = location.Size;
             if (!Pages || location.Offset < Pages.front().Offset) {

@@ -27,6 +27,7 @@ namespace NPageCollection {
             : Location(location)
             , Data(std::move(data))
         {
+
         }
 
         explicit operator bool() const noexcept

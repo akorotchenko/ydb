@@ -417,11 +417,9 @@ namespace NTest {
 
     public:
         TStorePageCollection(TIntrusiveConstPtr<TStore> store, ui32 room)
-            : Store(std::move(store))
-            , Room(room)
+            : Store(std::move(store)), Room(room)
             , Id(reinterpret_cast<ui64>(Store.Get()), 0, 0, 0, 0, room)
-        {
-        }
+        {}
 
         const TLogoBlobID& Label() const noexcept override {
             return Id;
@@ -432,7 +430,7 @@ namespace NTest {
         }
 
         NPageCollection::TInfo Page(ui32 page) const override {
-            return { Store->GetPageSize(Room, page), static_cast<ui32>(Store->GetPageType(Room, page)) };
+            return {Store->GetPageSize(Room, page), static_cast<ui32>(Store->GetPageType(Room, page)) };
         }
 
         NPageCollection::TBorder Bounds(ui32 page) const override {

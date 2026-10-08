@@ -846,12 +846,11 @@ namespace NTabletFlatExecutor {
                 TVector<TSharedCacheCollectionRef> resultingPageCollections;
                 for (auto& pageCollection : result.PageCollections) {
                     auto resultingPageCollection = SharedCachePages->AdmitCollection(pageCollection.PageCollection);
-                    auto saveCompactedPages =
-                        MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);
-                    for (auto& page : pageCollection.StickyPages) {
+                    auto saveCompactedPages = MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);
+                    for (auto &page : pageCollection.StickyPages) {
                         saveCompactedPages->AddPage(*SharedCachePages, std::move(page), true);
                     }
-                    for (auto& page : pageCollection.RegularPages) {
+                    for (auto &page : pageCollection.RegularPages) {
                         saveCompactedPages->AddPage(*SharedCachePages, std::move(page), false);
                     }
 

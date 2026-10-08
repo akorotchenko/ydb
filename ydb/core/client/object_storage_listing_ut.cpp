@@ -900,8 +900,7 @@ Y_UNIT_TEST_SUITE(TObjectStorageListingTest) {
         cleverServer.EnableGRpc(GRPC_PORT);
 
         // Disable shared-cache retention to trigger restarts, while keeping demand capacity.
-        cleverServer.GetRuntime()->Send(
-            NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 32_MB));
+        cleverServer.GetRuntime()->Send(NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 32_MB));
 
         TFlatMsgBusClient annoyingClient(port);
 
@@ -970,8 +969,7 @@ Y_UNIT_TEST_SUITE(TObjectStorageListingTest) {
         cleverServer.EnableGRpc(GRPC_PORT);
 
         // Disable shared-cache retention to trigger restarts, while keeping demand capacity.
-        cleverServer.GetRuntime()->Send(
-            NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 32_MB));
+        cleverServer.GetRuntime()->Send(NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 32_MB));
 
         TFlatMsgBusClient annoyingClient(port);
         PrepareS3Data(cleverServer.GetRuntime(), annoyingClient);

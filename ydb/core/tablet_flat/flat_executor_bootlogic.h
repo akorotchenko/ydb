@@ -37,7 +37,6 @@ namespace NBoot {
         TAutoPtr<TCompactionLogicState> Comp;
         TAutoPtr<TExecutorBorrowLogic> Loans;
         THashMap<ui32, NTable::TRowVersionRanges> RemovedRowVersions;
-
         bool ShouldSnapshotScheme = false;
     };
 }

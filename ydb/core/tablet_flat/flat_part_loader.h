@@ -2,7 +2,7 @@
 #include "defs.h"
 #include "flat_part_store.h"
 #include "flat_part_walker.h"
-#include "flat_page_collection.h"
+#include "flat_sausagecache.h"
 #include "shared_cache_events.h"
 #include "shared_cache_pages.h"
 #include "util_fmt_abort.h"
@@ -25,7 +25,6 @@ namespace NTable {
             PreloadData,
             Result,
         };
-
 
         struct TFetch : TMoveOnly {
             TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
@@ -59,8 +58,8 @@ namespace NTable {
                 Part = part;
             }
 
-            TSharedCachePageRef TryGetPage(
-                const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+            TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
+            {
                 Y_ENSURE(part == Part, "Unsupported part");
                 Y_ENSURE(groupId.Index == 0, "Unsupported column group");
 
@@ -99,8 +98,11 @@ namespace NTable {
                     for (const auto& page : pages) {
                         sticky.push_back(NeedIn(page.Type) || page.Type == EPage::FlatIndex);
                     }
-                    return { .PageCollection = PageCollection->PageCollection(), .Pages = std::move(pages),
-                        .Sticky = std::move(sticky) };
+                    return {
+                        .PageCollection = PageCollection->PageCollection(),
+                        .Pages = std::move(pages),
+                        .Sticky = std::move(sticky)
+                    };
                 } else {
                     return {};
                 }

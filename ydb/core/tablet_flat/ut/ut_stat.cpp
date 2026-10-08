@@ -20,7 +20,8 @@ namespace {
     using namespace NTest;
 
     struct TTouchEnv : public NTest::TTestEnv {
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TSharedCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
+        {
             auto page = NTest::TTestEnv::TryGetPage(part, location, groupId);
 
             bool newTouch = Touched[{part, groupId}].insert(location.Offset).second;

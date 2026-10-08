@@ -102,13 +102,13 @@ void TPageCollectionProtoHelper::Do(TBundle *bundle, const TIntrusiveConstPtr<NT
     bundle->SetEpoch(partStore->Epoch.ToProto());
 }
 
-void TPageCollectionProtoHelper::Bundle(
-    NKikimrExecutorFlat::TPageCollection* pageCollectionProto, const TCacheCollection& pageCollection_)
+void TPageCollectionProtoHelper::Bundle(NKikimrExecutorFlat::TPageCollection *pageCollectionProto, const TCacheCollection &pageCollection_)
 {
-    auto* pageCollection = CheckedCast<const NPageCollection::TPageCollection*>(pageCollection_.PageCollection().Get());
+    auto *pageCollection = CheckedCast<const NPageCollection::TPageCollection*>(pageCollection_.PageCollection().Get());
 
     return Bundle(pageCollectionProto, pageCollection->LargeGlobId, pageCollection);
 }
+
 
 void TPageCollectionProtoHelper::Bundle(
         NKikimrExecutorFlat::TPageCollection *pageCollectionProto,

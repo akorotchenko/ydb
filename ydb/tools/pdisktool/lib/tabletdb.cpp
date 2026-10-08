@@ -24,23 +24,23 @@ namespace NKikimr::NPDiskTool {
 
 namespace {
 
-    using namespace NActors;
-    using namespace NKikimr::NTabletFlatExecutor;
+using namespace NActors;
+using namespace NKikimr::NTabletFlatExecutor;
 
-    using NBoot::TCookie;
-    using NBoot::TSwitch;
-    using EIdx = TCookie::EIdx;
+using NBoot::TCookie;
+using NBoot::TSwitch;
+using EIdx = TCookie::EIdx;
 
-    // One page of a part, and one commit body, always stay well below this; a larger length has been read
-    // off a damaged blob and must not become an allocation.
-    constexpr ui64 MaxBody = NTable::MaxDecompressedBlobSize;
+// One page of a part, and one commit body, always stay well below this; a larger length has been read
+// off a damaged blob and must not become an allocation.
+constexpr ui64 MaxBody = NTable::MaxDecompressedBlobSize;
 
-    // A commit body, either external or embedded, in log order.
-    struct TCommit {
-        NTable::TTxStamp Stamp = 0;
-        NPageCollection::TLargeGlobId LargeGlobId;
-        TString Body;
-    };
+// A commit body, either external or embedded, in log order.
+struct TCommit {
+    NTable::TTxStamp Stamp = 0;
+    NPageCollection::TLargeGlobId LargeGlobId;
+    TString Body;
+};
 
 // A scheme change log body, resolved lazily.
 struct TMeta {
@@ -183,11 +183,12 @@ public:
         }
         // Extern and outer pages are addressed by page index: those collections have no byte offsets
         // to be addressed by, so the reference is turned into a location by the collection itself.
-        return { true, GetPage(collection, collection->PageCollection()->GetLocation(ref)) };
+        return {true, GetPage(collection, collection->PageCollection()->GetLocation(ref))};
     }
 
-    TSharedCachePageRef TryGetPage(
-        const NTable::TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TSharedCachePageRef TryGetPage(const NTable::TPart* part, const TPageLocation& location,
+            TGroupId groupId) override
+    {
         const auto* partStore = dynamic_cast<const NTable::TPartStore*>(part);
         if (!partStore || groupId.Index >= partStore->PageCollections.size()) {
             return {};
@@ -372,6 +373,7 @@ private:
 
     // Created first and destroyed last, after every database/environment native ref is released.
     TApplicationContext ApplicationContext;
+
     TBlobStore& Store;
     const ui64 TabletId;
     TIssueLog& Issues;
@@ -838,7 +840,8 @@ bool TTabletBoot::TImpl::LoadBundle(ui32 table, TSwitch::TBundle& bundle) {
                 largeGlobId.Lead.ToString());
             return false;
         }
-        collections.emplace_back(Env.AdmitCollection(largeGlobId, TSharedData::Copy(meta.data(), meta.size())));
+        collections.emplace_back(Env.AdmitCollection(
+            largeGlobId, TSharedData::Copy(meta.data(), meta.size())));
     }
     if (collections.empty()) {
         return false;
@@ -865,7 +868,8 @@ bool TTabletBoot::TImpl::LoadBundle(ui32 table, TSwitch::TBundle& bundle) {
         TVector<NSharedCache::TEvResult::TLoaded> loaded;
         loaded.reserve(fetch.Pages.size());
         for (const auto& location : fetch.Pages) {
-            auto page = Env.GetPage(fetch.PageCollection->Label(), fetch.PageCollection, location);
+            auto page = Env.GetPage(fetch.PageCollection->Label(), fetch.PageCollection,
+                location);
             if (!page) {
                 Repeated.Add("A part cannot be read far enough to be usable, so it is dropped whole",
                     bundle.LargeGlobIds[0].Lead.ToString());

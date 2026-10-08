@@ -129,7 +129,8 @@ namespace NFwd {
             return Pending == 0;
         }
 
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
+        {
             auto type = location.Type;
 
             if (groupId.IsMain() && IsIndexPage(type)) {
@@ -277,7 +278,7 @@ namespace NFwd {
         }
 
     private:
-        IPageLoadingLogic::TResult Get(TPartGroupLoadingQueue& queue, TPageOffset offset, EPage type)
+        IPageLoadingLogic::TResult Get(TPartGroupLoadingQueue &queue, TPageOffset offset, EPage type)
         {
             auto got = queue->Get(&queue, offset, type, Conf.AheadLo);
 
@@ -354,11 +355,11 @@ namespace NFwd {
 
             Y_ENSURE(groupId.Index < partStore->PageCollections.size(), "Got part without enough page collections");
 
-            return { CreateCache(part, PartIndexPageLocator[part], groupId, slices,
-                         partStore->PageCollections[groupId.Index]->PageCollection(),
-                         partStore->PageCollections[0]->PageCollection()),
+            return {CreateCache(part, PartIndexPageLocator[part], groupId, slices,
+                    partStore->PageCollections[groupId.Index]->PageCollection(),
+                    partStore->PageCollections[0]->PageCollection()),
                 partStore->PageCollections[0]->PageCollection(),
-                partStore->PageCollections[groupId.Index]->PageCollection() };
+                partStore->PageCollections[groupId.Index]->PageCollection()};
         }
 
         TGroupPages MakeExtern(const TPart *part, TIntrusiveConstPtr<TSlices> bounds) const

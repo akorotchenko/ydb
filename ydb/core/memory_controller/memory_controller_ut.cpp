@@ -433,8 +433,7 @@ Y_UNIT_TEST(SharedCache) {
     runtime.SimulateSleep(TDuration::Seconds(2));
     server->PrintCounters();
     UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), 0);
-    UNIT_ASSERT_LE(server->SharedPageCacheCounters->ActiveLimitBytes->Val(),
-        server->SharedPageCacheCounters->ConfigLimitBytes->Val());
+    UNIT_ASSERT_LE(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->ConfigLimitBytes->Val());
     UNIT_ASSERT_GT(server->SharedPageCacheCounters->ActiveBytes->Val(), 0);
     UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->PassiveBytes->Val(), 0);
     UNIT_ASSERT_GE(server->MemoryControllerCounters->GetCounter("Consumer/SharedCache/Consumption")->Val(),

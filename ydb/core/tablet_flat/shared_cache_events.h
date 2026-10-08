@@ -13,43 +13,43 @@
 #include <util/generic/hash_set.h>
 
 namespace NKikimr::NSharedCache {
-class TSharedCachePages;
-using EPriority = NTabletFlatExecutor::NBlockIO::EPriority;
-using TPageId = NTable::NPage::TPageId;
-using TPageOffset = NTable::NPage::TPageOffset;
-using TPageLocation = NTable::NPage::TPageLocation;
-using EPage = NTable::NPage::EPage;
+    class TSharedCachePages;
+    using EPriority = NTabletFlatExecutor::NBlockIO::EPriority;
+    using TPageId = NTable::NPage::TPageId;
+    using TPageOffset = NTable::NPage::TPageOffset;
+    using TPageLocation = NTable::NPage::TPageLocation;
+    using EPage = NTable::NPage::EPage;
 
-enum class EWakeupTag {
-    DoGCScheduled = 1,
-    DoGCManual = 2,
-    DoLimitMaintenance = 3,
-    ContinueBTreeWalk = 4,
-    RetryResources = 5,
-};
+    enum class EWakeupTag {
+        DoGCScheduled = 1,
+        DoGCManual = 2,
+        DoLimitMaintenance = 3,
+        ContinueBTreeWalk = 4,
+        RetryResources = 5,
+    };
 
-enum EEv {
-    EvBegin = EventSpaceBegin(TKikimrEvents::ES_FLAT_EXECUTOR),
+    enum EEv {
+        EvBegin = EventSpaceBegin(TKikimrEvents::ES_FLAT_EXECUTOR),
 
-    EvTouch = EvBegin + 512,
-    EvUnregister,
-    EvDetach,
-    EvAttach,
-    EvAttached,
-    EvSaveCompactedPages,
-    EvRequest,
-    EvResult,
-    EvInFlightReleased,
-    EvRequestAnswered,
-    EvKeepPageEvicted,
-    EvResourcesAvailable,
-    EvCollectionReleased,
-    EvCollectionBytesChanged,
+        EvTouch = EvBegin + 512,
+        EvUnregister,
+        EvDetach,
+        EvAttach,
+        EvAttached,
+        EvSaveCompactedPages,
+        EvRequest,
+        EvResult,
+        EvInFlightReleased,
+        EvRequestAnswered,
+        EvKeepPageEvicted,
+        EvResourcesAvailable,
+        EvCollectionReleased,
+        EvCollectionBytesChanged,
 
-    EvEnd
+        EvEnd
 
-    /* +1024 range is reserved for scan events */
-};
+        /* +1024 range is reserved for scan events */
+    };
 
     enum class ERequestTypeCookie : ui64 {
         Undefined = 0,
@@ -75,11 +75,10 @@ enum EEv {
         const TLogoBlobID PageCollectionId;
         TIntrusivePtr<TCollectionRegistry> Registry;
 
-        TEvDetach(const TLogoBlobID& pageCollectionId, TIntrusivePtr<TCollectionRegistry> registry = {})
+        TEvDetach(const TLogoBlobID &pageCollectionId, TIntrusivePtr<TCollectionRegistry> registry = {})
             : PageCollectionId(pageCollectionId)
             , Registry(std::move(registry))
-        {
-        }
+        {}
     };
 
     // notifies Shared Cache about Private Cache owned shared bodies
@@ -87,10 +86,9 @@ enum EEv {
     struct TEvSync : public TEventLocal<TEvSync, EvTouch> {
         THashMap<TLogoBlobID, THashSet<TPageOffset>> Pages;
 
-        TEvSync(THashMap<TLogoBlobID, THashSet<TPageOffset>>&& pages)
+        TEvSync(THashMap<TLogoBlobID, THashSet<TPageOffset>> &&pages)
             : Pages(std::move(pages))
-        {
-        }
+        {}
     };
 
     struct TEvAttach : public TEventLocal<TEvAttach, EvAttach> {
@@ -195,13 +193,15 @@ enum EEv {
             , ExecutorGeneration(executorGeneration)
             , RequestId(requestId)
             , CoreRoute(coreRoute)
-        {
-        }
+        { }
 
-        void Describe(IOutputStream& out) const {
-            out << "TEvResult{" << Pages.size() << " pages"
-                << " " << PageCollection->Label() << " " << (Status == NKikimrProto::OK ? "ok" : "fail") << " "
-                << NKikimrProto::EReplyStatus_Name(Status) << "}";
+        void Describe(IOutputStream &out) const
+        {
+            out
+                << "TEvResult{" << Pages.size() << " pages"
+                << " " << PageCollection->Label()
+                << " " << (Status == NKikimrProto::OK ? "ok" : "fail")
+                << " " << NKikimrProto::EReplyStatus_Name(Status) << "}";
         }
 
         ui64 Bytes() const
@@ -217,8 +217,7 @@ enum EEv {
                 : Offset(offset)
                 , Size(size)
                 , Page(std::move(page))
-            {
-            }
+            { }
 
             NTable::NPage::TPageOffset Offset;
             size_t Size;
@@ -227,6 +226,7 @@ enum EEv {
 
         bool ResourcePressure = false;
         bool ResourcesReady = false;
+
         const EStatus Status;
         const TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
         TVector<TLoaded> Pages;
@@ -340,8 +340,7 @@ enum EEv {
             , CacheItem(cacheItem)
             , Generation(generation)
             , Location(std::move(location))
-        {
-        }
+        {}
 
         const TLogoBlobID CollectionId;
         const TCollectionCacheItem CacheItem;
@@ -377,8 +376,7 @@ enum EEv {
         TIntrusivePtr<TRequestCompletion> Completion_;
         const ui32 Index_;
     };
-
-    } // namespace NKikimr::NSharedCache
+} // namespace NKikimr::NSharedCache
 
 template<> inline
 void Out<NKikimr::NTable::NPage::TPageLocation>(IOutputStream& o, const NKikimr::NTable::NPage::TPageLocation& val) {

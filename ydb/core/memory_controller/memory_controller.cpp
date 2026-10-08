@@ -527,12 +527,14 @@ private:
         ctx.Schedule(Interval, new TEvents::TEvWakeup());
     }
 
-    void Handle(TEvConsumerRegister::TPtr& ev, const TActorContext& ctx) {
-        const auto* msg = ev->Get();
+    void Handle(TEvConsumerRegister::TPtr &ev, const TActorContext& ctx) {
+        const auto *msg = ev->Get();
         // A kind the controller feeds itself has no registrant and must not be taken over
         Y_ABORT_UNLESS(!Consumers.contains(msg->Kind), "Consumer kind is owned by the memory controller");
         TIntrusivePtr<IMemoryConsumer> consumer = Collections[msg->Kind].Register(ev->Sender);
-        YDB_LOG_INFO_CTX(ctx, "Consumer registered", { "msgKind", msg->Kind }, { "sender", ev->Sender });
+        YDB_LOG_INFO_CTX(ctx, "Consumer registered",
+            {"msgKind", msg->Kind},
+            {"sender", ev->Sender});
         Send(ev->Sender, new TEvConsumerRegistered(std::move(consumer)));
         if (msg->Kind == EMemoryConsumerKind::SharedCache) {
             bool hasMemTotalHardLimit = false;
@@ -696,8 +698,7 @@ private:
             // The ceiling belongs to the configured kind; demand only redistributes current allocations.
             const ui64 maximum = kind == EMemoryConsumerKind::SharedCache ? maxLimitBytes : 0;
             const ui64 current = kind == EMemoryConsumerKind::SharedCache ? currentShares.at(share.Registrant) : 0;
-            Send(
-                share.Registrant, new TEvConsumerLimit(share.Bytes, maximum, current), IEventHandle::FlagTrackDelivery);
+            Send(share.Registrant, new TEvConsumerLimit(share.Bytes, maximum, current), IEventHandle::FlagTrackDelivery);
         }
     }
 

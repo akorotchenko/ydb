@@ -104,8 +104,7 @@ public:
         }
 
         PagesSize += location.Size;
-        Send(MakeSharedPageCacheId(),
-            new NSharedCache::TEvRequest(NSharedCache::EPriority::Bkgr, info->PageCollection(), { location }));
+        Send(MakeSharedPageCacheId(), new NSharedCache::TEvRequest(NSharedCache::EPriority::Bkgr, info->PageCollection(), { location }));
 
         Interrupt();
         auto ev = WaitForSpecificEvent<NSharedCache::TEvResult>(&TTableStatsCoroBuilder::ProcessUnexpectedEvent);
@@ -197,9 +196,8 @@ private:
                 throw TExTableStatsError(ECode::ACTOR_DIED, "Poisoned");
 
             default:
-                throw TExTableStatsError(ECode::UNHANDLED_EVENT, TStringBuilder()
-                                                                     << "Unhandled event type: " << ev->GetTypeRewrite()
-                                                                     << " event: " << ev->ToString());
+                throw TExTableStatsError(ECode::UNHANDLED_EVENT, TStringBuilder() <<
+                    "Unhandled event type: " << ev->GetTypeRewrite() << " event: " << ev->ToString());
         }
     }
 

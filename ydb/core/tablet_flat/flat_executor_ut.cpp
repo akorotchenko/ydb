@@ -596,7 +596,7 @@ THolder<TSharedPageCacheCounters> GetSharedPageCounters(TMyEnvBase& env) {
     return MakeHolder<TSharedPageCacheCounters>(GetServiceCounters(env->GetDynamicCounters(), "tablets")->GetSubgroup("type", "S_CACHE"));
 };
 
-void MinimizeSharedCache(TMyEnvBase& env) {
+void MinimizeSharedCache(TMyEnvBase &env) {
     auto request = MakeHolder<NConsole::TEvConsole::TEvConfigNotificationRequest>();
     auto* config = request->Record.MutableConfig()->MutableSharedCacheConfig();
     config->SetMemoryLimit(32_MB);
@@ -1942,6 +1942,7 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_ResourceProfile) {
 }
 
 Y_UNIT_TEST_SUITE(TFlatTableExecutor_SliceOverlapScan) {
+
     Y_UNIT_TEST(TestSliceOverlapScan) {
         TMyEnvBase env(128_MB, 8_MB);
         TRowsModel rows;
@@ -1973,6 +1974,7 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_SliceOverlapScan) {
         env.WaitFor<NFake::TEvCompacted>();
         env.SendSync(new TEvents::TEvPoison, false, true);
     }
+
 }
 
 Y_UNIT_TEST_SUITE(TFlatTableExecutor_ColumnGroups) {
@@ -6049,7 +6051,7 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_IndexLoading) {
         TMyEnvBase env(128_MB, 8_MB);
         TRowsModel rows;
 
-        auto& appData = env->GetAppData();
+        auto &appData = env->GetAppData();
         appData.FeatureFlags.SetEnableLocalDBBtreeIndex(true);
         appData.FeatureFlags.SetEnableLocalDBFlatIndex(false);
 
@@ -6807,25 +6809,25 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_StickyPages) {
        SetupEnvironment(env, false, true);
 
         // A V2 tree is not enumerable from the part, so its pages come only from the cache-side walk.
-       bool stickyDataPageLoaded = false;
-       auto stickyObserver = env->AddObserver<NSharedCache::TEvResult>([&](const auto& ev) {
-           if (ev->Cookie != ui64(NSharedCache::ERequestTypeCookie::StickyPages)) {
-               return;
-           }
-           for (const auto& loaded : ev->Get()->Pages) {
+        bool stickyDataPageLoaded = false;
+        auto stickyObserver = env->AddObserver<NSharedCache::TEvResult>([&](const auto& ev) {
+            if (ev->Cookie != ui64(NSharedCache::ERequestTypeCookie::StickyPages)) {
+                return;
+            }
+            for (const auto& loaded : ev->Get()->Pages) {
                stickyDataPageLoaded |= loaded.Page.GetType() == NTable::NPage::EPage::DataPage;
-           }
-       });
+            }
+        });
 
-       env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
+        env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
        MinimizeSharedCache(env);
 
-       env.SendSync(rows.MakeScheme(new TCompactionPolicy()));
-       env.SendSync(new NFake::TEvExecute{ new TTxKeepFamilyInMemory(0) });
+        env.SendSync(rows.MakeScheme(new TCompactionPolicy()));
+        env.SendSync(new NFake::TEvExecute{ new TTxKeepFamilyInMemory(0) });
 
-       // 10 historic pages followed by 10 current pages.
-       env.SendSync(rows.VersionTo(TRowVersion(1, 10)).RowTo(0).MakeRows(70, 950));
-       env.SendSync(rows.VersionTo(TRowVersion(2, 20)).RowTo(0).MakeRows(70, 950));
+        // 10 historic pages followed by 10 current pages.
+        env.SendSync(rows.VersionTo(TRowVersion(1, 10)).RowTo(0).MakeRows(70, 950));
+        env.SendSync(rows.VersionTo(TRowVersion(2, 20)).RowTo(0).MakeRows(70, 950));
 
        env.SendSync(new NFake::TEvCompact(TRowsModel::TableId));
        env.WaitFor<NFake::TEvCompacted>();
@@ -8644,7 +8646,7 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_BTreeIndex) {
         watchRequests = true;
         env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
 
-        for (ui32 i = 0; i < 400 && counters->InFlightPages->Val() != 0; ++i) {
+        for (ui32 i = 0; i < 400 && counters->LoadInFlyPages->Val() != 0; ++i) {
             WakeupSharedCache(env);
         }
 

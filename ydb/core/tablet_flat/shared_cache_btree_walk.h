@@ -80,8 +80,7 @@ public:
     // Regular-mode index reads; in-memory index reads go through PendingWalkPages.
     virtual void FetchWalkIndexLevel(TCacheCollection& collection, TVector<NTable::NPage::TPageLocation>&& locations,
         const TLogoBlobID& walkCollectionId) = 0;
-    virtual void RequestWalkStickyPages(TCacheCollection& collection, const TActorId& owner,
-        const TVector<NTable::NPage::TPageLocation>& locations) = 0;
+    virtual void RequestWalkStickyPages(TCacheCollection& collection, const TActorId& owner, const TVector<NTable::NPage::TPageLocation>& locations) = 0;
     virtual void CancelQueuedWalkRequestsAndPump(const TLogoBlobID& walkCollectionId) = 0;
     virtual void TryDropExpiredCollection(TCacheCollection& collection) = 0;
     virtual void ScheduleWalkContinuation() = 0;

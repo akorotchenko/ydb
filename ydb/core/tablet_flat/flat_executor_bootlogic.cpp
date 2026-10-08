@@ -197,9 +197,13 @@ NBoot::TSpawned TExecutorBootLogic::LoadPages(NBoot::IStep *step, NTable::TLoade
     SeenBlob(fetch.PageCollection->Label());
 
     auto* request = new NSharedCache::TEvRequest(
-        NBlockIO::EPriority::Fast, std::move(fetch.PageCollection), std::move(fetch.Pages), BootAttempt);
+            NBlockIO::EPriority::Fast,
+            std::move(fetch.PageCollection),
+            std::move(fetch.Pages),
+            BootAttempt);
     request->Sticky = std::move(fetch.Sticky);
-    Ops->Send(NSharedCache::MakeSharedPageCacheId(), request, 0, (ui64)ERequestTypeCookie::BootLogic);
+    Ops->Send(NSharedCache::MakeSharedPageCacheId(), request,
+        0, (ui64)ERequestTypeCookie::BootLogic);
 
     return NBoot::TSpawned(true);
 }
@@ -375,3 +379,4 @@ TExecutorCaches TExecutorBootLogic::DetachCaches() {
 }
 
 }}
+

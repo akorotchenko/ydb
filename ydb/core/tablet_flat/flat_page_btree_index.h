@@ -467,8 +467,7 @@ namespace NKikimr::NTable::NPage {
         }
 
         void Parse() {
-            const auto data =
-                NPage::TLabelWrapper().Read(Bytes(), IsV2Format ? EPage::BTreeIndexV2 : EPage::BTreeIndex);
+            const auto data = NPage::TLabelWrapper().Read(Bytes(), IsV2Format ? EPage::BTreeIndexV2 : EPage::BTreeIndex);
 
             Y_ENSURE(data == ECodec::Plain && data.Version == FormatVersion);
 

@@ -5,7 +5,7 @@
 #include "flat_part_store.h"
 #include "flat_store_hotdog.h"
 #include "flat_store_solid.h"
-#include "flat_page_collection.h"
+#include "flat_sausagecache.h"
 #include "tablet_flat_executor.h"
 #include "flat_executor_snapshot.h"
 #include "flat_direct_part_writer.h"
@@ -19,8 +19,7 @@ namespace NTabletFlatExecutor {
     struct TPageCollectionReadEnv : public NTable::IPages {
         TPageCollectionReadEnv(TSeat& seat)
             : Seat(seat)
-        {
-        }
+        { }
 
         struct TStats {
             size_t NewlyPinnedPages = 0;
@@ -38,10 +37,11 @@ namespace NTabletFlatExecutor {
             return NTable::MemTableRefLookup(memTable, ref, tag);
         }
 
-        TResult Locate(const TPart* part, ui64 ref, ELargeObj lob) override {
-            auto* partStore = CheckedCast<const NTable::TPartStore*>(part);
+        TResult Locate(const TPart *part, ui64 ref, ELargeObj lob) override
+        {
+            auto *partStore = CheckedCast<const NTable::TPartStore*>(part);
 
-            auto* info = partStore->Locate(lob, ref);
+            auto *info = partStore->Locate(lob, ref);
             auto page = TryGetPage(info->GetLocation(ref), info);
 
             if (!page && ReadMissingReferences) {
@@ -51,8 +51,9 @@ namespace NTabletFlatExecutor {
             return { !ReadMissingReferences, std::move(page) };
         }
 
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
-            auto* partStore = CheckedCast<const NTable::TPartStore*>(part);
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
+        {
+            auto *partStore = CheckedCast<const NTable::TPartStore*>(part);
 
             return TryGetPage(location, partStore->PageCollections.at(groupId.Index).Get());
         }
@@ -74,7 +75,7 @@ namespace NTabletFlatExecutor {
     private:
         using THashSetOfLocation = THashSet<TPageLocation, NTable::NPage::TPageLocationByOffsetHash>;
 
-        void ToLoadPage(const TPageLocation& location, TCacheCollection* pageCollection) {
+        void ToLoadPage(const TPageLocation& location, TCacheCollection *pageCollection) {
             auto res = ToLoad[pageCollection->Id()].insert(location);
             if (res.second) {
                 Stats.ToLoadPages++;
@@ -84,7 +85,7 @@ namespace NTabletFlatExecutor {
             }
         }
 
-        TSharedCachePageRef TryGetPage(const TPageLocation& location, TCacheCollection* pageCollection)
+        TSharedCachePageRef TryGetPage(const TPageLocation& location, TCacheCollection *pageCollection)
         {
             auto sharedBody = pageCollection->TryGetPage(location);
 
@@ -95,6 +96,7 @@ namespace NTabletFlatExecutor {
 
             if (!Seat.Pinned.contains(sharedBody)) {
                 Seat.Pinned.emplace(sharedBody.Acquire());
+
                 Stats.NewlyPinnedPages++;
                 if (!sharedBody.IsSticky()) {
                     Stats.NewlyPinnedBytes += sharedBody.size();
@@ -131,8 +133,7 @@ namespace NTabletFlatExecutor {
         TPageCollectionTxEnv(NTable::TDatabase& db, TSeat& seat)
             : TPageCollectionReadEnv(seat)
             , DB(db)
-        {
-        }
+        { }
 
         using TLogoId = TLogoBlobID;
 

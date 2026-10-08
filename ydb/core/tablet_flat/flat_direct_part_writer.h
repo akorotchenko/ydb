@@ -8,7 +8,7 @@
 #include "flat_part_laid.h"
 #include "flat_part_screen.h"
 #include "flat_part_store.h"
-#include "flat_page_collection.h"
+#include "flat_sausagecache.h"
 #include "flat_sausage_chop.h"
 #include "shared_cache_pages.h"
 #include "shared_sausagecache.h"
@@ -256,12 +256,11 @@ namespace NTabletFlatExecutor {
                 TVector<TSharedCacheCollectionRef> pageCollections;
                 for (auto& pageCollection : res.PageCollections) {
                     auto resultingPageCollection = SharedCachePages->AdmitCollection(pageCollection.PageCollection);
-                    auto saveCompactedPages =
-                        MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);
-                    for (auto& page : pageCollection.StickyPages) {
+                    auto saveCompactedPages = MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);
+                    for (auto &page : pageCollection.StickyPages) {
                         saveCompactedPages->AddPage(*SharedCachePages, std::move(page), true);
                     }
-                    for (auto& page : pageCollection.RegularPages) {
+                    for (auto &page : pageCollection.RegularPages) {
                         saveCompactedPages->AddPage(*SharedCachePages, std::move(page), false);
                     }
 

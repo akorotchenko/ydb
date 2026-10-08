@@ -157,7 +157,7 @@ namespace {
             intend += " |";
         }
 
-        auto dumpChild = [&](const TBtreeIndexNode& node, TRecIdx pos) {
+        auto dumpChild = [&] (const TBtreeIndexNode& node, TRecIdx pos) {
             auto ref = node.GetChild(pos, /* isDataPage */ false);
             TChild child{
                 std::holds_alternative<TPageId>(ref) ? std::get<TPageId>(ref) : Max<TPageId>(),
@@ -2324,8 +2324,7 @@ Y_UNIT_TEST_SUITE(TBTreePartWalker) {
                 Y_TABLET_ERROR("Unused");
             }
 
-            TSharedCachePageRef TryGetPage(
-                const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+            TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 Y_UNUSED(part);
                 if (Loaded.count(location.GetByteOffset())) {
                     return NTest::TTestEnv::TryGetPage(Part, location, groupId);

@@ -279,13 +279,14 @@ void RestartAndClearCache(TMyEnvBase& env, ui64 memoryLimit = Max<ui64>()) {
     UNIT_ASSERT_VALUES_EQUAL_C(counters->ActiveBytes->Val() + counters->PassiveBytes->Val(), 0,
         "hot=" << (core ? core->HotBytes() : 0) << " cold=" << (core ? core->ColdBytes() : 0)
                << " sticky=" << (core ? core->StickyBytes() : 0) << " keep=" << (core ? core->KeepColdBytes() : 0)
-               << " in-flight=" << counters->InFlightPages->Val() << " pending=" << counters->PendingRequests->Val());
+               << " in-flight=" << counters->LoadInFlyPages->Val() << " pending=" << counters->PendingRequests->Val());
     env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(memoryLimit));
     WaitEvent(env, NMemory::EvConsumerLimit);
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
 }
 
-void SetupSharedCache(TMyEnvBase& env, ui64 limit = 8_MB, bool resetMemoryLimit = false, ui64 inMemoryInFlyLimit = 0,
+void SetupSharedCache(TMyEnvBase& env, ui64 limit = 8_MB, bool resetMemoryLimit = false,
+        ui64 inMemoryInFlyLimit = 0,
     std::optional<ui64> softLimit = std::nullopt) {
     auto request = MakeHolder<NConsole::TEvConsole::TEvConfigNotificationRequest>();
 
@@ -306,11 +307,10 @@ void SetupSharedCache(TMyEnvBase& env, ui64 limit = 8_MB, bool resetMemoryLimit 
 
 // simulates other tablet shared cache usage
 void WakeupSharedCache(TMyEnvBase& env) {
-    env->Send(
-        MakeSharedPageCacheId(), TActorId{}, new TKikimrEvents::TEvWakeup(static_cast<ui64>(EWakeupTag::DoGCManual)));
+    env->Send(MakeSharedPageCacheId(), TActorId{}, new TKikimrEvents::TEvWakeup(static_cast<ui64>(EWakeupTag::DoGCManual)));
     TWaitForFirstEvent<TKikimrEvents::TEvWakeup>(*env, [&](const auto& ev) {
-        return ev->Get()->Tag == static_cast<ui64>(EWakeupTag::DoGCManual) &&
-               env->FindActorName(ev->GetRecipientRewrite()) == "SAUSAGE_CACHE";
+        return ev->Get()->Tag == static_cast<ui64>(EWakeupTag::DoGCManual)
+            && env->FindActorName(ev->GetRecipientRewrite()) == "SAUSAGE_CACHE";
     }).Wait(TDuration::Seconds(5));
 }
 
@@ -331,11 +331,11 @@ void AssertResidentWithinLimit(TMyEnvBase& env, const THolder<TSharedPageCacheCo
 // Waits until the shared cache has nothing in flight, i.e. the in-memory preload (and the walk
 // feeding it) has finished.
 void WaitInFlyDrain(TMyEnvBase& env, THolder<TSharedPageCacheCounters>& counters) {
-    for (ui32 i = 0; i < 400 && counters->InFlightPages->Val() != 0; ++i) {
+    for (ui32 i = 0; i < 400 && counters->LoadInFlyPages->Val() != 0; ++i) {
         WakeupSharedCache(env);
     }
 
-    UNIT_ASSERT_VALUES_EQUAL(counters->InFlightPages->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(counters->LoadInFlyPages->Val(), 0);
 }
 
 void DoReadRows(TMyEnvBase& env, TTxReadRows* read, bool retry = false) {
@@ -374,7 +374,7 @@ Y_UNIT_TEST(Limits) {
         DoReadRows(env, new TTxReadRows(key, retried));
     }
     LogCounters(counters);
-    UNIT_ASSERT_VALUES_EQUAL(counters->InFlightBytes->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(counters->LoadInFlyBytes->Val(), 0);
     AssertResidentWithinLimit(env, counters, 8_MB);
     UNIT_ASSERT_LE(counters->ActiveLimitBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_VALUES_EQUAL(counters->MemLimitBytes->Val(), 8_MB);
@@ -388,6 +388,7 @@ Y_UNIT_TEST(Limits) {
 
     auto* core = static_cast<TSharedCache*>(env->GetAppData().SharedCachePages->Cache.Get());
     const ui64 currentLimit = core->CurrentLimit();
+
     env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(6_MB));
     WaitEvent(env, NMemory::EvConsumerLimit);
     LogCounters(counters);
@@ -441,7 +442,7 @@ Y_UNIT_TEST(Limits_Config) {
         DoReadRows(env, new TTxReadRows(key, retried));
     }
     LogCounters(counters);
-    UNIT_ASSERT_VALUES_EQUAL(counters->InFlightBytes->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(counters->LoadInFlyBytes->Val(), 0);
     AssertResidentWithinLimit(env, counters, 8_MB);
     UNIT_ASSERT_LE(counters->ActiveLimitBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_VALUES_EQUAL(counters->ConfigLimitBytes->Val(), 32_MB);
@@ -1215,8 +1216,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Basics) {
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheHitPages->Val(), 0);
     UNIT_ASSERT_DOUBLES_EQUAL(counters->CacheMissBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissPages->Val(), 0);
-    UNIT_ASSERT_DOUBLES_EQUAL(
-        counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
+    UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
 
     // make second table to try to preempt first table from cache
@@ -1240,8 +1240,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Basics) {
     UNIT_ASSERT(retried.size() >= 2 && retried.size() <= 5);
     UNIT_ASSERT_GT(retried.at(1), 0);
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
-    UNIT_ASSERT_DOUBLES_EQUAL(
-        counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
+    UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
 
     // The Keep reservation must retain the table while Regular reads compete for cache space.
@@ -1253,7 +1252,6 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Basics) {
     LogCounters(counters);
     AssertKeepReads(retried);
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
-
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissInMemoryBytes->Val(), 0);
@@ -1273,7 +1271,6 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Basics) {
     UNIT_ASSERT(retried.size() >= 2 && retried.size() <= 5);
     UNIT_ASSERT_GE(retried.at(1), 50);
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
-
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
 
@@ -1285,9 +1282,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Basics) {
     LogCounters(counters);
     AssertKeepReads(retried);
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
-
-    UNIT_ASSERT_DOUBLES_EQUAL(
-        counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
+    UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissInMemoryBytes->Val() - keepMissBytesBeforeRestart, 0);
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissInMemoryPages->Val() - keepMissPagesBeforeRestart, 0);
@@ -1316,8 +1311,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2) {
     };
 
     writeAndCompact(TableId, true);
-    UNIT_ASSERT_DOUBLES_EQUAL(
-        counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
+    UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
 
     // A cache-sized Regular table keeps the competition test under pressure at the larger limit.
@@ -1386,8 +1380,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_Enabling) {
 
     WaitInFlyDrain(env, counters);
 
-    UNIT_ASSERT_DOUBLES_EQUAL(
-        counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
+    UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
 
     TRetriedCounters retried;
@@ -1772,8 +1765,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Enabling) {
     UNIT_ASSERT(retried.size() >= 2 && retried.size() <= 5);
     UNIT_ASSERT_GT(retried.at(1), 0);
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
-    UNIT_ASSERT_DOUBLES_EQUAL(
-        counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
+    UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
 
     // The Keep reservation must retain the table while Regular reads compete for cache space.
@@ -1785,9 +1777,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Enabling) {
     LogCounters(counters);
     AssertKeepReads(retried);
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
-
-    UNIT_ASSERT_DOUBLES_EQUAL(
-        counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
+    UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissInMemoryBytes->Val(), 0);
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissInMemoryPages->Val(), 0);
@@ -1806,7 +1796,6 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Enabling) {
     UNIT_ASSERT(retried.size() >= 2 && retried.size() <= 5);
     UNIT_ASSERT_GE(retried.at(1), 50);
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
-
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
 
@@ -1818,9 +1807,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Enabling) {
     LogCounters(counters);
     AssertKeepReads(retried);
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
-
-    UNIT_ASSERT_DOUBLES_EQUAL(
-        counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
+    UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissInMemoryBytes->Val() - keepMissBytesBeforeRestart, 0);
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissInMemoryPages->Val() - keepMissPagesBeforeRestart, 0);
@@ -1856,8 +1843,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Disabling) {
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheHitPages->Val(), 0);
     UNIT_ASSERT_DOUBLES_EQUAL(counters->CacheMissBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissPages->Val(), 0);
-    UNIT_ASSERT_DOUBLES_EQUAL(
-        counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
+    UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
 
     // Disable in-memory
@@ -1901,7 +1887,6 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Disabling) {
     UNIT_ASSERT(retried.size() >= 2 && retried.size() <= 5);
     UNIT_ASSERT_GT(retried.at(1), 0);
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
-
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->ActiveInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->CacheMissInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
@@ -1918,7 +1903,6 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Disabling) {
     UNIT_ASSERT(retried.size() >= 2 && retried.size() <= 5);
     UNIT_ASSERT_GE(retried.at(1), 50);
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
-
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->ActiveInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
 
@@ -1931,7 +1915,6 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Disabling) {
     UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 100);
     UNIT_ASSERT_LE(retried.size(), 5);
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
-
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->ActiveInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->CacheMissInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
@@ -1951,7 +1934,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_AfterCompaction) {
 
     // Count shared cache fetches for the in-memory table.
     ui64 inMemFetchesCount = 0;
-    auto inMemFetchesObserver = env.Env.AddObserver<NBlockIO::TEvFetch>([&inMemFetchesCount](const auto& ev) {
+    auto inMemFetchesObserver = env.Env.AddObserver<NBlockIO::TEvFetch>([&inMemFetchesCount] (const auto& ev) {
         // in-mem table will be created with channel 2
         if (ev->Get()->PageCollection->Label().Channel() == 2) {
             ++inMemFetchesCount;
@@ -1979,8 +1962,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_AfterCompaction) {
     LogCounters(counters);
     // The core's ring placement depends on page size; check the budget, not the legacy ring's exact occupancy.
     AssertBestEffortInMemory(counters, 10_MB);
-    UNIT_ASSERT_DOUBLES_EQUAL(
-        counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
+    UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
 
     // make second table to try to preempt first table from cache
     env.SendSync(new NFake::TEvExecute{ new TTxInitSchema(Table2Id, false, 3) });
@@ -2000,8 +1982,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_AfterCompaction) {
     }
     LogCounters(counters);
     AssertBestEffortInMemory(counters, 10_MB);
-    UNIT_ASSERT_DOUBLES_EQUAL(
-        counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
+    UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
 
     // Competing Regular reads must not displace pages within the Keep reservation.
     retried = {};
@@ -2013,6 +1994,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_AfterCompaction) {
     AssertKeepReads(retried);
 
     const ui64 fetchesBeforeRestart = inMemFetchesCount;
+
     RestartAndClearCache(env, 10_MB);
     env.Env.WaitFor("Keep preload after restart", [&] {
         return inMemFetchesCount > fetchesBeforeRestart;

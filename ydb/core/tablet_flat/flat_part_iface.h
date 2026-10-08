@@ -100,11 +100,13 @@ namespace NTable {
                 DestroyPayload();
             }
 
-            explicit operator bool() const noexcept {
+            explicit operator bool() const noexcept
+            {
                 return OwnsData_ ? bool(Data_) : bool(BorrowedData_);
             }
 
-            const TSharedData* operator*() const noexcept {
+            const TSharedData* operator*() const noexcept
+            {
                 return OwnsData_ ? &Data_ : BorrowedData_;
             }
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "flat_page_collection.h"
+#include "flat_sausagecache.h"
 #include "flat_sausage_packet.h"
 #include "flat_sausage_writer.h"
 #include "flat_sausage_solid.h"

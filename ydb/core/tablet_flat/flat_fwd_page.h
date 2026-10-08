@@ -70,7 +70,7 @@ namespace NFwd {
             return SharedPageRef.size();
         }
 
-        const TSharedCachePageRef* Touch(TPageOffset offset, TStat& stat)
+        const TSharedCachePageRef* Touch(TPageOffset offset, TStat &stat)
         {
             if (Offset != offset || (!SharedPageRef && Fetch == EFetch::Done)) {
                 Y_TABLET_ERROR("Touching page that doesn't fit to this action");
@@ -89,6 +89,7 @@ namespace NFwd {
             Fetch = Max(Fetch, EFetch::Drop);
             const ui64 bytes = SharedPageRef.size();
             SharedPageRef.Drop();
+
             return bytes;
         }
 

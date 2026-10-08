@@ -459,7 +459,7 @@ public:
     }
 
     // Admitted pages whose payload has not arrived yet, i.e. the pages currently being loaded. The actor publishes
-    // them as the InFlightPages/Bytes counters.
+    // them as the LoadInFlyPages/LoadInFlyBytes counters.
     ui64 ReservedPages() const noexcept {
         return ReservedPages_.load(std::memory_order_relaxed);
     }

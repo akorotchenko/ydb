@@ -88,7 +88,8 @@ namespace {
             return Part->Store->PageCollectionPagesCount(Room);
         }
 
-        NPageCollection::TInfo Page(ui32 page) const override {
+        NPageCollection::TInfo Page(ui32 page) const override
+        {
             const auto array = Part->Store->PageCollectionArray(Room);
 
             return { array.at(page).size(), ui32(Part->Store->GetPageType(Room, page)) };

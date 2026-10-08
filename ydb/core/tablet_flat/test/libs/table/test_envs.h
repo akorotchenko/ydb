@@ -46,7 +46,8 @@ namespace NTest {
                 pass ? TTestEnv::Locate(part, ref, lob) : TResult{need, nullptr };
         }
 
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TSharedCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
+        {
             return Pages ? TTestEnv::TryGetPage(part, location, groupId) : TSharedCachePageRef();
         }
 
@@ -106,7 +107,8 @@ namespace NTest {
             }
         }
 
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
+        {
             auto pass = ShouldPass((const void*)part,
                 static_cast<ui64>(THash<TPageOffset>()(location.Offset)) ^ (ui64(groupId.Raw()) << 48),
                 location.Type == EPage::FlatIndex || location.Type == EPage::BTreeIndex || location.Type == EPage::BTreeIndexV2);
@@ -275,14 +277,16 @@ namespace NTest {
                 Y_TABLET_ERROR("Invalid ref ELargeObj{" << int(lob) << ", " << ref << "}");
             }
 
-            const auto room =
-                (lob == ELargeObj::Extern) ? partStore->Store->GetExternRoom() : partStore->Store->GetOuterRoom();
+            const auto room = (lob == ELargeObj::Extern)
+                ? partStore->Store->GetExternRoom()
+                : partStore->Store->GetOuterRoom();
 
             auto got = Get(part, room).DoLoad(TPageOffset::FromPageIndex(ref), EPage::Opaque, AheadLo, AheadHi);
             return got.Page ? TResult(got.Need, got.Page->BuildSharedData()) : TResult(got.Need, nullptr);
         }
 
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
+        {
             InitPart(part);
 
             auto* partStore = CheckedCast<const TPartStore*>(part);

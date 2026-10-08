@@ -150,7 +150,6 @@ namespace NTabletFlatExecutor {
 
         ui64 Tablet = MakeTabletID(false, 1) & 0xFFFF'FFFF;
         const TActorId Edge;
-
     };
 
 } // namespace NTabletFlatExecutor

@@ -18,7 +18,8 @@ namespace {
     using TChild = TBtreeIndexNode::TChild;
 
     struct TTouchEnv : public NTest::TTestEnv {
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TSharedCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
+        {
             auto pageId = ResolvePageId(part, location, groupId);
             if (Sticky[groupId].contains(pageId)) {
                 Loaded[groupId].insert(pageId);
@@ -325,8 +326,8 @@ namespace {
         explicit TTouchEnvV2(const TPartStore* part)
             : Part(part) {}
 
-        TSharedCachePageRef TryGetPage(
-            const TPart* part, const NPage::TPageLocation& location, NPage::TGroupId groupId) override {
+        TSharedCachePageRef TryGetPage(const TPart* part, const NPage::TPageLocation& location,
+                NPage::TGroupId groupId) override {
             Y_UNUSED(part);
             const ui32 room = groupId.Index;
             // Type-aware on every access, cache hits included: the store knows the

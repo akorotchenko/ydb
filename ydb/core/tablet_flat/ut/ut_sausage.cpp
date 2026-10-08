@@ -659,7 +659,8 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
                 Map[loc.Offset] = std::move(data);
             }
 
-            TSharedCachePageRef TryGetPage(const TPart*, const TPageLocation& location, TGroupId) override {
+            TSharedCachePageRef TryGetPage(const TPart*, const TPageLocation& location, TGroupId) override
+            {
                 auto it = Map.find(location.Offset);
                 if (it == Map.end()) {
                     return {};
@@ -669,7 +670,8 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
                 return TSharedCachePages::Get().AdmitPage(Collection, page, TSharedData(it->second));
             }
 
-            TResult Locate(const TMemTable*, ui64, ui32) override {
+            TResult Locate(const TMemTable*, ui64, ui32) override
+            {
                 return {false, nullptr};
             }
 
@@ -708,7 +710,8 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
             auto page = store.TryGetPage(nullptr, loc, {});
             UNIT_ASSERT(page);
             UNIT_ASSERT_VALUES_EQUAL(page.size(), loc.Size);
-            UNIT_ASSERT(pageCollection->Verify(loc, TArrayRef<const char>(page.data(), page.size())));
+            UNIT_ASSERT(pageCollection->Verify(loc,
+                TArrayRef<const char>(page.data(), page.size())));
         }
 
         // Phase 3: unknown byte-offset location → nullptr
@@ -727,7 +730,7 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         {
             auto page = store.TryGetPage(nullptr, loc0, {});
             UNIT_ASSERT(page);                          // lookup succeeds (no CRC32 inside TryGetPage)
-            UNIT_ASSERT(!pageCollection->Verify(loc0, // but Verify catches the mismatch
+            UNIT_ASSERT(!pageCollection->Verify(loc0,    // but Verify catches the mismatch
                 TArrayRef<const char>(page.data(), page.size())));
         }
     }

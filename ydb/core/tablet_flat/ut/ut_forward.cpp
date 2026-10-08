@@ -31,8 +31,7 @@ namespace {
         TBlobPageCollection(TIntrusiveConstPtr<NPage::TFrames> frames)
             : Frames(std::move(frames))
             , Id(reinterpret_cast<ui64>(Frames.Get()), 0, 0, 0, 0, 0)
-        {
-        }
+        {}
 
         const TLogoBlobID& Label() const noexcept override {
             return Id;
@@ -135,7 +134,8 @@ namespace {
 
                 const TPageLocation location(qp.Offset, qp.Size, EPage::Opaque);
                 auto ref = TSharedCachePages::Get().AdmitPage(
-                    BlobsPageCollection, location, TSharedData::Copy(TString(qp.Size, 'x')));
+                    BlobsPageCollection, location,
+                    TSharedData::Copy(TString(qp.Size, 'x')));
                 load.emplace_back(std::move(ref));
             }
 
@@ -283,7 +283,7 @@ namespace {
             size_t i = 0;
             for (auto& loc : std::exchange(Queue, TDeque<TPageLocation>{})) {
                 UNIT_ASSERT_VALUES_EQUAL_C(loc.Offset, Part->GetPageLocation(pageIds[i++], { }).Offset, CurrentStepStr());
-                load.emplace_back(testEnv.TryGetPage(Part.Get(), loc, {}));
+                load.emplace_back(testEnv.TryGetPage(Part.Get(), loc, { }));
             }
 
             Shuffle(load.begin(), load.end(), Rnd);
@@ -331,7 +331,7 @@ namespace {
                     }
                 }
                 UNIT_ASSERT_C(found, CurrentStepStr());
-                load.emplace_back(testEnv.TryGetPage(Part.Get(), location, {}));
+                load.emplace_back(testEnv.TryGetPage(Part.Get(), location, { }));
             }
 
             Shuffle(load.begin(), load.end(), Rnd);
@@ -1721,7 +1721,7 @@ struct TCacheWrapV2 : public NTest::TSteps<TCacheWrapV2>, protected NFwd::IPageL
         size_t i = 0;
         for (auto& loc : std::exchange(Queue, TDeque<NPage::TPageLocation>{})) {
             UNIT_ASSERT_VALUES_EQUAL_C(loc.Offset, offsets[i++], CurrentStepStr());
-            load.emplace_back(testEnv.TryGetPage(Part.Get(), loc, {}));
+            load.emplace_back(testEnv.TryGetPage(Part.Get(), loc, { }));
         }
 
         Shuffle(load.begin(), load.end(), Rnd);
@@ -1763,7 +1763,7 @@ struct TCacheWrapV2 : public NTest::TSteps<TCacheWrapV2>, protected NFwd::IPageL
                 }
             }
             UNIT_ASSERT_C(found, CurrentStepStr());
-            load.emplace_back(testEnv.TryGetPage(Part.Get(), location, {}));
+            load.emplace_back(testEnv.TryGetPage(Part.Get(), location, { }));
         }
 
         Shuffle(load.begin(), load.end(), Rnd);

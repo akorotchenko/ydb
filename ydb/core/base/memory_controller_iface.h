@@ -85,8 +85,7 @@ struct TEvConsumerLimit : public TEventLocal<TEvConsumerLimit, EvConsumerLimit> 
     TEvConsumerLimit(ui64 limitBytes, ui64 maxLimitBytes = 0, ui64 currentLimitBytes = 0)
         : LimitBytes(limitBytes)
         , MaxLimitBytes(maxLimitBytes)
-        , CurrentLimitBytes(currentLimitBytes)
-    {
+        , CurrentLimitBytes(currentLimitBytes) {
     }
 };
 

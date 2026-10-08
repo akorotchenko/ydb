@@ -199,8 +199,7 @@ void TCacheBTreeWalkController::FinishFetch(const TLogoBlobID& walkCollectionId)
 
 void TCacheBTreeWalkController::FetchStarted(const TLogoBlobID& walkCollectionId) {
     auto* collection = Host.FindWalkCollection(walkCollectionId);
-    Y_ENSURE(
-        collection && State(collection->Id()).Run && State(collection->Id()).Run->State != EWalkRunState::Cancelled);
+    Y_ENSURE(collection && State(collection->Id()).Run && State(collection->Id()).Run->State != EWalkRunState::Cancelled);
     ++State(collection->Id()).Run->FetchesInFlight;
 }
 

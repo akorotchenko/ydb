@@ -172,7 +172,7 @@ public:
 
             if (hasValidRowsRange && (child.Ref == key1Ref || child.Ref == key2Ref)) {
                 auto location = NTable::ResolvePageLocation(Part, child.Ref, {});
-                auto page = TryGetDataPage(location, {});
+                auto page = TryGetDataPage(location, { });
                 if (page) {
                     auto data = NPage::TDataPage(std::move(page));
                     if (child.Ref == key1Ref) {
@@ -342,7 +342,7 @@ public:
 
             if (hasValidRowsRange && (child.Ref == key1Ref || child.Ref == key2Ref)) {
                 auto location = NTable::ResolvePageLocation(Part, child.Ref, {});
-                auto page = TryGetDataPage(location, {});
+                auto page = TryGetDataPage(location, { });
                 if (page) {
                     auto data = NPage::TDataPage(std::move(page));
                     if (child.Ref == key1Ref) {

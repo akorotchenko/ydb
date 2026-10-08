@@ -29,7 +29,8 @@ namespace NTable {
             return { true, nullptr };
         }
 
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
+        {
             auto *partStore = CheckedCast<const NTable::TPartStore*>(part);
             auto *collection = partStore->PageCollections.at(groupId.Index).Get();
 
@@ -53,7 +54,7 @@ namespace NTable {
         }
 
     private:
-        void AddPageSize(const NSharedCache::TCacheCollection* collection, const TPageLocation& location)
+        void AddPageSize(const NSharedCache::TCacheCollection *collection, const TPageLocation& location)
         {
             if (Touched[collection].insert(location.Offset).second) {
                 Pages++;

@@ -18,7 +18,8 @@ namespace NFwd {
     template<size_t Capacity>
     class TLoadedPagesCircularBuffer {
     public:
-        const TSharedCachePageRef* Get(TPageOffset offset) const {
+        const TSharedCachePageRef* Get(TPageOffset offset) const
+        {
             if (!MaxSeenOffset.IsMax() && offset <= MaxSeenOffset) {
                 for (const auto& page : LoadedPages) {
                     if (page && page.GetOffset() == offset) {
@@ -133,7 +134,7 @@ namespace NFwd {
                     Stat.Fetch += head->AddToQueue(IndexPage.Offset, EPage::FlatIndex, IndexPage.Size, IndexPage.Crc32);
                     IndexPage.Fetch = EFetch::Wait;
                 }
-                return { IndexPage.Touch(offset, Stat), false, true };
+                return {IndexPage.Touch(offset, Stat), false, true};
             }
 
             Y_ENSURE(type == EPage::DataPage);
@@ -164,7 +165,8 @@ namespace NFwd {
             }
         }
 
-        void Fill(TSharedCachePageRef&& page, EPage type) override {
+        void Fill(TSharedCachePageRef&& page, EPage type) override
+        {
             const auto location = page.GetLocation();
             const ui64 loadedSize = location.Size;
             Stat.Saved += loadedSize;
@@ -181,8 +183,7 @@ namespace NFwd {
             Y_ENSURE(type == EPage::DataPage);
 
             auto it = std::lower_bound(Pages.begin(), Pages.end(), location.Offset);
-            Y_ENSURE(
-                it != Pages.end() && it->Offset == location.Offset, "Got page that hasn't been requested for load");
+            Y_ENSURE(it != Pages.end() && it->Offset == location.Offset, "Got page that hasn't been requested for load");
 
             Y_ENSURE(loadedSize <= OnFetch, "Forward cache ahead counters is out of sync");
             OnFetch -= loadedSize;
@@ -382,7 +383,8 @@ namespace NFwd {
             }
         }
 
-        void Fill(TSharedCachePageRef&& page, EPage type) override {
+        void Fill(TSharedCachePageRef&& page, EPage type) override
+        {
             const auto location = page.GetLocation();
             const ui64 loadedSize = location.Size;
             Stat.Saved += loadedSize;
@@ -396,8 +398,7 @@ namespace NFwd {
             if (it->Offset < location.Offset) {
                 it = std::lower_bound(it, level.Pages.end(), location.Offset);
             }
-            Y_ENSURE(it != level.Pages.end() && it->Offset == location.Offset,
-                "Got page that hasn't been requested for load");
+            Y_ENSURE(it != level.Pages.end() && it->Offset == location.Offset, "Got page that hasn't been requested for load");
 
             if (levelId + 2 < Levels.size()) { // next level is index
                 NPage::TBtreeIndexNode node(std::move(page), Meta.HasRootV2());

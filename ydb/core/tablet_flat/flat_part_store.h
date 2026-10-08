@@ -6,7 +6,7 @@
 #include "flat_table_part.h"
 #include "flat_store_bundle.h"
 #include "flat_sausage_packet.h"
-#include "flat_page_collection.h"
+#include "flat_sausagecache.h"
 #include "util_fmt_abort.h"
 
 namespace NKikimr {
@@ -134,12 +134,13 @@ public:
 
     const NPageCollection::TPageCollection* Packet(ui32 room) const noexcept override
     {
-        auto* pageCollection = room < PageCollections.size() ? PageCollections[room]->PageCollection().Get() : nullptr;
+        auto *pageCollection = room < PageCollections.size() ? PageCollections[room]->PageCollection().Get() : nullptr;
 
         return dynamic_cast<const NPageCollection::TPageCollection*>(pageCollection);
     }
 
-    NSharedCache::TCacheCollection* Locate(ELargeObj lob, ui64 ref) const {
+    NSharedCache::TCacheCollection* Locate(ELargeObj lob, ui64 ref) const
+    {
         if ((lob != ELargeObj::Extern && lob != ELargeObj::Outer) || (ref >> 32)) {
             Y_TABLET_ERROR("Invalid ref ELargeObj{" << int(lob) << ", " << ref << "}");
         }
@@ -170,17 +171,17 @@ public:
         return pages;
     }
 
-    static TArrayRef<const TSharedCacheCollectionRef> Storages(const TPartView& partView)
+    static TArrayRef<const TSharedCacheCollectionRef> Storages(const TPartView &partView)
     {
         auto *part = partView.As<TPartStore>();
 
         Y_ENSURE(!partView || part, "Got an unexpected type of TPart part");
 
-        return part ? part->PageCollections : TArrayRef<const TSharedCacheCollectionRef>{};
+        return part ? part->PageCollections : TArrayRef<const TSharedCacheCollectionRef>{ };
     }
 
     TVector<TSharedCacheCollectionRef> PageCollections;
-    TSharedCacheCollectionRef Pseudo; /* Cache for NPage::TBlobs */
+    TSharedCacheCollectionRef Pseudo;    /* Cache for NPage::TBlobs */
 };
 
 class TTxStatusPartStore : public TTxStatusPart, public IBorrowBundle {

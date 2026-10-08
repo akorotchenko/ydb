@@ -289,8 +289,7 @@ namespace NTable {
                     if (key2Page && key2Page <= current) {
                         if (key2Page == current) {
                             if (needExactBounds && decoded) {
-                                auto key2RowId =
-                                    LookupRowId(key2, decoded, Scheme.Groups[0], ESeek::Upper, keyDefaults);
+                                auto key2RowId = LookupRowId(key2, decoded, Scheme.Groups[0], ESeek::Upper, keyDefaults);
                                 if (key2RowId) {
                                     prechargeCurrentLastRowId = Min(prechargeCurrentLastRowId, key2RowId - 1);
                                 } else {
@@ -380,10 +379,8 @@ namespace NTable {
 
                     if (key1Page && key1Page == current) {
                         if (needExactBounds && decoded) {
-                            auto key1RowId =
-                                LookupRowIdReverse(key1, decoded, Scheme.Groups[0], ESeek::Lower, keyDefaults);
-                            if (key1RowId !=
-                                Max<TRowId>()) { // Max<TRowId>() means that lower bound is before current page, so doesn't charge current page
+                            auto key1RowId = LookupRowIdReverse(key1, decoded, Scheme.Groups[0], ESeek::Lower, keyDefaults);
+                            if (key1RowId != Max<TRowId>()) { // Max<TRowId>() means that lower bound is before current page, so doesn't charge current page
                                 prechargeCurrentFirstRowId = Min(prechargeCurrentFirstRowId, key1RowId);
                             } else {
                                 prechargeCurrentLastRowId = Max<TRowId>(); // no precharge
@@ -404,8 +401,7 @@ namespace NTable {
                     if (key2Page && key2Page >= current) {
                         if (key2Page == current) {
                             if (needExactBounds && decoded) {
-                                auto key2RowId =
-                                    LookupRowIdReverse(key2, decoded, Scheme.Groups[0], ESeek::Upper, keyDefaults);
+                                auto key2RowId = LookupRowIdReverse(key2, decoded, Scheme.Groups[0], ESeek::Upper, keyDefaults);
                                 if (key2RowId != Max<TRowId>()) { // Max<TRowId>() means that upper bound is before current page, so doesn't limit current page
                                     prechargeCurrentLastRowId = Max(prechargeCurrentLastRowId, key2RowId + 1);
                                 }
@@ -570,8 +566,7 @@ namespace NTable {
             TGroupState(TPartGroupFlatIndexIter&& groupIndex, NPage::TGroupId groupId)
                 : GroupIndex(std::move(groupIndex))
                 , GroupId(groupId)
-            {
-            }
+            { }
         };
 
     private:
@@ -674,18 +669,20 @@ namespace NTable {
         }
 
     private:
-        TRowId LookupRowId(const TCells key, const TDataPage& data, const TPartScheme::TGroupInfo& group, ESeek seek,
-            const TKeyCellDefaults& keyDefaults) const {
+        TRowId LookupRowId(const TCells key, const TDataPage& data, const TPartScheme::TGroupInfo &group, ESeek seek, const TKeyCellDefaults &keyDefaults) const
+        {
             auto lookup = data.LookupKey(key, group, seek, &keyDefaults);
             auto rowId = data.BaseRow() + lookup.Off();
             return rowId;
         }
 
     private:
-        TRowId LookupRowIdReverse(const TCells key, const TDataPage& data, const TPartScheme::TGroupInfo& group,
-            ESeek seek, const TKeyCellDefaults& keyDefaults) const {
+        TRowId LookupRowIdReverse(const TCells key, const TDataPage& data, const TPartScheme::TGroupInfo &group, ESeek seek, const TKeyCellDefaults &keyDefaults) const
+        {
             auto lookup = data.LookupKeyReverse(key, group, seek, &keyDefaults);
-            auto rowId = lookup ? data.BaseRow() + lookup.Off() : Max<TRowId>();
+            auto rowId = lookup
+                ? data.BaseRow() + lookup.Off()
+                : Max<TRowId>();
             return rowId;
         }
 

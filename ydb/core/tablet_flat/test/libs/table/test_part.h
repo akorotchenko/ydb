@@ -118,14 +118,16 @@ namespace NTest {
                 Y_TABLET_ERROR("Invalid ref ELargeObj{" << int(lob) << ", " << ref << "}");
             }
 
-            ui32 room =
-                (lob == ELargeObj::Extern) ? partStore->Store->GetExternRoom() : partStore->Store->GetOuterRoom();
+            ui32 room = (lob == ELargeObj::Extern)
+                ? partStore->Store->GetExternRoom()
+                : partStore->Store->GetOuterRoom();
 
             auto* collection = partStore->GetPageCollection(room);
             return { true, TTestEnv::TryGetPage(part, collection->GetLocation(ref), TGroupId(room)) };
         }
 
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TSharedCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
+        {
             auto* storedPart = CheckedCast<const TPartStore*>(part);
             auto* data = storedPart->Store->GetPage(groupId.Index, location.Offset);
             auto* collection = storedPart->GetPageCollection(groupId.Index);
@@ -141,8 +143,6 @@ namespace NTest {
             }
             return location.Offset.AsPageIndex();
         }
-
-
     };
 
     struct TPartEggs {

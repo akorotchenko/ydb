@@ -245,7 +245,8 @@ namespace NPage {
             return BaseRow_;
         }
 
-        TDataPage& Set(const TSharedData* raw = nullptr) {
+        TDataPage& Set(const TSharedData *raw = nullptr)
+        {
             return Parse(raw ? *raw : TSharedData());
         }
 
