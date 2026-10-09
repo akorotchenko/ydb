@@ -380,7 +380,8 @@ bool TSharedCacheSpace::TryDrainTransition(TTransition& transition) noexcept {
     }
 
     while (transition.NextHazardIndex_ < HazardSlotCount_) {
-        const ui64 hazardState = Hazards_[transition.NextHazardIndex_].State.load(std::memory_order_acquire);
+        // Pair with registration CAS so late readers observe the published generation.
+        const ui64 hazardState = Hazards_[transition.NextHazardIndex_].State.fetch_add(0, std::memory_order_acq_rel);
         if (!SpaceHazardIsDrained(hazardState, transition.Generation_)) {
             return false;
         }
@@ -504,10 +505,9 @@ bool TSharedCacheSpace::TryReleaseOldMapping(ESpaceMap mapping, TTransition& tra
             return false;
         }
     }
-    if (!owner->Release(oldPointer, oldSize, currentPointer, currentSize)) {
-        return false;
-    }
+    const bool released = owner->Release(oldPointer, oldSize, currentPointer, currentSize);
 
+    // Release may unmap the old view before failing to shrink its backing; preserve that progress for retry.
     switch (mapping) {
         case ESpaceMap::Handles:
             old.Handles = static_cast<THandle*>(oldPointer);
@@ -530,7 +530,7 @@ bool TSharedCacheSpace::TryReleaseOldMapping(ESpaceMap mapping, TTransition& tra
         case ESpaceMap::Done:
             Y_ABORT("Invalid shared-cache release stage");
     }
-    return true;
+    return released;
 }
 
 bool TSharedCacheSpace::TryReleaseTransition(TTransition& transition) noexcept {
