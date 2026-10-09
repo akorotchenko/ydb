@@ -707,7 +707,12 @@ bool TSharedCache::DropReference(TCacheCollection& owner) noexcept {
 
 SHARED_CACHE_TEMPLATE
 void TSharedCache::DropOwnerReference(TSpaceOperation& spaceOp, TCacheCollection& owner) noexcept {
-    if (DropReference(owner)) {
+    // Keep the payload alive after dropping the page's collection ownership.
+    TOperationItemRef collectionRef(spaceOp, TryAcquireStructural(spaceOp, owner.CacheItem.CacheItem()));
+    Y_ABORT_UNLESS(collectionRef);
+    const bool lastOwner = DropReference(owner);
+    InvokeHook(ESharedCacheHookPoint::AfterCollectionOwnerReferenceDropped, collectionRef.CacheItem());
+    if (lastOwner) {
         const TLogoBlobID id = owner.Id();
         const TCollectionCacheItem item = owner.CacheItem;
         PublishCollectionForReclaim(spaceOp, item.CacheItem());

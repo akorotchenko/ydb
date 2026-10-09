@@ -2629,6 +2629,68 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(free.Version(), AdvanceItemVersion(inserted.Version()));
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionValue(*fixture.Cache, inserted.Index()), nullptr);
     }
+    Y_UNIT_TEST(CollectionOwnerDropPinsMetadataDuringReclaim) {
+        for (bool lastOwner : { false, true }) {
+            TFixture fixture;
+            const TLogoBlobID id(15, 16, 18);
+            const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+            UNIT_ASSERT(collection);
+            UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+            UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+
+            const ui32 pageCount = lastOwner ? 1 : 2;
+            TVector<TPageCacheItem> pages;
+            for (ui32 offset = 1; offset <= pageCount; ++offset) {
+                pages.push_back(InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, offset)));
+                UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, pages.back()));
+            }
+            UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+            UNIT_ASSERT_VALUES_EQUAL(
+                TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), pageCount);
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, collection.Index()).Refs(), 0);
+            const TCacheCollection* metadata =
+                TSharedCacheTestAccess::CollectionValue(*fixture.Cache, collection.Index());
+
+            TSharedCacheGate gate;
+            gate.Slots[0].Arm(
+                lastOwner ? ESharedCacheHookPoint::BeforeCollectionHotPublished
+                          : ESharedCacheHookPoint::AfterCollectionOwnerReferenceDropped, collection.CacheItem());
+            TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
+            auto cache = fixture.Cache;
+            bool erased = false;
+            TGateThread releaser(gate, [&] {
+                auto binding = cache->BindThreadHazard(0);
+                erased = TSharedCacheTestAccess::EraseCold(*cache, MakeColdItem(*cache, pages[0].Index()));
+            });
+            gate.Slots[0].Wait();
+
+            if (lastOwner) {
+                UNIT_ASSERT(cache->DeleteCollection(collection));
+            } else {
+                UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*cache, collection), 1);
+                UNIT_ASSERT(TSharedCacheTestAccess::EraseCold(*cache, MakeColdItem(*cache, pages[1].Index())));
+                UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*cache, collection));
+                UNIT_ASSERT(TSharedCacheTestAccess::EraseCold(*cache, MakeColdItem(*cache, collection.Index())));
+            }
+
+            const THandleState retired = TSharedCacheTestAccess::HandleState(*cache, collection.Index());
+            UNIT_ASSERT(retired.IsTombstone());
+            UNIT_ASSERT_VALUES_EQUAL(retired.Refs(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(cache->Collections(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionValue(*cache, collection.Index()), metadata);
+            UNIT_ASSERT_VALUES_EQUAL(metadata->Id(), id);
+            TTestSharedCacheCollectionRef missing;
+            UNIT_ASSERT(cache->Find(id, missing) == ESharedCacheResultStatus::Miss);
+
+            gate.Slots[0].Release();
+            releaser.Join();
+            UNIT_ASSERT(erased);
+            UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*cache, collection.Index()).IsFree());
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionValue(*cache, collection.Index()), nullptr);
+            UNIT_ASSERT_VALUES_EQUAL(cache->Collections(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(cache->ResidentBytes(), 0);
+        }
+    }
     Y_UNIT_TEST(CollectionLogicalDeleteUnstickysPagesAndRetainsRecord) {
         TFixture fixture;
         const TCollectionLocation location{ .Id = TLogoBlobID(15, 16, 17) };
