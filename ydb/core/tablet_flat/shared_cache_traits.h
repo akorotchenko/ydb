@@ -18,6 +18,7 @@ enum class ESharedCacheHookPoint {
     AfterTombstoneHelperClaim, // Payload is the claimed item.
     BeforeTombstoneFinalCas, // Payload is the item at its final CAS.
     BeforeHotExchange, // Payload is the Hot item; the target slot has been reserved but not exchanged.
+    AfterHotEvictionPublished, // Payload is the evicted item, before category accounting.
     BeforeColdExchange, // Payload is the Cold membership after occupancy accounting, before ring publication.
     BeforeColdRingPop, // No item payload; an occupied Cold ring is about to be probed.
     AfterGrowthBucketPublished, // Payload is the resize marker.

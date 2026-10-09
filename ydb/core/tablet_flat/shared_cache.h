@@ -387,11 +387,11 @@ public:
     }
 
     ui64 HotPages() const noexcept {
-        return HotPages_.load(std::memory_order_relaxed);
+        return static_cast<ui64>(Max<i64>(0, HotPages_.load(std::memory_order_relaxed)));
     }
 
     ui64 ColdPages() const noexcept {
-        return ColdPages_.load(std::memory_order_relaxed);
+        return static_cast<ui64>(Max<i64>(0, ColdPages_.load(std::memory_order_relaxed)));
     }
 
     ui64 ColdRingEntries() const noexcept {
@@ -399,11 +399,11 @@ public:
     }
 
     ui64 StickyPages() const noexcept {
-        return StickyPages_.load(std::memory_order_relaxed);
+        return static_cast<ui64>(Max<i64>(0, StickyPages_.load(std::memory_order_relaxed)));
     }
 
     ui64 KeepColdPages() const noexcept {
-        return KeepColdPages_.load(std::memory_order_relaxed);
+        return static_cast<ui64>(Max<i64>(0, KeepColdPages_.load(std::memory_order_relaxed)));
     }
 
     ui64 Collections() const noexcept {
@@ -823,9 +823,9 @@ private:
     static ui64 FractionCeil(ui64 value, double fraction) noexcept;
     static void TransferEstimatedBytes(std::atomic<i64>& source, std::atomic<i64>& destination, ui64 bytes) noexcept;
     static void TransferEstimatedPages(
-        std::atomic<ui64>& source, std::atomic<ui64>& destination, EItemKind kind) noexcept;
-    static void AddEstimatedPages(std::atomic<ui64>& counter, EItemKind kind) noexcept;
-    static void SubtractEstimatedPages(std::atomic<ui64>& counter, EItemKind kind) noexcept;
+        std::atomic<i64>& source, std::atomic<i64>& destination, EItemKind kind) noexcept;
+    static void AddEstimatedPages(std::atomic<i64>& counter, EItemKind kind) noexcept;
+    static void SubtractEstimatedPages(std::atomic<i64>& counter, EItemKind kind) noexcept;
     static void SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept;
 
     // The sticky budget covers pages only: collection records move through the sticky estimate but never consume it.
@@ -923,10 +923,11 @@ private:
     std::atomic<ui64> KeepActivePageBytes_{ 0 };
     ui64 ColdByteBudget_ = Max<ui64>(); // Protected by HotResize_; watermark calculation input.
     std::atomic<i64> StickyBytes_{ 0 };
-    std::atomic<ui64> HotPages_{ 0 };
-    std::atomic<ui64> ColdPages_{ 0 };
-    std::atomic<ui64> KeepColdPages_{ 0 };
-    std::atomic<ui64> StickyPages_{ 0 };
+    // State transitions can overtake category accounting, temporarily making these estimates negative.
+    std::atomic<i64> HotPages_{ 0 };
+    std::atomic<i64> ColdPages_{ 0 };
+    std::atomic<i64> KeepColdPages_{ 0 };
+    std::atomic<i64> StickyPages_{ 0 };
     std::atomic<ui64> Collections_{ 0 };
     std::atomic<ui64> CollectionBytes_{ 0 };
     std::atomic<ui64> StaticBytes_{ 0 };

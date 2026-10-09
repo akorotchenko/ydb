@@ -360,6 +360,14 @@ public:
         return cache.ColdBytes_.load(std::memory_order_relaxed);
     }
 
+    static i64 ColdPagesEstimate(const TTestSharedCache& cache) {
+        return cache.ColdPages_.load(std::memory_order_relaxed);
+    }
+
+    static i64 KeepColdPagesEstimate(const TTestSharedCache& cache) {
+        return cache.KeepColdPages_.load(std::memory_order_relaxed);
+    }
+
     static ETransitionPhase HardTransitionPhase(const TTestSharedCache& cache) noexcept {
         return cache.HardTransition_.Phase();
     }
@@ -5737,6 +5745,61 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             const THandleState state = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
             UNIT_ASSERT(state.IsSticky());
             UNIT_ASSERT(state.IsStickyField());
+        }
+    }
+    Y_UNIT_TEST(ReheatOvertakesHotEvictionAccounting) {
+        for (ECacheMode mode : { ECacheMode::Regular, ECacheMode::TryKeepInMemory }) {
+            TFixture fixture;
+            const TLogoBlobID id(37, 39, 43);
+            const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+            UNIT_ASSERT(collection);
+            UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+            UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, mode));
+            const ui64 pageBytes = 4096 + NActors::TSharedData::OverheadSize;
+            UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(2 * pageBytes));
+            const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 1));
+            AssertPageUnreferenced(*fixture.Cache, page);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->HotPages(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdPages(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdPages(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyPages(), 0);
+
+            TSharedCacheGate gate;
+            gate.Slots[0].Arm(ESharedCacheHookPoint::AfterHotEvictionPublished, page.CacheItem());
+            TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
+            auto cache = fixture.Cache;
+            bool evicted = false;
+            TGateThread evictor(gate, [&] {
+                auto binding = cache->BindThreadHazard(0);
+                evicted = TSharedCacheTestAccess::EvictFromHot(*cache, page);
+            });
+            gate.Slots[0].Wait();
+            const bool keep = mode == ECacheMode::TryKeepInMemory;
+            UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*cache, page.Index()).State() ==
+                        (keep ? EHandleState::KeepCold : EHandleState::Cold));
+
+            TTestSharedCachePageRef held;
+            UNIT_ASSERT(cache->Find(collection, 1, held) == ESharedCacheResultStatus::Hit);
+            UNIT_ASSERT(held.CacheItem() == page);
+            UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*cache, page.Index()).IsHot());
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::ColdPagesEstimate(*cache), keep ? 0 : -1);
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::KeepColdPagesEstimate(*cache), keep ? -1 : 0);
+            UNIT_ASSERT_VALUES_EQUAL(cache->HotPages(), 2);
+            UNIT_ASSERT_VALUES_EQUAL(cache->ColdPages(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(cache->KeepColdPages(), 0);
+
+            gate.Slots[0].Release();
+            evictor.Join();
+            UNIT_ASSERT(evicted);
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::ColdPagesEstimate(*cache), 0);
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::KeepColdPagesEstimate(*cache), 0);
+            UNIT_ASSERT_VALUES_EQUAL(cache->HotPages(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(cache->ColdPages(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(cache->KeepColdPages(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(cache->StickyPages(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(cache->HotBytes(), pageBytes);
+            UNIT_ASSERT_VALUES_EQUAL(cache->ResidentBytes(), pageBytes);
+            UNIT_ASSERT_VALUES_EQUAL(held.size(), 4096);
         }
     }
     Y_UNIT_TEST(ReorderedCategoryTransfersConverge) {

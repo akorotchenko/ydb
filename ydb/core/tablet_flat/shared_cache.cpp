@@ -652,27 +652,25 @@ void TSharedCache::TransferEstimatedBytes(
 
 SHARED_CACHE_TEMPLATE
 void TSharedCache::TransferEstimatedPages(
-    std::atomic<ui64>& source, std::atomic<ui64>& destination, EItemKind kind) noexcept {
+    std::atomic<i64>& source, std::atomic<i64>& destination, EItemKind kind) noexcept {
     if (kind != EItemKind::Page) {
         return;
     }
     destination.fetch_add(1, std::memory_order_relaxed);
-    const ui64 previous = source.fetch_sub(1, std::memory_order_relaxed);
-    Y_ABORT_UNLESS(previous != 0);
+    source.fetch_sub(1, std::memory_order_relaxed);
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCache::AddEstimatedPages(std::atomic<ui64>& counter, EItemKind kind) noexcept {
+void TSharedCache::AddEstimatedPages(std::atomic<i64>& counter, EItemKind kind) noexcept {
     if (kind == EItemKind::Page) {
         counter.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCache::SubtractEstimatedPages(std::atomic<ui64>& counter, EItemKind kind) noexcept {
+void TSharedCache::SubtractEstimatedPages(std::atomic<i64>& counter, EItemKind kind) noexcept {
     if (kind == EItemKind::Page) {
-        const ui64 previous = counter.fetch_sub(1, std::memory_order_relaxed);
-        Y_ABORT_UNLESS(previous != 0);
+        counter.fetch_sub(1, std::memory_order_relaxed);
     }
 }
 
@@ -1175,6 +1173,7 @@ Y_FORCE_INLINE bool TSharedCache::TakeHotFrequency(
 SHARED_CACHE_TEMPLATE
 Y_FORCE_INLINE void TSharedCache::CompleteHotEviction(
     TSpaceOperation& spaceOp, TCacheItem cacheItem, THandle& handle, THandleState coldState, ui64 bytes) noexcept {
+    InvokeHook(ESharedCacheHookPoint::AfterHotEvictionPublished, cacheItem);
     UpdateColdReclaimable(bytes, coldState.WithState(EHandleState::Hot), coldState);
     if (coldState.IsKeepCold()) {
         TransferEstimatedBytes(HotBytes_, KeepColdBytes_, bytes);
@@ -4154,7 +4153,7 @@ bool TSharedCache::DrainHotResize(TSpaceOperation& spaceOp) noexcept {
 
 SHARED_CACHE_TEMPLATE
 ui32 TSharedCache::MinimumHotSlots(bool underPressure) const noexcept {
-    const ui64 hotPages = HotPages_.load(std::memory_order_relaxed);
+    const ui64 hotPages = HotPages();
     const ui64 hotBytes = LoadEstimatedBytes(HotBytes_);
     const ui64 meanPageBytes = hotPages ? Max<ui64>(1, hotBytes / hotPages)
                                         : AccountedPageBytes(Space_->CurrentConfiguration().ExpectedPageSize);
