@@ -1282,7 +1282,7 @@ ui32 TSharedCache::TryAllocateHandle(TSpaceOperation& spaceOp) noexcept {
         return 0;
     }
 
-    Y_ABORT_UNLESS(!spare.IsFrozen() && spare.Index() >= 2 && spare.Index() < spaceOp.AllocationLimit());
+    Y_ABORT_UNLESS(!spare.IsFrozen() && spare.Index() >= 2 && spare.Index() < spaceOp.AccessibleHandleCount());
     const THandle& handle = spaceOp.Handles()[spare.Index()];
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     Y_ABORT_UNLESS(spare.Matches(state) && state.IsBegin() && state.Refs() == 0);
@@ -1603,7 +1603,7 @@ THandle* TSharedCache::TryGetPendingFetchHandle(TOperationItemRef& owner, TPageF
     Y_DEBUG_ABORT_UNLESS(owner);
     TSpaceOperation& spaceOp = owner.SpaceOperation();
     const TCacheItem cacheItem = owner.CacheItem();
-    Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AllocationLimit());
+    Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AccessibleHandleCount());
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     if (!MatchesPendingFetch(handle, state, cacheItem, fetch) || fetch.Completion() != EPageFetchCompletion::Pending)
@@ -1845,7 +1845,7 @@ SHARED_CACHE_TEMPLATE
 bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* registry, TCacheItem cacheItem,
     THolder<TCacheCollection>&& value) noexcept {
     Y_DEBUG_ABORT_UNLESS(value);
-    Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AllocationLimit());
+    Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AccessibleHandleCount());
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(state) && state.IsCollectionKind() && state.IsBegin());
@@ -1873,7 +1873,7 @@ SHARED_CACHE_TEMPLATE
 void TSharedCache::MakeReadyState(
     TSpaceOperation& spaceOp, TCacheItem cacheItem, EHandleState readyState, TCacheCollection* pageOwner) noexcept {
     const ui32 index = cacheItem.Index();
-    Y_DEBUG_ABORT_UNLESS(index >= 2 && index < spaceOp.AllocationLimit());
+    Y_DEBUG_ABORT_UNLESS(index >= 2 && index < spaceOp.AccessibleHandleCount());
 
     THandle& handle = spaceOp.Handles()[index];
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
@@ -1962,7 +1962,7 @@ void TSharedCache::MakeReadyState(
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::EvictFromHot(TSpaceOperation& spaceOp, ui32 index) noexcept {
-    Y_DEBUG_ABORT_UNLESS(index >= 2 && index < spaceOp.HandleCount());
+    Y_DEBUG_ABORT_UNLESS(index >= 2 && index < spaceOp.AccessibleHandleCount());
 
     const THandleState state = THandleState::FromRaw(spaceOp.Handles()[index].State.load(std::memory_order_relaxed));
     if (!state.IsHot()) {
@@ -2017,7 +2017,7 @@ TCollectionCacheItem TSharedCache::AllocateCollection(const TLogoBlobID& id, ui6
 SHARED_CACHE_TEMPLATE
 void TSharedCache::InitializePage(TSpaceOperation& spaceOp, TCacheItem cacheItem, TCollectionCacheItem collection,
     ui64 offset, ui64 size, NTable::NPage::EPage type, ui32 crc32, EStickyState sticky, bool reserved) noexcept {
-    Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AllocationLimit());
+    Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AccessibleHandleCount());
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     const THandleState claimed = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(claimed) && claimed.IsBegin() && claimed.Refs() == 0);
@@ -2058,7 +2058,7 @@ void TSharedCache::InitializePage(TSpaceOperation& spaceOp, TCacheItem cacheItem
 SHARED_CACHE_TEMPLATE
 void TSharedCache::InitializeCollection(
     TSpaceOperation& spaceOp, TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept {
-    Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AllocationLimit());
+    Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AccessibleHandleCount());
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     const THandleState claimed = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(claimed) && claimed.IsBegin() && claimed.Refs() == 0);
@@ -2098,7 +2098,7 @@ SHARED_CACHE_TEMPLATE
 void TSharedCache::DiscardCandidate(
     TSpaceOperation& spaceOp, TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes) noexcept {
     const ui32 index = cacheItem.Index();
-    Y_DEBUG_ABORT_UNLESS(index >= 2 && index < spaceOp.AllocationLimit());
+    Y_DEBUG_ABORT_UNLESS(index >= 2 && index < spaceOp.AccessibleHandleCount());
 
     THandle& handle = spaceOp.Handles()[index];
     THandleState expected = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
@@ -2340,7 +2340,7 @@ void TSharedCache::DrainStickyPages(TSpaceOperation& spaceOp, TCacheCollection& 
     }
 
     while (current != 0) {
-        Y_DEBUG_ABORT_UNLESS(current < spaceOp.HandleCount());
+        Y_DEBUG_ABORT_UNLESS(current < spaceOp.AccessibleHandleCount());
         THandle& page = spaceOp.Handles()[current];
         const ui32 next = page.NextInOwner.load(std::memory_order_acquire);
         page.NextInOwner.store(0, std::memory_order_release);
@@ -2654,7 +2654,7 @@ bool TSharedCache::UnstickyCutPages(TSpaceOperation& spaceOp, TCacheItem pageIte
     ui32 retainedHead = 0;
     ui32 retainedTail = 0;
     while (current != 0) {
-        Y_DEBUG_ABORT_UNLESS(current < spaceOp.HandleCount());
+        Y_DEBUG_ABORT_UNLESS(current < spaceOp.AccessibleHandleCount());
         THandle& page = spaceOp.Handles()[current];
         const ui32 next = page.NextInOwner.load(std::memory_order_acquire);
         const THandleState state = THandleState::FromRaw(page.State.load(std::memory_order_acquire));
@@ -2803,7 +2803,7 @@ bool TSharedCache::UnlinkCollectionRegistry(TSpaceOperation& spaceOp, TCollectio
         std::atomic<ui32>* link = &registry.CollectionListHead;
         ui32 current = link->load(std::memory_order_acquire);
         while (current != 0) {
-            Y_DEBUG_ABORT_UNLESS(current < spaceOp.HandleCount());
+            Y_DEBUG_ABORT_UNLESS(current < spaceOp.AccessibleHandleCount());
             THandle& handle = spaceOp.Handles()[current];
             const ui32 next = handle.NextInOwner.load(std::memory_order_acquire);
             const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));

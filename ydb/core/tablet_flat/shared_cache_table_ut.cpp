@@ -3415,6 +3415,75 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         }
     }
 
+    Y_UNIT_TEST(PageBatchAdmitsHighHandleThroughMigrationOperation) {
+        TSharedCacheCapacity reserved;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 8, reserved));
+        TFixture fixture(6, 8, 7, reserved.Limit);
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(fixture.ReservedCapacity.Limit));
+
+        const TLogoBlobID id(901, 902, 906);
+        const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+
+        TVector<TTestSharedCachePageRef> held;
+        for (ui64 offset = 0; offset < fixture.Capacity.HandleCount() - 3; ++offset) {
+            const auto key = TSharedCacheKey::Page(collection, offset);
+            InsertReadyPage(*fixture.Cache, key);
+            auto found = FindPage(*fixture.Cache, key);
+            UNIT_ASSERT(found.Status == ESharedCacheResultStatus::Hit);
+            held.push_back(std::move(found.Ref));
+        }
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::SpareItem(*fixture.Cache, 7), 0);
+
+        TTransition growth;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+
+        struct TContext {
+            TTestSharedCache& Cache;
+            TTransition& Growth;
+            bool Published = false;
+        } context{ *fixture.Cache, growth };
+
+        TTestTraits hooks{ &context,
+            [](void* opaque, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                auto& context = *static_cast<TContext*>(opaque);
+                if (point == ESharedCacheHookPoint::AfterPageBatchPrepared) {
+                    Y_ABORT_UNLESS(!context.Published);
+                    Y_ABORT_UNLESS(TSharedCacheTestAccess::PublishFinalView(context.Cache, context.Growth));
+                    while (context.Growth.Phase() == ETransitionPhase::AppendGrowth) {
+                        Y_ABORT_UNLESS(TSharedCacheTestAccess::AppendFreeHandles(context.Cache, context.Growth));
+                    }
+                    context.Published = true;
+                }
+            } };
+        std::atomic<ui32> completed = 0;
+        std::atomic<ui32> ready = 0;
+        std::atomic<ui64> completedItem = 0;
+        TVector<TTestSharedCachePageRequest> requests;
+        requests.emplace_back(MakePageLocation(1000), new TTestPageFetchWaiter(completed, ready, completedItem));
+        {
+            TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+            UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, requests, true, true));
+        }
+        UNIT_ASSERT(context.Published);
+        UNIT_ASSERT(requests[0].Status() == ESharedCacheResultStatus::Inserted);
+        const TPageCacheItem page = requests[0].Fetch().CacheItem();
+        UNIT_ASSERT(page.Index() >= fixture.Capacity.HandleCount());
+        UNIT_ASSERT(requests[0].Fetch().MakeReady(MakePageData(page.Index())));
+        AssertPageHit(*fixture.Cache, TSharedCacheKey::Page(collection, 1000), page);
+        UNIT_ASSERT_VALUES_EQUAL(ready.load(), 1);
+
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, growth));
+    }
+
     Y_UNIT_TEST(FinalDrainHot) {
         TFixture fixture(6, 8, 7);
 

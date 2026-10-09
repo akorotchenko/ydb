@@ -622,7 +622,7 @@ public:
 
     Y_FORCE_INLINE bool TryStoreSpareItem(TCacheItem cacheItem) noexcept {
         Y_DEBUG_ABORT_UNLESS(!cacheItem.IsNull() && !cacheItem.IsFrozen() && cacheItem.Index() >= 2 &&
-                             cacheItem.Index() < AllocationLimit());
+                             cacheItem.Index() < AccessibleHandleCount());
         const THandle& handle = Handles()[cacheItem.Index()];
         const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
         Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(state) && state.IsBegin() && state.Refs() == 0);

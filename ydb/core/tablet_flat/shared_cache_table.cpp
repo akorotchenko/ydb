@@ -349,7 +349,7 @@ bool TSharedCacheTable::InsertAt(
     }
 
     const ui32 candidateIndex = candidate.Index();
-    Y_DEBUG_ABORT_UNLESS(candidateIndex >= 2 && candidateIndex < spaceOp.AllocationLimit());
+    Y_DEBUG_ABORT_UNLESS(candidateIndex >= 2 && candidateIndex < spaceOp.AccessibleHandleCount());
     THandle& handle = spaceOp.Handles()[candidateIndex];
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
     Y_DEBUG_ABORT_UNLESS(candidate.Matches(state) && !state.IsFree() && !state.IsTombstone() && state.Refs() == 0);

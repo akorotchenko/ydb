@@ -916,6 +916,7 @@ Y_FORCE_INLINE ui32 TSharedCacheSpace::TryAllocateHandleImpl(
         if (handle.State.compare_exchange_strong(
                 expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed))
         {
+            Y_DEBUG_ABORT_UNLESS(cacheItem.Index() < spaceOp.AccessibleHandleCount());
             return cacheItem.Index();
         }
     }
