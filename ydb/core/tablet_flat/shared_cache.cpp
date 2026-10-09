@@ -2687,7 +2687,7 @@ bool TSharedCache::LinkCollection(
     Y_DEBUG_ABORT_UNLESS(collectionItem.Matches(state) && state.IsCollectionKind());
     Y_DEBUG_ABORT_UNLESS((state.IsBegin() && state.IsStickyField()) ||
                          ((state.IsHot() || state.IsCold()) && state.IsTransitionField()) ||
-                         (state.IsSticky() && (state.IsStickyField() || state.IsStickyNoneField())));
+                         (state.IsSticky() && (state.IsStickyField() || state.IsTransitionField())));
     Y_DEBUG_ABORT_UNLESS(handle.NextInOwner.load(std::memory_order_relaxed) == 0);
     Y_DEBUG_ABORT_UNLESS(handle.Body.Collection);
 
@@ -2731,25 +2731,13 @@ bool TSharedCache::TryBeginCollectionAttach(TSpaceOperation& spaceOp, TCollectio
             }
             return false;
         }
-        if (expected.IsSticky() && expected.IsStickyNoneField()) {
-            TCollectionRegistry* owner = handle.Body.Collection->Registry_.load(std::memory_order_acquire);
-            if (!owner && LinkCollection(spaceOp, registry, collectionItem)) {
-                const THandleState claimed = expected.WithSticky(EStickyState::Sticky);
-                if (handle.State.compare_exchange_weak(
-                        expectedRaw, claimed.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
-                {
-                    AddReference(*handle.Body.Collection);
-                    attachState = claimed;
-                    return true;
-                }
-            }
-            return false;
-        }
-        if ((!expected.IsHot() && !expected.IsCold()) || !expected.IsStickyNoneField()) {
+        if ((!expected.IsSticky() && !expected.IsHot() && !expected.IsCold()) || !expected.IsStickyNoneField() ||
+            handle.Body.Collection->Registry_.load(std::memory_order_acquire)) {
             return false;
         }
 
         const THandleState claimed = expected.WithSticky(EStickyState::Transition);
+        InvokeHook(ESharedCacheHookPoint::BeforeCollectionAttachClaim, collectionItem);
         if (handle.State.compare_exchange_weak(
                 expectedRaw, claimed.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
         {
@@ -2770,7 +2758,7 @@ void TSharedCache::FinishCollectionAttach(
         RetainedBytes_.fetch_add(bytes, std::memory_order_relaxed);
         TransferEstimatedBytes(ColdBytes_, StickyBytes_, bytes);
         ColdItems_.fetch_sub(1, std::memory_order_relaxed);
-    } else {
+    } else if (detachedState == EHandleState::Hot) {
         TransferEstimatedBytes(HotBytes_, StickyBytes_, bytes);
     }
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
@@ -2780,6 +2768,7 @@ void TSharedCache::FinishCollectionAttach(
                        expected.State() == detachedState && expected.IsTransitionField());
         const THandleState desired =
             expected.WithState(EHandleState::Sticky).WithSticky(EStickyState::Sticky).WithFrequency(0);
+        InvokeHook(ESharedCacheHookPoint::BeforeCollectionAttachPublished, collectionItem);
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
         {
@@ -2795,7 +2784,7 @@ bool TSharedCache::AttachCollection(
     if (!TryBeginCollectionAttach(spaceOp, registry, collectionItem, attachState)) {
         return false;
     }
-    if (attachState.IsSticky()) {
+    if (attachState.IsStickyField()) {
         return true;
     }
 
