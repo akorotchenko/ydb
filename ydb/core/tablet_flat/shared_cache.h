@@ -370,6 +370,7 @@ public:
         return TargetHandleCount_.load(std::memory_order_relaxed);
     }
 
+    // Serialized controller access; workers use their active space view.
     ui64 PhysicalHandleCount() const noexcept {
         return Space_->CurrentConfiguration().HandleCount();
     }
@@ -889,9 +890,10 @@ private:
 
     bool DrainHotResize() noexcept;
     bool DrainHotResize(TSpaceOperation& spaceOp) noexcept;
-    ui32 MinimumHotSlots(bool underPressure = false) const noexcept;
-    ui32 ShrinkHotTarget(ui32 effectiveHotSlots, ui32 step, bool underPressure) const noexcept;
-    ui32 GrowHotTarget(ui32 effectiveHotSlots, ui32 step) const noexcept;
+    ui32 MinimumHotSlots(const TSpaceOperation& spaceOp, bool underPressure = false) const noexcept;
+    ui32 ShrinkHotTarget(
+        const TSpaceOperation& spaceOp, ui32 effectiveHotSlots, ui32 step, bool underPressure) const noexcept;
+    ui32 GrowHotTarget(const TSpaceOperation& spaceOp, ui32 effectiveHotSlots, ui32 step) const noexcept;
     ui32 HotResizeStep(ui32 effectiveHotSlots) const noexcept;
     ui64 CalculateSoftLimit(ui64 currentLimit) const noexcept;
     void RefreshSoftLimit() noexcept;

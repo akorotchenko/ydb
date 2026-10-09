@@ -275,8 +275,24 @@ public:
         });
     }
 
-    static ui32 MinimumHotSlots(const TTestSharedCache& cache, bool underPressure = false) noexcept {
-        return cache.MinimumHotSlots(underPressure);
+    static ui32 MinimumHotSlots(TTestSharedCache& cache, bool underPressure = false) noexcept {
+        return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
+            return cache.MinimumHotSlots(spaceOp, underPressure);
+        });
+    }
+
+    static std::array<ui64, 4> HotPolicy(TTestSharedCache& cache, const TSpaceOperation& spaceOp) noexcept {
+        const ui32 effective = static_cast<ui32>(spaceOp.EffectiveHotSlots());
+        return { effective, cache.MinimumHotSlots(spaceOp), cache.ShrinkHotTarget(spaceOp, effective, 1, false),
+            cache.GrowHotTarget(spaceOp, effective, 2) };
+    }
+
+    static bool EnforceWithOperation(TTestSharedCache& cache, TSpaceOperation& spaceOp) noexcept {
+        return cache.EnforceCurrentLimit(spaceOp, 0, true);
+    }
+
+    static THotResize::TGuard LockHotResize(TTestSharedCache& cache) noexcept {
+        return cache.HotResize_.TryLock();
     }
 
     static std::pair<ui64, ui64> ColdByteWatermarks(const TTestSharedCache& cache) noexcept {
@@ -3093,6 +3109,179 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, shrink));
     }
+    Y_UNIT_TEST(HotPolicyUsesProtectedViewAcrossCapacityCommit) {
+        TSharedCacheCapacity reserved;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 8, reserved));
+        for (const bool growing : { true, false }) {
+            TFixture fixture(6, 8, 7, reserved.Limit);
+            if (!growing) {
+                TTransition growth;
+                UNIT_ASSERT(
+                    TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+                CompleteBucketResize(*fixture.Cache, *fixture.Space);
+                CommitTransition(*fixture.Cache, growth);
+            }
+            UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(fixture.ReservedCapacity.Limit));
+            UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(fixture.ReservedCapacity.Limit));
+            const auto& target = growing ? fixture.ReservedCapacity : fixture.Capacity;
+            TTransition transition;
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, target.AddressBits));
+            CompleteBucketResize(*fixture.Cache, *fixture.Space);
+
+            TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& oldOp) {
+                const auto oldPolicy = TSharedCacheTestAccess::HotPolicy(*fixture.Cache, oldOp);
+                UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, transition));
+                TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& newOp) {
+                    UNIT_ASSERT_VALUES_EQUAL(newOp.View().HotSlotCount, target.HotSlotCount());
+                    const auto policy = TSharedCacheTestAccess::HotPolicy(*fixture.Cache, newOp);
+                    for (ui64 bound : policy) {
+                        UNIT_ASSERT(bound <= target.HotSlotCount());
+                    }
+                    if (growing) {
+                        UNIT_ASSERT(policy[1] > oldPolicy[1]);
+                        UNIT_ASSERT(policy[3] > oldPolicy[3]);
+                        UNIT_ASSERT_VALUES_EQUAL(oldOp.EffectiveHotSlots(), oldOp.View().HotSlotCount);
+                    } else {
+                        UNIT_ASSERT(policy[1] < oldPolicy[1]);
+                    }
+                    for (ui64 bound : TSharedCacheTestAccess::HotPolicy(*fixture.Cache, oldOp)) {
+                        UNIT_ASSERT(bound <= oldOp.View().HotSlotCount);
+                    }
+                });
+            });
+
+            UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(0));
+            UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(target.Limit));
+            TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
+                const auto before = TSharedCacheTestAccess::HotPolicy(*fixture.Cache, spaceOp);
+                UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+                UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, transition));
+                UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, transition));
+                UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, transition));
+                UNIT_ASSERT(before == TSharedCacheTestAccess::HotPolicy(*fixture.Cache, spaceOp));
+            });
+        }
+    }
+
+    Y_UNIT_TEST(HotMaintenanceRefreshesOperationAfterGrowth) {
+        TSharedCacheCapacity reserved;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 8, reserved));
+        TFixture fixture(6, 8, 7, reserved.Limit);
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(fixture.ReservedCapacity.Limit));
+        TTransition growth;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        {
+            auto lock = TSharedCacheTestAccess::LockHotResize(*fixture.Cache);
+            UNIT_ASSERT(lock);
+            UNIT_ASSERT(!TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        TVector<TTestSharedCachePageRef> held;
+        TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& oldOp) {
+            {
+                auto lock = TSharedCacheTestAccess::LockHotResize(*fixture.Cache);
+                UNIT_ASSERT(lock);
+                UNIT_ASSERT(!TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, growth));
+            }
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, growth));
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::BeginHotResize(*fixture.Cache, fixture.ReservedCapacity.HotSlotCount()));
+            const auto collection = MakeCollectionCacheItem(701, 702);
+            TPageCacheItem highPage;
+            for (ui64 offset = 0; offset < fixture.Capacity.HandleCount() - 1; ++offset) {
+                const auto key = TSharedCacheKey::Page(collection, offset);
+                highPage = InsertReadyPage(*fixture.Cache, key);
+                auto found = FindPage(*fixture.Cache, key);
+                UNIT_ASSERT(found.Status == ESharedCacheResultStatus::Hit);
+                held.push_back(std::move(found.Ref));
+            }
+            UNIT_ASSERT(highPage.Index() >= oldOp.HandleCount());
+            TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& newOp) {
+                auto& handle = newOp.Handles()[highPage.Index()];
+                const auto state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
+                UNIT_ASSERT(state.IsHot());
+                handle.State.store(state.WithFrequency(0).Raw(), std::memory_order_relaxed);
+                bool moved = false;
+                for (ui64 slot = 0; slot < newOp.View().HotSlotCount; ++slot) {
+                    auto& word = newOp.View().HotSlots[slot];
+                    if (word.load(std::memory_order_relaxed) == highPage.CacheItem().Raw()) {
+                        const ui64 displaced = newOp.View().HotSlots[newOp.View().HotSlotCount - 1].exchange(
+                            highPage.CacheItem().Raw(), std::memory_order_relaxed);
+                        word.store(displaced, std::memory_order_relaxed);
+                        moved = true;
+                        break;
+                    }
+                }
+                UNIT_ASSERT(moved);
+            });
+            UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(0));
+            TSharedCacheTestAccess::EnforceWithOperation(*fixture.Cache, oldOp);
+            UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, highPage.Index()).IsCold());
+        });
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, growth));
+    }
+
+    Y_UNIT_TEST(HotPolicyRunsWhileCapacityCommits) {
+        for (const bool growing : { true, false }) {
+            TFixture fixture(6, 8, 7);
+            if (!growing) {
+                TTransition growth;
+                UNIT_ASSERT(
+                    TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+                CompleteBucketResize(*fixture.Cache, *fixture.Space);
+                CommitTransition(*fixture.Cache, growth);
+            }
+            const auto& target = growing ? fixture.ReservedCapacity : fixture.Capacity;
+            TTransition transition;
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, target.AddressBits));
+            CompleteBucketResize(*fixture.Cache, *fixture.Space);
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, transition));
+
+            std::atomic<bool> ready = false;
+            std::atomic<bool> done = false;
+            std::thread worker([&] {
+                auto binding = fixture.Cache->BindThreadHazard(0);
+                TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
+                    ready.store(true, std::memory_order_release);
+                    do {
+                        const auto policy = TSharedCacheTestAccess::HotPolicy(*fixture.Cache, spaceOp);
+                        for (ui64 bound : policy) {
+                            UNIT_ASSERT(bound <= target.HotSlotCount());
+                        }
+                        fixture.Cache->EnforceCurrentLimit();
+                    } while (!done.load(std::memory_order_acquire));
+                });
+            });
+            while (!ready.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, transition));
+            done.store(true, std::memory_order_release);
+            worker.join();
+        }
+    }
+
     Y_UNIT_TEST(FinalDrainHot) {
         TFixture fixture(6, 8, 7);
 

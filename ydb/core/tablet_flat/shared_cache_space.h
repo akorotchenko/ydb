@@ -789,6 +789,7 @@ public:
         return TSpaceState::FromRaw(SpaceState_.load(std::memory_order_acquire));
     }
 
+    // Serialized controller access; workers use their active space view.
     const TSharedCacheCapacity& CurrentConfiguration() const noexcept {
         return Capacity_;
     }

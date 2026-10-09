@@ -531,6 +531,26 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT(!TSharedCacheSpace::Create(invalid, reserved, 0));
     }
 
+    Y_UNIT_TEST(TransitionRejectsChangedPageSizeEstimate) {
+        TSharedCacheCapacity current;
+        TSharedCacheCapacity reserved;
+        TSharedCacheCapacity changedEstimate;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, current));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, reserved));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 2048, 0, 1, changedEstimate));
+        auto space = TSharedCacheSpace::Create(current, reserved, 1);
+        UNIT_ASSERT(space);
+        const auto state = space->CurrentSpaceState();
+        const auto* handles = TSharedCacheSpaceTestAccess::Handles(*space);
+        TTransition transition;
+        UNIT_ASSERT(!space->PrepareTransition(changedEstimate, transition));
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::Idle);
+        UNIT_ASSERT(space->CurrentSpaceState() == state);
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::Handles(*space) == handles);
+        UNIT_ASSERT(space->PrepareTransition(reserved, transition));
+        UNIT_ASSERT(space->AbandonTransition(transition));
+    }
+
     Y_UNIT_TEST(AllocateAndReturnItem) {
         TSharedCacheCapacity capacity;
         UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));

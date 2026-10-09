@@ -147,8 +147,9 @@ bool TSharedCacheSpace::PrepareTransition(const TSharedCacheCapacity& target, TT
     const TSpaceView& current = SpaceView(spaceState);
     if (transition.Phase_ != ETransitionPhase::Idle || target.AddressBits < MinSharedCacheAddressBits ||
         target.AddressBits > MaxSharedCacheAddressBits || target.AddressBits > ReservedCapacity_.AddressBits ||
-        target.AddressBits == Capacity_.AddressBits || target.StaticBytes > ReservedCapacity_.StaticBytes ||
-        current.HandleCount != Capacity_.HandleCount() || current.AllocationLimit != Capacity_.HandleCount())
+        target.AddressBits == Capacity_.AddressBits || target.ExpectedPageSize != ReservedCapacity_.ExpectedPageSize ||
+        target.StaticBytes > ReservedCapacity_.StaticBytes || current.HandleCount != Capacity_.HandleCount() ||
+        current.AllocationLimit != Capacity_.HandleCount())
     {
         return false;
     }
