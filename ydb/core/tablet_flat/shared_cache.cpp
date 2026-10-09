@@ -682,7 +682,7 @@ TCacheCollection* TSharedCache::PageCollection(TSpaceOperation& spaceOp, const T
 
 SHARED_CACHE_TEMPLATE
 TCacheCollection* TSharedCache::PageCollection(TSpaceOperation& spaceOp, TCollectionCacheItem item) noexcept {
-    if (item.Index() >= spaceOp.HandleCount()) {
+    if (item.Index() >= spaceOp.AccessibleHandleCount()) {
         return nullptr;
     }
     THandle& collection = spaceOp.Handles()[item.Index()];

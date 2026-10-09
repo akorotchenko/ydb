@@ -935,7 +935,7 @@ Y_FORCE_INLINE bool TSharedCacheSpace::ReturnFreeHandleImpl(
     TSpaceState currentState = CurrentSpaceState();
     const TSpaceView* currentView = &SpaceView(currentState);
     const TSpaceView& operationView = spaceOp.View();
-    if (index < 2 || index >= operationView.HandleCount) {
+    if (index < 2 || index >= spaceOp.AccessibleHandleCount()) {
         return false;
     }
 

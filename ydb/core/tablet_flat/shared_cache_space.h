@@ -577,8 +577,12 @@ public:
         return View().HandleCount;
     }
 
+    Y_FORCE_INLINE ui64 AccessibleHandleCount() const noexcept {
+        return View().HandlesBytes / sizeof(THandle);
+    }
+
     Y_FORCE_INLINE bool Contains(TCacheItem cacheItem) const noexcept {
-        return !cacheItem.IsNull() && cacheItem.Index() < HandleCount();
+        return !cacheItem.IsNull() && cacheItem.Index() < AccessibleHandleCount();
     }
 
     Y_FORCE_INLINE ui64 AllocationLimit() const noexcept {
