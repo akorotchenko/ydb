@@ -3066,6 +3066,758 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, shrink));
     }
+    Y_UNIT_TEST(HotPolicyUsesProtectedViewAcrossCapacityCommit) {
+        TSharedCacheCapacity reserved;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 8, reserved));
+        for (const bool growing : { true, false }) {
+            TFixture fixture(6, 8, 7, reserved.Limit);
+            if (!growing) {
+                TTransition growth;
+                UNIT_ASSERT(
+                    TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+                CompleteBucketResize(*fixture.Cache, *fixture.Space);
+                CommitTransition(*fixture.Cache, growth);
+            }
+            UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(fixture.ReservedCapacity.Limit));
+            UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(fixture.ReservedCapacity.Limit));
+            const auto& target = growing ? fixture.ReservedCapacity : fixture.Capacity;
+            TTransition transition;
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, target.AddressBits));
+            CompleteBucketResize(*fixture.Cache, *fixture.Space);
+
+            TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& oldOp) {
+                const auto oldPolicy = TSharedCacheTestAccess::HotPolicy(*fixture.Cache, oldOp);
+                UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, transition));
+                TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& newOp) {
+                    UNIT_ASSERT_VALUES_EQUAL(newOp.View().HotSlotCount, target.HotSlotCount());
+                    const auto policy = TSharedCacheTestAccess::HotPolicy(*fixture.Cache, newOp);
+                    for (ui64 bound : policy) {
+                        UNIT_ASSERT(bound <= target.HotSlotCount());
+                    }
+                    if (growing) {
+                        UNIT_ASSERT(policy[1] > oldPolicy[1]);
+                        UNIT_ASSERT(policy[3] > oldPolicy[3]);
+                        UNIT_ASSERT_VALUES_EQUAL(oldOp.EffectiveHotSlots(), oldOp.View().HotSlotCount);
+                    } else {
+                        UNIT_ASSERT(policy[1] < oldPolicy[1]);
+                    }
+                    for (ui64 bound : TSharedCacheTestAccess::HotPolicy(*fixture.Cache, oldOp)) {
+                        UNIT_ASSERT(bound <= oldOp.View().HotSlotCount);
+                    }
+                });
+            });
+
+            UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(0));
+            UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(target.Limit));
+            TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
+                const auto before = TSharedCacheTestAccess::HotPolicy(*fixture.Cache, spaceOp);
+                UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+                UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, transition));
+                UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, transition));
+                UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, transition));
+                UNIT_ASSERT(before == TSharedCacheTestAccess::HotPolicy(*fixture.Cache, spaceOp));
+            });
+        }
+    }
+
+    Y_UNIT_TEST(HotMaintenanceRefreshesOperationAfterGrowth) {
+        TSharedCacheCapacity reserved;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 8, reserved));
+        TFixture fixture(6, 8, 7, reserved.Limit);
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(fixture.ReservedCapacity.Limit));
+        TTransition growth;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        {
+            auto lock = TSharedCacheTestAccess::LockHotResize(*fixture.Cache);
+            UNIT_ASSERT(lock);
+            UNIT_ASSERT(!TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        TVector<TTestSharedCachePageRef> held;
+        TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& oldOp) {
+            {
+                auto lock = TSharedCacheTestAccess::LockHotResize(*fixture.Cache);
+                UNIT_ASSERT(lock);
+                UNIT_ASSERT(!TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, growth));
+            }
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, growth));
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::BeginHotResize(*fixture.Cache, fixture.ReservedCapacity.HotSlotCount()));
+            const auto collection = MakeCollectionCacheItem(701, 702);
+            TPageCacheItem highPage;
+            for (ui64 offset = 0; offset < fixture.Capacity.HandleCount() - 1; ++offset) {
+                const auto key = TSharedCacheKey::Page(collection, offset);
+                highPage = InsertReadyPage(*fixture.Cache, key);
+                auto found = FindPage(*fixture.Cache, key);
+                UNIT_ASSERT(found.Status == ESharedCacheResultStatus::Hit);
+                held.push_back(std::move(found.Ref));
+            }
+            UNIT_ASSERT(highPage.Index() >= oldOp.HandleCount());
+            TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& newOp) {
+                auto& handle = newOp.Handles()[highPage.Index()];
+                const auto state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
+                UNIT_ASSERT(state.IsHot());
+                handle.State.store(state.WithFrequency(0).Raw(), std::memory_order_relaxed);
+                bool moved = false;
+                for (ui64 slot = 0; slot < newOp.View().HotSlotCount; ++slot) {
+                    auto& word = newOp.View().HotSlots[slot];
+                    if (word.load(std::memory_order_relaxed) == highPage.CacheItem().Raw()) {
+                        const ui64 displaced = newOp.View().HotSlots[newOp.View().HotSlotCount - 1].exchange(
+                            highPage.CacheItem().Raw(), std::memory_order_relaxed);
+                        word.store(displaced, std::memory_order_relaxed);
+                        moved = true;
+                        break;
+                    }
+                }
+                UNIT_ASSERT(moved);
+            });
+            UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(0));
+            TSharedCacheTestAccess::EnforceWithOperation(*fixture.Cache, oldOp);
+            UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, highPage.Index()).IsCold());
+        });
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, growth));
+    }
+
+    Y_UNIT_TEST(HotPolicyRunsWhileCapacityCommits) {
+        for (const bool growing : { true, false }) {
+            TFixture fixture(6, 8, 7);
+            if (!growing) {
+                TTransition growth;
+                UNIT_ASSERT(
+                    TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+                CompleteBucketResize(*fixture.Cache, *fixture.Space);
+                CommitTransition(*fixture.Cache, growth);
+            }
+            const auto& target = growing ? fixture.ReservedCapacity : fixture.Capacity;
+            TTransition transition;
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, target.AddressBits));
+            CompleteBucketResize(*fixture.Cache, *fixture.Space);
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, transition));
+
+            std::atomic<bool> ready = false;
+            std::atomic<bool> done = false;
+            std::thread worker([&] {
+                auto binding = fixture.Cache->BindThreadHazard(0);
+                TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
+                    ready.store(true, std::memory_order_release);
+                    do {
+                        const auto policy = TSharedCacheTestAccess::HotPolicy(*fixture.Cache, spaceOp);
+                        for (ui64 bound : policy) {
+                            UNIT_ASSERT(bound <= target.HotSlotCount());
+                        }
+                        fixture.Cache->EnforceCurrentLimit();
+                    } while (!done.load(std::memory_order_acquire));
+                });
+            });
+            while (!ready.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, transition));
+            done.store(true, std::memory_order_release);
+            worker.join();
+        }
+    }
+
+    Y_UNIT_TEST(OldViewReclaimsHighColdAndKeepColdPages) {
+        enum class ECase {
+            Cold,
+            KeepCold,
+            KeepColdTrim,
+            KeepColdWithdraw
+        };
+        for (ECase scenario : { ECase::Cold, ECase::KeepCold, ECase::KeepColdTrim, ECase::KeepColdWithdraw }) {
+            const bool keep = scenario != ECase::Cold;
+            TSharedCacheCapacity reserved;
+            UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 8, reserved));
+            TFixture fixture(6, 8, 7, reserved.Limit);
+            const TLogoBlobID baseId(901, 902, 903);
+            TCollectionCacheItem base;
+            TTestSharedCacheCollectionRef collectionHit;
+            UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, { .Id = baseId }, base, collectionHit) ==
+                        ESharedCacheResultStatus::Inserted);
+            UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, base, MakeCollection(baseId)));
+            UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(base, ECacheMode::Regular));
+
+            TVector<TTestSharedCachePageRef> held;
+            for (ui64 offset = 0; offset < fixture.Capacity.HandleCount() - 3; ++offset) {
+                const TSharedCacheKey key = TSharedCacheKey::Page(base, offset);
+                const TPageCacheItem page = InsertReadyPage(*fixture.Cache, key);
+                auto found = FindPage(*fixture.Cache, key);
+                UNIT_ASSERT(found.Status == ESharedCacheResultStatus::Hit);
+                UNIT_ASSERT(found.Ref.CacheItem() == page);
+                held.push_back(std::move(found.Ref));
+            }
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 0);
+
+            TTransition growth;
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+            CompleteBucketResize(*fixture.Cache, *fixture.Space);
+
+            TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& oldOp) {
+                UNIT_ASSERT_VALUES_EQUAL(oldOp.HandleCount(), fixture.Capacity.HandleCount());
+                UNIT_ASSERT_VALUES_EQUAL(oldOp.AccessibleHandleCount(), fixture.ReservedCapacity.HandleCount());
+                UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, growth));
+                while (growth.Phase() == ETransitionPhase::AppendGrowth) {
+                    UNIT_ASSERT(TSharedCacheTestAccess::AppendFreeHandles(*fixture.Cache, growth));
+                }
+
+                const TLogoBlobID id(901, 902, keep ? 905 : 904);
+                TCollectionCacheItem collection;
+                TTestSharedCacheCollectionRef hit;
+                UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, { .Id = id }, collection, hit) ==
+                            ESharedCacheResultStatus::Inserted);
+                UNIT_ASSERT(collection.Index() >= oldOp.HandleCount());
+                UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+                UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(
+                    collection, keep ? ECacheMode::TryKeepInMemory : ECacheMode::Regular));
+                const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+                if (keep) {
+                    UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(4 * bytes));
+                }
+
+                const TSharedCacheKey key = TSharedCacheKey::Page(collection, 1);
+                const TPageCacheItem page = InsertReadyPage(*fixture.Cache, key);
+                UNIT_ASSERT(page.Index() >= oldOp.HandleCount());
+                auto found = FindPage(*fixture.Cache, key);
+                UNIT_ASSERT(found.Status == ESharedCacheResultStatus::Hit);
+                TCacheCollection* value = TSharedCacheTestAccess::CollectionValue(*fixture.Cache, collection.Index());
+                UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), 2);
+                UNIT_ASSERT_VALUES_EQUAL(value->ResidentPageBytes(), bytes);
+
+                if (keep) {
+                    found.Ref.Drop();
+                    UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+                    UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsKeepCold());
+                    UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdOwnedBytes(), bytes);
+                    UNIT_ASSERT(TSharedCacheTestAccess::ColdVersion(*fixture.Cache, page.Index()) & KeepColdQueuedMask);
+                    if (scenario == ECase::KeepCold) {
+                        UNIT_ASSERT(TSharedCacheTestAccess::ReclaimKeepCold(*fixture.Cache, oldOp));
+                    } else {
+                        TTestSharedCacheItemRef heldPage;
+                        if (scenario == ECase::KeepColdWithdraw) {
+                            heldPage = TSharedCacheTestAccess::AcquireStructural(*fixture.Cache, page.CacheItem());
+                            UNIT_ASSERT(heldPage);
+                        }
+                        UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(0));
+                        TSharedCacheTestAccess::TrimKeepCold(*fixture.Cache, oldOp);
+                        if (heldPage) {
+                            UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsKeepCold());
+                            UNIT_ASSERT(!(TSharedCacheTestAccess::ColdVersion(*fixture.Cache, page.Index()) &
+                                          KeepColdQueuedMask));
+                            heldPage.Drop();
+                        }
+                        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsCold());
+                        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 1);
+                        UNIT_ASSERT(TSharedCacheTestAccess::ReclaimCold(*fixture.Cache, oldOp));
+                        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 0);
+                    }
+                    UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdOwnedBytes(), 0);
+                } else {
+                    UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+                    found.Ref.Drop();
+                    UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsCold());
+                    UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 1);
+                    UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableItems(), 1);
+                    UNIT_ASSERT(TSharedCacheTestAccess::ReclaimCold(*fixture.Cache, oldOp));
+                    UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 0);
+                    UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableItems(), 0);
+                }
+                UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsFree());
+                UNIT_ASSERT_VALUES_EQUAL(value->ResidentPageBytes(), 0);
+                UNIT_ASSERT_VALUES_EQUAL(value->ActivePageBytes(), 0);
+                UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), 1);
+                UNIT_ASSERT(FindPage(*fixture.Cache, key).Status == ESharedCacheResultStatus::Miss);
+            });
+
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, growth));
+        }
+    }
+
+    Y_UNIT_TEST(PageBatchAdmitsHighHandleThroughMigrationOperation) {
+        TSharedCacheCapacity reserved;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 8, reserved));
+        TFixture fixture(6, 8, 7, reserved.Limit);
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(fixture.ReservedCapacity.Limit));
+
+        const TLogoBlobID id(901, 902, 906);
+        const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+
+        TVector<TTestSharedCachePageRef> held;
+        for (ui64 offset = 0; offset < fixture.Capacity.HandleCount() - 3; ++offset) {
+            const auto key = TSharedCacheKey::Page(collection, offset);
+            InsertReadyPage(*fixture.Cache, key);
+            auto found = FindPage(*fixture.Cache, key);
+            UNIT_ASSERT(found.Status == ESharedCacheResultStatus::Hit);
+            held.push_back(std::move(found.Ref));
+        }
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::SpareItem(*fixture.Cache, 7), 0);
+
+        TTransition growth;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+
+        struct TContext {
+            TTestSharedCache& Cache;
+            TTransition& Growth;
+            bool Published = false;
+        } context{ *fixture.Cache, growth };
+
+        TTestTraits hooks{ &context,
+            [](void* opaque, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                auto& context = *static_cast<TContext*>(opaque);
+                if (point == ESharedCacheHookPoint::AfterPageBatchPrepared) {
+                    Y_ABORT_UNLESS(!context.Published);
+                    Y_ABORT_UNLESS(TSharedCacheTestAccess::PublishFinalView(context.Cache, context.Growth));
+                    while (context.Growth.Phase() == ETransitionPhase::AppendGrowth) {
+                        Y_ABORT_UNLESS(TSharedCacheTestAccess::AppendFreeHandles(context.Cache, context.Growth));
+                    }
+                    context.Published = true;
+                }
+            } };
+        std::atomic<ui32> completed = 0;
+        std::atomic<ui32> ready = 0;
+        std::atomic<ui64> completedItem = 0;
+        TVector<TTestSharedCachePageRequest> requests;
+        requests.emplace_back(MakePageLocation(1000), new TTestPageFetchWaiter(completed, ready, completedItem));
+        {
+            TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+            UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, requests, true, true));
+        }
+        UNIT_ASSERT(context.Published);
+        UNIT_ASSERT(requests[0].Status() == ESharedCacheResultStatus::Inserted);
+        const TPageCacheItem page = requests[0].Fetch().CacheItem();
+        UNIT_ASSERT(page.Index() >= fixture.Capacity.HandleCount());
+        UNIT_ASSERT(requests[0].Fetch().MakeReady(MakePageData(page.Index())));
+        AssertPageHit(*fixture.Cache, TSharedCacheKey::Page(collection, 1000), page);
+        UNIT_ASSERT_VALUES_EQUAL(ready.load(), 1);
+
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, growth));
+    }
+
+    Y_UNIT_TEST(FinalDrainHot) {
+        TFixture fixture(6, 8, 7);
+
+        TTransition growth;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        CommitTransition(*fixture.Cache, growth);
+
+        const TCollectionCacheItem collection = MakeCollectionCacheItem(20, 21);
+        TVector<TPageCacheItem> pages;
+        for (ui64 offset = 0; offset < 32; ++offset) {
+            pages.push_back(InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, offset)));
+            UNIT_ASSERT(pages.back().Index() < fixture.Capacity.HandleCount());
+        }
+
+        const auto countHotWords = [&] {
+            TVector<ui32> counts(fixture.ReservedCapacity.HandleCount(), 0);
+            TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
+                for (ui32 level = 0; level < 4; ++level) {
+                    const TRingView& ring = spaceOp.Hot(level);
+                    for (ui64 slot = 0; slot < ring.Capacity; ++slot) {
+                        const TCacheItem cacheItem =
+                            TCacheItem::FromRaw(ring.Slots[slot].load(std::memory_order_relaxed));
+                        if (!cacheItem.IsNull() && cacheItem.Index() < counts.size()) {
+                            ++counts[cacheItem.Index()];
+                        }
+                    }
+                }
+            });
+            return counts;
+        };
+
+        auto counts = countHotWords();
+        for (TPageCacheItem page : pages) {
+            UNIT_ASSERT_VALUES_EQUAL(counts[page.Index()], 1);
+        }
+
+        TTransition shrink;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.Capacity, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 6));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, shrink));
+
+        counts = countHotWords();
+        for (TPageCacheItem page : pages) {
+            UNIT_ASSERT_VALUES_EQUAL(counts[page.Index()], 1);
+            UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsHot());
+        }
+    }
+    Y_UNIT_TEST(FinalDrainCold) {
+        TFixture fixture(6, 8, 7);
+
+        TTransition growth;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        CommitTransition(*fixture.Cache, growth);
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(fixture.ReservedCapacity.Limit));
+
+        const TCollectionCacheItem collection = MakeCollectionCacheItem(22, 23);
+        TVector<TSharedCacheKey> keys;
+        TVector<TPageCacheItem> pages;
+        for (ui64 offset = 0; offset < fixture.Capacity.HandleCount() - 2; ++offset) {
+            keys.push_back(TSharedCacheKey::Page(collection, offset));
+            pages.push_back(InsertReadyPage(*fixture.Cache, keys.back()));
+            UNIT_ASSERT(pages.back().Index() < fixture.Capacity.HandleCount());
+        }
+        for (TPageCacheItem page : pages) {
+            const EHandleState state = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).State();
+            if (state == EHandleState::Hot) {
+                UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+            } else {
+                UNIT_ASSERT(state == EHandleState::Cold);
+            }
+        }
+        for (ui32 index = 0; index < 8; ++index) {
+            auto found = FindPage(*fixture.Cache, keys[index]);
+            UNIT_ASSERT(found.Status == ESharedCacheResultStatus::Hit);
+            found.Ref.Drop();
+            UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, pages[index]));
+        }
+        const ui32 target = 2;
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, pages[target].Index()).IsCold());
+
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(fixture.Capacity.Limit));
+        TTransition shrink;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.Capacity, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 6));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, shrink));
+
+        while (fixture.Cache->ReclaimCold()) {
+        }
+        UNIT_ASSERT(FindPage(*fixture.Cache, keys[target]).Status == ESharedCacheResultStatus::Miss);
+    }
+    Y_UNIT_TEST(TransitionStaticAccounting) {
+        TFixture fixture(6, 8, 7);
+        const ui64 growthDelta = fixture.ReservedCapacity.StaticBytes - fixture.Capacity.StaticBytes;
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.Capacity.StaticBytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Capacity.StaticBytes);
+
+        TTransition canceled;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, canceled));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.Capacity.StaticBytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), growthDelta);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.ReservedCapacity.StaticBytes);
+        UNIT_ASSERT(TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, canceled));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.Capacity.StaticBytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Capacity.StaticBytes);
+
+        TTransition growth;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        CommitTransition(*fixture.Cache, growth);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.ReservedCapacity.StaticBytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.ReservedCapacity.StaticBytes);
+
+        TTransition shrink;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.Capacity, shrink));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.ReservedCapacity.StaticBytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.ReservedCapacity.StaticBytes);
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 6));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        CommitTransition(*fixture.Cache, shrink);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.Capacity.StaticBytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Capacity.StaticBytes);
+    }
+    Y_UNIT_TEST(ColdReclaimSkipsEmptyRingAndFindsSparseEntry) {
+        TFixture fixture;
+        const TCollectionCacheItem collection = MakeCollectionCacheItem(505, 506);
+        const TPageCacheItem page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 0));
+        ui64 probes = 0;
+        TTestTraits hooks{ &probes, [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                              if (point == ESharedCacheHookPoint::BeforeColdRingPop) {
+                                  ++*static_cast<ui64*>(context);
+                              }
+                          } };
+        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+        UNIT_ASSERT(!fixture.Cache->ReclaimCold());
+        UNIT_ASSERT_VALUES_EQUAL(probes, 0);
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        UNIT_ASSERT(fixture.Cache->ReclaimCold());
+        UNIT_ASSERT_VALUES_EQUAL(probes, fixture.Capacity.ColdSlotCount());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 0);
+        UNIT_ASSERT(!fixture.Cache->ReclaimCold());
+        UNIT_ASSERT_VALUES_EQUAL(probes, fixture.Capacity.ColdSlotCount());
+    }
+
+    Y_UNIT_TEST(ColdReclaimPreservesInProgressPublication) {
+        TFixture fixture;
+        const TCollectionCacheItem collection = MakeCollectionCacheItem(507, 508);
+        const TPageCacheItem page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 0));
+        TSharedCacheGate gate;
+        gate.Slots[0].Arm(ESharedCacheHookPoint::BeforeColdExchange, {});
+        TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
+        auto cache = fixture.Cache;
+        TGateThread publisher(gate, [&] {
+            auto binding = cache->BindThreadHazard(0);
+            UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*cache, page));
+        });
+        gate.Slots[0].Wait();
+        UNIT_ASSERT_VALUES_EQUAL(cache->ColdRingEntries(), 1);
+        UNIT_ASSERT(!cache->ReclaimCold());
+        UNIT_ASSERT_VALUES_EQUAL(cache->ColdRingEntries(), 1);
+        gate.Slots[0].Release();
+        publisher.Join();
+        UNIT_ASSERT(cache->ReclaimCold());
+        UNIT_ASSERT_VALUES_EQUAL(cache->ColdRingEntries(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache->ColdReclaimableBytes(), 0);
+    }
+
+    Y_UNIT_TEST(ColdBytesSeparateHeldPayloadFromReclaimablePayload) {
+        TFixture fixture;
+        const TCollectionCacheItem collection = MakeCollectionCacheItem(501, 502);
+        const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+        const TPageCacheItem page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 0));
+        TTestSharedCachePageRef held;
+        UNIT_ASSERT(fixture.Cache->Find(collection, 0, held) == ESharedCacheResultStatus::Hit);
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdBytes(), bytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableItems(), 0);
+        held.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableBytes(), bytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableItems(), 1);
+        UNIT_ASSERT(fixture.Cache->Find(collection, 0, held) == ESharedCacheResultStatus::Hit);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableItems(), 0);
+        held.Drop();
+        UNIT_ASSERT(!fixture.Cache->ReclaimCold()); // Removes the stale membership without charging it again.
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableBytes(), bytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableItems(), 1);
+        UNIT_ASSERT(fixture.Cache->ReclaimCold());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableItems(), 0);
+    }
+
+    Y_UNIT_TEST(HeldColdBytesDoNotSuppressHotShrinkUnderPressure) {
+        TFixture fixture(7);
+        const TCollectionCacheItem collection = MakeCollectionCacheItem(503, 504);
+        const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+        TVector<TTestSharedCachePageRef> held;
+        for (ui64 offset = 0; offset < 8; ++offset) {
+            const TPageCacheItem page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, offset));
+            held.emplace_back();
+            UNIT_ASSERT(fixture.Cache->Find(collection, offset, held.back()) == ESharedCacheResultStatus::Hit);
+            UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        }
+        for (ui64 offset = 8; offset < 16; ++offset) {
+            InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, offset));
+        }
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdBytes(), 8 * bytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableBytes(), 0);
+        const ui64 softLimit = 12 * bytes;
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(softLimit));
+        UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(softLimit));
+        const ui64 hotSlots = TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache);
+        for (ui32 step = 0; step < 1000 && fixture.Cache->PageUsage() > softLimit; ++step) {
+            fixture.Cache->EnforceCurrentLimit();
+        }
+        UNIT_ASSERT_LE(fixture.Cache->PageUsage(), softLimit);
+        UNIT_ASSERT(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache) < hotSlots);
+        for (const auto& page : held) {
+            UNIT_ASSERT_VALUES_EQUAL(page.size(), 4096);
+        }
+    }
+
+    Y_UNIT_TEST(PhysicalCapacityMayExceedExactHardLimit) {
+        TSharedCacheCapacity capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 8, capacity));
+        const ui64 hardLimit = capacity.StaticBytes + 8 * (4096 + NActors::TSharedData::OverheadSize);
+        UNIT_ASSERT(hardLimit < capacity.TotalBytes);
+        TFixture fixture(6, 8, 6, hardLimit);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->HardLimit(), hardLimit);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->CurrentLimit(), hardLimit);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PhysicalHandleCount(), capacity.HandleCount());
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(hardLimit - 4096));
+        UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(0));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PhysicalHandleCount(), capacity.HandleCount());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->HardLimit(), hardLimit);
+    }
+
+    Y_UNIT_TEST(DynamicCurrentAndHardLimits) {
+        TFixture fixture(6, 8, 7);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->CurrentLimit(), fixture.Capacity.Limit);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->HardLimit(), fixture.Capacity.Limit);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservationLimit(), fixture.ReservedCapacity.Limit);
+
+        const ui64 policyLimit = fixture.Capacity.Limit - 1;
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(policyLimit));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->CurrentLimit(), policyLimit);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleCount(*fixture.Cache), fixture.Capacity.HandleCount());
+        UNIT_ASSERT(!fixture.Cache->UpdateCurrentLimit(fixture.Capacity.Limit + 1));
+        UNIT_ASSERT(!fixture.Cache->UpdateHardLimit(policyLimit - 1));
+        UNIT_ASSERT(!fixture.Cache->UpdateHardLimit(fixture.ReservedCapacity.Limit + 1));
+        UNIT_ASSERT(!fixture.Cache->UpdateCurrentLimit(0));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->CurrentLimit(), policyLimit);
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(1));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->CurrentLimit(), 1);
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(policyLimit));
+
+        UNIT_ASSERT(fixture.Cache->UpdateHardLimit(fixture.ReservedCapacity.Limit));
+        for (ui32 step = 0;
+             step < 10000 &&
+             (TSharedCacheTestAccess::HandleCount(*fixture.Cache) != fixture.ReservedCapacity.HandleCount() ||
+                 TSharedCacheTestAccess::HardTransitionPhase(*fixture.Cache) != ETransitionPhase::Idle);
+             ++step)
+        {
+            UNIT_ASSERT_C(fixture.Cache->RunMaintenance(), TStringBuilder() << "growth stalled at step " << step);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(
+            TSharedCacheTestAccess::HandleCount(*fixture.Cache), fixture.ReservedCapacity.HandleCount());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->HardLimit(), fixture.ReservedCapacity.Limit);
+
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(fixture.Capacity.Limit));
+        UNIT_ASSERT(fixture.Cache->UpdateHardLimit(fixture.Capacity.Limit));
+        for (ui32 step = 0;
+             step < 10000 && (TSharedCacheTestAccess::HandleCount(*fixture.Cache) != fixture.Capacity.HandleCount() ||
+                                 TSharedCacheTestAccess::HardTransitionPhase(*fixture.Cache) != ETransitionPhase::Idle);
+             ++step)
+        {
+            UNIT_ASSERT_C(fixture.Cache->RunMaintenance(), TStringBuilder() << "shrink stalled at step " << step);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleCount(*fixture.Cache), fixture.Capacity.HandleCount());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->CurrentLimit(), fixture.Capacity.Limit);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->HardLimit(), fixture.Capacity.Limit);
+    }
+    Y_UNIT_TEST(HardLimitRetargetSurvivesIntermediateCommit) {
+        constexpr ui32 HazardCount = 7;
+        TFixture fixture(6, HazardCount, 8);
+        TSharedCacheCapacity middle;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, HazardCount, middle));
+
+        UNIT_ASSERT(fixture.Cache->UpdateHardLimit(middle.Limit));
+        UNIT_ASSERT(TSharedCacheTestAccess::HardTransitionPhase(*fixture.Cache) == ETransitionPhase::Prepare);
+        UNIT_ASSERT(fixture.Cache->UpdateHardLimit(fixture.ReservedCapacity.Limit));
+        UNIT_ASSERT(middle.Limit + 1 < fixture.ReservedCapacity.Limit);
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(middle.Limit + 1));
+
+        for (ui32 step = 0;
+             step < 10000 && (TSharedCacheTestAccess::HandleCount(*fixture.Cache) != middle.HandleCount() ||
+                                 TSharedCacheTestAccess::HardTransitionPhase(*fixture.Cache) != ETransitionPhase::Idle);
+             ++step)
+        {
+            UNIT_ASSERT_C(fixture.Cache->RunMaintenance(), TStringBuilder() << "first growth step stalled at " << step);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleCount(*fixture.Cache), middle.HandleCount());
+        UNIT_ASSERT(TSharedCacheTestAccess::HardTransitionPhase(*fixture.Cache) == ETransitionPhase::Idle);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->HardLimit(), fixture.ReservedCapacity.Limit);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->CurrentLimit(), middle.Limit + 1);
+
+        for (ui32 step = 0;
+             step < 10000 &&
+             (TSharedCacheTestAccess::HandleCount(*fixture.Cache) != fixture.ReservedCapacity.HandleCount() ||
+                 TSharedCacheTestAccess::HardTransitionPhase(*fixture.Cache) != ETransitionPhase::Idle);
+             ++step)
+        {
+            UNIT_ASSERT_C(
+                fixture.Cache->RunMaintenance(), TStringBuilder() << "second growth step stalled at " << step);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(
+            TSharedCacheTestAccess::HandleCount(*fixture.Cache), fixture.ReservedCapacity.HandleCount());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->HardLimit(), fixture.ReservedCapacity.Limit);
+    }
+    Y_UNIT_TEST(HardShrinkCutScanIsBatched) {
+        constexpr ui32 HazardCount = 1;
+        TFixture fixture(11, HazardCount, 11);
+        TSharedCacheCapacity target;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(10, 4096, 0, HazardCount, target));
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(target.Limit));
+        UNIT_ASSERT(fixture.Cache->UpdateHardLimit(target.Limit));
+
+        for (ui32 step = 0; step < 10000; ++step) {
+            const TSpaceState state = TSharedCacheTestAccess::CurrentSpaceState(*fixture.Space);
+            if (TSharedCacheTestAccess::HardTransitionPhase(*fixture.Cache) == ETransitionPhase::Migrate &&
+                !state.Resizing() && state.AddressBits() == target.AddressBits)
+            {
+                break;
+            }
+            UNIT_ASSERT_C(fixture.Cache->RunMaintenance(), TStringBuilder() << "shrink routing stalled at " << step);
+        }
+
+        UNIT_ASSERT(TSharedCacheTestAccess::HardTransitionPhase(*fixture.Cache) == ETransitionPhase::Migrate);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HardTransitionWorkIndex(*fixture.Cache), 0);
+        UNIT_ASSERT(fixture.Cache->RunMaintenance());
+        UNIT_ASSERT(TSharedCacheTestAccess::HardTransitionPhase(*fixture.Cache) == ETransitionPhase::Migrate);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HardTransitionWorkIndex(*fixture.Cache),
+            target.HandleCount() + SharedCacheTransitionWorkBatch);
+
+        for (ui32 step = 0;
+             step < 10000 && (TSharedCacheTestAccess::HandleCount(*fixture.Cache) != target.HandleCount() ||
+                                 TSharedCacheTestAccess::HardTransitionPhase(*fixture.Cache) != ETransitionPhase::Idle);
+             ++step)
+        {
+            UNIT_ASSERT_C(fixture.Cache->RunMaintenance(), TStringBuilder() << "shrink completion stalled at " << step);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleCount(*fixture.Cache), target.HandleCount());
+        UNIT_ASSERT(TSharedCacheTestAccess::HardTransitionPhase(*fixture.Cache) == ETransitionPhase::Idle);
+    }
 }
 
 } // namespace NKikimr::NSharedCache
