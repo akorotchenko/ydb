@@ -141,36 +141,36 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     ui64 InFlyInMemoryBytes = 0;
     bool WalkContinuationScheduled = false;
 
-    TCollection* FindWalkCollection(const TLogoBlobID& id) override {
+    TCollection* FindCollection(const TLogoBlobID& id) override {
         return Collections.FindPtr(id);
     }
 
-    TPendingInMemoryPages& PendingWalkPages() override {
+    TPendingInMemoryPages& PendingPages() override {
         return PendingInMemoryPages;
     }
 
-    void ScheduleWalkContinuation() override {
+    void ScheduleContinuation() override {
         if (!std::exchange(WalkContinuationScheduled, true)) {
             Send(SelfId(), new TKikimrEvents::TEvWakeup(static_cast<ui64>(EWakeupTag::ContinueBTreeWalk)));
         }
     }
 
-    TSharedCachePages* WalkCachePages() override {
+    TSharedCachePages* CachePages() override {
         return SharedCachePages;
     }
 
-    void FetchWalkIndexLevel(
+    void FetchIndexLevel(
         TCollection& collection, TVector<TPageLocation>&& locations, const TLogoBlobID& walkCollectionId) override {
         Y_DEBUG_ABORT_UNLESS(collection.GetCacheMode() == ECacheMode::Regular);
         FetchIndexLevelInQueue(collection, std::move(locations), walkCollectionId);
     }
 
-    void SendWalkStickyPages(
+    void RequestStickyPages(
         TCollection& collection, const TActorId& owner, const TVector<TPageLocation>& locations) override {
         SendStickyCollectionPages(collection, owner, locations);
     }
 
-    void CancelQueuedWalkRequestsAndPump(const TLogoBlobID& walkCollectionId) override {
+    void CancelQueuedRequestsAndPump(const TLogoBlobID& walkCollectionId) override {
         CancelQueuedWalkRequests(walkCollectionId);
         RequestFromQueue(AsyncRequests);
         RequestFromQueue(ScanRequests);

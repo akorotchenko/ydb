@@ -72,17 +72,17 @@ class ICacheBTreeWalkHost {
 public:
     virtual ~ICacheBTreeWalkHost() = default;
 
-    virtual TCollection* FindWalkCollection(const TLogoBlobID& id) = 0;
-    virtual TPendingInMemoryPages& PendingWalkPages() = 0;
-    virtual TSharedCachePages* WalkCachePages() = 0;
-    // Regular-mode index reads; in-memory index reads go through PendingWalkPages.
-    virtual void FetchWalkIndexLevel(TCollection& collection, TVector<NTable::NPage::TPageLocation>&& locations,
+    virtual TCollection* FindCollection(const TLogoBlobID& id) = 0;
+    virtual TPendingInMemoryPages& PendingPages() = 0;
+    virtual TSharedCachePages* CachePages() = 0;
+    // Regular-mode index reads; in-memory index reads go through PendingPages.
+    virtual void FetchIndexLevel(TCollection& collection, TVector<NTable::NPage::TPageLocation>&& locations,
         const TLogoBlobID& walkCollectionId) = 0;
-    virtual void SendWalkStickyPages(
+    virtual void RequestStickyPages(
         TCollection& collection, const TActorId& owner, const TVector<NTable::NPage::TPageLocation>& locations) = 0;
-    virtual void CancelQueuedWalkRequestsAndPump(const TLogoBlobID& walkCollectionId) = 0;
+    virtual void CancelQueuedRequestsAndPump(const TLogoBlobID& walkCollectionId) = 0;
     virtual void TryDropExpiredCollection(TCollection& collection) = 0;
-    virtual void ScheduleWalkContinuation() = 0;
+    virtual void ScheduleContinuation() = 0;
 };
 
 class TCacheBTreeWalkController {

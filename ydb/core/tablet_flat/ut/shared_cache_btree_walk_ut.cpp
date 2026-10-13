@@ -64,8 +64,8 @@ namespace {
     class TWalkHostMock final : public ICacheBTreeWalkHost {
     public:
         TCollection Collection;
-        TPendingInMemoryPages PendingPages;
-        TIntrusivePtr<TSharedCachePages> CachePages = new TSharedCachePages;
+        TPendingInMemoryPages PendingInMemoryPages;
+        TIntrusivePtr<TSharedCachePages> SharedCachePages = new TSharedCachePages;
         TVector<TVector<TPageLocation>> StickyBatches;
         ui32 CancelledRequests = 0;
         ui32 ScheduledContinuations = 0;
@@ -79,29 +79,29 @@ namespace {
             Collection.PageCollection = MakeIntrusiveConst<TPageCollectionStub>(Collection.Id);
         }
 
-        TCollection* FindWalkCollection(const TLogoBlobID& id) override {
+        TCollection* FindCollection(const TLogoBlobID& id) override {
             ++CollectionLookups;
             return id == Collection.Id ? &Collection : nullptr;
         }
 
-        TPendingInMemoryPages& PendingWalkPages() override {
-            return PendingPages;
+        TPendingInMemoryPages& PendingPages() override {
+            return PendingInMemoryPages;
         }
 
-        TSharedCachePages* WalkCachePages() override {
-            return CachePages.Get();
+        TSharedCachePages* CachePages() override {
+            return SharedCachePages.Get();
         }
 
-        void FetchWalkIndexLevel(TCollection&, TVector<TPageLocation>&&, const TLogoBlobID& walkCollectionId) override {
+        void FetchIndexLevel(TCollection&, TVector<TPageLocation>&&, const TLogoBlobID& walkCollectionId) override {
             UNIT_ASSERT_C(AllowFetch, "Unexpected index fetch");
             FetchWalkCollectionId = walkCollectionId;
         }
 
-        void SendWalkStickyPages(TCollection&, const TActorId&, const TVector<TPageLocation>& locations) override {
+        void RequestStickyPages(TCollection&, const TActorId&, const TVector<TPageLocation>& locations) override {
             StickyBatches.push_back(locations);
         }
 
-        void CancelQueuedWalkRequestsAndPump(const TLogoBlobID&) override {
+        void CancelQueuedRequestsAndPump(const TLogoBlobID&) override {
             ++CancelledRequests;
         }
 
@@ -109,7 +109,7 @@ namespace {
             ++ExpiredChecks;
         }
 
-        void ScheduleWalkContinuation() override {
+        void ScheduleContinuation() override {
             ++ScheduledContinuations;
         }
 
@@ -161,7 +161,7 @@ Y_UNIT_TEST_SUITE(TCacheBTreeWalkController) {
         walks.UpdateSeeds(host.Collection, owner, { seed });
         walks.Advance();
         walks.Advance();
-        const auto& pending = host.PendingPages.at(host.Collection.Id);
+        const auto& pending = host.PendingInMemoryPages.at(host.Collection.Id);
         UNIT_ASSERT_VALUES_EQUAL(pending.size(), 1);
         UNIT_ASSERT(pending.contains(seed.Root));
         // Capacity-blocked index reads wait for loader progress without spinning self-wakeups.
@@ -239,7 +239,7 @@ Y_UNIT_TEST_SUITE(TCacheBTreeWalkController) {
         seed.Sticky = true;
         host.Collection.InMemoryOwners.insert(owner);
         const auto blocker = TPageLocation::FromByteOffset(8000, 10, EPage::DataPage, 8);
-        auto& pending = host.PendingPages[host.Collection.Id];
+        auto& pending = host.PendingInMemoryPages[host.Collection.Id];
         pending.emplace(blocker);
         walks.UpdateSeeds(host.Collection, owner, { seed });
         walks.Advance();
@@ -274,7 +274,7 @@ Y_UNIT_TEST_SUITE(TCacheBTreeWalkController) {
         seed.Root = TPageLocation::FromByteOffset(3000, 10, EPage::DataPage, 2);
         seed.LevelCount = 0;
         host.Collection.InMemoryOwners.insert(owner);
-        auto& pending = host.PendingPages[host.Collection.Id];
+        auto& pending = host.PendingInMemoryPages[host.Collection.Id];
         pending.emplace(blocker);
 
         walks.UpdateSeeds(host.Collection, owner, { seed });
@@ -308,7 +308,7 @@ Y_UNIT_TEST_SUITE(TCacheBTreeWalkController) {
         walks.FinishReady();
         UNIT_ASSERT(!walks.HasActiveWalks());
         UNIT_ASSERT_VALUES_EQUAL(host.ExpiredChecks, 1);
-        UNIT_ASSERT(host.PendingPages.at(host.Collection.Id).contains(seed.Root));
+        UNIT_ASSERT(host.PendingInMemoryPages.at(host.Collection.Id).contains(seed.Root));
 
         // The final completion consumes its bookkeeping; later calls have no host side effects.
         host.CollectionLookups = 0;
@@ -351,7 +351,7 @@ Y_UNIT_TEST_SUITE(TCacheBTreeWalkController) {
         seed.Root = TPageLocation::FromByteOffset(3000, 10, EPage::DataPage, 2);
         seed.LevelCount = 0;
         host.Collection.InMemoryOwners.insert(owner);
-        auto& pending = host.PendingPages[host.Collection.Id];
+        auto& pending = host.PendingInMemoryPages[host.Collection.Id];
         pending.emplace(TPageLocation::FromByteOffset(2000, 10, EPage::DataPage, 1));
 
         walks.UpdateSeeds(host.Collection, owner, { seed });
