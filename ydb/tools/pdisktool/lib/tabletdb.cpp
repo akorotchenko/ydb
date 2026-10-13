@@ -204,7 +204,7 @@ public:
     }
 
     TSharedCachePageRef GetPage(const TLogoBlobID& label,
-        TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, const TPageLocation& location)
+        const TIntrusiveConstPtr<NPageCollection::IPageCollection>& pageCollection, const TPageLocation& location)
     {
         auto& slot = Cache[label].Pages[location.Offset];
         if (slot.Ref) {
@@ -229,7 +229,7 @@ public:
             slot.Failed = true;
             return {};
         }
-        slot.Ref = pages.AdmitPage(std::move(pageCollection), location, std::move(data),
+        slot.Ref = pages.AdmitPage(pageCollection, location, std::move(data),
             NTable::TLoader::NeedIn(location.Type) || location.Type == EPage::FlatIndex);
         Y_ENSURE(slot.Ref, "Cannot admit offline page " << location.Offset);
         ++Stats.PagesRead;
