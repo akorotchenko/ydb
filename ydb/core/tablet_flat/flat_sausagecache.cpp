@@ -1,13 +1,12 @@
 #include "flat_sausagecache.h"
 #include "shared_cache.h"
-#include "shared_cache_pages.h"
 
 #include <ydb/core/base/appdata_fwd.h>
 
 namespace NKikimr::NSharedCache {
 
 TSharedCachePageRef TCollection::TryGetPage(const NTable::NPage::TPageLocation& location, bool sticky) const {
-    auto* cache = TSharedCache::TrySharedCachePages();
+    auto* cache = TSharedCache::TryGet();
     if (!cache) {
         return {};
     }
@@ -30,11 +29,9 @@ TSharedCachePageRef TCollection::TryGetPage(const NTable::NPage::TPageLocation& 
         TCollectionCacheItem inserted;
         TSharedCacheCollectionRef attached;
         const TCollectionLocation collectionLocation{ .Id = Id(), .BackingSize = PageCollection_->BackingSize() };
-        const auto status =
-            cache->FindOrInsert(*AppData()->SharedCachePages->Registry, collectionLocation, inserted, attached);
+        const auto status = cache->FindOrInsert(collectionLocation, inserted, attached);
         if (status == ESharedCacheResultStatus::Inserted) {
-            Y_ENSURE(cache->MakeReady(
-                *AppData()->SharedCachePages->Registry, inserted, MakeHolder<TCollection>(PageCollection_, inserted)));
+            Y_ENSURE(cache->MakeReady(inserted, MakeHolder<TCollection>(PageCollection_, inserted)));
             Y_ENSURE(cache->SetCollectionPagesCacheMode(inserted, ECacheMode::Regular));
             return {};
         }

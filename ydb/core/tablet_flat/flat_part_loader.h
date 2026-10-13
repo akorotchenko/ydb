@@ -4,7 +4,7 @@
 #include "flat_part_walker.h"
 #include "flat_sausagecache.h"
 #include "shared_cache_events.h"
-#include "shared_cache_pages.h"
+#include "shared_cache.h"
 #include "util_fmt_abort.h"
 #include <ydb/core/tablet_flat/protos/flat_table_part.pb.h>
 #include <ydb/core/util/pb.h>
@@ -113,8 +113,8 @@ namespace NTable {
                 Y_ENSURE(it != NeedPages.end(), "Got unknown decoder page");
                 NeedPages.erase(it);
                 SavedPages[page.Location.Offset] =
-                    TSharedCachePages::Get().AdmitPage(PageCollection->PageCollection(), page.Location,
-                        std::move(page.Data), NeedIn(page.Location.Type) || page.Location.Type == EPage::FlatIndex);
+                    TSharedCache::Get().AdmitPage(PageCollection->PageCollection(), page.Location, std::move(page.Data),
+                        NeedIn(page.Location.Type) || page.Location.Type == EPage::FlatIndex);
             }
 
             void Save(NSharedCache::TEvResult::TLoaded&& loaded)

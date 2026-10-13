@@ -24,7 +24,10 @@ namespace NKikimr {
         class TInFlightLimiterRegistry;
     }
     namespace NSharedCache {
-        class TSharedCachePages;
+        struct TProdTraits;
+        template <class TTraits>
+        class TSharedCacheImpl;
+        using TSharedCache = TSharedCacheImpl<TProdTraits>;
     }
     namespace NJaegerTracing {
         class TSamplingThrottlingConfigurator;
@@ -248,7 +251,7 @@ struct TAppData {
     TIntrusivePtr<NKikimr::TControlBoard> Icb;
     TIntrusivePtr<NKikimr::TDynamicControlBoard> Dcb;
     TIntrusivePtr<NGRpcService::TInFlightLimiterRegistry> InFlightLimiterRegistry;
-    TIntrusivePtr<NSharedCache::TSharedCachePages> SharedCachePages;
+    TIntrusivePtr<NSharedCache::TSharedCache> SharedCache;
 
     TIntrusivePtr<NInterconnect::TPollerThreads> PollerThreads;
 

@@ -1,4 +1,4 @@
-#include "shared_cache_pages.h"
+#include "shared_cache.h"
 #include <ydb/core/tablet_flat/flat_sausage_align.h>
 #include <ydb/core/tablet_flat/flat_sausage_meta.h>
 #include <ydb/core/tablet_flat/flat_sausage_writer.h>
@@ -667,7 +667,7 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
                 }
                 auto page = location;
                 page.Type = NTable::NPage::EPage::DataPage;
-                return TSharedCachePages::Get().AdmitPage(Collection, page, TSharedData(it->second));
+                return TSharedCache::Get().AdmitPage(Collection, page, TSharedData(it->second));
             }
 
             TResult Locate(const TMemTable*, ui64, ui32) override

@@ -4,7 +4,6 @@
 #include "shared_cache_btree_walk.h"
 #include "shared_cache_events.h"
 #include "shared_sausagecache_state.h"
-#include "shared_cache_pages.h"
 #include "shared_cache_counters.h"
 #include "shared_sausagecache.h"
 #include "util_fmt_abort.h"
@@ -119,11 +118,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     TActorId Owner;
     TIntrusivePtr<NMemory::IMemoryConsumer> MemoryConsumer;
-    NSharedCache::TSharedCachePages* SharedCachePages;
     TSharedCacheConfig Config;
     TSharedPageCacheCounters Counters;
     TIntrusivePtr<TSharedCache> CacheCore;
-    TIntrusivePtr<TCollectionRegistry> CoreRegistry;
     TCacheBTreeWalkController Walks{ *this };
     TPendingInMemoryPages PendingInMemoryPages;
     THashMap<ui64, TLogoBlobID> CoreWalkRequests;
@@ -171,7 +168,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             return;
         }
         auto binding = CacheCore->BindCurrentThreadHazard();
-        CacheCore->ForEachCollection(*CoreRegistry, [&](TCollection& collection) {
+        CacheCore->ForEachCollection([&](TCollection& collection) {
             if (collection.GetActorState()) {
                 callback(collection);
             }
@@ -299,10 +296,10 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         const TCollectionLocation location{ .Id = pageCollectionId, .BackingSize = pageCollection->BackingSize() };
         TCollectionCacheItem inserted;
         TSharedCacheCollectionRef ref;
-        const auto status = CacheCore->FindOrInsert(*CoreRegistry, location, inserted, ref);
+        const auto status = CacheCore->FindOrInsert(location, inserted, ref);
         if (status == ESharedCacheResultStatus::Inserted) {
             auto value = MakeHolder<TCollection>(pageCollection, inserted);
-            Y_ENSURE(CacheCore->MakeReady(*CoreRegistry, inserted, std::move(value)));
+            Y_ENSURE(CacheCore->MakeReady(inserted, std::move(value)));
             Y_ENSURE(CacheCore->Find(pageCollectionId, ref) == ESharedCacheResultStatus::Hit);
         } else {
             Y_ENSURE(status == ESharedCacheResultStatus::Hit);
@@ -440,9 +437,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     void Registered(TActorSystem* sys, const TActorId& owner) override {
         NActors::TActorBootstrapped<TSharedPageCache>::Registered(sys, owner);
         Owner = owner;
-
-        SharedCachePages = sys->AppData<TAppData>()->SharedCachePages.Get();
-        CoreRegistry = SharedCachePages->Registry;
     }
 
     void DetachCoreCollection(TCollection& collection) {
@@ -466,7 +460,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             auto binding = CacheCore->BindCurrentThreadHazard();
             ForEachCollection([&](TCollection& collection) {
                 collection.ResetActorState();
-                Y_ENSURE(CacheCore->DetachCollection(*CoreRegistry, collection.CacheItem));
+                Y_ENSURE(CacheCore->DetachCollection(collection.CacheItem));
             });
         }
         KeepPreloadBytes = 0;
@@ -1208,7 +1202,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             auto binding = CacheCore->BindCurrentThreadHazard();
             // Detach releases the registry hold; no access to collection follows it.
             collection.ResetActorState();
-            Y_ENSURE(CacheCore->DetachCollection(*CoreRegistry, collection.CacheItem));
+            Y_ENSURE(CacheCore->DetachCollection(collection.CacheItem));
             Counters.PageCollections->Dec();
         }
     }

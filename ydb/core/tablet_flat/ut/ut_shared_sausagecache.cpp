@@ -2,7 +2,6 @@
 
 #include <shared_cache.h>
 #include <shared_cache_counters.h>
-#include <shared_cache_pages.h>
 #include <util/system/sanitizers.h>
 #include <ydb/core/base/counters.h>
 #include <ydb/core/cms/console/console.h>
@@ -268,7 +267,7 @@ void WaitEvent(TMyEnvBase& env, ui32 eventType, ui32 requiredCount = 1) {
 void WakeupSharedCache(TMyEnvBase& env);
 
 void RestartAndClearCache(TMyEnvBase& env, ui64 memoryLimit = Max<ui64>()) {
-    auto* core = static_cast<TSharedCache*>(env->GetAppData().SharedCachePages->Cache.Get());
+    auto* core = &NSharedCache::TSharedCache::Get();
     env.SendSync(new TEvents::TEvPoison, false, true);
     env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0));
     WaitEvent(env, NMemory::EvConsumerLimit);
@@ -315,7 +314,7 @@ void WakeupSharedCache(TMyEnvBase& env) {
 }
 
 void AssertResidentWithinLimit(TMyEnvBase& env, const THolder<TSharedPageCacheCounters>& counters, ui64 limit) {
-    auto* core = static_cast<TSharedCache*>(env->GetAppData().SharedCachePages->Cache.Get());
+    auto* core = &NSharedCache::TSharedCache::Get();
     UNIT_ASSERT(core);
     const i64 softBound = static_cast<i64>(limit + (limit ? 1_MB : 0));
     const ui64 currentBound = core->CurrentLimit() + 1_MB;
@@ -386,7 +385,7 @@ Y_UNIT_TEST(Limits) {
     UNIT_ASSERT_LE(counters->ActiveLimitBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_VALUES_EQUAL(counters->MemLimitBytes->Val(), 100_MB);
 
-    auto* core = static_cast<TSharedCache*>(env->GetAppData().SharedCachePages->Cache.Get());
+    auto* core = &NSharedCache::TSharedCache::Get();
     const ui64 currentLimit = core->CurrentLimit();
 
     env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(6_MB));
@@ -462,7 +461,7 @@ Y_UNIT_TEST(Limits_Config) {
     env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(1_MB));
     WaitEvent(env, NMemory::EvConsumerLimit);
     AssertResidentWithinLimit(env, counters, 1_MB);
-    auto* core = static_cast<TSharedCache*>(env->GetAppData().SharedCachePages->Cache.Get());
+    auto* core = &NSharedCache::TSharedCache::Get();
     UNIT_ASSERT_VALUES_EQUAL(core->CurrentLimit(), 2_MB);
     UNIT_ASSERT_VALUES_EQUAL(core->SoftLimit(), 1_MB);
     UNIT_ASSERT_VALUES_EQUAL(counters->MemLimitBytes->Val(), 1_MB);
@@ -1202,7 +1201,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Basics) {
     Cerr << "...waiting until first table compacted" << Endl;
     env.WaitFor<NFake::TEvCompacted>();
 
-    auto* core = static_cast<TSharedCache*>(env->GetAppData().SharedCachePages->Cache.Get());
+    auto* core = &NSharedCache::TSharedCache::Get();
     UNIT_ASSERT(core);
     UNIT_ASSERT_VALUES_EQUAL(core->SoftLimit(), softLimit);
     UNIT_ASSERT_VALUES_EQUAL(core->CurrentLimit(), hardLimit);
@@ -1724,7 +1723,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Enabling) {
     Cerr << "...waiting until first table compacted" << Endl;
     env.WaitFor<NFake::TEvCompacted>();
 
-    auto* core = static_cast<TSharedCache*>(env->GetAppData().SharedCachePages->Cache.Get());
+    auto* core = &NSharedCache::TSharedCache::Get();
     UNIT_ASSERT(core);
     UNIT_ASSERT_VALUES_EQUAL(core->SoftLimit(), softLimit);
     UNIT_ASSERT_VALUES_EQUAL(core->CurrentLimit(), hardLimit);

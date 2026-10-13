@@ -45,8 +45,8 @@ struct TProdTraits {
     NActors::TActorSystem* KeepEvictionActorSystem = nullptr;
     TActorId KeepEvictionActor;
 
-    static void* TrySharedCachePages() noexcept;
-    static bool InstallSharedCachePages(void* cache) noexcept;
+    static void* TryGetCache() noexcept;
+    static bool InstallCache(void* cache) noexcept;
     static ui32 CurrentWorkerIndex() noexcept;
 
     void NotifyResourcesAvailable() const noexcept;
@@ -60,7 +60,7 @@ struct TProdTraits {
 };
 
 struct TTestTraits {
-    inline static thread_local void* CurrentSharedCachePages = nullptr;
+    inline static thread_local void* CurrentCache = nullptr;
 
     void* Context = nullptr;
     // The TCacheItem argument follows the payload rules documented on ESharedCacheHookPoint.
@@ -81,22 +81,22 @@ struct TTestTraits {
 
     void NotifyCollectionBytesChanged(const TLogoBlobID&, TCollectionCacheItem) const noexcept {}
 
-    static void* TrySharedCachePages() noexcept {
-        return CurrentSharedCachePages;
+    static void* TryGetCache() noexcept {
+        return CurrentCache;
     }
 
-    static bool InstallSharedCachePages(void*) noexcept {
+    static bool InstallCache(void*) noexcept {
         return true;
     }
 
-    static void BindSharedCachePages(void* cache) noexcept {
-        Y_DEBUG_ABORT_UNLESS(!CurrentSharedCachePages);
-        CurrentSharedCachePages = cache;
+    static void BindCache(void* cache) noexcept {
+        Y_DEBUG_ABORT_UNLESS(!CurrentCache);
+        CurrentCache = cache;
     }
 
-    static void UnbindSharedCachePages(void* cache) noexcept {
-        Y_DEBUG_ABORT_UNLESS(CurrentSharedCachePages == cache);
-        CurrentSharedCachePages = nullptr;
+    static void UnbindCache(void* cache) noexcept {
+        Y_DEBUG_ABORT_UNLESS(CurrentCache == cache);
+        CurrentCache = nullptr;
     }
 
     static ui32 CurrentWorkerIndex() noexcept {

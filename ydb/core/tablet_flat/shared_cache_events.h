@@ -13,7 +13,6 @@
 #include <util/generic/hash_set.h>
 
 namespace NKikimr::NSharedCache {
-    class TSharedCachePages;
     using EPriority = NTabletFlatExecutor::NBlockIO::EPriority;
     using TPageId = NTable::NPage::TPageId;
     using TPageOffset = NTable::NPage::TPageOffset;
@@ -62,22 +61,13 @@ namespace NKikimr::NSharedCache {
 
     static_assert(EvEnd < EventSpaceEnd(TKikimrEvents::ES_FLAT_EXECUTOR), "");
 
-    struct TEvUnregister : public TEventLocal<TEvUnregister, EvUnregister> {
-        TIntrusivePtr<TCollectionRegistry> Registry;
-
-        explicit TEvUnregister(TIntrusivePtr<TCollectionRegistry> registry = {})
-            : Registry(std::move(registry))
-        {
-        }
-    };
+    struct TEvUnregister : public TEventLocal<TEvUnregister, EvUnregister> {};
 
     struct TEvDetach : public TEventLocal<TEvDetach, EvDetach> {
         const TLogoBlobID PageCollectionId;
-        TIntrusivePtr<TCollectionRegistry> Registry;
 
-        TEvDetach(const TLogoBlobID &pageCollectionId, TIntrusivePtr<TCollectionRegistry> registry = {})
+        TEvDetach(const TLogoBlobID& pageCollectionId)
             : PageCollectionId(pageCollectionId)
-            , Registry(std::move(registry))
         {}
     };
 
@@ -108,7 +98,6 @@ namespace NKikimr::NSharedCache {
         };
 
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
-        TIntrusivePtr<TCollectionRegistry> Registry;
         ECacheMode CacheMode;
         TIntrusivePtr<TCollectionOwnerStats> OwnerStats;
         // Authoritative for the sender: an empty vector withdraws that owner's walks.
@@ -128,14 +117,10 @@ namespace NKikimr::NSharedCache {
         {
         }
 
-        // The registry ties the collection to the owner's shared cache state.
-        TEvAttach(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, ECacheMode cacheMode,
-            TIntrusivePtr<TCollectionRegistry> registry = {})
+        TEvAttach(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, ECacheMode cacheMode)
             : PageCollection(std::move(pageCollection))
-            , Registry(std::move(registry))
             , CacheMode(cacheMode)
-        {
-        }
+        {}
     };
 
     struct TEvAttached : public TEventLocal<TEvAttached, EvAttached> {
@@ -157,7 +142,7 @@ namespace NKikimr::NSharedCache {
         TVector<TPageLocation> Pages;
         TCollectionCacheItem CacheItem;
 
-        TSharedCachePageRef AddPage(TSharedCachePages& cachePages, NPageCollection::TPageData&& page, bool sticky);
+        TSharedCachePageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky);
 
         TEvSaveCompactedPages(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection)
             : PageCollection(std::move(pageCollection))

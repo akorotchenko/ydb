@@ -133,9 +133,8 @@ namespace {
                 }
 
                 const TPageLocation location(qp.Offset, qp.Size, EPage::Opaque);
-                auto ref = TSharedCachePages::Get().AdmitPage(
-                    BlobsPageCollection, location,
-                    TSharedData::Copy(TString(qp.Size, 'x')));
+                auto ref = TSharedCache::Get().AdmitPage(
+                    BlobsPageCollection, location, TSharedData::Copy(TString(qp.Size, 'x')));
                 load.emplace_back(std::move(ref));
             }
 
@@ -651,7 +650,7 @@ Y_UNIT_TEST_SUITE(NFwd_TLoadedPagesCircularBuffer){
             auto page = NFwd::TPage(TPageOffset::FromPageIndex(pageId * 1), pageId * 10 + 1, pageId * 100, pageId * 1000);
             const TPageLocation location(page.Offset, page.Size, EPage::Opaque);
             page.SharedPageRef =
-                TSharedCachePages::Get().AdmitPage(collection, location, TSharedData::Copy(TString(page.Size, 'x')));
+                TSharedCache::Get().AdmitPage(collection, location, TSharedData::Copy(TString(page.Size, 'x')));
 
             auto result = buffer.Emplace(page);
             UNIT_ASSERT_VALUES_EQUAL(result, pageId >= 5 ? (pageId - 5) * 10 + 1 : 0);

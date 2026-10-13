@@ -8,7 +8,6 @@
 #include <ydb/core/testlib/actors/block_events.h>
 #include <ydb/core/testlib/actors/wait_events.h>
 #include "shared_cache.h"
-#include "shared_cache_pages.h"
 
 namespace NKikimr {
 namespace NTabletFlatExecutor {
@@ -4050,7 +4049,7 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_Follower) {
         env.WaitFor<NFake::TEvCompacted>();
 
         // Force metadata loads: direct core lookup can otherwise boot the follower without requests.
-        auto* core = static_cast<TSharedCache*>(env->GetAppData().SharedCachePages->Cache.Get());
+        auto* core = &NSharedCache::TSharedCache::Get();
         {
             auto binding = core->BindCurrentThreadHazard();
             TSharedCacheCollectionRef collection;
@@ -8636,7 +8635,7 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_BTreeIndex) {
 
         env.SendSync(new TEvents::TEvPoison, false, true);
         SetSharedCacheSize(env, 0);
-        auto* core = static_cast<TSharedCache*>(appData.SharedCachePages->Cache.Get());
+        auto* core = &NSharedCache::TSharedCache::Get();
         for (ui32 step = 0; step < 400 && core->PageUsage() != 0; ++step) {
             WakeupSharedCache(env);
         }

@@ -7,6 +7,7 @@
 #include <util/generic/noncopyable.h>
 
 #include <new>
+#include <type_traits>
 
 namespace NKikimr::NSharedCache {
 
@@ -264,14 +265,22 @@ public:
     TSharedCacheImpl(const TSharedCacheImpl&) = delete;
     TSharedCacheImpl& operator=(const TSharedCacheImpl&) = delete;
 
-    static TSharedCacheImpl& SharedCachePages() noexcept {
-        TSharedCacheImpl* cache = TrySharedCachePages();
+    static TSharedCacheImpl& Get() noexcept {
+        TSharedCacheImpl* cache = TryGet();
         Y_DEBUG_ABORT_UNLESS(cache);
         return *cache;
     }
 
-    static TSharedCacheImpl* TrySharedCachePages() noexcept {
-        return static_cast<TSharedCacheImpl*>(TTraits::TrySharedCachePages());
+    TSharedCacheCollectionRefImpl<TTraits> AdmitCollection(
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> collection)
+        requires std::is_same_v<TTraits, TProdTraits>;
+
+    TSharedCachePageRefImpl<TTraits> AdmitPage(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
+        NTable::NPage::TPageLocation location, NActors::TSharedData&& data, bool sticky = false)
+        requires std::is_same_v<TTraits, TProdTraits>;
+
+    static TSharedCacheImpl* TryGet() noexcept {
+        return static_cast<TSharedCacheImpl*>(TTraits::TryGetCache());
     }
 
     TSharedCacheThreadBinding<TTraits> BindThreadHazard(ui32 index) const noexcept {
@@ -293,19 +302,11 @@ public:
 
     bool FailReady(TPageCacheItem page) noexcept;
 
-    bool MakeReady(
-        TCollectionRegistry& registry, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept;
+    bool MakeReady(TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept;
 
-    bool DetachCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
-
-    bool UnlinkCollectionRegistry(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
-
-    bool DeleteCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
+    bool DetachCollection(TCollectionCacheItem collection) noexcept;
 
     bool DeleteCollection(TCollectionCacheItem collection) noexcept;
-
-    bool MoveCollectionRegistry(
-        TCollectionRegistry& source, TCollectionRegistry& destination, TCollectionCacheItem collection) noexcept;
 
     bool SetCollectionPagesCacheMode(TCollectionCacheItem collection, ECacheMode mode) noexcept;
     bool SetCollectionSkipBTreeIndexV1Shadow(TCollectionCacheItem collection, bool skip) noexcept;
@@ -317,13 +318,13 @@ public:
     ESharedCacheResultStatus Find(const TLogoBlobID& id, TSharedCacheCollectionRefImpl<TTraits>& collection) noexcept;
 
     // The callback may detach the current collection. Registry mutations remain serialized by its owner.
-    void ForEachCollection(TCollectionRegistry& registry, TFunctionRef<void(TCollection&)> callback) noexcept;
+    void ForEachCollection(TFunctionRef<void(TCollection&)> callback) noexcept;
 
     bool FindOrInsertBatch(TCollectionCacheItem collection, TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests,
         bool recordStats = true, bool waitForMemory = false) noexcept;
 
-    ESharedCacheResultStatus FindOrInsert(TCollectionRegistry& registry, const TCollectionLocation& collection,
-        TCollectionCacheItem& inserted, TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
+    ESharedCacheResultStatus FindOrInsert(const TCollectionLocation& collection, TCollectionCacheItem& inserted,
+        TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
 
     bool ReclaimCold() noexcept;
 
@@ -631,6 +632,9 @@ private:
     bool FailFetch(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept;
 
     bool MakeReady(
+        TCollectionRegistry& registry, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept;
+
+    bool MakeReady(
         TCollectionRegistry* registry, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept;
 
     bool MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* registry, TCacheItem cacheItem,
@@ -659,8 +663,10 @@ private:
     ESharedCacheResultStatus FindOrInsert(TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page,
         EStickyState sticky, TIntrusivePtr<TPageFetchWaiter> waiter, TSharedCachePageRefImpl<TTraits>& hit,
         TPageFetchImpl<TTraits>& fetch) noexcept;
-    ESharedCacheResultStatus FindOrInsert(const TCollectionLocation& collection, TCollectionCacheItem& inserted,
-        TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
+    ESharedCacheResultStatus FindOrInsert(TCollectionRegistry& registry, const TCollectionLocation& collection,
+        TCollectionCacheItem& inserted, TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
+    ESharedCacheResultStatus FindOrInsertUnregistered(const TCollectionLocation& collection,
+        TCollectionCacheItem& inserted, TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
 
     ESharedCacheResultStatus FindOrInsertPage(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate,
         TIntrusivePtr<TPageFetchWaiter> waiter, TSharedCachePageRefImpl<TTraits>& hit,
@@ -758,6 +764,10 @@ private:
     void PublishCollectionForReclaim(TSpaceOperation& spaceOp, TCacheItem collection) noexcept;
     void FinishCollectionRetain(TSpaceOperation& spaceOp, TCacheItem collection) noexcept;
     bool DetachCollection(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
+    bool DetachCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
+    bool UnlinkCollectionRegistry(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
+    bool DeleteCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
+    void ForEachCollection(TCollectionRegistry& registry, TFunctionRef<void(TCollection&)> callback) noexcept;
     bool UnlinkCollectionRegistry(
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
     bool TryClaimCollectionDeletion(TSpaceOperation& spaceOp, TCollectionRegistry* expectedRegistry,
@@ -918,6 +928,7 @@ private:
 private:
     THolder<TSharedCacheSpace> Space_;
     TSharedCacheTableImpl<TTraits> Table_;
+    TIntrusivePtr<TCollectionRegistry> CollectionRegistry_ = new TCollectionRegistry;
     std::atomic<ui64> ResidentBytes_{ 0 };
     std::atomic<i64> HotBytes_{ 0 };
     std::atomic<i64> ColdBytes_{ 0 }; // All Cold storage, including held and retiring payloads

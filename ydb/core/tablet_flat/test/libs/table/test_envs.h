@@ -192,7 +192,7 @@ namespace NTest {
                     for (auto &fetchEntry: IndexFetch) {
                         auto* pageData = Store->GetPage(IndexRoom, fetchEntry.Offset);
                         auto ref =
-                            TSharedCachePages::Get().AdmitPage(IndexPageCollection, fetchEntry, TSharedData(*pageData));
+                            TSharedCache::Get().AdmitPage(IndexPageCollection, fetchEntry, TSharedData(*pageData));
                         PageLoadingLogic->Fill(std::move(ref), fetchEntry.Type);
                     }
                 }
@@ -200,7 +200,7 @@ namespace NTest {
                     for (auto &fetchEntry: GroupFetch) {
                         auto* pageData = Store->GetPage(GroupRoom, fetchEntry.Offset);
                         auto ref =
-                            TSharedCachePages::Get().AdmitPage(GroupPageCollection, fetchEntry, TSharedData(*pageData));
+                            TSharedCache::Get().AdmitPage(GroupPageCollection, fetchEntry, TSharedData(*pageData));
                         PageLoadingLogic->Fill(std::move(ref), fetchEntry.Type);
                     }
                 }

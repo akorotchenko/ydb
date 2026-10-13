@@ -10,7 +10,7 @@
 #include "flat_part_store.h"
 #include "flat_sausagecache.h"
 #include "flat_sausage_chop.h"
-#include "shared_cache_pages.h"
+#include "shared_cache.h"
 #include "shared_sausagecache.h"
 #include "util_fmt_abort.h"
 
@@ -81,7 +81,6 @@ namespace NTabletFlatExecutor {
             , Scheme(std::move(scheme))
         {
             Bundle = new TBundle(Mask_, Cfg.Writer);
-            SharedCachePages = AppData()->SharedCachePages.Get();
         }
 
         const TLogoBlobID& Mask() const noexcept { return Mask_; }
@@ -254,14 +253,15 @@ namespace NTabletFlatExecutor {
                 Y_ENSURE(res.PageCollections, "Direct write produced a part without page collections");
 
                 TVector<TSharedCacheCollectionRef> pageCollections;
+                auto& sharedCache = NSharedCache::TSharedCache::Get();
                 for (auto& pageCollection : res.PageCollections) {
-                    auto resultingPageCollection = SharedCachePages->AdmitCollection(pageCollection.PageCollection);
+                    auto resultingPageCollection = sharedCache.AdmitCollection(pageCollection.PageCollection);
                     auto saveCompactedPages = MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);
                     for (auto &page : pageCollection.StickyPages) {
-                        saveCompactedPages->AddPage(*SharedCachePages, std::move(page), true);
+                        saveCompactedPages->AddPage(sharedCache, std::move(page), true);
                     }
                     for (auto &page : pageCollection.RegularPages) {
-                        saveCompactedPages->AddPage(*SharedCachePages, std::move(page), false);
+                        saveCompactedPages->AddPage(sharedCache, std::move(page), false);
                     }
 
                     ctx.Send(MakeSharedPageCacheId(), saveCompactedPages.Release());
@@ -363,7 +363,6 @@ namespace NTabletFlatExecutor {
         TAutoPtr<TPartWriter> Writer;
         NTable::TWriteStats WriteStats;
         TVector<TBundle::TResult> Results;
-        NSharedCache::TSharedCachePages *SharedCachePages = nullptr;
 
         TOwnedCellVec PrevKey;
         bool HavePrevKey = false;

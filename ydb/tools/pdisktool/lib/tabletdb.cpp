@@ -127,13 +127,12 @@ public:
     {}
 
     ~TOfflinePages() override {
-        auto& pages = TSharedCachePages::Get();
-        auto* core = static_cast<NSharedCache::TSharedCache*>(pages.Cache.Get());
-        auto binding = core->BindCurrentThreadHazard();
+        auto& cache = TSharedCache::Get();
+        auto binding = cache.BindCurrentThreadHazard();
         for (auto& [_, entry] : Cache) {
             entry.Pages.clear();
             if (entry.Collection) {
-                core->DetachCollection(*pages.Registry, entry.Collection.CacheItem());
+                cache.DetachCollection(entry.Collection.CacheItem());
             }
         }
     }
@@ -141,7 +140,7 @@ public:
     TSharedCacheCollectionRef AdmitCollection(NPageCollection::TLargeGlobId id, TSharedData meta) {
         auto& entry = Cache[id.Lead];
         if (!entry.Collection) {
-            entry.Collection = TSharedCachePages::Get().AdmitCollection(
+            entry.Collection = TSharedCache::Get().AdmitCollection(
                 MakeIntrusiveConst<NPageCollection::TPageCollection>(std::move(id), std::move(meta)));
         }
         return entry.Collection.Acquire();
@@ -214,12 +213,11 @@ public:
             return {};
         }
 
-        auto& pages = TSharedCachePages::Get();
-        auto* core = static_cast<NSharedCache::TSharedCache*>(pages.Cache.Get());
-        auto binding = core->BindCurrentThreadHazard();
+        auto& cache = TSharedCache::Get();
+        auto binding = cache.BindCurrentThreadHazard();
         NSharedCache::TSharedCacheCollectionRef collection;
-        if (core->Find(label, collection) == NSharedCache::ESharedCacheResultStatus::Hit &&
-            core->Find(collection.CacheItem(), static_cast<ui64>(location.Offset), slot.Ref) ==
+        if (cache.Find(label, collection) == NSharedCache::ESharedCacheResultStatus::Hit &&
+            cache.Find(collection.CacheItem(), static_cast<ui64>(location.Offset), slot.Ref) ==
                 NSharedCache::ESharedCacheResultStatus::Hit) {
             return slot.Ref.Acquire();
         }
@@ -229,7 +227,7 @@ public:
             slot.Failed = true;
             return {};
         }
-        slot.Ref = pages.AdmitPage(pageCollection, location, std::move(data),
+        slot.Ref = cache.AdmitPage(pageCollection, location, std::move(data),
             NTable::TLoader::NeedIn(location.Type) || location.Type == EPage::FlatIndex);
         Y_ENSURE(slot.Ref, "Cannot admit offline page " << location.Offset);
         ++Stats.PagesRead;

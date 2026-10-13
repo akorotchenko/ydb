@@ -1,7 +1,7 @@
 #pragma once
 
 #include "test_store.h"
-#include <ydb/core/tablet_flat/shared_cache_pages.h>
+#include <ydb/core/tablet_flat/shared_cache.h>
 #include <ydb/core/tablet_flat/flat_fwd_blobs.h>
 #include <ydb/core/tablet_flat/flat_fwd_cache.h>
 #include <ydb/core/tablet_flat/flat_part_iface.h>
@@ -132,8 +132,7 @@ namespace NTest {
             auto* data = storedPart->Store->GetPage(groupId.Index, location.Offset);
             auto* collection = storedPart->GetPageCollection(groupId.Index);
             const auto actual = collection->GetLocation(ResolvePageId(part, location, groupId));
-            return TSharedCachePages::Get().AdmitPage(
-                storedPart->PageColls.at(groupId.Index), actual, TSharedData(*data));
+            return TSharedCache::Get().AdmitPage(storedPart->PageColls.at(groupId.Index), actual, TSharedData(*data));
         }
 
     protected:
