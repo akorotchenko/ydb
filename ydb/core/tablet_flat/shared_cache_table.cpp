@@ -818,6 +818,180 @@ bool TSharedCacheTable::FindLink(
     }
 }
 
+SHARED_CACHE_TEMPLATE
+bool TSharedCacheTable::BridgeTombstone(
+    TCacheItem cacheItem, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept {
+    const TCacheItem successor = FreezeNext(spaceOp, cacheItem).WithoutFrozen();
+    TCacheItem leftmostTombstone;
+    TCacheItem rightmostTombstone;
+    TCacheItem current = cacheItem;
+
+    for (;;) {
+        TSharedCacheKey currentKey = key;
+        if (current != cacheItem) {
+            THandle& tombstone = spaceOp.Handles()[current.Index()];
+            const THandleState state = THandleState::FromRaw(tombstone.State.load(std::memory_order_relaxed));
+            Y_DEBUG_ABORT_UNLESS(current.Matches(state) && state.IsTombstone() && state.Refs() > 0);
+            currentKey = LoadSharedCacheKey(tombstone, state.Kind());
+        }
+        TOrderedLink orderedLink;
+        if (!FindLink(spaceOp, currentKey, current, orderedLink)) {
+            if (current == cacheItem) {
+                Y_DEBUG_ABORT_UNLESS(leftmostTombstone.IsNull());
+                return true;
+            }
+
+            THandle& tombstone = spaceOp.Handles()[current.Index()];
+            const TCacheItem next = TCacheItem::FromRaw(tombstone.Next.load(std::memory_order_acquire)).WithoutFrozen();
+            const bool wasRightmost = current == rightmostTombstone;
+            Cache_.Release(spaceOp, current);
+            if (wasRightmost) {
+                leftmostTombstone = {};
+                rightmostTombstone = {};
+                current = cacheItem;
+            } else {
+                leftmostTombstone = next;
+                current = next;
+            }
+            continue;
+        }
+
+        bool removed;
+        {
+            TOperationItemRef ownerRef(spaceOp);
+            if (!orderedLink.Owner.IsNull()) {
+                const THandleState ownerState = THandleState::FromRaw(
+                    spaceOp.Handles()[orderedLink.Owner.Index()].State.load(std::memory_order_relaxed));
+                if (!orderedLink.Owner.Matches(ownerState)) {
+                    continue;
+                }
+                if (ownerState.IsTombstone()) {
+                    auto tombstoneRef = TryAcquireTombstone(spaceOp, orderedLink.Owner);
+                    if (!tombstoneRef) {
+                        continue;
+                    }
+                    const TCacheItem frozenNext = FreezeNext(spaceOp, orderedLink.Owner).WithoutFrozen();
+                    if (frozenNext != current) {
+                        tombstoneRef.Drop(spaceOp);
+                        continue;
+                    }
+                    tombstoneRef.Disarm();
+                    if (leftmostTombstone.IsNull()) {
+                        rightmostTombstone = orderedLink.Owner;
+                    }
+                    leftmostTombstone = orderedLink.Owner;
+                    current = orderedLink.Owner;
+                    continue;
+                }
+                ownerRef.Get() = TryAcquire(spaceOp, orderedLink.Owner);
+                if (!ownerRef) {
+                    continue;
+                }
+                if (orderedLink.Link->load(std::memory_order_acquire) != orderedLink.Expected.Raw()) {
+                    continue;
+                }
+            }
+
+            TCacheItem replacement = successor;
+            if (successor.IsNull()) {
+                replacement =
+                    orderedLink.Owner.IsNull() ? TCacheItem{} : TCacheItem::Make(orderedLink.Owner.Version(), 0);
+            }
+            ui64 expectedRaw = orderedLink.Expected.Raw();
+            removed = orderedLink.Link->compare_exchange_strong(
+                expectedRaw, replacement.Raw(), std::memory_order_release, std::memory_order_relaxed);
+        }
+        if (removed) {
+            current = leftmostTombstone;
+            while (!current.IsNull()) {
+                THandle& tombstone = spaceOp.Handles()[current.Index()];
+                const TCacheItem next =
+                    TCacheItem::FromRaw(tombstone.Next.load(std::memory_order_acquire)).WithoutFrozen();
+                const bool wasRightmost = current == rightmostTombstone;
+                Cache_.Release(spaceOp, current);
+                if (wasRightmost) {
+                    break;
+                }
+                current = next;
+            }
+            return true;
+        }
+    }
+}
+
+SHARED_CACHE_TEMPLATE
+void TSharedCacheTable::PublishPageReplacement(
+    TCacheItem source, TCacheItem replacement, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept {
+    for (;;) {
+        TOrderedLink orderedLink;
+        const bool found = FindLink(spaceOp, key, source, orderedLink);
+        Y_DEBUG_ABORT_UNLESS(found);
+        if (!found) {
+            return;
+        }
+
+        bool replaced;
+        {
+            TOperationItemRef ownerRef(spaceOp);
+            if (!orderedLink.Owner.IsNull()) {
+                const THandleState ownerState = THandleState::FromRaw(
+                    spaceOp.Handles()[orderedLink.Owner.Index()].State.load(std::memory_order_relaxed));
+                if (!orderedLink.Owner.Matches(ownerState)) {
+                    continue;
+                }
+                if (ownerState.IsTombstone()) {
+                    HelpTombstone(orderedLink.Owner, spaceOp);
+                    continue;
+                }
+                ownerRef.Get() = TryAcquire(spaceOp, orderedLink.Owner);
+                if (!ownerRef) {
+                    continue;
+                }
+                if (orderedLink.Link->load(std::memory_order_acquire) != orderedLink.Expected.Raw()) {
+                    continue;
+                }
+            }
+
+            ui64 expectedRaw = source.Raw();
+            Cache_.InvokeHook(ESharedCacheHookPoint::BeforeTableLinkCas, orderedLink.Owner);
+            replaced = orderedLink.Link->compare_exchange_strong(
+                expectedRaw, replacement.Raw(), std::memory_order_release, std::memory_order_relaxed);
+            if (replaced) {
+                Cache_.InvokeHook(ESharedCacheHookPoint::AfterTableLinkCas, orderedLink.Owner);
+            }
+        }
+        if (replaced) {
+            return;
+        }
+    }
+}
+
+SHARED_CACHE_TEMPLATE
+void TSharedCacheTable::HelpTombstone(TCacheItem cacheItem, TSpaceOperation& spaceOp) noexcept {
+    TOperationItemRef hold(spaceOp, TryAcquireTombstone(spaceOp, cacheItem));
+    if (!hold) {
+        return;
+    }
+    const TCacheItem tombstone = hold.CacheItem();
+    THandle& handle = spaceOp.Handles()[tombstone.Index()];
+    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
+    if (tombstone.Matches(state) && state.IsTombstone()) {
+        const TSharedCacheKey key = LoadSharedCacheKey(handle, state.Kind());
+        FreezeNext(spaceOp, tombstone);
+        BridgeTombstone(tombstone, key, spaceOp);
+    }
+}
+
+SHARED_CACHE_TEMPLATE
+void TSharedCacheTable::CompleteTombstone(
+    TCacheItem cacheItem, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept {
+    const THandleState state =
+        THandleState::FromRaw(spaceOp.Handles()[cacheItem.Index()].State.load(std::memory_order_acquire));
+    Y_ABORT_UNLESS(cacheItem.Matches(state) && state.IsTombstone() && state.Refs() > 0);
+    FreezeNext(spaceOp, cacheItem);
+    BridgeTombstone(cacheItem, key, spaceOp);
+}
+
 #undef TSharedCacheTable
 #undef TSharedCacheItemRef
 #undef TOperationItemRef
