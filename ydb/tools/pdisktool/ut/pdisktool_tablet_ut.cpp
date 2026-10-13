@@ -399,6 +399,15 @@ Y_UNIT_TEST_SUITE(TPDiskToolBlobStore) {
         UNIT_ASSERT(store.Get(largeGlobId, out));
         UNIT_ASSERT_VALUES_EQUAL(out, body);
 
+        NActors::TSharedData sharedOut;
+        UNIT_ASSERT(store.Get(largeGlobId, sharedOut));
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(sharedOut.data(), sharedOut.size()), body);
+
+        const NPageCollection::TLargeGlobId singleGlobId(0, lead);
+        NActors::TSharedData singleOut;
+        UNIT_ASSERT(store.Get(singleGlobId, singleOut));
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(singleOut.data(), singleOut.size()), body.substr(0, 100));
+
         // The last blob of the run is missing, so the body cannot be handed out at all.
         TExport partial;
         partial.PutPart(lead, 1, body.substr(0, 100));
@@ -408,6 +417,21 @@ Y_UNIT_TEST_SUITE(TPDiskToolBlobStore) {
         TBlobStore incomplete({}, issues);
         UNIT_ASSERT(incomplete.AddDirectory(partial.Path()));
         UNIT_ASSERT(!incomplete.Get(largeGlobId, out));
+        UNIT_ASSERT_VALUES_EQUAL(out, body);
+        const char* sharedBuffer = sharedOut.data();
+        UNIT_ASSERT(!incomplete.Get(largeGlobId, sharedOut));
+        UNIT_ASSERT(sharedOut.data() == sharedBuffer);
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(sharedOut.data(), sharedOut.size()), body);
+
+        auto malformed = largeGlobId;
+        malformed.Bytes = lead.BlobSize() - 1;
+        for (const auto& id : { NPageCollection::TLargeGlobId{}, malformed }) {
+            UNIT_ASSERT(!store.Get(id, out));
+            UNIT_ASSERT_VALUES_EQUAL(out, body);
+            UNIT_ASSERT(!store.Get(id, sharedOut));
+            UNIT_ASSERT(sharedOut.data() == sharedBuffer);
+            UNIT_ASSERT_VALUES_EQUAL(TStringBuf(sharedOut.data(), sharedOut.size()), body);
+        }
     }
 }
 

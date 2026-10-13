@@ -829,19 +829,18 @@ bool TTabletBoot::TImpl::LoadBundle(ui32 table, TSwitch::TBundle& bundle) {
             // built while the group is still the placeholder value.
             largeGlobId.Group = 0;
         }
-        TString meta;
+        TSharedData meta;
         if (!Store.Get(largeGlobId, meta)) {
             Repeated.Add("A page collection meta blob is missing from the input, so the rows of that"
                 " part are lost", largeGlobId.Lead.ToString());
             return false;
         }
-        if (meta.size() != largeGlobId.Bytes || !PlausibleMeta(meta)) {
+        if (meta.size() != largeGlobId.Bytes || !PlausibleMeta(TStringBuf(meta.data(), meta.size()))) {
             Repeated.Add("A page collection meta blob is damaged, so the rows of that part are lost",
                 largeGlobId.Lead.ToString());
             return false;
         }
-        collections.emplace_back(Env.AdmitCollection(
-            largeGlobId, TSharedData::Copy(meta.data(), meta.size())));
+        collections.emplace_back(Env.AdmitCollection(largeGlobId, std::move(meta)));
     }
     if (collections.empty()) {
         return false;
