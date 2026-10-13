@@ -782,6 +782,246 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT(space->TryReleaseTransition(shrink));
         UNIT_ASSERT(space->CommitTransition(shrink));
     }
+
+    Y_UNIT_TEST(CapacityGrowthAddsEveryNewHandleToFree) {
+        TSharedCacheCapacity small;
+        TSharedCacheCapacity large;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, large));
+
+        auto space = TSharedCacheSpace::Create(small, large, 1);
+        UNIT_ASSERT(space);
+        auto binding = space->BindThreadHazard(0);
+
+        TTransition transition;
+        UNIT_ASSERT(space->PrepareTransition(large, transition));
+        UNIT_ASSERT(space->PublishMigrationView(transition));
+        UNIT_ASSERT(space->TryDrainTransition(transition));
+        CompleteEmptyBucketResize(*space, large.AddressBits);
+        UNIT_ASSERT(space->PublishFinalView(transition));
+        CompleteGrowthAppend(*space, transition);
+        UNIT_ASSERT(space->TryDrainTransition(transition));
+        CompleteFinalDrain(*space, transition);
+        UNIT_ASSERT(space->TryReleaseTransition(transition));
+        UNIT_ASSERT(space->CommitTransition(transition));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), large.HandleCount() - 2);
+
+        auto operation = space->BeginOperation();
+        TVector<bool> seen(large.HandleCount(), false);
+        ui64 count = 0;
+        while (const ui32 index = operation.TryAllocateHandle()) {
+            UNIT_ASSERT(index >= 2 && index < large.HandleCount());
+            UNIT_ASSERT(!seen[index]);
+            seen[index] = true;
+            ++count;
+        }
+        UNIT_ASSERT_VALUES_EQUAL(count, large.HandleCount() - 2);
+        for (ui64 index = 2; index < large.HandleCount(); ++index) {
+            UNIT_ASSERT(seen[index]);
+        }
+    }
+
+    Y_UNIT_TEST(CapacityGrowthWorkIsBatched) {
+        TSharedCacheCapacity small;
+        TSharedCacheCapacity large;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(10, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(11, 4096, 0, 1, large));
+
+        auto space = TSharedCacheSpace::Create(small, large, 1);
+        UNIT_ASSERT(space);
+        auto binding = space->BindThreadHazard(0);
+
+        TTransition canceled;
+        UNIT_ASSERT(space->PrepareTransition(large, canceled));
+        UNIT_ASSERT(space->PublishMigrationView(canceled));
+        UNIT_ASSERT(canceled.Phase() == ETransitionPhase::InitializeGrowth);
+        UNIT_ASSERT(space->AbandonTransition(canceled));
+        UNIT_ASSERT(canceled.Phase() == ETransitionPhase::Idle);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).HandleCount, small.HandleCount());
+
+        TTransition transition;
+        UNIT_ASSERT(space->PrepareTransition(large, transition));
+        ui32 initializationCalls = 0;
+        do {
+            UNIT_ASSERT(space->PublishMigrationView(transition));
+            ++initializationCalls;
+        } while (transition.Phase() == ETransitionPhase::InitializeGrowth);
+        UNIT_ASSERT(initializationCalls > 1);
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::MigrationDrain);
+
+        UNIT_ASSERT(space->TryDrainTransition(transition));
+        CompleteEmptyBucketResize(*space, large.AddressBits);
+        UNIT_ASSERT(space->PublishFinalView(transition));
+        ui32 appendCalls = 1;
+        while (transition.Phase() == ETransitionPhase::AppendGrowth) {
+            UNIT_ASSERT(space->AppendFreeHandles(transition));
+            ++appendCalls;
+        }
+        UNIT_ASSERT(appendCalls > 1);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), large.HandleCount() - 2);
+
+        UNIT_ASSERT(space->TryDrainTransition(transition));
+        CompleteFinalDrain(*space, transition);
+        UNIT_ASSERT(space->TryReleaseTransition(transition));
+        UNIT_ASSERT(space->CommitTransition(transition));
+    }
+
+    Y_UNIT_TEST(CapacityShrinkDrainsWrappedFreeRing) {
+        TSharedCacheCapacity small;
+        TSharedCacheCapacity large;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, large));
+
+        auto space = TSharedCacheSpace::Create(large, large, 1);
+        UNIT_ASSERT(space);
+        auto binding = space->BindThreadHazard(0);
+        {
+            auto operation = space->BeginOperation();
+            for (ui64 iteration = 0; iteration < large.HandleCount() * 3; ++iteration) {
+                const ui32 index = operation.TryAllocateHandle();
+                UNIT_ASSERT(index >= 2 && index < large.HandleCount());
+                THandle& handle = operation.Handles()[index];
+                const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
+                UNIT_ASSERT(state.IsBegin() && state.Refs() == 0);
+                handle.State.store(state.WithState(EHandleState::Free).Raw(), std::memory_order_release);
+                UNIT_ASSERT(operation.ReturnFreeHandle(index, state.Version()));
+            }
+        }
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), large.HandleCount() - 2);
+
+        TTransition transition;
+        UNIT_ASSERT(space->PrepareTransition(small, transition));
+        UNIT_ASSERT(space->PublishMigrationView(transition));
+        UNIT_ASSERT(space->TryDrainTransition(transition));
+        CompleteEmptyBucketResize(*space, small.AddressBits);
+        UNIT_ASSERT(space->PublishFinalView(transition));
+        UNIT_ASSERT(space->TryDrainTransition(transition));
+        CompleteFinalDrain(*space, transition);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), small.HandleCount() - 2);
+        UNIT_ASSERT(space->TryReleaseTransition(transition));
+        UNIT_ASSERT(space->CommitTransition(transition));
+
+        auto operation = space->BeginOperation();
+        TVector<bool> seen(small.HandleCount(), false);
+        ui64 count = 0;
+        while (const ui32 index = operation.TryAllocateHandle()) {
+            UNIT_ASSERT(index >= 2 && index < small.HandleCount());
+            UNIT_ASSERT(!seen[index]);
+            seen[index] = true;
+            ++count;
+        }
+        UNIT_ASSERT_VALUES_EQUAL(count, small.HandleCount() - 2);
+    }
+
+    Y_UNIT_TEST(MigrationViewPublicationOrdersRestrictionBeforeGeneration) {
+        TSharedCacheCapacity small;
+        TSharedCacheCapacity large;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 0, small));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 0, large));
+        auto space = TSharedCacheSpace::Create(large, large, 0);
+        UNIT_ASSERT(space);
+
+        TTransition transition;
+        UNIT_ASSERT(space->PrepareTransition(small, transition));
+        const ui64 generation = TSharedCacheSpaceTestAccess::CurrentSpaceState(*space).Generation();
+        const TSpaceState publishedState =
+            TSharedCacheSpaceTestAccess::CurrentSpaceState(*space).WithGeneration(generation + 1);
+        bool called = false;
+        auto check = [&]() noexcept {
+            called = true;
+            const TSpaceView& publishedView = TSharedCacheSpaceTestAccess::SpaceView(*space, publishedState);
+            UNIT_ASSERT_VALUES_EQUAL(publishedView.AllocationLimit, small.HandleCount());
+            UNIT_ASSERT_VALUES_EQUAL(publishedView.HandleCount, large.HandleCount());
+            UNIT_ASSERT_VALUES_EQUAL(
+                TSharedCacheSpaceTestAccess::CurrentView(*space).AllocationLimit, large.HandleCount());
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).HandleCount, large.HandleCount());
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentSpaceState(*space).Generation(), generation);
+            UNIT_ASSERT(transition.Phase() == ETransitionPhase::PublishMigration);
+        };
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::PublishMigrationView(*space, transition, check));
+        UNIT_ASSERT(called);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentSpaceState(*space).Generation(), generation + 1);
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::MigrationDrain);
+    }
+
+    Y_UNIT_TEST(CapacityReleaseRetriesFailedStage) {
+        TSharedCacheCapacity small;
+        TSharedCacheCapacity large;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(10, 4096, 0, 0, small));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(11, 4096, 0, 0, large));
+        auto space = TSharedCacheSpace::Create(large, large, 0);
+        UNIT_ASSERT(space);
+
+        TTransition transition;
+        UNIT_ASSERT(space->PrepareTransition(small, transition));
+        UNIT_ASSERT(space->PublishMigrationView(transition));
+        UNIT_ASSERT(space->TryDrainTransition(transition));
+        CompleteEmptyBucketResize(*space, small.AddressBits);
+        UNIT_ASSERT(space->PublishFinalView(transition));
+        UNIT_ASSERT(space->TryDrainTransition(transition));
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::FinalDrain(*space, transition));
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::FinalDrain);
+        CompleteFinalDrain(*space, transition);
+        UNIT_ASSERT(transition.ReleaseStage() == ESpaceMap::Handles);
+
+        ui32 calls = 0;
+        auto failHandles = [&](ESpaceMap mapping, const void* begin, size_t size) noexcept {
+            ++calls;
+            UNIT_ASSERT(begin);
+            UNIT_ASSERT(size != 0);
+            return mapping != ESpaceMap::Handles;
+        };
+        UNIT_ASSERT(!TSharedCacheSpaceTestAccess::TryReleaseTransition(*space, transition, failHandles));
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::ReleaseRetry);
+        UNIT_ASSERT(transition.ReleaseStage() == ESpaceMap::Handles);
+        UNIT_ASSERT_VALUES_EQUAL(calls, 1);
+
+        calls = 0;
+        auto succeed = [&](ESpaceMap mapping, const void* begin, size_t size) noexcept {
+            ++calls;
+            if (calls == 1) {
+                UNIT_ASSERT(mapping == ESpaceMap::Handles);
+            }
+            UNIT_ASSERT(begin);
+            UNIT_ASSERT(size != 0);
+            return true;
+        };
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::TryReleaseTransition(*space, transition, succeed));
+        UNIT_ASSERT(calls >= 1);
+        UNIT_ASSERT(transition.ReleaseStage() == ESpaceMap::Done);
+        UNIT_ASSERT(space->CommitTransition(transition));
+    }
+
+    Y_UNIT_TEST(CapacityShutdownCancelsPrivateAndAbandonsPublished) {
+        TSharedCacheCapacity small;
+        TSharedCacheCapacity large;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 0, small));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 0, large));
+
+        auto space = TSharedCacheSpace::Create(small, large, 0);
+        UNIT_ASSERT(space);
+        THandle* initialHandles = TSharedCacheSpaceTestAccess::Handles(*space);
+
+        TTransition privateTransition;
+        UNIT_ASSERT(space->PrepareTransition(large, privateTransition));
+        UNIT_ASSERT_VALUES_EQUAL(privateTransition.ResizeDeltaBits(), 1);
+        UNIT_ASSERT(space->AbandonTransition(privateTransition));
+        UNIT_ASSERT(privateTransition.Phase() == ETransitionPhase::Idle);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::Handles(*space), initialHandles);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).HandleCount, small.HandleCount());
+
+        TTransition publishedTransition;
+        UNIT_ASSERT(space->PrepareTransition(large, publishedTransition));
+        UNIT_ASSERT(space->PublishMigrationView(publishedTransition));
+        const ui64 generation = TSharedCacheSpaceTestAccess::CurrentSpaceState(*space).Generation();
+        UNIT_ASSERT(space->AbandonTransition(publishedTransition));
+        UNIT_ASSERT(publishedTransition.Phase() == ETransitionPhase::AbandonedForShutdown);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentSpaceState(*space).Generation(), generation);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).HandleCount, small.HandleCount());
+        UNIT_ASSERT(!space->TryDrainTransition(publishedTransition));
+        UNIT_ASSERT(!space->TryReleaseTransition(publishedTransition));
+        UNIT_ASSERT(!space->CommitTransition(publishedTransition));
+    }
 }
 
 } // namespace NKikimr::NSharedCache
