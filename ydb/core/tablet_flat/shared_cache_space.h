@@ -613,6 +613,10 @@ public:
         return TCacheItem::FromRaw(Cold().PutAndPop(cacheItem.Raw()));
     }
 
+    ui32 TryAllocateHandle() noexcept;
+
+    bool ReturnFreeHandle(ui32 index, ui32 version) noexcept;
+
     Y_FORCE_INLINE bool TryStoreSpareItem(TCacheItem cacheItem) noexcept {
         Y_DEBUG_ABORT_UNLESS(!cacheItem.IsNull() && !cacheItem.IsFrozen() && cacheItem.Index() >= 2 &&
                              cacheItem.Index() < AccessibleHandleCount());
@@ -808,8 +812,19 @@ public:
         return TlsHazard_;
     }
 
+    bool BeginBucketResize(ui8 newAddressBits) noexcept;
+    bool AdvanceBucketResizePhase(EBucketResizePhase phase) noexcept;
+    bool PublishBucketResizeCursor(ui32 cursor) noexcept;
+    bool PrepareNextBucketResizePair() noexcept;
+    bool FinishBucketResize() noexcept;
+
     TSpaceHazardBinding BindThreadHazard(ui32 index) const noexcept;
     TSpaceHazardBinding BindAnyThreadHazard() const noexcept;
+
+    TCacheItem TakeCutSpare(ui64 allocationLimit) noexcept;
+
+    bool BeginHotResize(ui32 targetEffectiveHotSlots, THotResize& resize) noexcept;
+    bool DrainHotResize(THotResize& resize, ui32& level, ui64& raw) noexcept;
 
     Y_FORCE_INLINE bool RefreshSpaceState(TSpaceState& spaceState) const noexcept {
         const TSpaceState current = CurrentSpaceState();
@@ -826,7 +841,31 @@ private:
     friend class TSharedCacheTestAccess;
     friend class TSpaceOperation;
 
+    struct TFreeExchangeHook {
+        void* Context = nullptr;
+        void (*Function)(void*) noexcept = nullptr;
+
+        void Run() const noexcept {
+            if (Function) {
+                Function(Context);
+            }
+        }
+    };
+
+    ui32 TryAllocateHandleWithHook(TSpaceOperation& spaceOp, TFreeExchangeHook hook) noexcept;
+
+    bool ReturnFreeHandleWithHook(TSpaceOperation& spaceOp, ui32 index, ui32 version, TFreeExchangeHook hook) noexcept;
+
     bool AdvanceSpaceGeneration() noexcept;
+
+    template <bool WithHook>
+    Y_FORCE_INLINE ui32 TryAllocateHandleImpl(TSpaceOperation& spaceOp, TFreeExchangeHook hook) noexcept;
+
+    template <bool WithHook>
+    Y_FORCE_INLINE bool ReturnFreeHandleImpl(
+        TSpaceOperation& spaceOp, ui32 index, ui32 version, TFreeExchangeHook hook) noexcept;
+
+    static ui32 HotLevelForSlot(ui64 slot, ui64 hotSlotCount) noexcept;
 
     void PrepareView(ui32 generation, TSpaceView view) noexcept;
 

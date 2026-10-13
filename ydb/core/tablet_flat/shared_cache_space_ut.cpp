@@ -75,6 +75,28 @@ public:
     static bool AdvanceSpaceGeneration(TSharedCacheSpace& space) noexcept {
         return space.AdvanceSpaceGeneration();
     }
+
+    template <class TCallback>
+    static ui32 TryAllocateHandle(TSharedCacheSpace& space, TSpaceOperation& operation, TCallback& callback) noexcept {
+        return space.TryAllocateHandleWithHook(operation, {
+                                                              .Context = &callback,
+                                                              .Function = [](void* context) noexcept {
+                                                                  (*static_cast<TCallback*>(context))();
+                                                              },
+                                                          });
+    }
+
+    template <class TCallback>
+    static bool ReturnFreeHandle(
+        TSharedCacheSpace& space, TSpaceOperation& operation, ui32 index, ui32 version, TCallback& callback) noexcept {
+        return space.ReturnFreeHandleWithHook(operation, index, version,
+            {
+                .Context = &callback,
+                .Function = [](void* context) noexcept {
+                    (*static_cast<TCallback*>(context))();
+                },
+            });
+    }
 };
 
 Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
@@ -259,6 +281,45 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT(!SpaceHazardIsActive(TSharedCacheSpaceTestAccess::Hazard(*space, 1).State.load()));
     }
 
+    Y_UNIT_TEST(HotPolicyResizeDoesNotUseHazards) {
+        TSharedCacheCapacity capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        auto space = TSharedCacheSpace::Create(capacity, capacity, 1);
+        UNIT_ASSERT(space);
+
+        std::atomic<bool> active = false;
+        std::atomic<bool> resume = false;
+        ui64 observedHotSlots = 0;
+        std::thread worker([&] {
+            auto binding = space->BindThreadHazard(0);
+            auto operation = space->BeginOperation();
+            observedHotSlots = operation.EffectiveHotSlots();
+            active.store(true, std::memory_order_release);
+            while (!resume.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        });
+
+        while (!active.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        THotResize resize;
+        const ui32 target = static_cast<ui32>(capacity.HotSlotCount() - 1);
+        UNIT_ASSERT(space->BeginHotResize(target, resize));
+        UNIT_ASSERT_VALUES_EQUAL(space->EffectiveHotSlots(), target);
+        while (resize.Phase() == EHotResizePhase::Cut) {
+            ui32 level;
+            ui64 raw;
+            UNIT_ASSERT(space->DrainHotResize(resize, level, raw));
+            UNIT_ASSERT_VALUES_EQUAL(raw, 0);
+        }
+        UNIT_ASSERT(resize.Phase() == EHotResizePhase::Idle);
+
+        resume.store(true, std::memory_order_release);
+        worker.join();
+        UNIT_ASSERT_VALUES_EQUAL(observedHotSlots, capacity.HotSlotCount());
+    }
+
     Y_UNIT_TEST(NestedOperationsShareHazard) {
         TSharedCacheCapacity capacity;
         UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
@@ -345,6 +406,151 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         invalid = current;
         invalid.AddressBits = MinSharedCacheAddressBits - 1;
         UNIT_ASSERT(!TSharedCacheSpace::Create(invalid, reserved, 0));
+    }
+
+    Y_UNIT_TEST(AllocateAndReturnItem) {
+        TSharedCacheCapacity capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        auto space = TSharedCacheSpace::Create(capacity, capacity, 1);
+        UNIT_ASSERT(space);
+        auto hazard = space->BindThreadHazard(0);
+        auto operation = space->BeginOperation();
+
+        TVector<bool> seen(capacity.HandleCount(), false);
+        for (ui32 count = 0; count < capacity.HandleCount() - 2; ++count) {
+            const auto index = operation.TryAllocateHandle();
+            UNIT_ASSERT(index);
+            UNIT_ASSERT(index >= 2 && index < capacity.HandleCount());
+            UNIT_ASSERT(!seen[index]);
+            seen[index] = true;
+            const auto state = THandleState::FromRaw(TSharedCacheSpaceTestAccess::Handles(*space)[index].State.load());
+            UNIT_ASSERT(state.IsBegin());
+            UNIT_ASSERT_VALUES_EQUAL(state.Version(), 0);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), 0);
+        UNIT_ASSERT(!operation.TryAllocateHandle());
+
+        constexpr ui32 ReturnedIndex = 7;
+        auto state = THandleState::FromRaw(TSharedCacheSpaceTestAccess::Handles(*space)[ReturnedIndex].State.load());
+        TSharedCacheSpaceTestAccess::Handles(*space)[ReturnedIndex].State.store(
+            state.WithState(EHandleState::Free).Raw(), std::memory_order_release);
+        UNIT_ASSERT(operation.ReturnFreeHandle(ReturnedIndex, state.Version()));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), 1);
+        const auto allocatedAgain = operation.TryAllocateHandle();
+        UNIT_ASSERT(allocatedAgain);
+        UNIT_ASSERT_VALUES_EQUAL(allocatedAgain, ReturnedIndex);
+    }
+
+    Y_UNIT_TEST(ConcurrentAllocationIsUnique) {
+        constexpr ui32 HandleCount = 1024;
+        constexpr ui32 ThreadCount = 8;
+
+        TSharedCacheCapacity capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(10, 4096, 0, ThreadCount, capacity));
+        auto space = TSharedCacheSpace::Create(capacity, capacity, ThreadCount);
+        UNIT_ASSERT(space);
+
+        TVector<TVector<ui32>> allocated(ThreadCount);
+        TVector<std::thread> threads;
+        for (ui32 thread = 0; thread < ThreadCount; ++thread) {
+            threads.emplace_back([&, thread] {
+                auto hazard = space->BindThreadHazard(thread);
+                auto operation = space->BeginOperation();
+                for (;;) {
+                    const auto index = operation.TryAllocateHandle();
+                    if (!index) {
+                        return;
+                    }
+                    allocated[thread].push_back(index);
+                }
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        TVector<bool> seen(HandleCount, false);
+        ui32 count = 0;
+        for (const auto& indices : allocated) {
+            for (ui32 index : indices) {
+                UNIT_ASSERT(index >= 2 && index < HandleCount);
+                UNIT_ASSERT(!seen[index]);
+                seen[index] = true;
+                ++count;
+            }
+        }
+        UNIT_ASSERT_VALUES_EQUAL(count, HandleCount - 2);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), 0);
+    }
+
+    Y_UNIT_TEST(AllocateReroutesAfterGenerationChange) {
+        TSharedCacheCapacity capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        auto space = TSharedCacheSpace::Create(capacity, capacity, 1);
+        UNIT_ASSERT(space);
+        auto hazard = space->BindThreadHazard(0);
+        auto operation = space->BeginOperation();
+
+        bool advanced = false;
+        auto advance = [&]() noexcept {
+            if (!advanced) {
+                advanced = true;
+                UNIT_ASSERT(TSharedCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+            }
+        };
+
+        TVector<bool> seen(capacity.HandleCount(), false);
+        const auto first = TSharedCacheSpaceTestAccess::TryAllocateHandle(*space, operation, advance);
+        UNIT_ASSERT(first);
+        seen[first] = true;
+        ui32 count = 1;
+        while (const auto index = operation.TryAllocateHandle()) {
+            UNIT_ASSERT(!seen[index]);
+            seen[index] = true;
+            ++count;
+        }
+
+        UNIT_ASSERT(advanced);
+        UNIT_ASSERT_VALUES_EQUAL(count, capacity.HandleCount() - 2);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), 0);
+    }
+
+    Y_UNIT_TEST(ReturnReroutesAfterGenerationChange) {
+        TSharedCacheCapacity capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        auto space = TSharedCacheSpace::Create(capacity, capacity, 1);
+        UNIT_ASSERT(space);
+        auto hazard = space->BindThreadHazard(0);
+        auto operation = space->BeginOperation();
+
+        const auto returned = operation.TryAllocateHandle();
+        UNIT_ASSERT(returned);
+        THandleState state = THandleState::FromRaw(TSharedCacheSpaceTestAccess::Handles(*space)[returned].State.load());
+        TSharedCacheSpaceTestAccess::Handles(*space)[returned].State.store(
+            state.WithState(EHandleState::Free).Raw(), std::memory_order_release);
+
+        bool advanced = false;
+        auto advance = [&]() noexcept {
+            if (!advanced) {
+                advanced = true;
+                UNIT_ASSERT(TSharedCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+            }
+        };
+        UNIT_ASSERT(
+            TSharedCacheSpaceTestAccess::ReturnFreeHandle(*space, operation, returned, state.Version(), advance));
+        UNIT_ASSERT(advanced);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), capacity.HandleCount() - 2);
+
+        TVector<bool> seen(capacity.HandleCount(), false);
+        ui32 count = 0;
+        while (const auto index = operation.TryAllocateHandle()) {
+            UNIT_ASSERT(!seen[index]);
+            seen[index] = true;
+            ++count;
+        }
+        UNIT_ASSERT(seen[returned]);
+        UNIT_ASSERT_VALUES_EQUAL(count, capacity.HandleCount() - 2);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), 0);
     }
 }
 
