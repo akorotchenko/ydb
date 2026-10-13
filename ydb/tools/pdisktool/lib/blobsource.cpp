@@ -5,6 +5,8 @@
 #include <util/stream/file.h>
 #include <util/string/cast.h>
 
+#include <type_traits>
+
 namespace NKikimr::NPDiskTool {
 
 bool ParseExportedBlobName(const TString& name, TLogoBlobID& id, ui32& partId) {
@@ -253,9 +255,10 @@ const TString* TBlobStore::Get(const TLogoBlobID& id) {
     return Restore(id.FullID(), *entry) ? &entry->Whole : nullptr;
 }
 
-bool TBlobStore::Get(const NPageCollection::TLargeGlobId& largeGlobId, TString& out) {
-    if (!largeGlobId || !largeGlobId.Lead || !largeGlobId.Lead.BlobSize()
-            || largeGlobId.Lead.BlobSize() > largeGlobId.Bytes) {
+template <class TBody>
+bool TBlobStore::RestoreLargeGlob(const NPageCollection::TLargeGlobId& largeGlobId, TBody& out) {
+    if (!largeGlobId || !largeGlobId.Lead || !largeGlobId.Lead.BlobSize() ||
+        largeGlobId.Lead.BlobSize() > largeGlobId.Bytes) {
         // TLargeGlobIdRestoreState divides by the lead size and asserts on the rest of this.
         return false;
     }
@@ -270,8 +273,20 @@ bool TBlobStore::Get(const NPageCollection::TLargeGlobId& largeGlobId, TString& 
     if (!state) {
         return false;
     }
-    out = state.ExtractString();
+    if constexpr (std::is_same_v<TBody, TString>) {
+        out = state.ExtractString();
+    } else {
+        out = state.ExtractSharedData();
+    }
     return out.size() == largeGlobId.Bytes;
+}
+
+bool TBlobStore::Get(const NPageCollection::TLargeGlobId& largeGlobId, TString& out) {
+    return RestoreLargeGlob(largeGlobId, out);
+}
+
+bool TBlobStore::Get(const NPageCollection::TLargeGlobId& largeGlobId, NActors::TSharedData& out) {
+    return RestoreLargeGlob(largeGlobId, out);
 }
 
 void TBlobStore::FlushIssues() {
