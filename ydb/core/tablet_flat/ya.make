@@ -88,6 +88,7 @@ SRCS(
     shared_cache_space.cpp
     shared_cache_collection.cpp
     shared_cache_table.cpp
+    shared_cache.cpp
     shared_cache_counters.cpp
     shared_cache_btree_walk.cpp
     shared_cache_btree_walk.h
