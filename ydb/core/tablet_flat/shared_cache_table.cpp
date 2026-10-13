@@ -1,4 +1,4 @@
-#include "shared_cache_table.h"
+#include "shared_cache.h"
 #include "shared_cache_traits.h"
 
 #include <util/generic/bitops.h>
