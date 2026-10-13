@@ -998,4 +998,7 @@ void TSharedCacheTable::CompleteTombstone(
 #undef TSharedCache
 #undef SHARED_CACHE_TEMPLATE
 
+template class TSharedCacheItemRefImpl<TTestTraits>;
+template class TSharedCacheTableImpl<TTestTraits>;
+
 } // namespace NKikimr::NSharedCache
