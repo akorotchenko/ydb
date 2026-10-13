@@ -13,5 +13,5 @@ namespace NTable {
         return { true, &data };
     }
 
-}
+} // namespace NTable
 }

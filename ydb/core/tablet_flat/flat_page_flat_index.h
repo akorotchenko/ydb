@@ -1,5 +1,7 @@
 #pragma once
 
+#include "shared_cache.h"
+
 #include "flat_page_base.h"
 #include "flat_page_label.h"
 #include "flat_row_nulls.h"
@@ -64,14 +66,29 @@ namespace NPage {
         TFlatIndex(TSharedData raw)
             : Raw(std::move(raw))
         {
-            const auto data = NPage::TLabelWrapper().Read(Raw, EPage::FlatIndex);
+            Parse();
+        }
+
+        explicit TFlatIndex(TSharedCachePageRef&& ref)
+            : Ref(std::move(ref))
+        {
+            Parse();
+        }
+
+    private:
+        TArrayRef<const char> Bytes() const noexcept {
+            return Ref ? TArrayRef<const char>(Ref.data(), Ref.size()) : TArrayRef<const char>(Raw);
+        }
+
+        void Parse() {
+            const auto data = NPage::TLabelWrapper().Read(Bytes(), EPage::FlatIndex);
             Y_ENSURE(data == ECodec::Plain && (data.Version == 2 || data.Version == 3));
 
             auto *recordsHeader = TDeref<const TRecordsHeader>::At(data.Page.data(), 0);
             auto count = recordsHeader->Count;
             Y_ENSURE(count >= 1u + (data.Version == 3 ? 1 : 0));
 
-            Page.Base = Raw.data();
+            Page.Base = Bytes().data();
             auto offsetsOffset = data.Page.size() - count * sizeof(TPgSize);
             Page.Offsets = TDeref<const TRecordsEntry>::At(recordsHeader, offsetsOffset);
             Page.Count = count - (data.Version == 3 ? 1 : 0);
@@ -79,6 +96,7 @@ namespace NPage {
             EndRowId = LastKey ? LastKey->GetRowId() + 1 : Max<TRowId>();
         }
 
+    public:
         const TBlock* operator->() const noexcept
         {
             return &Page;
@@ -86,7 +104,7 @@ namespace NPage {
 
         NPage::TLabel Label() const noexcept
         {
-            return ReadUnaligned<NPage::TLabel>(Raw.data());
+            return ReadUnaligned<NPage::TLabel>(Bytes().data());
         }
 
         /**
@@ -266,6 +284,7 @@ namespace NPage {
         }
 
     private:
+        TSharedCachePageRef Ref;
         TSharedData Raw;
         TBlock Page;
         const TRecord* LastKey;

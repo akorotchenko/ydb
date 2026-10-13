@@ -84,15 +84,15 @@ SRCS(
     flat_table_committed.h
     flat_update_op.h
     probes.cpp
-    shared_handle.cpp
-    shared_cache_space.cpp
-    shared_cache_collection.cpp
-    shared_cache_table.cpp
-    shared_cache.cpp
     shared_cache_counters.cpp
     shared_cache_btree_walk.cpp
     shared_cache_btree_walk.h
     shared_sausagecache_state.h
+    shared_cache.cpp
+    shared_cache_collection.cpp
+    shared_cache_events.cpp
+    shared_cache_space.cpp
+    shared_cache_table.cpp
     shared_sausagecache.cpp
     shared_sausagecache.h
     tablet_flat_executor.h

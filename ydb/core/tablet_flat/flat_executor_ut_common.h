@@ -1,10 +1,15 @@
 #pragma once
 
 #include <ydb/core/tablet_flat/test/libs/exec/runner.h>
+#include <ydb/core/base/memory_controller_iface.h>
+
+#include <optional>
 #include <ydb/core/tablet_flat/test/libs/exec/world.h>
 #include <ydb/core/tablet_flat/test/libs/exec/dummy.h>
 #include <ydb/core/tablet_flat/ut/flat_database_ut_common.h>
 #include <ydb/core/tablet_flat/flat_executor_compaction_logic.h>
+#include <ydb/core/tablet_flat/shared_cache.h>
+#include <ydb/core/tablet_flat/shared_cache_pages.h>
 #include <ydb/core/tablet/tablet_impl.h>
 #include <ydb/library/yverify_stream/yverify_stream.h>
 #include <library/cpp/testing/unittest/registar.h>
@@ -15,12 +20,21 @@ namespace NKikimr {
 namespace NTabletFlatExecutor {
 
     struct TMyEnvBase : public NFake::TRunner {
-
-        TMyEnvBase()
-            : Edge(Env.AllocateEdgeActor())
+        explicit TMyEnvBase(ui64 sharedCacheLimit = 8_MB, std::optional<ui64> softLimit = std::nullopt)
+            : NFake::TRunner(sharedCacheLimit)
+            , Edge(Env.AllocateEdgeActor())
         {
             Env.SetLogPriority(NKikimrServices::TABLET_SAUSAGECACHE, NActors::NLog::PRI_INFO);
-
+            if (softLimit) {
+                Env.WaitFor("shared-cache service registration", [&] {
+                    return bool(Env.SingleSys()->LookupLocalService(NSharedCache::MakeSharedPageCacheId()));
+                }, TDuration::Seconds(5));
+                Env.Send(NSharedCache::MakeSharedPageCacheId(), TActorId{},
+                    new NMemory::TEvConsumerLimit(*softLimit, sharedCacheLimit));
+                TDispatchOptions allocation;
+                allocation.FinalEvents.emplace_back(NMemory::EvConsumerLimit, 1);
+                Env.DispatchEvents(allocation);
+            }
             if (false) {
                 Env.SetLogPriority(NKikimrServices::TABLET_EXECUTOR, NActors::NLog::PRI_INFO);
                 Env.SetLogPriority(NKikimrServices::TABLET_OPS_HOST, NActors::NLog::PRI_INFO);

@@ -209,8 +209,8 @@ struct TSourceDb {
             return {true, nullptr};
         }
 
-        const TSharedData* TryGetPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
-            return nullptr;
+        TSharedCachePageRef TryGetPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
+            return {};
         }
     };
 
@@ -786,6 +786,20 @@ Y_UNIT_TEST_SUITE(TPDiskToolRestoreTablet) {
             Pack(snap.SerializeAsString()));
 
         dir.PutWhole(1, 2, 0, 0, TLogEntryBuilder(1, 2).Snapshot().Confirmed(0).Ref(snapId).Serialize());
+
+        // Warm the shared core from a complete input with exactly the same blob identities.
+        // The incomplete inspection below must still read its own source and reject the part.
+        TExport complete;
+        for (const auto& glob : part.Blobs) {
+            complete.PutGlob(glob.GId, glob.Data);
+        }
+        complete.PutWhole(1, 1, 0, CookieFor(EIdx::Alter), scheme);
+        complete.PutWhole(1, 2, 0, CookieFor(EIdx::SnapLz4), Pack(snap.SerializeAsString()));
+        complete.PutWhole(1, 2, 0, 0, TLogEntryBuilder(1, 2).Snapshot().Confirmed(0).Ref(snapId).Serialize());
+        TRestored warm;
+        Restore(complete.Path(), warm);
+        UNIT_ASSERT_C(warm.Ok, Complaints(warm.Issues));
+        UNIT_ASSERT_VALUES_EQUAL(warm.Dump.Rows, rows.size());
 
         TRestored restored;
         Restore(dir.Path(), restored);

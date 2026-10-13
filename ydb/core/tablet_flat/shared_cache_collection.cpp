@@ -1,9 +1,10 @@
+#include "shared_cache.h"
 #include "shared_cache_collection.h"
-#include "shared_cache_collection_state.h"
+#include "shared_sausagecache_state.h"
 
 namespace NKikimr::NSharedCache {
 
-TCacheCollection::TCacheCollection(
+TCollection::TCollection(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, TCollectionCacheItem cacheItem) noexcept
     : CacheItem(cacheItem)
     , PageCollection_(std::move(pageCollection))
@@ -11,11 +12,24 @@ TCacheCollection::TCacheCollection(
     Y_DEBUG_ABORT_UNLESS(PageCollection_);
 }
 
-TCacheCollection::~TCacheCollection() {
+TCollection::~TCollection() {
     ResetActorState();
 }
 
-TCollectionActorState& TCacheCollection::EnsureActorState() {
+void TCollection::SetSkipBTreeIndexV1Shadow(bool skip) {
+    auto& cache = TSharedCache::SharedCachePages();
+    auto binding = cache.BindCurrentThreadHazard();
+    cache.SetCollectionSkipBTreeIndexV1Shadow(*this, skip);
+}
+
+void TCollection::DrainStickyPages() {
+    auto& cache = TSharedCache::SharedCachePages();
+    auto binding = cache.BindCurrentThreadHazard();
+    auto spaceOp = cache.BeginOperation();
+    cache.DrainStickyPages(spaceOp, *this);
+}
+
+TCollectionActorState& TCollection::EnsureActorState() {
     auto* state = GetActorState();
     if (!state) {
         state = new TCollectionActorState;
@@ -24,7 +38,7 @@ TCollectionActorState& TCacheCollection::EnsureActorState() {
     return *state;
 }
 
-void TCacheCollection::ResetActorState() noexcept {
+void TCollection::ResetActorState() noexcept {
     delete ActorState_.exchange(nullptr, std::memory_order_acq_rel);
 }
 

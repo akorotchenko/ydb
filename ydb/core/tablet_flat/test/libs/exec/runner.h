@@ -12,11 +12,13 @@
 #include <ydb/core/base/tablet_resolver.h>
 #include <ydb/core/tablet/resource_broker.h>
 #include <ydb/core/tablet_flat/shared_sausagecache.h>
+#include <ydb/core/tablet_flat/shared_cache_pages.h>
 #include <ydb/library/services/services.pb.h>
 #include <library/cpp/time_provider/time_provider.h>
 
 #include <ydb/core/tablet_flat/test/libs/rows/tool.h>
 #include <ydb/core/testlib/actors/test_runtime.h>
+#include <ydb/core/testlib/actor_helpers.h>
 
 #include <util/generic/xrange.h>
 
@@ -26,7 +28,7 @@ namespace NFake {
     struct TRunner {
         using ELnLev = NUtil::ELnLev;
 
-        TRunner()
+        explicit TRunner(ui64 sharedCacheLimit = 8_MB)
             : Time(TAppData::TimeProvider.Get())
             , NodeId(Env.GetNodeId())
             , Names(MakeComponentsNames())
@@ -48,12 +50,15 @@ namespace NFake {
             auto *app = new TAppData(0, 0, 0, 0, { }, types, nullptr, nullptr, nullptr);
 
             Env.Initialize({ app, nullptr, nullptr, {}, {} });
+            // Keep the runtime's AppData available while the harness releases native refs outside events.
+            CacheContext = MakeHolder<TActorSystemStub>();
+            CacheContext->AppData.SharedCachePages = Env.GetAppData().SharedCachePages;
             Env.SetDispatchTimeout(DEFAULT_DISPATCH_TIMEOUT);
             Env.SetLogPriority(NKikimrServices::FAKE_ENV, NActors::NLog::PRI_INFO);
 
             Leader = Env.Register(new NFake::TLeader(8, Stopped), 0);
 
-            SetupModelServices();
+            SetupModelServices(sharedCacheLimit);
         }
 
         TTestActorRuntime& operator*() noexcept
@@ -174,7 +179,7 @@ namespace NFake {
             }
         }
 
-        void SetupModelServices()
+        void SetupModelServices(ui64 sharedCacheLimit)
         {
             { /*_ Blob storage proxies mock factory */
                 auto *actor = new NFake::TWarden(StorageGroupCount);
@@ -184,7 +189,7 @@ namespace NFake {
 
             { /*_ Shared page collection cache service, used by executor */
                 NSharedCache::TSharedCacheConfig config;
-                config.SetMemoryLimit(8_MB);
+                config.SetMemoryLimit(sharedCacheLimit);
                 config.SetScanQueueInFlyLimit(256_KB);
                 config.SetAsyncQueueInFlyLimit(256_KB);
 
@@ -213,6 +218,8 @@ namespace NFake {
         }
 
     public:
+        // Declared before Env so its context and cache owner outlive runtime cleanup.
+        THolder<TActorSystemStub> CacheContext;
         TTestActorRuntime Env{ NActors::THeSingleSystemEnv{ } };
 
         ITimeProvider * const Time = nullptr;

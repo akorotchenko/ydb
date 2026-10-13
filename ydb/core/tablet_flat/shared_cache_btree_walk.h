@@ -17,8 +17,9 @@
 
 namespace NKikimr::NSharedCache {
 
-struct TCollection;
-class TSharedCachePages;
+class TCollection;
+
+inline constexpr size_t MaxPreloadBatchLocations = 1024;
 
 using TPendingInMemoryPages = THashMap<TLogoBlobID, TSet<NTable::NPage::TPageLocation>>;
 
@@ -64,6 +65,7 @@ struct TWalkRun {
 struct TWalkCollectionState {
     TMap<TActorId, TVector<TEvAttach::TBtreeSeed>> SeedsByOwner;
     TLogoBlobID IndexCollectionId;
+    ui64 IndexOnlySeedCount = 0;
     std::optional<TWalkRun> Run;
     EWalkControllerState ControllerState = EWalkControllerState::Idle;
 };
@@ -74,7 +76,7 @@ public:
 
     virtual TCollection* FindCollection(const TLogoBlobID& id) = 0;
     virtual TPendingInMemoryPages& PendingPages() = 0;
-    virtual TSharedCachePages* CachePages() = 0;
+    virtual NActors::TSharedData FindPage(TCollection& collection, TPageOffset offset) = 0;
     // Regular-mode index reads; in-memory index reads go through PendingPages.
     virtual void FetchIndexLevel(TCollection& collection, TVector<NTable::NPage::TPageLocation>&& locations,
         const TLogoBlobID& walkCollectionId) = 0;
@@ -108,6 +110,7 @@ public:
     void FetchStarted(const TLogoBlobID& walkCollectionId);
     void InvalidateRun(const TLogoBlobID& walkCollectionId);
     void InvalidateDataCollection(const TLogoBlobID& collectionId);
+    void InvalidateIndexCollection(const TLogoBlobID& collectionId);
     void DropForIndexCollection(const TLogoBlobID& indexCollectionId);
     void RestartForIndexCollection(const TLogoBlobID& indexCollectionId);
     void DropIndexOnlyWalks(const TLogoBlobID& indexCollectionId);

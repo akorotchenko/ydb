@@ -998,6 +998,8 @@ void TSharedCacheTable::CompleteTombstone(
 #undef TSharedCache
 #undef SHARED_CACHE_TEMPLATE
 
+template class TSharedCacheItemRefImpl<TProdTraits>;
+template class TSharedCacheTableImpl<TProdTraits>;
 template class TSharedCacheItemRefImpl<TTestTraits>;
 template class TSharedCacheTableImpl<TTestTraits>;
 

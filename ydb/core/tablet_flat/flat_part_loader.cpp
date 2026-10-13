@@ -9,7 +9,7 @@
 namespace NKikimr {
 namespace NTable {
 
-TLoader::TLoader(TPartComponents components, TVector<TIntrusivePtr<TPageCollection>> prebuiltPageCollections)
+TLoader::TLoader(TPartComponents components, TVector<TSharedCacheCollectionRef> prebuiltPageCollections)
     : PageCollections(std::move(prebuiltPageCollections))
     , Components(std::move(components))
     , Legacy(std::move(Components.Legacy))
@@ -35,25 +35,16 @@ void TLoader::StageParseMeta()
         auto& comp = Components.PageCollectionComponents[0];
         Y_ENSURE(comp.RawMeta, "Slot 0 has no raw meta data");
 
-        auto cache = MakeIntrusive<TPageCollection>(
+        auto cache = TSharedCachePages::Get().AdmitCollection(
             MakeIntrusiveConst<NPageCollection::TPageCollection>(
                 comp.LargeGlobId, TSharedData(comp.RawMeta)));
-
-        for (auto& p : comp.StickyPages) {
-            cache->AddStickyPage(p.Location.Offset, p.Location.Size,
-                NSharedCache::TSharedPageRef::MakePrivate(std::move(p.Data)));
-        }
-        for (auto& p : comp.RegularPages) {
-            cache->AddPage(p.Location.Offset, p.Location.Size,
-                NSharedCache::TSharedPageRef::MakePrivate(std::move(p.Data)));
-        }
 
         PageCollections[0] = std::move(cache);
     }
 
-    auto* metaPacket = dynamic_cast<const NPageCollection::TPageCollection*>(PageCollections.at(0)->PageCollection.Get());
+    auto* metaPacket = dynamic_cast<const NPageCollection::TPageCollection*>(PageCollections.at(0)->PageCollection().Get());
     if (!metaPacket) {
-        Y_TABLET_ERROR("Unexpected IPageCollection type " << TypeName(*PageCollections.at(0)->PageCollection));
+        Y_TABLET_ERROR("Unexpected IPageCollection type " << TypeName(*PageCollections.at(0)->PageCollection()));
     }
 
     auto &meta = metaPacket->Meta;
@@ -152,7 +143,7 @@ void TLoader::StageParseMeta()
             }
         };
 
-        PageCollections[0]->PageCollection->SetSkipBTreeIndexV1Shadow(false);
+        PageCollections[0]->SetSkipBTreeIndexV1Shadow(false);
         if (HasAppData()) {
             if (!AppData()->FeatureFlags.GetEnableLocalDBBtreeIndexV2()) {
                 // V2 read disabled: for dual-root (V2+V1) parts, strip RootV2 to use V1 index
@@ -170,7 +161,7 @@ void TLoader::StageParseMeta()
                     if (meta.HasRootV2() && meta.HasRootV1()) {
                         meta.RootV1 = Max<TPageId>();
                         meta.LevelCountV1 = Max<ui32>();
-                        PageCollections[0]->PageCollection->SetSkipBTreeIndexV1Shadow(true);
+                        PageCollections[0]->SetSkipBTreeIndexV1Shadow(true);
                     }
                 });
             }
@@ -212,17 +203,9 @@ void TLoader::StageParseMeta()
         auto& comp = Components.PageCollectionComponents[i];
         Y_ENSURE(comp.RawMeta, "Slot " << i << " has no raw meta data");
 
-        auto collection = MakeIntrusive<TPageCollection>(
+        auto collection = TSharedCachePages::Get().AdmitCollection(
             MakeIntrusiveConst<NPageCollection::TPageCollection>(
                 comp.LargeGlobId, TSharedData(comp.RawMeta)));
-        for (auto& p : comp.StickyPages) {
-            collection->AddStickyPage(p.Location.Offset, p.Location.Size,
-                NSharedCache::TSharedPageRef::MakePrivate(std::move(p.Data)));
-        }
-        for (auto& p : comp.RegularPages) {
-            collection->AddPage(p.Location.Offset, p.Location.Size,
-                NSharedCache::TSharedPageRef::MakePrivate(std::move(p.Data)));
-        }
         PageCollections[i] = std::move(collection);
     }
 
@@ -231,29 +214,20 @@ void TLoader::StageParseMeta()
         auto& comp = Components.PageCollectionComponents.back();
         Y_ENSURE(comp.RawMeta, "Outer blob slot has no raw meta data");
 
-        auto cache = MakeIntrusive<TPageCollection>(
+        auto cache = TSharedCachePages::Get().AdmitCollection(
             MakeIntrusiveConst<NPageCollection::TOuterPageCollection>(
                 comp.LargeGlobId, TSharedData(comp.RawMeta)));
-
-        for (auto& p : comp.StickyPages) {
-            cache->AddStickyPage(p.Location.Offset, p.Location.Size,
-                NSharedCache::TSharedPageRef::MakePrivate(std::move(p.Data)));
-        }
-        for (auto& p : comp.RegularPages) {
-            cache->AddPage(p.Location.Offset, p.Location.Size,
-                NSharedCache::TSharedPageRef::MakePrivate(std::move(p.Data)));
-        }
 
         PageCollections.back() = std::move(cache);
     }
 
-    LoaderEnv = MakeHolder<TLoaderEnv>(PageCollections[0]);
+    LoaderEnv = MakeHolder<TLoaderEnv>(PageCollections[0].Acquire());
 
     if (!HasBasics() || (Rooted && SchemeId != meta.TotalPages() - 1)
         || (LargeId == Max<TPageId>()) != (GlobsId == Max<TPageId>())
         || (Max(BTreeGroupIndexes.size(), FlatGroupIndexes.size()) + (SmallId == Max<TPageId>() ? 0 : 1)) != PageCollections.size())
     {
-        Y_TABLET_ERROR("Part " << PageCollections[0]->PageCollection->Label() << " has"
+        Y_TABLET_ERROR("Part " << PageCollections[0]->PageCollection()->Label() << " has"
             << " invalid layout : " << (Rooted ? "rooted" : "legacy")
             << " " << PageCollections.size() << "s " << meta.TotalPages() << "pg"
             << ", Scheme " << SchemeId
@@ -271,12 +245,12 @@ TLoader::TFetch TLoader::StageCreatePartView(bool preloadIndex)
     Y_ENSURE(!PartView, "PartView already initialized in CreatePartView stage");
     Y_ENSURE(PageCollections && PageCollections.front());
 
-    auto getPage = [&](TPageId pageId) {
+    auto getPage = [&](TPageId pageId) -> TSharedCachePageRef {
         return pageId == Max<TPageId>()
-            ? nullptr
-            : LoaderEnv->TryGetPage(nullptr, PageCollections[0]->PageCollection->GetLocation(pageId), {});
+            ? TSharedCachePageRef()
+                   : LoaderEnv->TryGetPage(nullptr, PageCollections[0]->PageCollection()->GetLocation(pageId), {});
     };
-    auto getMetaPage = [&](const NPage::TBtreeIndexMeta& meta) {
+    auto getMetaPage = [&](const NPage::TBtreeIndexMeta& meta) -> TSharedCachePageRef {
         return meta.HasRootV2() ? LoaderEnv->TryGetPage(nullptr, meta.RootV2, {})
                                 : getPage(meta.RootV1PageId());
     };
@@ -313,15 +287,15 @@ TLoader::TFetch TLoader::StageCreatePartView(bool preloadIndex)
         return fetch;
     }
 
-    auto *scheme = getPage(SchemeId);
-    auto *large = getPage(LargeId);
-    auto *small = getPage(SmallId);
-    auto *blobs = getPage(GlobsId);
-    auto *byKey = getPage(ByKeyId);
-    auto *garbageStats = getPage(GarbageStatsId);
-    auto *txIdStats = getPage(TxIdStatsId);
+    auto scheme = getPage(SchemeId);
+    auto large = getPage(LargeId);
+    auto small = getPage(SmallId);
+    auto blobs = getPage(GlobsId);
+    auto byKey = getPage(ByKeyId);
+    auto garbageStats = getPage(GarbageStatsId);
+    auto txIdStats = getPage(TxIdStatsId);
 
-    if (scheme == nullptr) {
+    if (!scheme) {
         Y_TABLET_ERROR("Scheme page is not loaded");
     } else if (ByKeyId != Max<TPageId>() && !byKey) {
         Y_TABLET_ERROR("Filter page must be loaded if it exists");
@@ -329,7 +303,7 @@ TLoader::TFetch TLoader::StageCreatePartView(bool preloadIndex)
         Y_TABLET_ERROR("TPart has small blobs, " << PageCollections.size() << " page collections");
     }
 
-    const auto extra = BlobsLabelFor(PageCollections[0]->PageCollection->Label());
+    const auto extra = BlobsLabelFor(PageCollections[0]->PageCollection()->Label());
 
     auto *stat = Root.HasStat() ? &Root.GetStat() : nullptr;
 
@@ -355,13 +329,13 @@ TLoader::TFetch TLoader::StageCreatePartView(bool preloadIndex)
         }
     }
 
-    auto partScheme = TPartScheme::Parse(*scheme, Rooted);
+    auto partScheme = TPartScheme::Parse(scheme.BuildSharedData(), Rooted);
 
     TVector<std::pair<ui32, TIntrusiveConstPtr<NPage::TBloom>>> byKeyPrefixes;
     for (const auto& meta : ByKeyPrefixMetas) {
         if (meta.PageId != Max<TPageId>()) {
-            if (auto* page = getPage(meta.PageId)) {
-                byKeyPrefixes.emplace_back(meta.PrefixColumns, new NPage::TBloom(*page));
+            if (auto page = getPage(meta.PageId)) {
+                byKeyPrefixes.emplace_back(meta.PrefixColumns, new NPage::TBloom(page.BuildSharedData()));
             }
         }
     }
@@ -374,25 +348,25 @@ TLoader::TFetch TLoader::StageCreatePartView(bool preloadIndex)
             ui32 keyCount = partScheme->Groups[0].KeyTypes.size();
             // Appending at the end maintains sorted order because keyCount (full key)
             // is always >= any prefix length in ByKeyPrefixMetas.
-            byKeyPrefixes.emplace_back(keyCount, new NPage::TBloom(*byKey));
+            byKeyPrefixes.emplace_back(keyCount, new NPage::TBloom(byKey.BuildSharedData()));
         }
     }
 
     auto *partStore = new TPartStore(
-        PageCollections.front()->PageCollection->Label(),
+        PageCollections.front()->PageCollection()->Label(),
         {
             epoch,
             std::move(partScheme),
             { FlatGroupIndexes, FlatHistoricIndexes, BTreeGroupIndexes, BTreeHistoricIndexes },
-            blobs ? new NPage::TExtBlobs(*blobs, extra) : nullptr,
+            blobs ? new NPage::TExtBlobs(blobs.BuildSharedData(), extra) : nullptr,
             std::move(byKeyPrefixes),
-            large ? new NPage::TFrames(*large) : nullptr,
-            small ? new NPage::TFrames(*small) : nullptr,
+            large ? new NPage::TFrames(large.BuildSharedData()) : nullptr,
+            small ? new NPage::TFrames(small.BuildSharedData()) : nullptr,
             indexesRawSize,
             MinRowVersion,
             MaxRowVersion,
-            garbageStats ? new NPage::TGarbageStats(*garbageStats) : nullptr,
-            txIdStats ? new NPage::TTxIdStatsPage(*txIdStats) : nullptr,
+            garbageStats ? new NPage::TGarbageStats(garbageStats.BuildSharedData()) : nullptr,
+            txIdStats ? new NPage::TTxIdStatsPage(txIdStats.BuildSharedData()) : nullptr,
         },
         {
             (stat && stat->HasBytes()) ? stat->GetBytes() :
@@ -411,7 +385,7 @@ TLoader::TFetch TLoader::StageCreatePartView(bool preloadIndex)
     if (partStore->Blobs) {
         Y_ENSURE(partStore->Large, "Cannot use blobs without frames");
 
-        partStore->Pseudo = new TPageCollection(partStore->Blobs);
+        partStore->Pseudo = TSharedCachePages::Get().AdmitCollection(partStore->Blobs);
     }
 
     auto overlay = TOverlay::Decode(Legacy, Opaque);
@@ -513,7 +487,7 @@ TLoader::TFetch TLoader::StagePreloadData()
     }
 
     // V1 path
-    auto pageCollection = partStore->PageCollections[0]->PageCollection;
+    auto pageCollection = partStore->PageCollections[0]->PageCollection();
     auto total = pageCollection->MetaPages();
     auto* part = PartView.Part.Get();
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "test_store.h"
+#include <ydb/core/tablet_flat/shared_cache_pages.h>
 #include <ydb/core/tablet_flat/flat_fwd_blobs.h>
 #include <ydb/core/tablet_flat/flat_fwd_cache.h>
 #include <ydb/core/tablet_flat/flat_part_iface.h>
@@ -121,12 +122,18 @@ namespace NTest {
                 ? partStore->Store->GetExternRoom()
                 : partStore->Store->GetOuterRoom();
 
-            return { true, Get(part, room, ref) };
+            auto* collection = partStore->GetPageCollection(room);
+            return { true, TTestEnv::TryGetPage(part, collection->GetLocation(ref), TGroupId(room)) };
         }
 
-        const TSharedData* TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
+        TSharedCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
         {
-            return CheckedCast<const TPartStore*>(part)->Store->GetPage(groupId.Index, location.Offset);
+            auto* storedPart = CheckedCast<const TPartStore*>(part);
+            auto* data = storedPart->Store->GetPage(groupId.Index, location.Offset);
+            auto* collection = storedPart->GetPageCollection(groupId.Index);
+            const auto actual = collection->GetLocation(ResolvePageId(part, location, groupId));
+            return TSharedCachePages::Get().AdmitPage(
+                storedPart->PageColls.at(groupId.Index), actual, TSharedData(*data));
         }
 
     protected:
@@ -135,14 +142,6 @@ namespace NTest {
                 return CheckedCast<const TPartStore*>(part)->Store->ResolveByteOffset(groupId.Index, location.Offset.AsByteOffset());
             }
             return location.Offset.AsPageIndex();
-        }
-
-    private:
-        const TSharedData* Get(const TPart *part, ui32 room, ui32 ref) const
-        {
-            Y_ENSURE(ref != Max<ui32>(), "Got invalid page reference");
-
-            return CheckedCast<const TPartStore*>(part)->Store->GetPage(room, ref);
         }
     };
 

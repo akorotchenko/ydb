@@ -1017,8 +1017,9 @@ struct TBackupStarter : public NFake::TStarter {
 }; // TBackupStarter
 
 struct TEnv : public TMyEnvBase {
-    explicit TEnv(TTabletTypes::EType tabletType = TTabletTypes::Dummy, TPathId tenantPathId = {})
-        : TMyEnvBase()
+    explicit TEnv(TTabletTypes::EType tabletType = TTabletTypes::Dummy, TPathId tenantPathId = {},
+        ui64 sharedCacheLimit = 8_MB, std::optional<ui64> softLimit = std::nullopt)
+        : TMyEnvBase(sharedCacheLimit, softLimit)
         , TabletType(tabletType)
         , TenantPathId(tenantPathId)
     {
@@ -1756,7 +1757,7 @@ Y_UNIT_TEST_SUITE(Backup) {
     }
 
     Y_UNIT_TEST(SnapshotLargeData) {
-        TEnv env;
+        TEnv env(TTabletTypes::Dummy, {}, 64_MB, 8_MB);
 
         Cerr << "...starting tablet" << Endl;
         env.FireDummyTablet(TestTabletFlags);
@@ -1959,7 +1960,7 @@ Y_UNIT_TEST_SUITE(Backup) {
     }
 
     Y_UNIT_TEST(ChangelogLargeData) {
-        TEnv env;
+        TEnv env(TTabletTypes::Dummy, {}, 64_MB, 8_MB);
 
         Cerr << "...starting tablet" << Endl;
         env.FireDummyTablet(TestTabletFlags);

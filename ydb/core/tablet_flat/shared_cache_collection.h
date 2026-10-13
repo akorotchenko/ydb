@@ -22,9 +22,6 @@ class TSharedCacheImpl;
 
 using ECacheMode = NTable::NPage::ECacheMode;
 
-// Keep the legacy actor enum unchanged until production integration.
-inline constexpr ECacheMode StickyCacheMode = static_cast<ECacheMode>(2);
-
 struct TPageCollectionStats {
     ui64 PageCollections = 0;
     ui64 SharedBodyBytes = 0;
@@ -51,14 +48,14 @@ struct TCollectionOwnerStats : public TThrRefBase {
 
 struct TCollectionActorState;
 
-class TCacheCollection {
+class TCollection {
 public:
-    explicit TCacheCollection(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection,
+    explicit TCollection(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection,
         TCollectionCacheItem cacheItem = {}) noexcept;
 
-    TCacheCollection(const TCacheCollection&) = delete;
-    TCacheCollection& operator=(const TCacheCollection&) = delete;
-    ~TCacheCollection();
+    TCollection(const TCollection&) = delete;
+    TCollection& operator=(const TCollection&) = delete;
+    ~TCollection();
 
     const TLogoBlobID& Id() const noexcept {
         return PageCollection_->Label();
@@ -83,6 +80,11 @@ public:
     ECacheMode GetCacheMode() const noexcept {
         return CacheMode_.load(std::memory_order_acquire);
     }
+
+    void SetSkipBTreeIndexV1Shadow(bool skip);
+    void DrainStickyPages();
+
+    TSharedCachePageRef TryGetPage(const NTable::NPage::TPageLocation& location, bool sticky = false) const;
 
     ui64 TotalSize() const noexcept {
         return NActors::TSharedData::OverheadSize * PageCollection_->Total() + PageCollection_->BackingSize();
@@ -149,7 +151,7 @@ private:
     std::atomic<TCollectionActorState*> ActorState_{ nullptr };
     const TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
     std::atomic<TCollectionRegistry*> Registry_{ nullptr };
-    std::atomic<ECacheMode> CacheMode_{ StickyCacheMode };
+    std::atomic<ECacheMode> CacheMode_{ ECacheMode::Sticky };
     std::atomic<ui64> KeepGeneration_{ 0 };
     std::atomic<ui64> ResidentPageBytes_{ 0 };
     // Ring transitions update this estimate after publishing their page state.

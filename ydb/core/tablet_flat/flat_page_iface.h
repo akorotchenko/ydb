@@ -184,6 +184,10 @@ namespace NPage {
             return {TPageOffset::FromPageIndex(pageId), size, type, crc32};
         }
 
+        const TPageLocation& Location() const noexcept {
+            return *this;
+        }
+
         TPageLocation(TPageOffset offset, ui64 size = 0, EPage type = EPage::Undef, ui32 crc32 = 0) noexcept
             : Offset(offset), Size(size), Type(type), Crc32(crc32)
         {}
@@ -260,6 +264,7 @@ namespace NPage {
     enum class ECacheMode : ui16 {
         Regular = 0,
         TryKeepInMemory = 1,
+        Sticky = 2,
     };
 
     /** Hash functor for TPageLocation — uses only Offset for hashing */

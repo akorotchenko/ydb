@@ -80,19 +80,19 @@ public:
     }
 
     TCollectionCacheItem CacheItem() const noexcept;
-    TCacheCollection& GetCollection() const noexcept;
+    TCollection& GetCollection() const noexcept;
     TSharedCacheCollectionRefImpl Acquire() const& noexcept;
     bool IsSoleReference() const noexcept;
 
-    TCacheCollection* Get() const noexcept {
+    TCollection* Get() const noexcept {
         return Ref_ ? &GetCollection() : nullptr;
     }
 
-    TCacheCollection* operator->() const noexcept {
+    TCollection* operator->() const noexcept {
         return &GetCollection();
     }
 
-    TCacheCollection& operator*() const noexcept {
+    TCollection& operator*() const noexcept {
         return GetCollection();
     }
 
@@ -294,7 +294,7 @@ public:
     bool FailReady(TPageCacheItem page) noexcept;
 
     bool MakeReady(
-        TCollectionRegistry& registry, TCollectionCacheItem collection, THolder<TCacheCollection>&& value) noexcept;
+        TCollectionRegistry& registry, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept;
 
     bool DetachCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
 
@@ -317,7 +317,7 @@ public:
     ESharedCacheResultStatus Find(const TLogoBlobID& id, TSharedCacheCollectionRefImpl<TTraits>& collection) noexcept;
 
     // The callback may detach the current collection. Registry mutations remain serialized by its owner.
-    void ForEachCollection(TCollectionRegistry& registry, TFunctionRef<void(TCacheCollection&)> callback) noexcept;
+    void ForEachCollection(TCollectionRegistry& registry, TFunctionRef<void(TCollection&)> callback) noexcept;
 
     bool FindOrInsertBatch(TCollectionCacheItem collection, TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests,
         bool recordStats = true, bool waitForMemory = false) noexcept;
@@ -539,7 +539,7 @@ public:
 
 private:
     friend class TSharedCacheTestAccess;
-    friend class TCacheCollection;
+    friend class TCollection;
     friend class TSharedCacheItemRefImpl<TTraits>;
     friend class TSharedCacheTableImpl<TTraits>;
     friend class TSharedCachePageRefImpl<TTraits>;
@@ -631,13 +631,13 @@ private:
     bool FailFetch(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept;
 
     bool MakeReady(
-        TCollectionRegistry* registry, TCollectionCacheItem collection, THolder<TCacheCollection>&& value) noexcept;
+        TCollectionRegistry* registry, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept;
 
     bool MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* registry, TCacheItem cacheItem,
-        THolder<TCacheCollection>&& value) noexcept;
+        THolder<TCollection>&& value) noexcept;
 
     void MakeReadyState(TSpaceOperation& spaceOp, TCacheItem cacheItem, EHandleState readyState = EHandleState::Hot,
-        TCacheCollection* pageOwner = nullptr) noexcept;
+        TCollection* pageOwner = nullptr) noexcept;
 
     void FinishFetch(TOperationItemRef<TTraits>& finalizerRef, TPageFetchState& fetch, bool reserved) noexcept;
     void FinishFailedFetch(TOperationItemRef<TTraits>& finalizerRef, TPageFetchState& fetch, TPageFetchWaiter* waiters,
@@ -665,11 +665,11 @@ private:
     ESharedCacheResultStatus FindOrInsertPage(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate,
         TIntrusivePtr<TPageFetchWaiter> waiter, TSharedCachePageRefImpl<TTraits>& hit,
         TPageFetchImpl<TTraits>& fetch) noexcept;
-    bool PreparePageBatch(TSpaceOperation& spaceOp, TCacheCollection& collection,
+    bool PreparePageBatch(TSpaceOperation& spaceOp, TCollection& collection,
         TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests, TVector<TPageInsertCandidate>& candidates,
         ui64& reservedBytes) noexcept;
-    bool AllocatePageBatch(TSpaceOperation& spaceOp, TCacheCollection& collection,
-        TVector<TPageInsertCandidate>& candidates, ui64 reservedBytes, bool waitForMemory) noexcept;
+    bool AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& collection, TVector<TPageInsertCandidate>& candidates,
+        ui64 reservedBytes, bool waitForMemory) noexcept;
     ESharedCacheResultStatus FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
         const TCollectionLocation& collection, TCollectionCacheItem& inserted,
         TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
@@ -734,17 +734,17 @@ private:
     TSharedCacheItemRefImpl<TTraits> BuildExternalRef(EItemKind kind, TCacheItem cacheItem) noexcept;
 
     TSharedCacheItemRefImpl<TTraits> AcquireStickyCollection(
-        TSpaceOperation& spaceOp, TCollectionCacheItem collection, TCacheCollection*& value) noexcept;
+        TSpaceOperation& spaceOp, TCollectionCacheItem collection, TCollection*& value) noexcept;
 
     bool LinkStickyPage(
         TSpaceOperation& spaceOp, TCacheItem page, TSharedCacheItemRefImpl<TTraits>& collectionRef) noexcept;
     void UnlinkPendingStickyPage(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
-    void RestoreStickyPageList(TSpaceOperation& spaceOp, TCacheCollection& collection, ui32 detachedHead) noexcept;
-    void DrainStickyPages(TSpaceOperation& spaceOp, TCacheCollection& collection) noexcept;
+    void RestoreStickyPageList(TSpaceOperation& spaceOp, TCollection& collection, ui32 detachedHead) noexcept;
+    void DrainStickyPages(TSpaceOperation& spaceOp, TCollection& collection) noexcept;
     static void PublishPageUnsticky(THandle& page, THandleState state) noexcept;
     void MergeRetainedStickyPages(
-        TSpaceOperation& spaceOp, TCacheCollection& collection, ui32 retainedHead, ui32 retainedTail) noexcept;
-    bool SetCollectionPagesCacheMode(TSpaceOperation& spaceOp, TCacheCollection& collection, ECacheMode mode) noexcept;
+        TSpaceOperation& spaceOp, TCollection& collection, ui32 retainedHead, ui32 retainedTail) noexcept;
+    bool SetCollectionPagesCacheMode(TSpaceOperation& spaceOp, TCollection& collection, ECacheMode mode) noexcept;
     bool MakePageSticky(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
     bool UnstickyCutPages(TSpaceOperation& spaceOp, TCacheItem page, ui64 allocationLimit) noexcept;
 
@@ -784,14 +784,14 @@ private:
 
     void Release(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
-    TCacheCollection* ReleaseTombstone(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
-    TCacheCollection* ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
+    TCollection* ReleaseTombstone(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
+    TCollection* ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
     void ReleaseReplacing(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
     void ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
-    void DeletePayload(THandle& handle, EItemKind kind, EHandleState state, TCacheCollection* owner = nullptr) noexcept;
+    void DeletePayload(THandle& handle, EItemKind kind, EHandleState state, TCollection* owner = nullptr) noexcept;
 
     static void DeleteReplacedPage(THandle& handle) noexcept;
 
@@ -808,16 +808,16 @@ private:
         return MatchesCandidateMetadata(spaceOp, candidate.CacheItem, existing);
     }
 
-    static TCacheCollection* PageCollection(TSpaceOperation& spaceOp, const THandle& page) noexcept;
-    static TCacheCollection* PageCollection(TSpaceOperation& spaceOp, TCollectionCacheItem collection) noexcept;
-    static void AddReference(TCacheCollection& owner) noexcept;
+    static TCollection* PageCollection(TSpaceOperation& spaceOp, const THandle& page) noexcept;
+    static TCollection* PageCollection(TSpaceOperation& spaceOp, TCollectionCacheItem collection) noexcept;
+    static void AddReference(TCollection& owner) noexcept;
     void DropPageItemRef(TSpaceOperation& spaceOp, THandle& page) noexcept;
-    static bool DropReference(TCacheCollection& owner) noexcept;
-    void AddResidentPageBytes(TCacheCollection& owner, NTable::NPage::EPage type, i64 bytes) noexcept;
-    void AddActivePageBytes(TCacheCollection& owner, NTable::NPage::EPage type, i64 bytes) noexcept;
-    void PublishKeepPageBytes(TCacheCollection& owner) noexcept;
-    void SetCollectionSkipBTreeIndexV1Shadow(TCacheCollection& owner, bool skip) noexcept;
-    void DropOwnerReference(TSpaceOperation& spaceOp, TCacheCollection& owner) noexcept;
+    static bool DropReference(TCollection& owner) noexcept;
+    void AddResidentPageBytes(TCollection& owner, NTable::NPage::EPage type, i64 bytes) noexcept;
+    void AddActivePageBytes(TCollection& owner, NTable::NPage::EPage type, i64 bytes) noexcept;
+    void PublishKeepPageBytes(TCollection& owner) noexcept;
+    void SetCollectionSkipBTreeIndexV1Shadow(TCollection& owner, bool skip) noexcept;
+    void DropOwnerReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept;
     static ui64 PayloadBytes(const THandle& handle, EItemKind kind) noexcept;
     static ui64 AccountedPageBytes(ui64 size) noexcept;
     static ui64 PageBytes(const THandle& handle) noexcept;
@@ -849,7 +849,7 @@ private:
     bool GrowKeepCold() noexcept;
 
     bool WantsKeepCold(TSpaceOperation& spaceOp, const THandle& page) noexcept;
-    static bool WantsStickyPage(const TCacheCollection& collection) noexcept;
+    static bool WantsStickyPage(const TCollection& collection) noexcept;
 
     void RouteKeepCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
 

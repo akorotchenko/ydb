@@ -1,7 +1,6 @@
 #pragma once
 
 #include "flat_sausage_solid.h"
-#include "flat_sausage_fetch.h"
 #include "util_store.h"
 
 #include <ydb/library/actors/util/shared_data.h>
@@ -69,13 +68,11 @@ namespace NMem {
             return ref;
         }
 
-        void Assign(TArrayRef<NPageCollection::TLoadedPage> pages)
+        void Assign(TArrayRef<TSharedData> pages)
         {
-            for (auto &one : pages) {
-                size_t index = one.Location.GetPageIndex();
-                Y_ENSURE(index < Store.size());
-
-                Store[index].Data = std::move(one.Data);
+            Y_ENSURE(pages.size() == Store.size());
+            for (size_t index = 0; index < pages.size(); ++index) {
+                Store[index].Data = std::move(pages[index]);
             }
         }
 
