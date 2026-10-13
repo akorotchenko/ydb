@@ -8,7 +8,6 @@
 #include "util_fmt_abort.h"
 #include "shared_cache.h"
 #include "shared_cache_events.h"
-#include "shared_cache_pages.h"
 
 #include <util/system/sanitizers.h>
 #include <util/system/valgrind.h>

@@ -4,9 +4,8 @@
 
 #include <flat_page_btree_index_writer.h>
 #include <shared_cache_btree_walk.h>
-#include <shared_cache_pages.h>
-#include <shared_sausagecache_state.h>
 #include <shared_cache.h>
+#include <shared_sausagecache_state.h>
 
 namespace NKikimr::NSharedCache {
 namespace {
@@ -77,16 +76,16 @@ namespace {
 
         TWalkHostMock() {
             Collection =
-                TSharedCachePages::Get().AdmitCollection(MakeIntrusiveConst<TPageCollectionStub>(TLogoBlobID(1, 1, 1)));
+                TSharedCache::Get().AdmitCollection(MakeIntrusiveConst<TPageCollectionStub>(TLogoBlobID(1, 1, 1)));
             Collection->EnsureActorState();
-            auto& cache = TSharedCache::SharedCachePages();
+            auto& cache = TSharedCache::Get();
             auto binding = cache.BindCurrentThreadHazard();
             UNIT_ASSERT(cache.SetCollectionPagesCacheMode(Collection.CacheItem(), ECacheMode::Regular));
         }
 
         void KeepCollection(const TActorId& owner) {
             Collection->GetActorState()->InMemoryOwners.insert(owner);
-            auto& cache = TSharedCache::SharedCachePages();
+            auto& cache = TSharedCache::Get();
             auto binding = cache.BindCurrentThreadHazard();
             UNIT_ASSERT(cache.SetCollectionPagesCacheMode(Collection.CacheItem(), ECacheMode::TryKeepInMemory));
         }

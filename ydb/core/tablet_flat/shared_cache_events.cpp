@@ -2,30 +2,30 @@
 #include "shared_cache_events.h"
 
 #include <ydb/library/actors/core/actorsystem.h>
-#include "shared_cache_pages.h"
 
 #include <thread>
 
 namespace NKikimr::NSharedCache {
 
-TSharedCacheCollectionRef TSharedCachePages::AdmitCollection(
-    TIntrusiveConstPtr<NPageCollection::IPageCollection> collection) {
-    auto* cache = static_cast<TSharedCache*>(Cache.Get());
-    Y_ENSURE(cache, "Shared-cache core must be initialized before publishing collection metadata");
-    auto binding = cache->BindCurrentThreadHazard();
+template <class TTraits>
+TSharedCacheCollectionRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitCollection(
+    TIntrusiveConstPtr<NPageCollection::IPageCollection> collection)
+    requires std::is_same_v<TTraits, TProdTraits>
+{
+    auto binding = BindCurrentThreadHazard();
     const TCollectionLocation location{ .Id = collection->Label(), .BackingSize = collection->BackingSize() };
     TCollectionCacheItem inserted;
-    TSharedCacheCollectionRef hit;
-    auto status = cache->FindOrInsert(*Registry, location, inserted, hit);
+    TSharedCacheCollectionRefImpl<TTraits> hit;
+    auto status = FindOrInsert(location, inserted, hit);
     while (status == ESharedCacheResultStatus::Pending) {
         // A concurrent metadata publisher completes synchronously; share its ready collection.
         std::this_thread::yield();
-        status = cache->FindOrInsert(*Registry, location, inserted, hit);
+        status = FindOrInsert(location, inserted, hit);
     }
     if (status == ESharedCacheResultStatus::Inserted) {
-        Y_ENSURE(cache->MakeReady(*Registry, inserted, MakeHolder<TCollection>(std::move(collection), inserted)));
-        Y_ENSURE(cache->SetCollectionPagesCacheMode(inserted, ECacheMode::Regular));
-        Y_ENSURE(cache->Find(location.Id, hit) == ESharedCacheResultStatus::Hit);
+        Y_ENSURE(MakeReady(inserted, MakeHolder<TCollection>(std::move(collection), inserted)));
+        Y_ENSURE(SetCollectionPagesCacheMode(inserted, ECacheMode::Regular));
+        Y_ENSURE(Find(location.Id, hit) == ESharedCacheResultStatus::Hit);
     } else {
         Y_ENSURE(status == ESharedCacheResultStatus::Hit);
         hit->SetSkipBTreeIndexV1Shadow(collection->SkipBTreeIndexV1Shadow());
@@ -33,8 +33,12 @@ TSharedCacheCollectionRef TSharedCachePages::AdmitCollection(
     return hit;
 }
 
-TSharedCachePageRef TSharedCachePages::AdmitPage(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
-    NTable::NPage::TPageLocation location, NActors::TSharedData&& data, bool sticky) {
+template <class TTraits>
+TSharedCachePageRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitPage(
+    TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, NTable::NPage::TPageLocation location,
+    NActors::TSharedData&& data, bool sticky)
+    requires std::is_same_v<TTraits, TProdTraits>
+{
     TEvSaveCompactedPages admission(std::move(collection));
     return admission.AddPage(*this, NPageCollection::TPageData(location, std::move(data)), sticky);
 }
@@ -44,17 +48,15 @@ public:
     void Complete(TPageCacheItem item, EPageFetchCompletion completion) noexcept override {
         Y_ABORT_UNLESS(completion == EPageFetchCompletion::Ready);
         // Acquire before the fetch releases its owner, so admission cannot race eviction.
-        Y_ABORT_UNLESS(TSharedCache::SharedCachePages().AcquirePage(item, Page));
+        Y_ABORT_UNLESS(TSharedCache::Get().AcquirePage(item, Page));
     }
 
     TSharedCachePageRef Page;
 };
 
 TSharedCachePageRef TEvSaveCompactedPages::AddPage(
-    TSharedCachePages& cachePages, NPageCollection::TPageData&& page, bool sticky) {
-    auto* cache = static_cast<TSharedCache*>(cachePages.Cache.Get());
-    Y_ENSURE(cache, "Shared-cache core must be initialized before writing page collections");
-    auto binding = cache->BindCurrentThreadHazard();
+    TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
+    auto binding = cachePages.BindCurrentThreadHazard();
     if (!CacheItem) {
         auto collection = cachePages.AdmitCollection(PageCollection);
         CacheItem = collection.CacheItem();
@@ -62,7 +64,7 @@ TSharedCachePageRef TEvSaveCompactedPages::AddPage(
     Pages.push_back(page.Location);
     auto waiter = MakeIntrusive<TCompactedPageWaiter>();
     TSharedCachePageRequest request(page.Location, waiter, sticky);
-    if (!cache->FindOrInsertBatch(CacheItem, { &request, 1 }, false)) {
+    if (!cachePages.FindOrInsertBatch(CacheItem, { &request, 1 }, false)) {
         Y_ENSURE(!sticky, "Cannot admit Sticky compacted page " << page.Location.Offset);
         return {};
     }
@@ -186,7 +188,7 @@ void TRequestPageWaiter::Complete(TPageCacheItem page, EPageFetchCompletion comp
     TSharedCachePageRef result;
     if (completion == EPageFetchCompletion::Ready) {
         TSharedCachePageRef cachePage;
-        if (TSharedCache* cache = TSharedCache::TrySharedCachePages()) {
+        if (TSharedCache* cache = TSharedCache::TryGet()) {
             auto binding = cache->BindCurrentThreadHazard();
             if (cache->AcquirePage(page, cachePage)) {
                 result = std::move(cachePage);
@@ -200,5 +202,11 @@ void TRequestPageWaiter::Complete(TPageCacheItem page, EPageFetchCompletion comp
     Completion_->Complete(Index_, std::move(result), completion);
     Completion_.Drop();
 }
+
+template TSharedCacheCollectionRef TSharedCacheImpl<TProdTraits>::AdmitCollection(
+    TIntrusiveConstPtr<NPageCollection::IPageCollection> collection);
+template TSharedCachePageRef TSharedCacheImpl<TProdTraits>::AdmitPage(
+    TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, NTable::NPage::TPageLocation location,
+    NActors::TSharedData&& data, bool sticky);
 
 } // namespace NKikimr::NSharedCache

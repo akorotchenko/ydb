@@ -49,6 +49,32 @@ using TItemResult = TTestResult<TTestSharedCacheItemRef>;
 
 class TSharedCacheTestAccess {
 public:
+    static bool MakeReady(TTestSharedCache& cache, TCollectionRegistry& registry, TCollectionCacheItem collection,
+        THolder<TCollection>&& value) noexcept {
+        return cache.MakeReady(registry, collection, std::move(value));
+    }
+
+    static bool DetachCollection(
+        TTestSharedCache& cache, TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept {
+        return cache.DetachCollection(registry, collection);
+    }
+
+    static bool UnlinkCollectionRegistry(
+        TTestSharedCache& cache, TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept {
+        return cache.UnlinkCollectionRegistry(registry, collection);
+    }
+
+    static bool DeleteCollection(
+        TTestSharedCache& cache, TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept {
+        return cache.DeleteCollection(registry, collection);
+    }
+
+    static ESharedCacheResultStatus FindOrInsert(TTestSharedCache& cache, TCollectionRegistry& registry,
+        const TCollectionLocation& collection, TCollectionCacheItem& inserted,
+        TTestSharedCacheCollectionRef& hit) noexcept {
+        return cache.FindOrInsert(registry, collection, inserted, hit);
+    }
+
     static bool MakeReadyUnregistered(
         TTestSharedCache& cache, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept {
         return cache.MakeReady(nullptr, collection, std::move(value));
@@ -101,7 +127,7 @@ public:
     static ESharedCacheResultStatus FindOrInsertUnregistered(TTestSharedCache& cache,
         const TCollectionLocation& collection, TCollectionCacheItem& inserted,
         TTestSharedCacheCollectionRef& hit) noexcept {
-        return cache.FindOrInsert(collection, inserted, hit);
+        return cache.FindOrInsertUnregistered(collection, inserted, hit);
     }
 
     static bool AcquirePage(TTestSharedCache& cache, TPageCacheItem page, TTestSharedCachePageRef& result) noexcept {
@@ -1129,8 +1155,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             auto data = MakePageData(1);
             auto metadata = TIntrusiveConstPtr<NPageCollection::IPageCollection>(
                 new TTestPageCollection(id, data, pagesReleasedBeforeCollection));
-            UNIT_ASSERT(
-                fixture.Cache->MakeReady(fixture.Registry, collection, MakeHolder<TCollection>(std::move(metadata))));
+            UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+                *fixture.Cache, fixture.Registry, collection, MakeHolder<TCollection>(std::move(metadata))));
             const auto page = AllocatePage(*fixture.Cache, TSharedCacheKey::Page(collection, 1), data.size());
             UNIT_ASSERT(page);
             // Handle-order teardown would destroy this metadata before releasing its page buffer.
@@ -1138,6 +1164,29 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(fixture.Cache->MakeReady(page, std::move(data)));
         }
         UNIT_ASSERT(pagesReleasedBeforeCollection);
+    }
+
+    Y_UNIT_TEST(OwnedCollectionRegistryLifecycle) {
+        TFixture fixture;
+        const TCollectionLocation location{ .Id = TLogoBlobID(12, 34, 56) };
+        TCollectionCacheItem collection;
+        TTestSharedCacheCollectionRef hit;
+        UNIT_ASSERT(fixture.Cache->FindOrInsert(location, collection, hit) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(fixture.Cache->MakeReady(collection, MakeCollection(location.Id)));
+        UNIT_ASSERT(!fixture.Cache->DeleteCollection(collection));
+
+        bool visited = false;
+        fixture.Cache->ForEachCollection([&](TCollection& value) {
+            UNIT_ASSERT(!visited);
+            visited = true;
+            UNIT_ASSERT_VALUES_EQUAL(value.Id(), location.Id);
+            UNIT_ASSERT(fixture.Cache->DetachCollection(value.CacheItem));
+        });
+        UNIT_ASSERT(visited);
+        UNIT_ASSERT(fixture.Cache->DeleteCollection(collection));
+        fixture.Cache->ForEachCollection([](TCollection&) {
+            UNIT_FAIL("Detached collection remained registered");
+        });
     }
 
     Y_UNIT_TEST(InsertFindAndRollback) {
@@ -1208,7 +1257,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TLogoBlobID id(61, 62, 63);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         const auto location = NTable::NPage::TPageLocation::FromPageIndex(7, 4096, NTable::NPage::EPage::DataPage, 123);
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
@@ -1250,7 +1300,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TLogoBlobID id(83, 84, 85);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
         std::atomic<ui64> completedItem = 0;
@@ -1273,7 +1324,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(83, 84, 95);
         const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         const auto location = MakePageLocation(1);
         const ui64 bytes = location.Size + NActors::TSharedData::OverheadSize;
         UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(bytes));
@@ -1313,7 +1365,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(83, 84, 96);
         const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         const auto location = MakePageLocation(1);
         const ui64 bytes = location.Size + NActors::TSharedData::OverheadSize;
         UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(bytes));
@@ -1336,7 +1389,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(83, 84, 97);
         const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         const auto location = MakePageLocation(1);
         const ui64 bytes = location.Size + NActors::TSharedData::OverheadSize;
         UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(2 * bytes));
@@ -1374,7 +1428,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(83, 84, 98);
         const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
         const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 1));
         TTestSharedCachePageRef held;
@@ -1420,7 +1475,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TLogoBlobID id(83, 84, 86);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
 
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
@@ -1448,7 +1504,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TLogoBlobID id(85, 86, 87);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
 
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
@@ -1499,7 +1556,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(85, 86, 89);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
@@ -1533,14 +1591,15 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(hits[0].Page().IsSticky());
         }
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyPages(), 2);
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyOwnedBytes(), 0);
     }
     Y_UNIT_TEST(ExplicitStickyHintPromotesAnOrdinaryPendingFetch) {
         TFixture fixture;
         const TLogoBlobID id(85, 86, 92);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
@@ -1560,14 +1619,15 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(completed.load(), 2);
         UNIT_ASSERT_VALUES_EQUAL(ready.load(), 2);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyPages(), 1);
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyOwnedBytes(), 0);
     }
     Y_UNIT_TEST(FailedStickyFetchUnlinksOnlyItsPage) {
         TFixture fixture;
         const TLogoBlobID id(85, 86, 93);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
         std::atomic<ui64> completedItem = 0;
@@ -1588,7 +1648,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, kept.Index()).IsSticky());
         UNIT_ASSERT_VALUES_EQUAL(completed.load(), 2);
         UNIT_ASSERT_VALUES_EQUAL(ready.load(), 1);
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyOwnedBytes(), 0);
     }
     Y_UNIT_TEST(StickyBatchCompletionHonorsModeWithdrawal) {
@@ -1596,7 +1656,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TFixture fixture;
             const TLogoBlobID id(85, 86, 90);
             const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-            UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
             std::atomic<ui32> completed = 0;
             std::atomic<ui32> ready = 0;
             std::atomic<ui64> completedItem = 0;
@@ -1621,7 +1682,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(85, 86, 91);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
@@ -1640,7 +1702,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             succeeded = fetch.MakeReady(MakePageData(page.Index()));
         });
         gate.Slots[0].Wait();
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
         gate.Slots[0].Release();
         completer.Join();
         UNIT_ASSERT(succeeded);
@@ -1652,7 +1714,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(85, 86, 91);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
@@ -1684,7 +1747,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TLogoBlobID id(85, 86, 88);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
 
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
@@ -1713,7 +1777,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TLogoBlobID id(89, 90, 91);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
         std::atomic<ui64> completedItem = 0;
@@ -1736,7 +1801,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TLogoBlobID id(87, 88, 89);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
         std::atomic<ui64> completedItem = 0;
@@ -1759,14 +1825,15 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                         ESharedCacheResultStatus::Miss);
         }
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), 1);
-        UNIT_ASSERT(fixture.Cache->DeleteCollection(fixture.Registry, collection));
+        UNIT_ASSERT(TSharedCacheTestAccess::DeleteCollection(*fixture.Cache, fixture.Registry, collection));
     }
     Y_UNIT_TEST(PageBatchCoalescesDuplicateCandidates) {
         TFixture fixture;
         const TLogoBlobID id(85, 86, 87);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         const auto location = MakePageLocation(3);
         const ui64 pageBytes = location.Size + NActors::TSharedData::OverheadSize;
         std::atomic<ui32> completed = 0;
@@ -1803,7 +1870,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TLogoBlobID id(93, 94, 95);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         const auto first = MakePageLocation(1, 4096);
         const auto second = MakePageLocation(2, 8192);
         const ui64 requestedBytes = first.Size + second.Size;
@@ -1935,7 +2003,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(95, 96, 104);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         TCollection* value = TSharedCacheTestAccess::CollectionValue(*fixture.Cache, collection.Index());
         const ui64 generation = value->KeepGeneration();
         const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
@@ -1978,14 +2047,15 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(explicitSticky[0].Page().IsSticky());
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyOwnedBytes(), bytes);
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyOwnedBytes(), 0);
     }
     Y_UNIT_TEST(AttachmentTransitionRejectsCollectionPagesCacheModeChanges) {
         TFixture fixture;
         const TLogoBlobID id(95, 96, 105);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         const auto page = AllocatePage(*fixture.Cache, TSharedCacheKey::Page(collection, 0), 4096,
             NTable::NPage::EPage::DataPage, 0, EStickyState::Sticky);
         UNIT_ASSERT(fixture.Cache->MakeReady(page, MakePageData(page.Index())));
@@ -1995,7 +2065,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         bool detached = false;
         TGateThread detacher(gate, [&] {
             auto binding = fixture.Cache->BindThreadHazard(0);
-            detached = fixture.Cache->DetachCollection(fixture.Registry, collection);
+            detached = TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection);
         });
         gate.Slots[0].Wait();
         UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, collection.Index()).IsTransitionField());
@@ -2407,20 +2477,21 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         TCollectionCacheItem inserted;
         TTestSharedCacheCollectionRef collection;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, location, inserted, collection) ==
-                    ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, location, inserted,
+                        collection) == ESharedCacheResultStatus::Inserted);
         UNIT_ASSERT(inserted);
         UNIT_ASSERT(!collection);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), location.AccountedBytes());
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, inserted, MakeCollection(id, location.BackingSize)));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, inserted, MakeCollection(id, location.BackingSize)));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->CollectionBytes(), location.AccountedBytes());
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::FreeCount(*fixture.Cache), freeBefore - 2);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionListHead(fixture.Registry), inserted.Index());
 
         TCollectionCacheItem duplicate;
         TTestSharedCacheCollectionRef hitCollection;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, location, duplicate, hitCollection) ==
-                    ESharedCacheResultStatus::Hit);
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, location, duplicate,
+                        hitCollection) == ESharedCacheResultStatus::Hit);
         UNIT_ASSERT(!duplicate);
         UNIT_ASSERT(hitCollection.CacheItem() == inserted);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::FreeCount(*fixture.Cache), freeBefore - 2);
@@ -2440,15 +2511,15 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::NextInOwner(*fixture.Cache, inserted.Index()), 0);
 
         TCollectionCacheItem duplicate;
-        UNIT_ASSERT(
-            fixture.Cache->FindOrInsert(fixture.Registry, location, duplicate, hit) == ESharedCacheResultStatus::Hit);
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, location, duplicate, hit) ==
+                    ESharedCacheResultStatus::Hit);
         UNIT_ASSERT(!duplicate);
         UNIT_ASSERT(hit.CacheItem() == inserted);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionListHead(fixture.Registry), inserted.Index());
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::NextInOwner(*fixture.Cache, inserted.Index()), 0);
         hit.Drop();
 
-        UNIT_ASSERT(fixture.Cache->UnlinkCollectionRegistry(fixture.Registry, inserted));
+        UNIT_ASSERT(TSharedCacheTestAccess::UnlinkCollectionRegistry(*fixture.Cache, fixture.Registry, inserted));
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionListHead(fixture.Registry), 0);
         const THandleState retained = TSharedCacheTestAccess::HandleState(*fixture.Cache, inserted.Index());
         UNIT_ASSERT(retained.IsSticky());
@@ -2478,21 +2549,23 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         TCollectionCacheItem first;
         TTestSharedCacheCollectionRef hit;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, firstLocation, first, hit) ==
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, firstLocation, first, hit) ==
                     ESharedCacheResultStatus::Inserted);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, first, MakeCollection(firstId)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, first, MakeCollection(firstId)));
 
         TCollectionCacheItem second;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, secondLocation, second, hit) ==
-                    ESharedCacheResultStatus::Inserted);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, second, MakeCollection(secondId)));
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, secondLocation, second,
+                        hit) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, second, MakeCollection(secondId)));
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionListHead(fixture.Registry), second.Index());
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::NextInOwner(*fixture.Cache, second.Index()), first.Index());
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::NextInOwner(*fixture.Cache, first.Index()), 0);
 
         /* a detached, unreferenced record goes to the eviction control, so it can be re-attached
          * while it is still there */
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, first));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, first));
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionListHead(fixture.Registry), second.Index());
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::NextInOwner(*fixture.Cache, second.Index()), 0);
         UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, first.Index()).IsHot());
@@ -2501,8 +2574,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         TCollectionCacheItem duplicate;
         TTestSharedCacheCollectionRef reattached;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, firstLocation, duplicate, reattached) ==
-                    ESharedCacheResultStatus::Hit);
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, firstLocation, duplicate,
+                        reattached) == ESharedCacheResultStatus::Hit);
         UNIT_ASSERT(!duplicate);
         UNIT_ASSERT(reattached.CacheItem() == first);
         UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, first.Index()).IsSticky());
@@ -2511,8 +2584,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::NextInOwner(*fixture.Cache, first.Index()), second.Index());
 
         reattached.Drop();
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, first));
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, second));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, first));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, second));
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionListHead(fixture.Registry), 0);
     }
     Y_UNIT_TEST(CollectionReattachRestoresOwnReferenceWithResidentPage) {
@@ -2520,9 +2593,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TCollectionLocation location{ .Id = TLogoBlobID(15, 17, 19) };
         TCollectionCacheItem collection;
         TTestSharedCacheCollectionRef collectionHit;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, location, collection, collectionHit) ==
-                    ESharedCacheResultStatus::Inserted);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(location.Id)));
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, location, collection,
+                        collectionHit) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(location.Id)));
 
         TPageCacheItem page;
         TTestSharedCachePageRef pageHit;
@@ -2530,13 +2604,13 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                         pageHit) == ESharedCacheResultStatus::Inserted);
         UNIT_ASSERT(fixture.Cache->MakeReady(page, MakePageData(page.Index())));
 
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), 1);
         TCollectionCacheItem duplicate;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, location, duplicate, collectionHit) ==
-                    ESharedCacheResultStatus::Hit);
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, location, duplicate,
+                        collectionHit) == ESharedCacheResultStatus::Hit);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), 2);
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), 1);
         UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
         UNIT_ASSERT(TSharedCacheTestAccess::EraseCold(*fixture.Cache, MakeColdItem(*fixture.Cache, page.Index())));
@@ -2548,16 +2622,17 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             const TCollectionLocation location{ .Id = TLogoBlobID(15, 17, 20) };
             TCollectionCacheItem collection;
             TTestSharedCacheCollectionRef collectionHit;
-            UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, location, collection, collectionHit) ==
-                        ESharedCacheResultStatus::Inserted);
+            UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, location, collection,
+                            collectionHit) == ESharedCacheResultStatus::Inserted);
             UNIT_ASSERT(collection);
-            UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(location.Id)));
+            UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+                *fixture.Cache, fixture.Registry, collection, MakeCollection(location.Id)));
             UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
             TPageCacheItem page;
             if (sourceState == EHandleState::Sticky) {
                 page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 1));
             }
-            UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+            UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
             if (sourceState == EHandleState::Cold) {
                 UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, collection));
             }
@@ -2576,7 +2651,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TGateThread attacher(gate, [&] {
                 auto binding = cache->BindThreadHazard(0);
                 TCollectionCacheItem duplicate;
-                status = cache->FindOrInsert(fixture.Registry, location, duplicate, attached);
+                status = TSharedCacheTestAccess::FindOrInsert(*cache, fixture.Registry, location, duplicate, attached);
             });
             gate.Slots[0].Wait();
             UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionListHead(fixture.Registry), 0);
@@ -2606,7 +2681,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             claimReader.Drop();
             publishReader.Drop();
             attached.Drop();
-            UNIT_ASSERT(cache->DetachCollection(fixture.Registry, collection));
+            UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*cache, fixture.Registry, collection));
             if (page) {
                 UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*cache, page));
                 UNIT_ASSERT(TSharedCacheTestAccess::EraseCold(*cache, MakeColdItem(*cache, page.Index())));
@@ -2621,11 +2696,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TIntrusiveConstPtr<NPageCollection::IPageCollection> source = new TTestPageCollection(location.Id, 0);
         TCollectionCacheItem collection;
         TTestSharedCacheCollectionRef hit;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, location, collection, hit) ==
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, location, collection, hit) ==
                     ESharedCacheResultStatus::Inserted);
         auto value = MakeHolder<TCollection>(source, collection);
         auto* owner = value.Get();
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, std::move(value)));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, std::move(value)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
         TPageCacheItem shadow;
         TTestSharedCachePageRef pageHit;
@@ -2668,7 +2743,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             const TLogoBlobID id(16, 18, 20);
             const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
             UNIT_ASSERT(collection);
-            UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
             UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(
                 collection, initiallyKeep ? ECacheMode::TryKeepInMemory : ECacheMode::Regular));
             TTestSharedCachePageRef hit;
@@ -2708,14 +2784,15 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         TCollectionCacheItem inserted;
         TTestSharedCacheCollectionRef hit;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, location, inserted, hit) ==
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, location, inserted, hit) ==
                     ESharedCacheResultStatus::Inserted);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, inserted, MakeCollection(location.Id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, inserted, MakeCollection(location.Id)));
 
         TTestSharedCacheCollectionRef held;
         UNIT_ASSERT(fixture.Cache->Find(location.Id, held) == ESharedCacheResultStatus::Hit);
         const TCollection* value = &held.GetCollection();
-        UNIT_ASSERT(fixture.Cache->DeleteCollection(fixture.Registry, inserted));
+        UNIT_ASSERT(TSharedCacheTestAccess::DeleteCollection(*fixture.Cache, fixture.Registry, inserted));
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionListHead(fixture.Registry), 0);
 
         TTestSharedCacheCollectionRef missing;
@@ -2743,10 +2820,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             const TLogoBlobID id(15, 16, 18);
             TCollectionCacheItem collection;
             TTestSharedCacheCollectionRef collectionHit;
-            UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, { .Id = id }, collection, collectionHit) ==
-                        ESharedCacheResultStatus::Inserted);
+            UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, { .Id = id }, collection,
+                            collectionHit) == ESharedCacheResultStatus::Inserted);
             UNIT_ASSERT(collection);
-            UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
             UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
 
             const ui32 pageCount = lastOwner ? 1 : 2;
@@ -2755,7 +2833,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 pages.push_back(InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, offset)));
                 UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, pages.back()));
             }
-            UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+            UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
             UNIT_ASSERT_VALUES_EQUAL(
                 TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), pageCount);
             UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, collection.Index()).Refs(), 0);
@@ -2806,9 +2884,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TCollectionLocation location{ .Id = TLogoBlobID(15, 16, 17) };
         TCollectionCacheItem collection;
         TTestSharedCacheCollectionRef collectionHit;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, location, collection, collectionHit) ==
-                    ESharedCacheResultStatus::Inserted);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(location.Id)));
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, location, collection,
+                        collectionHit) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(location.Id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Sticky));
 
         std::array<TPageCacheItem, 2> pages;
@@ -2821,7 +2900,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_UNEQUAL(TSharedCacheTestAccess::StickyPageListHead(*fixture.Cache, collection), 0);
 
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionListHead(fixture.Registry), 0);
         UNIT_ASSERT(!fixture.Cache->DeleteCollection(collection));
         UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, collection.Index()).IsSticky());
@@ -2863,9 +2942,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         TCollectionCacheItem collection;
         TTestSharedCacheCollectionRef hit;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, location, collection, hit) ==
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, location, collection, hit) ==
                     ESharedCacheResultStatus::Inserted);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(location.Id)));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(location.Id)));
 
         const TPageCacheItem page = AllocatePage(*fixture.Cache, TSharedCacheKey::Page(collection, 1), 4096,
             NTable::NPage::EPage::DataPage, 0, EStickyState::Sticky);
@@ -2874,8 +2954,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         TCollectionCacheItem duplicate;
         TTestSharedCacheCollectionRef moved;
-        UNIT_ASSERT(
-            fixture.Cache->FindOrInsert(destination, location, duplicate, moved) == ESharedCacheResultStatus::Hit);
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, destination, location, duplicate, moved) ==
+                    ESharedCacheResultStatus::Hit);
         UNIT_ASSERT(!duplicate);
         UNIT_ASSERT(moved.CacheItem() == collection);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionListHead(fixture.Registry), 0);
@@ -2896,8 +2976,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         std::array<TCollectionCacheItem, 2> collections;
         TTestSharedCacheCollectionRef hit;
         for (ui32 index = 0; index < collections.size(); ++index) {
-            UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, locations[index], collections[index], hit) ==
-                        ESharedCacheResultStatus::Inserted);
+            UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, locations[index],
+                            collections[index], hit) == ESharedCacheResultStatus::Inserted);
             values[index] = MakeCollection(locations[index].Id);
         }
 
@@ -2910,7 +2990,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 while (!start.load(std::memory_order_acquire)) {
                     std::this_thread::yield();
                 }
-                ready[index] = fixture.Cache->MakeReady(fixture.Registry, collections[index], std::move(values[index]));
+                ready[index] = TSharedCacheTestAccess::MakeReady(
+                    *fixture.Cache, fixture.Registry, collections[index], std::move(values[index]));
             });
         }
         start.store(true, std::memory_order_release);
@@ -3315,9 +3396,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             const TLogoBlobID baseId(901, 902, 903);
             TCollectionCacheItem base;
             TTestSharedCacheCollectionRef collectionHit;
-            UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, { .Id = baseId }, base, collectionHit) ==
-                        ESharedCacheResultStatus::Inserted);
-            UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, base, MakeCollection(baseId)));
+            UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, { .Id = baseId }, base,
+                            collectionHit) == ESharedCacheResultStatus::Inserted);
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, base, MakeCollection(baseId)));
             UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(base, ECacheMode::Regular));
 
             TVector<TTestSharedCachePageRef> held;
@@ -3349,10 +3431,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 const TLogoBlobID id(901, 902, keep ? 905 : 904);
                 TCollectionCacheItem collection;
                 TTestSharedCacheCollectionRef hit;
-                UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, { .Id = id }, collection, hit) ==
-                            ESharedCacheResultStatus::Inserted);
+                UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, { .Id = id },
+                                collection, hit) == ESharedCacheResultStatus::Inserted);
                 UNIT_ASSERT(collection.Index() >= oldOp.HandleCount());
-                UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+                UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+                    *fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
                 UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(
                     collection, keep ? ECacheMode::TryKeepInMemory : ECacheMode::Regular));
                 const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
@@ -3429,7 +3512,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         const TLogoBlobID id(901, 902, 906);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
 
         TVector<TTestSharedCachePageRef> held;
@@ -3888,9 +3972,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TCollectionLocation collectionLocation{ .Id = TLogoBlobID(53, 54, 55) };
         TCollectionCacheItem collection;
         TTestSharedCacheCollectionRef collectionRef;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, collectionLocation, collection, collectionRef) ==
-                    ESharedCacheResultStatus::Inserted);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(collectionLocation.Id)));
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, collectionLocation,
+                        collection, collectionRef) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(collectionLocation.Id)));
         TVector<TSharedCacheKey> keys;
         TVector<TPageCacheItem> pages;
         for (ui64 offset = 0; offset < target.HandleCount() - 1; ++offset) {
@@ -3915,7 +4000,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const ui64 pageOwners = target.HandleCount() - 3;
         UNIT_ASSERT_VALUES_EQUAL(
             TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), pageOwners + 1);
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
         collectionRef.Drop();
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), pageOwners);
 
@@ -4053,9 +4138,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TCollectionLocation collectionLocation{ .Id = TLogoBlobID(70, 71, 72) };
         TCollectionCacheItem collection;
         TTestSharedCacheCollectionRef collectionRef;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, collectionLocation, collection, collectionRef) ==
-                    ESharedCacheResultStatus::Inserted);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(collectionLocation.Id)));
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, collectionLocation,
+                        collection, collectionRef) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(collectionLocation.Id)));
 
         TVector<TSharedCacheKey> regularKeys;
         TVector<TPageCacheItem> regularPages;
@@ -4186,9 +4272,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TCollectionLocation collectionLocation{ .Id = TLogoBlobID(73, 74, 75) };
         TCollectionCacheItem collection;
         TTestSharedCacheCollectionRef collectionRef;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, collectionLocation, collection, collectionRef) ==
-                    ESharedCacheResultStatus::Inserted);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(collectionLocation.Id)));
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, collectionLocation,
+                        collection, collectionRef) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(collectionLocation.Id)));
 
         TVector<TPageCacheItem> regularPages;
         for (ui64 offset = 0; offset < target.HandleCount() - 3; ++offset) {
@@ -4235,7 +4322,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(state.IsSticky() && state.IsTransitionField());
         }
 
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
         collectionRef.Drop();
         for (ui32 step = 0; step < 10000; ++step) {
             if (TSharedCacheTestAccess::HandleState(*fixture.Cache, heldPage.Index()).IsReplaced() &&
@@ -4374,12 +4461,13 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         TCollectionCacheItem inserted;
         TTestSharedCacheCollectionRef hit;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, location, inserted, hit) ==
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, location, inserted, hit) ==
                     ESharedCacheResultStatus::Inserted);
         UNIT_ASSERT(inserted);
         UNIT_ASSERT(!hit);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, inserted, MakeCollection(location.Id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, inserted, MakeCollection(location.Id)));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ResidentBytes(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->CollectionBytes(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Cache->StaticBytes());
@@ -4411,7 +4499,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
         const TLogoBlobID id(42, 43, 44);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         TPageCacheItem cacheItem;
         TTestSharedCachePageRef hit;
         UNIT_ASSERT(FindOrInsertPage(*fixture.Cache, collection, MakePageLocation(0), EStickyState::Sticky, cacheItem,
@@ -4505,7 +4594,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::MinimumHotSlots(*fixture.Cache, true), 25);
         const TLogoBlobID id(95, 96, 121);
         const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         for (ui32 offset = 0; offset < 20; ++offset) {
             const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, offset));
             UNIT_ASSERT(TSharedCacheTestAccess::MakePageSticky(*fixture.Cache, page));
@@ -4559,7 +4649,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(20 * bytes));
         const TLogoBlobID id(95, 96, 120);
         const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         for (ui32 offset = 0; offset < 4; ++offset) {
             const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, offset));
             UNIT_ASSERT(TSharedCacheTestAccess::MakePageSticky(*fixture.Cache, page));
@@ -4622,7 +4713,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TFixture fixture;
             const TLogoBlobID id(95, 96, 119);
             const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-            UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
             UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
             if (atMinimum) {
                 TSharedCacheTestAccess::ShrinkHotToMinimum(*fixture.Cache);
@@ -4661,7 +4753,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TFixture fixture;
             const TLogoBlobID id(95, 96, 120);
             const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-            UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
             UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(0));
             TTestSharedCachePageRef held;
             auto waiter = MakeIntrusive<TAcquiringPageFetchWaiter>(*fixture.Cache, held);
@@ -4696,7 +4789,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(95, 96, 121);
         const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 0));
         TTestSharedCachePageRef held;
         UNIT_ASSERT(fixture.Cache->Find(collection, 0, held) == ESharedCacheResultStatus::Hit);
@@ -4722,14 +4816,14 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(Cache->UpdateKeepColdLimit(10 * PageBytes));
             const TLogoBlobID keepId(95, 96, 123);
             const auto keep = AllocateCollection(*Cache, TSharedCacheKey::Collection(keepId));
-            UNIT_ASSERT(Cache->MakeReady(Registry, keep, MakeCollection(keepId)));
+            UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(*Cache, Registry, keep, MakeCollection(keepId)));
             UNIT_ASSERT(Cache->SetCollectionPagesCacheMode(keep, ECacheMode::TryKeepInMemory));
             for (ui32 offset = 0; offset < 20; ++offset) {
                 Keep.push_back(InsertReadyPage(*Cache, TSharedCacheKey::Page(keep, offset)));
             }
             const TLogoBlobID regularId(95, 96, 124);
             Regular = AllocateCollection(*Cache, TSharedCacheKey::Collection(regularId));
-            UNIT_ASSERT(Cache->MakeReady(Registry, Regular, MakeCollection(regularId)));
+            UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(*Cache, Registry, Regular, MakeCollection(regularId)));
             UNIT_ASSERT(Cache->SetCollectionPagesCacheMode(Regular, ECacheMode::Regular));
             UNIT_ASSERT_VALUES_EQUAL(Cache->RetainedBytes(), 20 * PageBytes);
         }
@@ -4847,7 +4941,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
         const TLogoBlobID id(95, 96, 113);
         const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
         UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(0));
         TTestSharedCachePageRef first;
@@ -4891,7 +4986,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(95, 96, 117);
         const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
         UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(0));
         TTestSharedCachePageRef held;
@@ -4937,7 +5033,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
         const TLogoBlobID keepId(95, 96, 114);
         const auto keep = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(keepId));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, keep, MakeCollection(keepId)));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, keep, MakeCollection(keepId)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(keep, ECacheMode::TryKeepInMemory));
         UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(bytes));
         const auto kept = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(keep, 0));
@@ -4945,7 +5041,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(bytes));
         const TLogoBlobID regularId(95, 96, 115);
         const auto regular = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(regularId));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, regular, MakeCollection(regularId)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, regular, MakeCollection(regularId)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(regular, ECacheMode::Regular));
         TTestSharedCachePageRef ref;
         auto waiter = MakeIntrusive<TAcquiringPageFetchWaiter>(*fixture.Cache, ref);
@@ -4973,7 +5070,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
             const TLogoBlobID id(95, 96, 116);
             const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-            UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
             UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
             UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(0));
             TTestSharedCachePageRef held;
@@ -5043,7 +5141,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture(5);
         const TLogoBlobID id(95, 96, 107);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
         TSharedCacheTestAccess::ShrinkHotToMinimum(*fixture.Cache);
         const auto heldItem = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 0));
@@ -5072,7 +5171,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const ui64 minimum = TSharedCacheTestAccess::MinimumHotSlots(*fixture.Cache);
         const TLogoBlobID id(95, 96, 108);
         const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::TryKeepInMemory));
         UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(5 * bytes));
         TVector<TPageCacheItem> keep;
@@ -5101,7 +5201,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
         const TLogoBlobID id(95, 96, 112);
         const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::TryKeepInMemory));
         UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(3 * bytes));
         TVector<TPageCacheItem> keep;
@@ -5131,7 +5232,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
                 const TLogoBlobID id(95, 96, 109);
                 const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-                UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+                UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+                    *fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
                 UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::TryKeepInMemory));
                 UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(4 * bytes));
                 TPageCacheItem ordinary;
@@ -5175,11 +5277,13 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
         const TLogoBlobID id(95, 96, 110);
         const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::TryKeepInMemory));
         const TLogoBlobID stickyId(95, 96, 111);
         const auto stickyCollection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(stickyId));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, stickyCollection, MakeCollection(stickyId)));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, stickyCollection, MakeCollection(stickyId)));
         UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(26 * bytes));
         for (ui32 offset = 0; offset < 54; ++offset) {
             if (offset < 26) {
@@ -5345,9 +5449,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TLogoBlobID id(93, 94, 96);
         TCollectionCacheItem collection;
         TTestSharedCacheCollectionRef collectionHit;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, { .Id = id }, collection, collectionHit) ==
-                    ESharedCacheResultStatus::Inserted);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, { .Id = id }, collection,
+                        collectionHit) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
 
         for (ui64 offset = 1; offset <= 60; ++offset) {
             TPageCacheItem page;
@@ -6025,8 +6130,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(7, 8, 9));
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, collectionKey);
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(
-            fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
 
         const auto regularKey = TSharedCacheKey::Page(collection, 1);
         const TPageCacheItem regular = AllocatePage(*fixture.Cache, regularKey, 4096);
@@ -6072,9 +6177,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TCollectionLocation collectionLocation{ .Id = TLogoBlobID(7, 8, 10) };
         TCollectionCacheItem collection;
         TTestSharedCacheCollectionRef collectionRef;
-        UNIT_ASSERT(fixture.Cache->FindOrInsert(fixture.Registry, collectionLocation, collection, collectionRef) ==
-                    ESharedCacheResultStatus::Inserted);
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(collectionLocation.Id)));
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, collectionLocation,
+                        collection, collectionRef) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(collectionLocation.Id)));
 
         TPageCacheItem page;
         TTestSharedCachePageRef pageHit;
@@ -6086,7 +6192,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(sourceState.IsSticky() && sourceState.IsTransitionField());
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::StickyPageListHead(*fixture.Cache, collection), 0);
 
-        UNIT_ASSERT(fixture.Cache->DetachCollection(fixture.Registry, collection));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
         collectionRef.Drop();
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), 1);
         const ui64 residentBytes = fixture.Cache->ResidentBytes();
@@ -6100,8 +6206,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(16, 17, 18));
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, collectionKey);
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(
-            fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
 
         const auto key = TSharedCacheKey::Page(collection, 1);
         const TPageCacheItem page = AllocatePage(*fixture.Cache, key, 4096);
@@ -6128,8 +6234,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(19, 20, 21));
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, collectionKey);
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(
-            fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
 
         const auto key = TSharedCacheKey::Page(collection, 1);
         const TPageCacheItem page = AllocatePage(*fixture.Cache, key, 4096);
@@ -6160,8 +6266,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(10, 11, 12));
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, collectionKey);
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(
-            fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
 
         std::array<TPageCacheItem, 2> pages;
         for (ui32 index = 0; index < pages.size(); ++index) {
@@ -6203,8 +6309,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(13, 14, 15));
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, collectionKey);
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(
-            fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
 
         const ui64 pageBytes = 4096 + NActors::TSharedData::OverheadSize;
         UNIT_ASSERT(fixture.Cache->UpdateStickyLimit(pageBytes));
@@ -6242,7 +6348,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(95, 96, 106);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         const auto page = AllocatePage(*fixture.Cache, TSharedCacheKey::Page(collection, 0), 4096,
             NTable::NPage::EPage::DataPage, 0, EStickyState::Sticky);
         const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
@@ -6272,8 +6379,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(12, 13, 14));
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, collectionKey);
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(
-            fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
 
         const TPageCacheItem ready = AllocatePage(*fixture.Cache, TSharedCacheKey::Page(collection, 1), 4096,
             NTable::NPage::EPage::DataPage, 0, EStickyState::Sticky);
@@ -6329,8 +6436,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(31, 32, 33));
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, collectionKey);
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(
-            fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
 
         const TPageCacheItem existing = AllocatePage(*fixture.Cache, TSharedCacheKey::Page(collection, 1), 4096,
             NTable::NPage::EPage::DataPage, 0, EStickyState::Sticky);
@@ -6371,8 +6478,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(13, 14, 15));
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, collectionKey);
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(
-            fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
 
         const auto existingKey = TSharedCacheKey::Page(collection, 1);
         const TPageCacheItem existing =
@@ -6425,8 +6532,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(16, 17, 18));
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, collectionKey);
         UNIT_ASSERT(collection);
-        UNIT_ASSERT(
-            fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
 
         const auto existingKey = TSharedCacheKey::Page(collection, 1);
         const TPageCacheItem existing =
@@ -6491,7 +6598,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(16, 17, 19);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
 
         std::atomic<ui32> completed = 0;
         std::atomic<ui32> ready = 0;
@@ -6551,7 +6659,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             const TLogoBlobID id(37, 39, 43);
             const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
             UNIT_ASSERT(collection);
-            UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
             UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, mode));
             const ui64 pageBytes = 4096 + NActors::TSharedData::OverheadSize;
             UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(2 * pageBytes));
@@ -6605,7 +6714,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TFixture fixture;
             const TLogoBlobID id(37, 39, mode == ECacheMode::Regular ? 44 : 45);
             const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-            UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
             UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, mode));
             const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
             UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(2 * bytes));
@@ -6646,7 +6756,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(37, 39, 46);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::TryKeepInMemory));
         const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
         UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(2 * bytes));
@@ -6665,7 +6776,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture;
         const TLogoBlobID id(37, 39, 47);
         const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
-        UNIT_ASSERT(fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::TryKeepInMemory));
         UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(0));
         const TPageCacheItem page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 1));
@@ -7191,8 +7303,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const auto page = AllocatePage(*fixture.Cache, pageKey, 4096);
         UNIT_ASSERT(collection);
         UNIT_ASSERT(page);
-        UNIT_ASSERT(
-            fixture.Cache->MakeReady(fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
         UNIT_ASSERT(FindOrInsertCollection(*fixture.Cache, collectionKey, collection).Status ==
                     ESharedCacheResultStatus::Inserted);
         UNIT_ASSERT(FindOrInsertPage(*fixture.Cache, pageKey, page).Status == ESharedCacheResultStatus::Inserted);

@@ -17,13 +17,13 @@ TCollection::~TCollection() {
 }
 
 void TCollection::SetSkipBTreeIndexV1Shadow(bool skip) {
-    auto& cache = TSharedCache::SharedCachePages();
+    auto& cache = TSharedCache::Get();
     auto binding = cache.BindCurrentThreadHazard();
     cache.SetCollectionSkipBTreeIndexV1Shadow(*this, skip);
 }
 
 void TCollection::DrainStickyPages() {
-    auto& cache = TSharedCache::SharedCachePages();
+    auto& cache = TSharedCache::Get();
     auto binding = cache.BindCurrentThreadHazard();
     auto spaceOp = cache.BeginOperation();
     cache.DrainStickyPages(spaceOp, *this);

@@ -39,7 +39,7 @@ namespace NBoot {
             Prebuilt.resize(LargeGlobIds.size());
             Components.resize(LargeGlobIds.size());
 
-            auto* cache = TSharedCache::TrySharedCachePages();
+            auto* cache = TSharedCache::TryGet();
             auto binding = cache ? cache->BindCurrentThreadHazard() : TSharedCacheThreadBinding<TProdTraits>{};
             for (auto slot: xrange(LargeGlobIds.size())) {
                 if (cache) {

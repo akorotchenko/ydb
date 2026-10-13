@@ -9,7 +9,6 @@
 #include <ydb/core/tablet_flat/ut/flat_database_ut_common.h>
 #include <ydb/core/tablet_flat/flat_executor_compaction_logic.h>
 #include <ydb/core/tablet_flat/shared_cache.h>
-#include <ydb/core/tablet_flat/shared_cache_pages.h>
 #include <ydb/core/tablet/tablet_impl.h>
 #include <ydb/library/yverify_stream/yverify_stream.h>
 #include <library/cpp/testing/unittest/registar.h>

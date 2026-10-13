@@ -178,7 +178,7 @@ namespace {
 
         TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection = new TTestPartPageCollection(part, 0);
         TVector<TSharedCacheCollectionRef> collections;
-        collections.push_back(TSharedCachePages::Get().AdmitCollection(pageCollection));
+        collections.push_back(TSharedCache::Get().AdmitCollection(pageCollection));
         NTable::TLoader::TLoaderEnv env(std::move(collections), part->Slots);
         env.ProvidePart(part.Get());
         TKeysLoader loader(part.Get(), &env);

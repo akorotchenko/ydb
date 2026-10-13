@@ -1,6 +1,6 @@
 #include "flat_page_btree_index.h"
 #include "shared_cache_btree_walk.h"
-#include "shared_cache_pages.h"
+#include "shared_cache.h"
 #include "shared_cache_collection.h"
 
 #include <util/generic/algorithm.h>
