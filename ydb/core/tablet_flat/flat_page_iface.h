@@ -43,6 +43,11 @@ namespace NPage {
             return TPageOffset(static_cast<ui64>(value) | IndexTag);
         }
 
+        static TPageOffset FromRaw(ui64 value) noexcept {
+            Y_DEBUG_ABORT_UNLESS(value != MaxRaw);
+            return TPageOffset(value);
+        }
+
         /** Max sentinel — all bits set */
         static TPageOffset Max() noexcept { return TPageOffset(); }
         static TPageOffset Min() noexcept { return TPageOffset(ui64(0)); }
