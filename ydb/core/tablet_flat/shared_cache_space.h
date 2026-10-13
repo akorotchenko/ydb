@@ -495,6 +495,12 @@ private:
     ui64 NextCutSlot_ = 0;
 };
 
+bool TryCalculateSharedCacheFootprint(
+    ui8 addressBits, ui64 expectedPageSize, ui64 fixedBytes, ui32 hazardCount, TSharedCacheCapacity& result) noexcept;
+
+bool TryCalculateSharedCacheCapacity(
+    ui64 limit, ui64 expectedPageSize, ui64 fixedBytes, ui32 hazardCount, TSharedCacheCapacity& result) noexcept;
+
 struct alignas(64) TSpaceHazard {
     std::atomic<ui64> State{ 0 }; // {generation:32, active-count:32}
     std::atomic<ui64> SpareItem{ 0 };
@@ -707,5 +713,164 @@ inline constexpr bool SpaceHazardIsActive(ui64 state) noexcept {
 inline constexpr bool SpaceHazardIsDrained(ui64 state, ui64 generation) noexcept {
     return !SpaceHazardIsActive(state) || SpaceHazardGeneration(state) == generation;
 }
+
+class TSharedCacheSpaceTestAccess;
+class TSharedCacheTestAccess;
+
+class TSpaceHazardBinding {
+public:
+    TSpaceHazardBinding() noexcept = default;
+    TSpaceHazardBinding(const TSpaceHazardBinding&) = delete;
+    TSpaceHazardBinding& operator=(const TSpaceHazardBinding&) = delete;
+    TSpaceHazardBinding(TSpaceHazardBinding&& other) noexcept;
+    TSpaceHazardBinding& operator=(TSpaceHazardBinding&& other) noexcept;
+    ~TSpaceHazardBinding();
+
+private:
+    friend class TSharedCacheSpace;
+
+    TSpaceHazardBinding(const TSharedCacheSpace* space, TSpaceHazard* hazard) noexcept;
+
+    void Reset() noexcept;
+
+private:
+    const TSharedCacheSpace* Space_ = nullptr;
+    TSpaceHazard* Hazard_ = nullptr;
+};
+
+class TSharedCacheSpace {
+public:
+    static THolder<TSharedCacheSpace> Create(
+        const TSharedCacheCapacity& current, const TSharedCacheCapacity& reserved, ui32 hazardCount);
+
+    TSharedCacheSpace(const TSharedCacheSpace&) = delete;
+    TSharedCacheSpace& operator=(const TSharedCacheSpace&) = delete;
+    ~TSharedCacheSpace();
+
+    Y_FORCE_INLINE TSpaceOperation BeginOperation() noexcept {
+        return TSpaceOperation::Begin(SpaceState_, CurrentThreadHazard(), SpaceViews_);
+    }
+
+    Y_FORCE_INLINE const TSpaceView& SpaceView(TSpaceState state) const noexcept {
+        const TSpaceView& view = SpaceViews_[state.Generation() & 1];
+        Y_DEBUG_ABORT_UNLESS(view.Generation == state.Generation());
+        return view;
+    }
+
+    Y_FORCE_INLINE TBucketResizeState BucketResizeState() const noexcept {
+        return TBucketResizeState::FromRaw(BucketResizeState_.load(std::memory_order_acquire));
+    }
+
+    Y_FORCE_INLINE bool RefreshBucketRoute(TSpaceState& spaceState, TBucketResizeState& resizeState) const noexcept {
+        const TSpaceState currentSpaceState = CurrentSpaceState();
+        if (!currentSpaceState.Resizing()) {
+            const bool unchanged = currentSpaceState == spaceState;
+            spaceState = currentSpaceState;
+            if (!unchanged) {
+                resizeState = {};
+            }
+            return unchanged;
+        }
+
+        const TBucketResizeState currentResizeState = BucketResizeState();
+        if (currentSpaceState == spaceState && currentResizeState == resizeState)
+        {
+            return true;
+        }
+        spaceState = currentSpaceState;
+        resizeState = currentResizeState;
+        return false;
+    }
+
+    Y_FORCE_INLINE TSpaceState CurrentSpaceState() const noexcept {
+        return TSpaceState::FromRaw(SpaceState_.load(std::memory_order_acquire));
+    }
+
+    // Serialized controller access; workers use their active space view.
+    const TSharedCacheCapacity& CurrentConfiguration() const noexcept {
+        return Capacity_;
+    }
+
+    const TSharedCacheCapacity& ReservedConfiguration() const noexcept {
+        return ReservedCapacity_;
+    }
+
+    ui64 EffectiveHotSlots() const noexcept {
+        return EffectiveHotSlots_.load(std::memory_order_acquire);
+    }
+
+    ui32 HazardCount() const noexcept {
+        return HazardCount_;
+    }
+
+    bool ThreadHazardBound() const noexcept {
+        Y_DEBUG_ABORT_UNLESS(!TlsHazard_ || TlsSpace_ == this);
+        return TlsHazard_;
+    }
+
+    TSpaceHazardBinding BindThreadHazard(ui32 index) const noexcept;
+    TSpaceHazardBinding BindAnyThreadHazard() const noexcept;
+
+    Y_FORCE_INLINE bool RefreshSpaceState(TSpaceState& spaceState) const noexcept {
+        const TSpaceState current = CurrentSpaceState();
+        if (current == spaceState) {
+            return true;
+        }
+        spaceState = current;
+        return false;
+    }
+
+private:
+    friend class TSpaceHazardBinding;
+    friend class TSharedCacheSpaceTestAccess;
+    friend class TSharedCacheTestAccess;
+    friend class TSpaceOperation;
+
+    bool AdvanceSpaceGeneration() noexcept;
+
+    void PrepareView(ui32 generation, TSpaceView view) noexcept;
+
+    Y_FORCE_INLINE const TSpaceView& NewestView() const noexcept {
+        TSpaceView* view = NewestView_.load(std::memory_order_acquire);
+        Y_DEBUG_ABORT_UNLESS(view);
+        return *view;
+    }
+
+    Y_FORCE_INLINE TSpaceHazard& CurrentThreadHazard() const noexcept {
+        Y_DEBUG_ABORT_UNLESS(TlsSpace_ == this);
+        Y_DEBUG_ABORT_UNLESS(TlsHazard_);
+        return *TlsHazard_;
+    }
+
+    TSharedCacheSpace() = default;
+
+    bool Initialize(const TSharedCacheCapacity& current, const TSharedCacheCapacity& reserved, ui32 hazardCount);
+
+private:
+    TSharedCacheMapping HandlesMapping_;
+    TSharedCacheMapping BucketsMapping_;
+    TSharedCacheMapping HotMapping_;
+    TSharedCacheMapping ColdMapping_;
+    TSharedCacheMapping KeepColdMapping_;
+    TSharedCacheMapping FreeMapping_;
+    THolder<TSpaceView> NewestViewOwner_;
+    std::atomic<TSpaceView*> NewestView_{ nullptr };
+    std::array<TSpaceView, 2> SpaceViews_;
+    THolder<TS5FifoRings> S5FifoRings_;
+    THolder<TFreeRingCursor> FreeRingCursor_;
+    TArrayHolder<TSpaceHazard> Hazards_;
+
+    inline static thread_local TSpaceHazard* TlsHazard_ = nullptr;
+    inline static thread_local const TSharedCacheSpace* TlsSpace_ = nullptr;
+
+    ui32 HazardCount_ = 0;
+    ui32 HazardSlotCount_ = 1;
+    TSharedCacheCapacity Capacity_;
+    TSharedCacheCapacity ReservedCapacity_;
+
+    std::atomic<ui64> SpaceState_{ 0 };
+    std::atomic<ui64> EffectiveHotSlots_{ 0 };
+    std::atomic<ui64> BucketResizeState_{ 0 };
+};
 
 } // namespace NKikimr::NSharedCache
