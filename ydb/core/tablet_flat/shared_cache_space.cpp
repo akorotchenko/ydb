@@ -40,6 +40,99 @@ namespace {
 
 TSharedCacheSpace::~TSharedCacheSpace() = default;
 
+bool TSharedCacheSpace::BeginBucketResize(ui8 newAddressBits) noexcept {
+    const TSpaceState spaceState = CurrentSpaceState();
+    if (spaceState.Resizing()) {
+        return false;
+    }
+
+    const ui8 oldAddressBits = spaceState.AddressBits();
+    EBucketResize direction;
+    if (newAddressBits == oldAddressBits + 1 && newAddressBits <= ReservedCapacity_.AddressBits &&
+        SharedCacheBucketCount(newAddressBits) <= NewestView().BucketsBytes / sizeof(std::atomic<ui64>))
+    {
+        direction = EBucketResize::Growing;
+    } else if (newAddressBits + 1 == oldAddressBits) {
+        direction = EBucketResize::Shrinking;
+    } else {
+        return false;
+    }
+
+    if (direction == EBucketResize::Growing) {
+        std::atomic<ui64>* buckets = NewestView().Buckets;
+        const ui64 oldBucketCount = SharedCacheBucketCount(oldAddressBits);
+        const ui64 newBucketCount = SharedCacheBucketCount(newAddressBits);
+        for (ui64 index = oldBucketCount; index < newBucketCount; ++index) {
+            new (&buckets[index]) std::atomic<ui64>(0);
+        }
+    }
+
+    BucketResizeState_.store(TBucketResizeState::Make(direction, EBucketResizePhase::Prepared, oldAddressBits).Raw(),
+        std::memory_order_relaxed);
+    SpaceState_.store(spaceState.BeginResize().Raw(), std::memory_order_release);
+    return true;
+}
+
+bool TSharedCacheSpace::AdvanceBucketResizePhase(EBucketResizePhase phase) noexcept {
+    Y_ABORT_UNLESS(phase != EBucketResizePhase::Stable);
+    if (!CurrentSpaceState().Resizing()) {
+        return false;
+    }
+    const TBucketResizeState state = TBucketResizeState::FromRaw(BucketResizeState_.load(std::memory_order_acquire));
+    if (!state || static_cast<ui8>(phase) < static_cast<ui8>(state.Phase())) {
+        return false;
+    }
+    BucketResizeState_.store(state.WithPhase(phase).Raw(), std::memory_order_release);
+    return true;
+}
+
+bool TSharedCacheSpace::PublishBucketResizeCursor(ui32 cursor) noexcept {
+    if (!CurrentSpaceState().Resizing()) {
+        return false;
+    }
+    const TBucketResizeState state = TBucketResizeState::FromRaw(BucketResizeState_.load(std::memory_order_acquire));
+    if (!state || state.Phase() != EBucketResizePhase::Activated || cursor > state.PairCount() ||
+        cursor < state.Cursor())
+    {
+        return false;
+    }
+    BucketResizeState_.store(
+        state.WithCursorAndPhase(cursor, EBucketResizePhase::CursorPublished).Raw(), std::memory_order_release);
+    return true;
+}
+
+bool TSharedCacheSpace::PrepareNextBucketResizePair() noexcept {
+    if (!CurrentSpaceState().Resizing()) {
+        return false;
+    }
+    const TBucketResizeState state = TBucketResizeState::FromRaw(BucketResizeState_.load(std::memory_order_acquire));
+    if (!state || state.Cursor() >= state.PairCount() ||
+        (state.Phase() != EBucketResizePhase::CursorPublished && state.Phase() != EBucketResizePhase::Closed))
+    {
+        return false;
+    }
+    BucketResizeState_.store(state.WithPhase(EBucketResizePhase::Prepared).Raw(), std::memory_order_release);
+    return true;
+}
+
+bool TSharedCacheSpace::FinishBucketResize() noexcept {
+    const TSpaceState spaceState = CurrentSpaceState();
+    if (!spaceState.Resizing()) {
+        return false;
+    }
+    const TBucketResizeState state = TBucketResizeState::FromRaw(BucketResizeState_.load(std::memory_order_acquire));
+    const ui32 pairCount = state.PairCount();
+    if (!state || state.Cursor() != pairCount ||
+        (state.Direction() == EBucketResize::Shrinking && state.Phase() != EBucketResizePhase::Closed) ||
+        (state.Direction() == EBucketResize::Growing && state.Phase() != EBucketResizePhase::CursorPublished))
+    {
+        return false;
+    }
+
+    SpaceState_.store(spaceState.WithAddressBits(state.NewAddressBits()).Raw(), std::memory_order_release);
+    return true;
+}
+
 bool TSharedCacheSpace::AdvanceSpaceGeneration() noexcept {
     const TSpaceState current = CurrentSpaceState();
     Y_ABORT_UNLESS(current.Generation() < MaxSpaceGeneration);
@@ -60,6 +153,22 @@ void TSharedCacheSpace::PrepareView(ui32 generation, TSpaceView view) noexcept {
     view.FreeCursor = FreeRingCursor_.Get();
     view.EffectiveHotSlots = &EffectiveHotSlots_;
     SpaceViews_[generation & 1] = view;
+}
+
+ui32 TSharedCacheSpace::HotLevelForSlot(ui64 slot, ui64 hotSlotCount) noexcept {
+    const ui64 l3End = hotSlotCount / 15;
+    const ui64 l2End = l3End + (hotSlotCount * 2) / 15;
+    const ui64 l1End = l2End + (hotSlotCount * 5) / 15;
+    if (slot < l3End) {
+        return 3;
+    }
+    if (slot < l2End) {
+        return 2;
+    }
+    if (slot < l1End) {
+        return 1;
+    }
+    return 0;
 }
 
 TSpaceHazardBinding::TSpaceHazardBinding(const TSharedCacheSpace* space, TSpaceHazard* hazard) noexcept
@@ -118,6 +227,66 @@ TSpaceHazardBinding TSharedCacheSpace::BindAnyThreadHazard() const noexcept {
         }
     }
     Y_ABORT("Shared-cache hazard slots exhausted");
+}
+
+TCacheItem TSharedCacheSpace::TakeCutSpare(ui64 allocationLimit) noexcept {
+    const auto take = [allocationLimit](TSpaceHazard& hazard) noexcept {
+        ui64 raw = hazard.SpareItem.load(std::memory_order_acquire);
+        while (raw != 0) {
+            const TCacheItem cacheItem = TCacheItem::FromRaw(raw);
+            if (cacheItem.Index() < allocationLimit) {
+                return TCacheItem{};
+            }
+            if (hazard.SpareItem.compare_exchange_weak(raw, 0, std::memory_order_acquire, std::memory_order_relaxed))
+            {
+                return cacheItem;
+            }
+        }
+        return TCacheItem{};
+    };
+
+    for (ui32 index = 0; index < HazardSlotCount_; ++index) {
+        TCacheItem cacheItem = take(Hazards_[index]);
+        if (!cacheItem.IsNull()) {
+            return cacheItem;
+        }
+    }
+    return {};
+}
+
+bool TSharedCacheSpace::BeginHotResize(ui32 targetEffectiveHotSlots, THotResize& resize) noexcept {
+    const ui64 currentEffectiveHotSlots = EffectiveHotSlots();
+    const ui64 maximumHotSlots = SpaceView(CurrentSpaceState()).HotSlotCount;
+    if (resize.Phase_ != EHotResizePhase::Idle || !SharedCacheHotLayoutIsValid(targetEffectiveHotSlots) ||
+        targetEffectiveHotSlots > maximumHotSlots || targetEffectiveHotSlots == currentEffectiveHotSlots)
+    {
+        return false;
+    }
+
+    resize.OldEffectiveHotSlots_ = currentEffectiveHotSlots;
+    resize.NextCutSlot_ = targetEffectiveHotSlots;
+    EffectiveHotSlots_.store(targetEffectiveHotSlots, std::memory_order_release);
+    if (targetEffectiveHotSlots < currentEffectiveHotSlots) {
+        resize.Phase_ = EHotResizePhase::Cut;
+    } else {
+        resize.Reset();
+    }
+    return true;
+}
+
+bool TSharedCacheSpace::DrainHotResize(THotResize& resize, ui32& level, ui64& raw) noexcept {
+    if (resize.Phase_ != EHotResizePhase::Cut || resize.NextCutSlot_ >= resize.OldEffectiveHotSlots_)
+    {
+        return false;
+    }
+
+    const ui64 slot = resize.NextCutSlot_++;
+    level = HotLevelForSlot(slot, resize.OldEffectiveHotSlots_);
+    raw = NewestView().HotSlots[slot].exchange(0, std::memory_order_acq_rel);
+    if (resize.NextCutSlot_ == resize.OldEffectiveHotSlots_) {
+        resize.Reset();
+    }
+    return true;
 }
 
 bool TryCalculateSharedCacheFootprint(
@@ -278,6 +447,147 @@ bool TSharedCacheSpace::Initialize(
     SpaceState_.store(TSpaceState::Make(0, current.AddressBits).Raw(), std::memory_order_release);
     EffectiveHotSlots_.store(current.HotSlotCount(), std::memory_order_release);
     return true;
+}
+
+ui32 TSpaceOperation::TryAllocateHandle() noexcept {
+    return View().Space->TryAllocateHandleImpl<false>(*this, {});
+}
+
+template <bool WithHook>
+Y_FORCE_INLINE ui32 TSharedCacheSpace::TryAllocateHandleImpl(
+    TSpaceOperation& spaceOp, TFreeExchangeHook hook) noexcept {
+    for (;;) {
+        const TSpaceState attemptState = CurrentSpaceState();
+        const TSpaceView& attemptView = SpaceView(attemptState);
+        const TFreeRingView free = attemptView.Free();
+        const TRingExchangeResult exchange = free.Pop([&] {
+            if constexpr (WithHook) {
+                hook.Run();
+            }
+        });
+        if (!exchange.Slot) {
+            return 0;
+        }
+        const ui64 rawItem = exchange.Previous;
+        if (rawItem == 0) {
+            continue;
+        }
+
+        const TCacheItem cacheItem = TCacheItem::FromRaw(rawItem);
+        if (CurrentSpaceState().Generation() != attemptState.Generation())
+        {
+            if (!cacheItem.IsNull() && !cacheItem.IsFrozen()) {
+                spaceOp.ReturnFreeHandle(cacheItem.Index(), cacheItem.Version());
+            }
+            continue;
+        }
+        if (cacheItem.IsNull() || cacheItem.IsFrozen() || cacheItem.Index() >= attemptView.AllocationLimit) {
+            continue;
+        }
+
+        THandle& handle = attemptView.Handles[cacheItem.Index()];
+        ui64 expectedRaw = handle.State.load(std::memory_order_acquire);
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        if (!cacheItem.Matches(expected) || !expected.IsFree() || expected.Refs() != 0)
+        {
+            continue;
+        }
+
+        const THandleState desired =
+            expected.WithState(EHandleState::Begin).WithFrequency(0).WithSticky(EStickyState::None);
+        if (handle.State.compare_exchange_strong(
+                expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed))
+        {
+            Y_DEBUG_ABORT_UNLESS(cacheItem.Index() < spaceOp.AccessibleHandleCount());
+            return cacheItem.Index();
+        }
+    }
+}
+
+ui32 TSharedCacheSpace::TryAllocateHandleWithHook(TSpaceOperation& spaceOp, TFreeExchangeHook hook) noexcept {
+    return TryAllocateHandleImpl<true>(spaceOp, hook);
+}
+
+bool TSpaceOperation::ReturnFreeHandle(ui32 index, ui32 version) noexcept {
+    return View().Space->ReturnFreeHandleImpl<false>(*this, index, version, {});
+}
+
+template <bool WithHook>
+Y_FORCE_INLINE bool TSharedCacheSpace::ReturnFreeHandleImpl(
+    TSpaceOperation& spaceOp, ui32 index, ui32 version, TFreeExchangeHook hook) noexcept {
+    TSpaceState currentState = CurrentSpaceState();
+    const TSpaceView* currentView = &SpaceView(currentState);
+    const TSpaceView& operationView = spaceOp.View();
+    if (index < 2 || index >= spaceOp.AccessibleHandleCount()) {
+        return false;
+    }
+
+    const THandleState state =
+        THandleState::FromRaw(operationView.Handles[index].State.load(std::memory_order_acquire));
+    if (state.Version() != version || !state.IsFree() || state.Refs() != 0) {
+        return false;
+    }
+    if (index >= currentView->AllocationLimit) {
+        return true;
+    }
+
+    std::array<ui64, 2> pending = {
+        TCacheItem::Make(version, index).Raw(),
+        0,
+    };
+    ui32 pendingCount = 1;
+    while (pendingCount) {
+        ui64 carried = pending[--pendingCount];
+        for (;;) {
+            const TCacheItem cacheItem = TCacheItem::FromRaw(carried);
+            currentState = CurrentSpaceState();
+            currentView = &SpaceView(currentState);
+            if (cacheItem.IsNull() || cacheItem.IsFrozen() || cacheItem.Index() >= currentView->AllocationLimit)
+            {
+                break;
+            }
+            const THandleState handleState =
+                THandleState::FromRaw(currentView->Handles[cacheItem.Index()].State.load(std::memory_order_acquire));
+            if (!cacheItem.Matches(handleState) || !handleState.IsFree() || handleState.Refs() != 0)
+            {
+                break;
+            }
+
+            const TSpaceState attemptState = currentState;
+            const TSpaceView* attemptView = currentView;
+            const TRingExchangeResult exchange = attemptView->Free().Push(carried, [&] {
+                if constexpr (WithHook) {
+                    hook.Run();
+                }
+            });
+            const ui64 displaced = exchange.Previous;
+
+            if (CurrentSpaceState().Generation() == attemptState.Generation())
+            {
+                if (displaced == 0) {
+                    break;
+                }
+                carried = displaced;
+                continue;
+            }
+
+            const ui64 late = FreeRingCursor_->Clear(exchange.Slot);
+            if (late != 0) {
+                Y_ABORT_UNLESS(pendingCount < pending.size());
+                pending[pendingCount++] = late;
+            }
+            if (displaced == 0) {
+                break;
+            }
+            carried = displaced;
+        }
+    }
+    return true;
+}
+
+bool TSharedCacheSpace::ReturnFreeHandleWithHook(
+    TSpaceOperation& spaceOp, ui32 index, ui32 version, TFreeExchangeHook hook) noexcept {
+    return ReturnFreeHandleImpl<true>(spaceOp, index, version, hook);
 }
 
 } // namespace NKikimr::NSharedCache
