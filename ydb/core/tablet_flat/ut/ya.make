@@ -30,6 +30,7 @@ SRCS(
     shared_cache_cyclic_buffer_ut.cpp
     shared_cache_space_ut.cpp
     shared_cache_table_key_ut.cpp
+    shared_cache_table_ut.cpp
     shared_cache_s3fifo_ut.cpp
     shared_cache_tiered_ut.cpp
     shared_handle_ut.cpp

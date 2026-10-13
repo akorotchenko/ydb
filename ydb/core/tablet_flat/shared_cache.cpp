@@ -5000,4 +5000,10 @@ TCacheCollection* TSharedCache::ReleaseItem(TSpaceOperation& spaceOp, TCacheItem
 #undef TSharedCache
 #undef SHARED_CACHE_TEMPLATE
 
+template class TSharedCacheThreadBinding<TTestTraits>;
+template class TSharedCachePageRefImpl<TTestTraits>;
+template class TSharedCacheCollectionRefImpl<TTestTraits>;
+template class TPageFetchImpl<TTestTraits>;
+template class TSharedCacheImpl<TTestTraits>;
+
 } // namespace NKikimr::NSharedCache
