@@ -182,20 +182,21 @@ Y_UNIT_TEST_SUITE(TIterator) {
             return NTest::TTestEnv::Locate(part, ref, lob);
         }
 
-        const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             if (Touch(groupId, ResolvePageId(part, location, part->DataSlot(groupId)))) {
                 return NTest::TTestEnv::TryGetPage(part, location, groupId);
             }
-            return nullptr;
+            return {};
         }
 
-        const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TSharedCachePageRef TryGetIndexPage(
+            const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             // index pages are tracked as pages of their page collection
             const ui32 slot = part->IndexSlot(groupId);
             if (Touch(TGroupId(slot), ResolvePageId(part, location, slot))) {
                 return NTest::TTestEnv::TryGetIndexPage(part, location, groupId);
             }
-            return nullptr;
+            return {};
         }
 
         bool Touch(TGroupId groupId, TPageId pageId) {

@@ -41,13 +41,15 @@ class TPartStore : public TPart, public IBundle {
 protected:
     TPartStore(const TPartStore& src, TEpoch epoch)
         : TPart(src, epoch)
-        , PageCollections(src.PageCollections)
-        , Pseudo(src.Pseudo)
-    { }
+        , Pseudo(src.Pseudo.Acquire())
+    {
+        PageCollections.reserve(src.PageCollections.size());
+        for (const auto& collection : src.PageCollections) {
+            PageCollections.push_back(collection.Acquire());
+        }
+    }
 
 public:
-    using TPageCollection = NTabletFlatExecutor::TPrivatePageCache::TPageCollection;
-
     TPartStore(const TLogoBlobID &label, TPart::TParams egg, TStat stat)
         : TPart(label, egg, stat)
     {
@@ -56,14 +58,14 @@ public:
 
     const TLogoBlobID& BundleId() const noexcept override
     {
-        return PageCollections[0]->PageCollection->Label();
+        return PageCollections[0]->PageCollection()->Label();
     }
 
     ui64 BackingSize() const noexcept override
     {
         ui64 size = 0;
         for (const auto &cache : PageCollections) {
-            size += cache->PageCollection->BackingSize();
+            size += cache->PageCollection()->BackingSize();
         }
         return size;
     }
@@ -79,13 +81,13 @@ public:
     {
         auto* cache = Locate(lob, ref);
 
-        return cache->PageCollection->Page(ref).Size;
+        return cache->PageCollection()->Page(ref).Size;
     }
 
     const NPageCollection::IPageCollection* GetPageCollection(ui32 slot) const override
     {
         Y_ENSURE(slot < PageCollections.size());
-        return PageCollections[slot]->PageCollection.Get();
+        return PageCollections[slot]->PageCollection().Get();
     }
 
     ui64 GetSlotPageSize(ui32 slot, NPage::TPageId pageId) const override
@@ -103,7 +105,7 @@ public:
     ui8 GetSlotChannel(ui32 slot) const override
     {
         Y_ENSURE(slot < PageCollections.size());
-        return PageCollections[slot]->Id.Channel();
+        return PageCollections[slot]->Id().Channel();
     }
 
     ui8 GetPageChannel(ELargeObj lob, ui64 ref) const override
@@ -113,11 +115,11 @@ public:
         }
 
         if (lob == ELargeObj::Extern) {
-            auto bounds = Pseudo.Get()->PageCollection->Bounds(ref);
-            auto glob = Pseudo.Get()->PageCollection->Glob(bounds.Lo.Blob);
+            auto bounds = Pseudo.Get()->PageCollection()->Bounds(ref);
+            auto glob = Pseudo.Get()->PageCollection()->Glob(bounds.Lo.Blob);
             return glob.Logo.Channel();
         } else {
-            return PageCollections.at(OuterSlot()).Get()->Id.Channel();
+            return PageCollections.at(OuterSlot()).Get()->Id().Channel();
         }
     }
 
@@ -128,13 +130,12 @@ public:
 
     const NPageCollection::TPageCollection* Packet(ui32 room) const noexcept override
     {
-        auto *pageCollection = room < PageCollections.size() ? PageCollections[room]->PageCollection.Get() : nullptr;
+        auto *pageCollection = room < PageCollections.size() ? PageCollections[room]->PageCollection().Get() : nullptr;
 
         return dynamic_cast<const NPageCollection::TPageCollection*>(pageCollection);
     }
 
-    TPageCollection* Locate(ELargeObj lob, ui64 ref) const
-    {
+    NSharedCache::TCollection* Locate(ELargeObj lob, ui64 ref) const {
         if ((lob != ELargeObj::Extern && lob != ELargeObj::Outer) || (ref >> 32)) {
             Y_TABLET_ERROR("Invalid ref ELargeObj{" << int(lob) << ", " << ref << "}");
         }
@@ -150,7 +151,7 @@ public:
     {
         Y_ENSURE(slot < PageCollections.size());
 
-        auto& pageCollection = *PageCollections[slot]->PageCollection;
+        auto& pageCollection = *PageCollections[slot]->PageCollection();
         const auto& metas = groupId.IsHistoric() ? IndexPages.BTreeHistoric : IndexPages.BTreeGroups;
         auto meta = groupId.Index < metas.size() ? &IndexPages.GetBTree(groupId) : nullptr;
         bool supersededByV2Tree = meta && meta->HasRootV2();
@@ -169,17 +170,17 @@ public:
         return pages;
     }
 
-    static TArrayRef<const TIntrusivePtr<TPageCollection>> Storages(const TPartView &partView)
+    static TArrayRef<const TSharedCacheCollectionRef> Storages(const TPartView &partView)
     {
         auto *part = partView.As<TPartStore>();
 
         Y_ENSURE(!partView || part, "Got an unexpected type of TPart part");
 
-        return part ? part->PageCollections : TArrayRef<const TIntrusivePtr<TPageCollection>> { };
+        return part ? part->PageCollections : TArrayRef<const TSharedCacheCollectionRef>{ };
     }
 
-    TVector<TIntrusivePtr<TPageCollection>> PageCollections;
-    TIntrusivePtr<TPageCollection> Pseudo;    /* Cache for NPage::TBlobs */
+    TVector<TSharedCacheCollectionRef> PageCollections;
+    TSharedCacheCollectionRef Pseudo;    /* Cache for NPage::TBlobs */
 };
 
 class TTxStatusPartStore : public TTxStatusPart, public IBorrowBundle {

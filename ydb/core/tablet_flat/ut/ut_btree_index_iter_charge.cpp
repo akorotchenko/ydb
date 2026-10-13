@@ -18,22 +18,22 @@ namespace {
     using TChild = TBtreeIndexNode::TChild;
 
     struct TTouchEnv : public NTest::TTestEnv {
-        const TSharedData* TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
+        TSharedCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
         {
             if (Touch(groupId, ResolvePageId(part, location, part->DataSlot(groupId)))) {
                 return NTest::TTestEnv::TryGetPage(part, location, groupId);
             }
-            return nullptr;
+            return {};
         }
 
-        const TSharedData* TryGetIndexPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
-        {
+        TSharedCachePageRef TryGetIndexPage(
+            const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             // index pages are tracked as pages of their page collection
             const ui32 slot = part->IndexSlot(groupId);
             if (Touch(TGroupId(slot), ResolvePageId(part, location, slot))) {
                 return NTest::TTestEnv::TryGetIndexPage(part, location, groupId);
             }
-            return nullptr;
+            return {};
         }
 
         bool Touch(TGroupId groupId, TPageId pageId)
@@ -340,17 +340,17 @@ namespace {
         explicit TTouchEnvV2(const TPartStore* part)
             : Part(part) {}
 
-        const TSharedData* TryGetPage(const TPart* part, const NPage::TPageLocation& location,
+        TSharedCachePageRef TryGetPage(const TPart* part, const NPage::TPageLocation& location,
                 NPage::TGroupId groupId) override {
             return TryGetRoomPage(location, part->DataSlot(groupId));
         }
 
-        const TSharedData* TryGetIndexPage(const TPart* part, const NPage::TPageLocation& location,
-                NPage::TGroupId groupId) override {
+        TSharedCachePageRef TryGetIndexPage(
+            const TPart* part, const NPage::TPageLocation& location, NPage::TGroupId groupId) override {
             return TryGetRoomPage(location, part->IndexSlot(groupId));
         }
 
-        const TSharedData* TryGetRoomPage(const NPage::TPageLocation& location, ui32 room) {
+        TSharedCachePageRef TryGetRoomPage(const NPage::TPageLocation& location, ui32 room) {
             // Type-aware on every access, cache hits included: the store knows the
             // true page type for this offset/room. Validate the charger's requested
             // Type before serving from cache, so a same-offset request that later
@@ -366,11 +366,11 @@ namespace {
                 << " room " << room
                 << ": charger asked " << static_cast<ui16>(location.Type)
                 << " store says " << static_cast<ui16>(trueType));
-            if (auto* p = Loaded[room].FindPtr(location.Offset)) {
-                return p;
+            if (Loaded[room].contains(location.Offset)) {
+                return NTest::TTestEnv::TryGetSlotPage(Part, location, room);
             }
             Touched[room].push_back(location);
-            return nullptr;
+            return {};
         }
 
         // Simulate ObtainToLoad -> fetch -> save: every miss becomes available.

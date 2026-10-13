@@ -5,11 +5,13 @@
 #include "flat_table_stats.h"
 #include "flat_row_eggs.h"
 #include "util_basics.h"
+#include "shared_cache.h"
 
 #include <ydb/library/actors/util/shared_data.h>
 
 #include <util/generic/string.h>
 #include <util/system/types.h>
+#include <new>
 
 namespace NKikimr {
 namespace NTable {
@@ -56,36 +58,101 @@ namespace NTable {
 
         virtual ~IPages() = default;
 
-        struct TResult {
+        struct TResult : private TMoveOnly {
+            TResult(bool need, const TSharedData* data)
+                : Need(need)
+                , OwnsData_(false)
+                , BorrowedData_(data)
+            {
+            }
+
+            TResult(bool need, TSharedData&& data)
+                : Need(need)
+                , OwnsData_(true)
+            {
+                new (&Data_) TSharedData(std::move(data));
+            }
+
+            TResult(bool need, TSharedCachePageRef&& page)
+                : TResult(need, page ? page.BuildSharedData() : TSharedData())
+            {
+                page.Drop();
+            }
+
+            TResult(TResult&& other) noexcept
+                : Need(other.Need)
+                , OwnsData_(other.OwnsData_)
+            {
+                MovePayload(other);
+            }
+
+            TResult& operator=(TResult&& other) noexcept {
+                if (this != &other) {
+                    DestroyPayload();
+                    Need = other.Need;
+                    OwnsData_ = other.OwnsData_;
+                    MovePayload(other);
+                }
+                return *this;
+            }
+
+            ~TResult() {
+                DestroyPayload();
+            }
+
             explicit operator bool() const noexcept
             {
-                return bool(Page);
+                return OwnsData_ ? bool(Data_) : bool(BorrowedData_);
             }
 
             const TSharedData* operator*() const noexcept
             {
-                return Page;
+                return OwnsData_ ? &Data_ : BorrowedData_;
             }
 
             bool Need;
-            const TSharedData *Page;
+
+        private:
+            void MovePayload(TResult& other) noexcept {
+                if (OwnsData_) {
+                    new (&Data_) TSharedData(std::move(other.Data_));
+                } else {
+                    BorrowedData_ = std::exchange(other.BorrowedData_, nullptr);
+                }
+            }
+
+            void DestroyPayload() noexcept {
+                if (OwnsData_) {
+                    Data_.~TSharedData();
+                }
+            }
+
+            bool OwnsData_;
+
+            union {
+                const TSharedData* BorrowedData_;
+                TSharedData Data_;
+            };
         };
+
+        static_assert(sizeof(TResult) == 24);
 
         virtual TResult Locate(const TMemTable*, ui64 ref, ui32 tag) = 0;
         virtual TResult Locate(const TPart*, ui64 ref, ELargeObj lob) = 0;
 
         /**
-         * Returns a data page of the column group, or nullptr if it is not loaded yet
+         * Returns a data page of the column group, or an empty reference if it is not loaded yet
          */
-        virtual const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
+        virtual TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
 
         /**
-         * Returns an index page (flat or b-tree) of the column group, or nullptr if it is not loaded yet
+         * Returns an index page (flat or b-tree) of the column group, or an empty reference if it is not loaded yet
          *
          * Index pages may be stored in another page collection than data pages of the same group,
          * so the page collection is chosen by the part (TPart::IndexSlot) rather than the caller
          */
-        virtual const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
+        virtual TSharedCachePageRef TryGetIndexPage(
+            const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
 
         /**
          * Hook for cleaning up env on DB.RollbackChanges()

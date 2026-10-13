@@ -1,5 +1,6 @@
 #include <ydb/core/tablet_flat/flat_executor_ut_common.h>
 #include <ydb/core/base/memory_controller_iface.h>
+#include <ydb/core/cms/console/console.h>
 #include <ydb/core/tablet/tablet_monitoring_proxy.h>
 #include <ydb/core/tablet_flat/shared_sausagecache.h>
 #include <ydb/core/testlib/actors/wait_events.h>
@@ -228,11 +229,26 @@ public:
         return GrabEdgeEvent<NMon::TEvRemoteHttpInfoRes>()->Get()->Html;
     }
 
-    void SetSharedCacheLimit(ui64 memoryLimit)
+    void MinimizeSharedCache()
     {
-        TWaitForFirstEvent<NMemory::TEvConsumerLimit> wait(Env);
-        Env.Send(NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(memoryLimit));
+        auto config = MakeHolder<NConsole::TEvConsole::TEvConfigNotificationRequest>();
+        auto* sharedCache = config->Record.MutableConfig()->MutableSharedCacheConfig();
+        sharedCache->SetMemoryLimit(8_MB);
+        sharedCache->SetScanQueueInFlyLimit(256_KB);
+        sharedCache->SetAsyncQueueInFlyLimit(256_KB);
+        TWaitForFirstEvent<NConsole::TEvConsole::TEvConfigNotificationRequest> wait(Env);
+        Env.Send(NSharedCache::MakeSharedPageCacheId(), TActorId{}, config.Release());
         wait.Wait();
+        TWaitForFirstEvent<NMemory::TEvConsumerLimit> allocation(Env);
+        Env.Send(NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 8_MB));
+        allocation.Wait();
+        auto* core = static_cast<NSharedCache::TSharedCache*>(Env.GetAppData().SharedCachePages->Cache.Get());
+        for (ui32 step = 0; step < 400 && (core->HotPages() != 0 || core->ColdRingEntries() != 0); ++step) {
+            TWaitForFirstEvent<TKikimrEvents::TEvWakeup> maintenance(Env);
+            Env.Send(NSharedCache::MakeSharedPageCacheId(), TActorId{},
+                new TKikimrEvents::TEvWakeup(ui64(NSharedCache::EWakeupTag::DoGCManual)));
+            maintenance.Wait();
+        }
     }
 
     ui64 GetExecutorCumulativeCounter(TStringBuf name)
@@ -422,7 +438,7 @@ Y_UNIT_TEST_SUITE(TabletMon) {
 
         TDbMonEnv env;
         env.AddRowsAndCompact(Rows);
-        env.SetSharedCacheLimit(0);
+        env.MinimizeSharedCache();
 
         const ui64 postponedBefore = env.GetExecutorCumulativeCounter("TxPostponed");
         const ui64 missesBefore = env.GetExecutorCumulativeCounter("TxPageCacheMisses");
@@ -454,7 +470,7 @@ Y_UNIT_TEST_SUITE(TabletMon) {
 
         TDbMonEnv env;
         env.AddRowsAndCompact(Rows);
-        env.SetSharedCacheLimit(0);
+        env.MinimizeSharedCache();
 
         const TString html = env.RequestDbPage(
             RowsOffset,
@@ -477,7 +493,7 @@ Y_UNIT_TEST_SUITE(TabletMon) {
         auto runRequest = [] (bool disableOffsetScanPrecharge) {
             TDbMonEnv env;
             env.AddRowsAndCompact(Rows);
-            env.SetSharedCacheLimit(0);
+            env.MinimizeSharedCache();
 
             return RequestDbPageWithStats(
                 env,
@@ -513,7 +529,7 @@ Y_UNIT_TEST_SUITE(TabletMon) {
 
         TDbMonEnv env;
         env.AddRowsAndCompact(Rows);
-        env.SetSharedCacheLimit(0);
+        env.MinimizeSharedCache();
 
         auto prevDispatchTimeout = env.Env.SetDispatchTimeout(TDuration::Seconds(5));
         ui32 registeredActors = 0;

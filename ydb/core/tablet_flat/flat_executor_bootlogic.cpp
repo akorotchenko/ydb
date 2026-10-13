@@ -146,7 +146,6 @@ void TExecutorBootLogic::PrepareEnv(bool follower, ui32 gen, TExecutorCaches cac
 
     State_ = new NBoot::TBack(follower, Info->TabletID, gen);
     State().Scheme = new NTable::TScheme;
-    State().PageCollections = std::move(caches.PageCollections);
     State().TxStatusCaches = std::move(caches.TxStatusCaches);
 
     Steps = new NBoot::TRoot(this, State_.Get(), logger);
@@ -197,13 +196,13 @@ NBoot::TSpawned TExecutorBootLogic::LoadPages(NBoot::IStep *step, NTable::TLoade
 
     SeenBlob(fetch.PageCollection->Label());
 
-    Ops->Send(
-        NSharedCache::MakeSharedPageCacheId(),
-        new NSharedCache::TEvRequest(
+    auto* request = new NSharedCache::TEvRequest(
             NBlockIO::EPriority::Fast,
             std::move(fetch.PageCollection),
             std::move(fetch.Pages),
-            BootAttempt),
+            BootAttempt);
+    request->Sticky = std::move(fetch.Sticky);
+    Ops->Send(NSharedCache::MakeSharedPageCacheId(), request,
         0, (ui64)ERequestTypeCookie::BootLogic);
 
     return NBoot::TSpawned(true);
@@ -343,7 +342,7 @@ TAutoPtr<NBoot::TResult> TExecutorBootLogic::ExtractState() {
                 }
                 if (const auto* partStore = part.As<const NTable::TPartStore>()) {
                     for (const auto& pageCollection : partStore->PageCollections) {
-                        SeenBlob(pageCollection->PageCollection->Label());
+                        SeenBlob(pageCollection->PageCollection()->Label());
                     }
                 }
             }
@@ -374,12 +373,7 @@ void TExecutorBootLogic::FollowersSyncComplete() {
 }
 
 TExecutorCaches TExecutorBootLogic::DetachCaches() {
-    if (Result_) {
-        for (auto &x : Result().PageCollections)
-            State().PageCollections[x->Id] = x;
-    }
     return TExecutorCaches{
-        .PageCollections = std::move(State().PageCollections),
         .TxStatusCaches = std::move(State().TxStatusCaches),
     };
 }

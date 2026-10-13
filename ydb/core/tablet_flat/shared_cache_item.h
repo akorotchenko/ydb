@@ -437,7 +437,7 @@ public:
 };
 
 struct TPage;
-class TCacheCollection;
+class TCollection;
 
 template <class TTraits>
 class TSharedCacheImpl;
@@ -603,7 +603,7 @@ struct alignas(64) THandle {
     union TBody {
         NActors::TSharedData::TBuffer PageBuffer;
         TPageFetchState* Fetch;
-        TCacheCollection* Collection;
+        TCollection* Collection;
 
         constexpr TBody() noexcept {}
 

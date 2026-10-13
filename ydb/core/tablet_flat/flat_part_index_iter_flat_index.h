@@ -187,7 +187,7 @@ private:
         auto location = Part->GetIndexPageLocation(pageId, GroupId);
         auto page = Env->TryGetIndexPage(Part, location, GroupId);
         if (page) {
-            Index = TIndex(*page);
+            Index = TIndex(std::move(page));
             Y_VERIFY_DEBUG_S(EndRowId == Index->GetEndRowId(), "EndRowId mismatch " << EndRowId << " != " << Index->GetEndRowId() << " (group " << GroupId.Historic << "/" << GroupId.Index <<")");
             return &*Index;
         }

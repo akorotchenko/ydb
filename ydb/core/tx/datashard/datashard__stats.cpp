@@ -83,23 +83,29 @@ public:
         Y_ENSURE(false, "IPages::Locate(TPart*, ...) shouldn't be used here");
     }
 
-    const TSharedData* TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
+    TSharedCachePageRef TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
         Y_ENSURE(false, "IPages::TryGetPage(...) shouldn't be used here");
     }
 
-    const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TSharedCachePageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         auto partStore = CheckedCast<const TPartStore*>(part);
         auto info = partStore->PageCollections.at(part->IndexSlot(groupId)).Get();
         Y_ENSURE(NPage::IsIndexPage(location.Type));
 
         auto& partPages = Pages[info];
         auto page = partPages.FindPtr(location.Offset);
-        if (page != nullptr) {
-            return page;
+        if (page && *page) {
+            return page->Acquire();
+        }
+        if (auto cached = info->TryGetPage(location)) {
+            PagesSize += location.Size;
+            auto& saved = partPages[location.Offset];
+            saved = std::move(cached);
+            return saved.Acquire();
         }
 
         PagesSize += location.Size;
-        Send(MakeSharedPageCacheId(), new NSharedCache::TEvRequest(NSharedCache::EPriority::Bkgr, info->PageCollection, { location }));
+        Send(MakeSharedPageCacheId(), new NSharedCache::TEvRequest(NSharedCache::EPriority::Bkgr, info->PageCollection(), { location }));
 
         Interrupt();
         auto ev = WaitForSpecificEvent<NSharedCache::TEvResult>(&TTableStatsCoroBuilder::ProcessUnexpectedEvent);
@@ -113,14 +119,13 @@ public:
         Resume();
 
         for (auto& loaded : ev->Get()->Pages) {
-            partPages.emplace(loaded.Offset, TPinnedPageRef(loaded.Page).GetData());
-            PageRefs.emplace_back(std::move(loaded.Page));
+            partPages[loaded.Offset] = std::move(loaded.Page);
         }
 
         page = partPages.FindPtr(location.Offset);
         Y_ENSURE(page != nullptr);
 
-        return page;
+        return page->Acquire();
     }
 
 private:
@@ -188,10 +193,6 @@ private:
                 break;
             }
 
-            case ui32(NKikimr::NSharedCache::EEv::EvUpdated):
-                // ignore shared cache Dropped events
-                break;
-
             case TEvents::TSystem::Poison:
                 throw TExTableStatsError(ECode::ACTOR_DIED, "Poisoned");
 
@@ -226,8 +227,7 @@ private:
         CoroutineDeadline = GetCycleCountFast() + DurationToCycles(MaxCoroutineExecutionTime);
     }
 
-    THashMap<const NTabletFlatExecutor::TPrivatePageCache::TPageCollection*, THashMap<TPageOffset, TSharedData>> Pages;
-    TVector<TSharedPageRef> PageRefs;
+    THashMap<const NSharedCache::TCollection*, THashMap<TPageOffset, TSharedCachePageRef>> Pages;
     ui64 PagesSize = 0;
     ui64 CoroutineDeadline;
     TAutoPtr<TSpent> Spent;

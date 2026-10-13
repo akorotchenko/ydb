@@ -20,7 +20,7 @@ namespace {
     using namespace NTest;
 
     struct TTouchEnv : public NTest::TTestEnv {
-        const TSharedData* TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
+        TSharedCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
         {
             auto type = location.Type;
             if (type == EPage::Undef && location.Offset.IsPageIndex()) {
@@ -29,8 +29,8 @@ namespace {
             return Touch(part, location, groupId, type, NTest::TTestEnv::TryGetPage(part, location, groupId));
         }
 
-        const TSharedData* TryGetIndexPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
-        {
+        TSharedCachePageRef TryGetIndexPage(
+            const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto type = location.Type;
             if (type == EPage::Undef && location.Offset.IsPageIndex()) {
                 type = part->GetIndexPageType(location.Offset.AsPageIndex(), groupId);
@@ -39,28 +39,30 @@ namespace {
             return Touch(part, location, TGroupId(part->IndexSlot(groupId)), type, NTest::TTestEnv::TryGetIndexPage(part, location, groupId));
         }
 
-        const TSharedData* Touch(const TPart *part, const TPageLocation& location, TGroupId groupId, EPage type, const TSharedData* page)
+        TSharedCachePageRef Touch(
+            const TPart* part, const TPageLocation& location, TGroupId groupId, EPage type, TSharedCachePageRef page)
         {
             bool newTouch = Touched[{part, groupId}].insert(location.Offset).second;
 
             if (newTouch) {
                 if (type == EPage::DataPage) {
-                    auto dataPage = NPage::TDataPage(page);
+                    auto dataPage = NPage::TDataPage(page.Acquire());
 
-                    TouchedBytes += page->size();
+                    TouchedBytes += page.size();
                     if (groupId.IsMain()) {
                         TouchedRows += dataPage->Count;
                     }
                 }
                 if (NPage::IsIndexPage(type)) {
                     TouchedIndexPages++;
-                    TouchedIndexBytes += page->size();
+                    TouchedIndexBytes += page.size();
                 }
             }
 
-            return newTouch && Faulty
-                ? nullptr
-                : page;
+            if (newTouch && Faulty) {
+                return {};
+            }
+            return page;
         }
 
         TMap<std::pair<const TPart*, TGroupId>, TSet<TPageOffset>> Touched;

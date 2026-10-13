@@ -183,13 +183,13 @@ public:
         return Inner->Locate(part, ref, lob);
     }
 
-    const TSharedData* TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
+    TSharedCachePageRef TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
         Y_TABLET_ERROR("key-block iterator requested a data page");
     }
 
-    const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TSharedCachePageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         Y_ENSURE(NPage::IsIndexPage(location.Type), "key-block iterator requested a non-index page");
-        const TSharedData* page = Inner->TryGetIndexPage(part, location, groupId);
+        auto page = Inner->TryGetIndexPage(part, location, groupId);
         if (page) {
             Seen.insert({ part->Label, part->IndexSlot(groupId), location.Offset });
         }

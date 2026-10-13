@@ -32,9 +32,9 @@ struct TTabletBootStats {
     ui64 GcEntries = 0;
 };
 
-// The flat executor boot sequence without the actor system: the same classification of log blobs, the
+// The flat executor boot sequence without running actor services: the same classification of log blobs, the
 // same snapshot handling, the same order of scheme, switch, bundle and redo application, with the
-// shared cache and BlobStorage replaced by a blob store and every read done inline.
+// ordinary core cache owned by its AppData and BlobStorage reads supplied by a blob store inline.
 //
 // Every unit of work is independent, so a log entry, a bundle or a page that cannot be recovered is
 // reported and skipped rather than ending the run.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "test_store.h"
+#include <ydb/core/tablet_flat/shared_cache_pages.h>
 #include <ydb/core/tablet_flat/flat_fwd_blobs.h>
 #include <ydb/core/tablet_flat/flat_fwd_cache.h>
 #include <ydb/core/tablet_flat/flat_part_iface.h>
@@ -117,36 +118,37 @@ namespace NTest {
                 ? partStore->Store->GetExternRoom()
                 : partStore->Store->GetOuterRoom();
 
-            return { true, Get(part, room, ref) };
+            auto* collection = partStore->GetPageCollection(room);
+            return { true, TryGetSlotPage(part, collection->GetLocation(ref), room) };
         }
 
-        const TSharedData* TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
+        TSharedCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
         {
             Y_ENSURE(!NPage::IsIndexPage(location.Type), "Index page " << location << " is requested as a data page");
-            return CheckedCast<const TPartStore*>(part)->Store->GetPage(part->DataSlot(groupId), location.Offset);
+            return TryGetSlotPage(part, location, part->DataSlot(groupId));
         }
 
-        const TSharedData* TryGetIndexPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
-        {
+        TSharedCachePageRef TryGetIndexPage(
+            const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             Y_ENSURE(location.Type == EPage::Undef || NPage::IsIndexPage(location.Type),
                 "Page " << location << " is requested as an index page");
-            return CheckedCast<const TPartStore*>(part)->Store->GetPage(part->IndexSlot(groupId), location.Offset);
+            return TryGetSlotPage(part, location, part->IndexSlot(groupId));
         }
 
     protected:
+        TSharedCachePageRef TryGetSlotPage(const TPart* part, const TPageLocation& location, ui32 slot) {
+            auto* storedPart = CheckedCast<const TPartStore*>(part);
+            auto* data = storedPart->Store->GetPage(slot, location.Offset);
+            auto* collection = storedPart->GetPageCollection(slot);
+            const auto actual = collection->GetLocation(ResolvePageId(part, location, slot));
+            return TSharedCachePages::Get().AdmitPage(storedPart->PageColls.at(slot), actual, TSharedData(*data));
+        }
+
         ui32 ResolvePageId(const TPart *part, const TPageLocation& location, ui32 slot) const {
             if (location.Offset.IsByteOffset()) {
                 return CheckedCast<const TPartStore*>(part)->Store->ResolveByteOffset(slot, location.Offset.AsByteOffset());
             }
             return location.Offset.AsPageIndex();
-        }
-
-    private:
-        const TSharedData* Get(const TPart *part, ui32 room, ui32 ref) const
-        {
-            Y_ENSURE(ref != Max<ui32>(), "Got invalid page reference");
-
-            return CheckedCast<const TPartStore*>(part)->Store->GetPage(room, ref);
         }
     };
 

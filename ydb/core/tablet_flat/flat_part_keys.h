@@ -129,8 +129,8 @@ namespace NTable {
         {
             Y_ENSURE(location.Offset != TPageOffset::Max(), "Unexpected seek to an invalid page id");
             if (Offset != location.Offset) {
-                if (auto* data = Env->TryGetPage(Part, location, {})) {
-                    Y_ENSURE(Page.Set(data), "Unexpected failure to load data page");
+                if (auto data = Env->TryGetPage(Part, location, {})) {
+                    Y_ENSURE(Page.Set(std::move(data)), "Unexpected failure to load data page");
                     Offset = location.Offset;
                 } else {
                     return false;

@@ -40,9 +40,8 @@ public:
             size_t keep = 0;
             for (size_t pos = 0; pos < nodes.size(); ++pos) {
                 const auto loc = nodes[pos];
-                const TSharedData* data = isDataLevel
-                    ? pages->TryGetPage(part, loc, groupId)
-                    : pages->TryGetIndexPage(part, loc, groupId);
+                auto data =
+                    isDataLevel ? pages->TryGetPage(part, loc, groupId) : pages->TryGetIndexPage(part, loc, groupId);
                 if (!data) {
                     anyMissed = true;
                     nodes[keep++] = loc; // the page is not here yet, keep it for the next round
@@ -50,7 +49,7 @@ public:
                 }
 
                 if (!isDataLevel) {
-                    auto node = NPage::TBtreeIndexNode(*data, /*v2Format=*/true);
+                    auto node = NPage::TBtreeIndexNode(std::move(data), /*v2Format=*/true);
                     const bool childrenAreData = (LevelCount_ > 0 && level + 1 >= LevelCount_);
                     if (!(skipDataPages && childrenAreData)) {
                         for (NPage::TRecIdx childPos : xrange(node.GetChildrenCount())) {

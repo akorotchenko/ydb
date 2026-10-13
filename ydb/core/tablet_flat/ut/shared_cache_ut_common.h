@@ -1,9 +1,11 @@
 #pragma once
 
 #include <shared_cache_s3fifo.h>
-#include <shared_page.h>
+#include <flat_page_iface.h>
 
 namespace NKikimr::NSharedCache::NTest {
+
+    using ECacheMode = NTable::NPage::ECacheMode;
 
     struct TPage : public TIntrusiveListItem<TPage> {
         ui32 Id;
