@@ -142,6 +142,79 @@ bool TSharedCacheSpace::AdvanceSpaceGeneration() noexcept {
     return true;
 }
 
+bool TSharedCacheSpace::PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept {
+    const TSpaceState spaceState = CurrentSpaceState();
+    const TSpaceView& current = SpaceView(spaceState);
+    if (transition.Phase_ != ETransitionPhase::Idle || target.AddressBits < MinSharedCacheAddressBits ||
+        target.AddressBits > MaxSharedCacheAddressBits || target.AddressBits > ReservedCapacity_.AddressBits ||
+        target.AddressBits == Capacity_.AddressBits || target.ExpectedPageSize != ReservedCapacity_.ExpectedPageSize ||
+        target.StaticBytes > ReservedCapacity_.StaticBytes || current.HandleCount != Capacity_.HandleCount() ||
+        current.AllocationLimit != Capacity_.HandleCount())
+    {
+        return false;
+    }
+
+    if (spaceState.Resizing() || spaceState.AddressBits() != Capacity_.AddressBits)
+    {
+        return false;
+    }
+
+    THolder<TSpaceView> view = MakeHolder<TSpaceView>();
+    if (!TryMappingSize(target.HandleCount(), sizeof(THandle), view->HandlesBytes) ||
+        !TryMappingSize(target.BucketCount(), sizeof(std::atomic<ui64>), view->BucketsBytes) ||
+        !TryMappingSize(target.HotSlotCount(), sizeof(std::atomic<ui64>), view->HotSlotBytes) ||
+        !TryMappingSize(target.ColdSlotCount(), sizeof(std::atomic<ui64>), view->ColdSlotBytes) ||
+        !TryMappingSize(target.KeepColdSlotCount(), sizeof(std::atomic<ui64>), view->KeepColdSlotBytes) ||
+        !TryMappingSize(target.HandleCount(), sizeof(std::atomic<ui64>), view->FreeSlotBytes) ||
+        !HandlesMapping_.Prepare(view->HandlesBytes, view->Handles) ||
+        !BucketsMapping_.Prepare(view->BucketsBytes, view->Buckets) ||
+        !HotMapping_.Prepare(view->HotSlotBytes, view->HotSlots) ||
+        !ColdMapping_.Prepare(view->ColdSlotBytes, view->ColdSlots) ||
+        !KeepColdMapping_.Prepare(view->KeepColdSlotBytes, view->KeepColdSlots) ||
+        !FreeMapping_.Prepare(view->FreeSlotBytes, view->FreeSlots))
+    {
+        CancelPreparedView(*view);
+        return false;
+    }
+
+    transition.Phase_ = ETransitionPhase::Prepare;
+    transition.Generation_ = spaceState.Generation();
+    transition.OldConfiguration_ = Capacity_;
+    transition.TargetConfiguration_ = target;
+    transition.ResizeDeltaBits_ = Capacity_.AddressBits < target.AddressBits
+                                      ? target.AddressBits - Capacity_.AddressBits
+                                      : Capacity_.AddressBits - target.AddressBits;
+    transition.ReleaseStage_ = ESpaceMap::Done;
+    transition.NextWorkIndex_ = 0;
+    transition.FinalDrainStage_ = ESpaceMap::Done;
+    transition.CutBlocked_ = false;
+    transition.PreparedView_ = std::move(view);
+    transition.OldView_.Reset();
+    return true;
+}
+
+void TSharedCacheSpace::CancelPreparedView(TSpaceView& view) noexcept {
+    HandlesMapping_.Cancel(view.Handles, view.HandlesBytes);
+    BucketsMapping_.Cancel(view.Buckets, view.BucketsBytes);
+    HotMapping_.Cancel(view.HotSlots, view.HotSlotBytes);
+    ColdMapping_.Cancel(view.ColdSlots, view.ColdSlotBytes);
+    KeepColdMapping_.Cancel(view.KeepColdSlots, view.KeepColdSlotBytes);
+    FreeMapping_.Cancel(view.FreeSlots, view.FreeSlotBytes);
+}
+
+void TSharedCacheSpace::PublishPreparedView(THolder<TSpaceView> view, THolder<TSpaceView>& oldView) noexcept {
+    Y_DEBUG_ABORT_UNLESS(view);
+    oldView = std::move(NewestViewOwner_);
+    HandlesMapping_.Publish(view->Handles, view->HandlesBytes);
+    BucketsMapping_.Publish(view->Buckets, view->BucketsBytes);
+    HotMapping_.Publish(view->HotSlots, view->HotSlotBytes);
+    ColdMapping_.Publish(view->ColdSlots, view->ColdSlotBytes);
+    KeepColdMapping_.Publish(view->KeepColdSlots, view->KeepColdSlotBytes);
+    FreeMapping_.Publish(view->FreeSlots, view->FreeSlotBytes);
+    NewestViewOwner_ = std::move(view);
+    NewestView_.store(NewestViewOwner_.Get(), std::memory_order_release);
+}
+
 void TSharedCacheSpace::PrepareView(ui32 generation, TSpaceView view) noexcept {
     Y_DEBUG_ABORT_UNLESS(S5FifoRings_ && FreeRingCursor_);
     view.Space = this;
@@ -169,6 +242,350 @@ ui32 TSharedCacheSpace::HotLevelForSlot(ui64 slot, ui64 hotSlotCount) noexcept {
         return 1;
     }
     return 0;
+}
+
+bool TSharedCacheSpace::InitializeGrowth(TTransition& transition) noexcept {
+    Y_DEBUG_ABORT_UNLESS(transition.PreparedView_);
+    TSpaceView& view = *transition.PreparedView_;
+    const TSharedCacheCapacity& old = transition.OldConfiguration_;
+    const TSharedCacheCapacity& target = transition.TargetConfiguration_;
+    const ui64 handleDelta = target.HandleCount() - old.HandleCount();
+    const ui64 hotDelta = target.HotSlotCount() - old.HotSlotCount();
+    const ui64 coldDelta = target.ColdSlotCount() - old.ColdSlotCount();
+    const ui64 keepColdDelta = target.KeepColdSlotCount() - old.KeepColdSlotCount();
+    const ui64 end = Min(handleDelta, transition.NextWorkIndex_ + SharedCacheTransitionWorkBatch);
+    while (transition.NextWorkIndex_ < end) {
+        const ui64 offset = transition.NextWorkIndex_++;
+        const ui64 handleIndex = old.HandleCount() + offset;
+        new (&view.Handles[handleIndex]) THandle();
+        new (&view.Buckets[handleIndex]) std::atomic<ui64>(0);
+        new (&view.FreeSlots[handleIndex]) std::atomic<ui64>(0);
+        if (offset < coldDelta) {
+            new (&view.ColdSlots[old.ColdSlotCount() + offset]) std::atomic<ui64>(0);
+        }
+        if (offset < keepColdDelta) {
+            new (&view.KeepColdSlots[old.KeepColdSlotCount() + offset]) std::atomic<ui64>(0);
+        }
+        if (offset < hotDelta) {
+            new (&view.HotSlots[old.HotSlotCount() + offset]) std::atomic<ui64>(0);
+        }
+    }
+    const bool complete = transition.NextWorkIndex_ == handleDelta;
+    if (complete) {
+        transition.NextWorkIndex_ = 0;
+    }
+    return complete;
+}
+
+bool TSharedCacheSpace::IsCurrentFreeWord(const TSpaceView& view, ui64 raw) const noexcept {
+    const TCacheItem cacheItem = TCacheItem::FromRaw(raw);
+    if (cacheItem.IsNull() || cacheItem.IsFrozen() || cacheItem.Index() < 2 ||
+        cacheItem.Index() >= view.AllocationLimit || cacheItem.Index() >= view.HandleCount)
+    {
+        return false;
+    }
+    const THandleState state =
+        THandleState::FromRaw(view.Handles[cacheItem.Index()].State.load(std::memory_order_acquire));
+    return cacheItem.Matches(state) && state.IsFree() && state.Refs() == 0;
+}
+
+void TSharedCacheSpace::RouteFreeWord(const TSpaceView& view, ui64 raw) noexcept {
+    const TFreeRingView free = view.Free();
+    while (raw != 0 && IsCurrentFreeWord(view, raw)) {
+        raw = free.Push(raw).Previous;
+    }
+}
+
+bool TSharedCacheSpace::AppendFreeHandles(TTransition& transition) noexcept {
+    if (transition.Phase_ != ETransitionPhase::AppendGrowth ||
+        transition.Generation_ != CurrentSpaceState().Generation())
+    {
+        return false;
+    }
+
+    const TSpaceView& view = SpaceView(CurrentSpaceState());
+    const ui64 oldCount = transition.OldConfiguration_.HandleCount();
+    const ui64 targetCount = transition.TargetConfiguration_.HandleCount();
+    Y_DEBUG_ABORT_UNLESS(oldCount < targetCount && view.HandleCount == targetCount);
+    const ui64 end = Min(targetCount, transition.NextWorkIndex_ + SharedCacheTransitionWorkBatch);
+    while (transition.NextWorkIndex_ < end) {
+        const ui64 index = transition.NextWorkIndex_++;
+        RouteFreeWord(view, TCacheItem::Make(0, static_cast<ui32>(index)).Raw());
+    }
+    if (transition.NextWorkIndex_ == targetCount) {
+        transition.NextWorkIndex_ = 0;
+        transition.FinalDrainStage_ = ESpaceMap::Done;
+        transition.Phase_ = ETransitionPhase::FinalDrain;
+    }
+    return true;
+}
+
+void TSharedCacheSpace::ResetHazardScan(TTransition& transition) noexcept {
+    transition.NextHazardIndex_ = 0;
+}
+
+bool TSharedCacheSpace::PublishMigrationView(TTransition& transition) noexcept {
+    return PublishMigrationViewImpl<false>(transition, {});
+}
+
+template <bool WithHook>
+bool TSharedCacheSpace::PublishMigrationViewImpl(TTransition& transition, TPublishMigrationViewHook hook) noexcept {
+    const TSpaceState expectedState = CurrentSpaceState();
+    if ((transition.Phase_ != ETransitionPhase::Prepare && transition.Phase_ != ETransitionPhase::InitializeGrowth) ||
+        expectedState.Resizing() || expectedState.AddressBits() != transition.OldConfiguration_.AddressBits ||
+        expectedState.Generation() == MaxSpaceGeneration)
+    {
+        return false;
+    }
+
+    const bool growing = transition.TargetConfiguration_.HandleCount() > transition.OldConfiguration_.HandleCount();
+    if (transition.Phase_ == ETransitionPhase::Prepare) {
+        transition.Phase_ = growing ? ETransitionPhase::InitializeGrowth : ETransitionPhase::PublishMigration;
+    }
+    if (transition.Phase_ == ETransitionPhase::InitializeGrowth) {
+        if (!InitializeGrowth(transition)) {
+            return true;
+        }
+        transition.Phase_ = ETransitionPhase::PublishMigration;
+    }
+    if (growing) {
+        PublishPreparedView(std::move(transition.PreparedView_), transition.OldView_);
+    }
+
+    const TSpaceState nextState = expectedState.WithGeneration(expectedState.Generation() + 1);
+    const TSpaceView& current = SpaceView(expectedState);
+    TSpaceView nextView = current;
+    nextView.CopyMappings(NewestView());
+    nextView.AllocationLimit = growing ? current.AllocationLimit : transition.TargetConfiguration_.HandleCount();
+    PrepareView(nextState.Generation(), nextView);
+    if constexpr (WithHook) {
+        hook.Run();
+    }
+
+    SpaceState_.store(nextState.Raw(), std::memory_order_release);
+    transition.Generation_ = nextState.Generation();
+    ResetHazardScan(transition);
+    transition.Phase_ = ETransitionPhase::MigrationDrain;
+    return true;
+}
+
+bool TSharedCacheSpace::PublishMigrationViewWithHook(TTransition& transition, TPublishMigrationViewHook hook) noexcept {
+    return PublishMigrationViewImpl<true>(transition, hook);
+}
+
+bool TSharedCacheSpace::TryDrainTransition(TTransition& transition) noexcept {
+    if ((transition.Phase_ != ETransitionPhase::MigrationDrain && transition.Phase_ != ETransitionPhase::FinalDrain) ||
+        transition.Generation_ != CurrentSpaceState().Generation())
+    {
+        return false;
+    }
+
+    while (transition.NextHazardIndex_ < HazardSlotCount_) {
+        // Pair with registration CAS so late readers observe the published generation.
+        const ui64 hazardState = Hazards_[transition.NextHazardIndex_].State.fetch_add(0, std::memory_order_acq_rel);
+        if (!SpaceHazardIsDrained(hazardState, transition.Generation_)) {
+            return false;
+        }
+        ++transition.NextHazardIndex_;
+    }
+    if (transition.Phase_ == ETransitionPhase::MigrationDrain) {
+        transition.Phase_ = ETransitionPhase::Migrate;
+    }
+    return true;
+}
+
+bool TSharedCacheSpace::PublishFinalView(TTransition& transition) noexcept {
+    const TSpaceState expectedState = CurrentSpaceState();
+    if (transition.Phase_ != ETransitionPhase::Migrate || transition.NextHazardIndex_ != HazardSlotCount_ ||
+        expectedState.Resizing() || expectedState.AddressBits() != transition.TargetConfiguration_.AddressBits ||
+        expectedState.Generation() == MaxSpaceGeneration)
+    {
+        return false;
+    }
+
+    const bool growing = transition.TargetConfiguration_.HandleCount() > transition.OldConfiguration_.HandleCount();
+    if (!growing) {
+        PublishPreparedView(std::move(transition.PreparedView_), transition.OldView_);
+    }
+
+    const TSpaceState retired = expectedState.WithGeneration(expectedState.Generation() + 1);
+    TSpaceView retiredView = SpaceView(expectedState);
+    retiredView.CopyMappings(NewestView());
+    retiredView.HandleCount = transition.TargetConfiguration_.HandleCount();
+    retiredView.AllocationLimit = transition.TargetConfiguration_.HandleCount();
+    retiredView.HotSlotCount = transition.TargetConfiguration_.HotSlotCount();
+    PrepareView(retired.Generation(), retiredView);
+
+    const ui64 currentEffectiveHotSlots = EffectiveHotSlots();
+    const ui64 effectiveHotSlots = Min(currentEffectiveHotSlots, transition.TargetConfiguration_.HotSlotCount());
+    if (effectiveHotSlots != currentEffectiveHotSlots) {
+        EffectiveHotSlots_.store(effectiveHotSlots, std::memory_order_release);
+    }
+    SpaceState_.store(retired.Raw(), std::memory_order_release);
+    transition.Generation_ = retired.Generation();
+    transition.ReleaseStage_ = ESpaceMap::Handles;
+    ResetHazardScan(transition);
+    if (growing) {
+        transition.NextWorkIndex_ = transition.OldConfiguration_.HandleCount();
+        transition.FinalDrainStage_ = ESpaceMap::Done;
+        transition.Phase_ = ETransitionPhase::AppendGrowth;
+        return AppendFreeHandles(transition);
+    }
+
+    transition.NextWorkIndex_ = transition.TargetConfiguration_.HotSlotCount();
+    transition.FinalDrainStage_ = ESpaceMap::Hot;
+    transition.Phase_ = ETransitionPhase::FinalDrain;
+    return true;
+}
+
+template <bool WithHook>
+bool TSharedCacheSpace::TryReleaseOldMapping(ESpaceMap mapping, TTransition& transition, TReleaseHook hook) noexcept {
+    Y_DEBUG_ABORT_UNLESS(transition.OldView_);
+    TSpaceView& old = *transition.OldView_;
+    const TSpaceView& newest = *NewestViewOwner_;
+    TSharedCacheMapping* owner;
+    void* oldPointer;
+    size_t oldSize;
+    void* currentPointer;
+    size_t currentSize;
+    switch (mapping) {
+        case ESpaceMap::Handles:
+            owner = &HandlesMapping_;
+            oldPointer = old.Handles;
+            oldSize = old.HandlesBytes;
+            currentPointer = newest.Handles;
+            currentSize = newest.HandlesBytes;
+            break;
+        case ESpaceMap::Buckets:
+            owner = &BucketsMapping_;
+            oldPointer = old.Buckets;
+            oldSize = old.BucketsBytes;
+            currentPointer = newest.Buckets;
+            currentSize = newest.BucketsBytes;
+            break;
+        case ESpaceMap::Hot:
+            owner = &HotMapping_;
+            oldPointer = old.HotSlots;
+            oldSize = old.HotSlotBytes;
+            currentPointer = newest.HotSlots;
+            currentSize = newest.HotSlotBytes;
+            break;
+        case ESpaceMap::Cold:
+            owner = &ColdMapping_;
+            oldPointer = old.ColdSlots;
+            oldSize = old.ColdSlotBytes;
+            currentPointer = newest.ColdSlots;
+            currentSize = newest.ColdSlotBytes;
+            break;
+        case ESpaceMap::KeepCold:
+            owner = &KeepColdMapping_;
+            oldPointer = old.KeepColdSlots;
+            oldSize = old.KeepColdSlotBytes;
+            currentPointer = newest.KeepColdSlots;
+            currentSize = newest.KeepColdSlotBytes;
+            break;
+        case ESpaceMap::Free:
+            owner = &FreeMapping_;
+            oldPointer = old.FreeSlots;
+            oldSize = old.FreeSlotBytes;
+            currentPointer = newest.FreeSlots;
+            currentSize = newest.FreeSlotBytes;
+            break;
+        case ESpaceMap::Done:
+            Y_ABORT("Invalid shared-cache release stage");
+    }
+
+    if (!owner->NeedsRelease(oldPointer, oldSize, currentPointer, currentSize)) {
+        return true;
+    }
+    if constexpr (WithHook) {
+        const void* begin;
+        size_t size;
+        owner->ReleaseRange(oldPointer, oldSize, currentPointer, currentSize, begin, size);
+        if (!hook.Run(mapping, begin, size)) {
+            return false;
+        }
+    }
+    const bool released = owner->Release(oldPointer, oldSize, currentPointer, currentSize);
+
+    // Release may unmap the old view before failing to shrink its backing; preserve that progress for retry.
+    switch (mapping) {
+        case ESpaceMap::Handles:
+            old.Handles = static_cast<THandle*>(oldPointer);
+            break;
+        case ESpaceMap::Buckets:
+            old.Buckets = static_cast<std::atomic<ui64>*>(oldPointer);
+            break;
+        case ESpaceMap::Hot:
+            old.HotSlots = static_cast<std::atomic<ui64>*>(oldPointer);
+            break;
+        case ESpaceMap::Cold:
+            old.ColdSlots = static_cast<std::atomic<ui64>*>(oldPointer);
+            break;
+        case ESpaceMap::KeepCold:
+            old.KeepColdSlots = static_cast<std::atomic<ui64>*>(oldPointer);
+            break;
+        case ESpaceMap::Free:
+            old.FreeSlots = static_cast<std::atomic<ui64>*>(oldPointer);
+            break;
+        case ESpaceMap::Done:
+            Y_ABORT("Invalid shared-cache release stage");
+    }
+    return released;
+}
+
+bool TSharedCacheSpace::TryReleaseTransition(TTransition& transition) noexcept {
+    return TryReleaseTransitionImpl<false>(transition, {});
+}
+
+template <bool WithHook>
+bool TSharedCacheSpace::TryReleaseTransitionImpl(TTransition& transition, TReleaseHook hook) noexcept {
+    if ((transition.Phase_ != ETransitionPhase::Release && transition.Phase_ != ETransitionPhase::ReleaseRetry) ||
+        transition.NextHazardIndex_ != HazardSlotCount_)
+    {
+        return false;
+    }
+
+    while (transition.ReleaseStage_ != ESpaceMap::Done) {
+        if (!TryReleaseOldMapping<WithHook>(transition.ReleaseStage_, transition, hook)) {
+            transition.Phase_ = ETransitionPhase::ReleaseRetry;
+            return false;
+        }
+        transition.ReleaseStage_ = static_cast<ESpaceMap>(static_cast<ui8>(transition.ReleaseStage_) + 1);
+    }
+
+    transition.OldView_.Reset();
+    transition.Phase_ = ETransitionPhase::Commit;
+    return true;
+}
+
+bool TSharedCacheSpace::TryReleaseTransitionWithHook(TTransition& transition, TReleaseHook hook) noexcept {
+    return TryReleaseTransitionImpl<true>(transition, hook);
+}
+
+bool TSharedCacheSpace::CommitTransition(TTransition& transition) noexcept {
+    if (transition.Phase_ != ETransitionPhase::Commit || transition.ReleaseStage_ != ESpaceMap::Done)
+    {
+        return false;
+    }
+    Capacity_ = transition.TargetConfiguration_;
+    transition.Reset();
+    return true;
+}
+
+bool TSharedCacheSpace::AbandonTransition(TTransition& transition) noexcept {
+    if (transition.Phase_ == ETransitionPhase::Idle || transition.Phase_ == ETransitionPhase::AbandonedForShutdown)
+    {
+        return false;
+    }
+    if (transition.Phase_ == ETransitionPhase::Prepare || transition.Phase_ == ETransitionPhase::InitializeGrowth)
+    {
+        CancelPreparedView(*transition.PreparedView_);
+        transition.Reset();
+        return true;
+    }
+    transition.Phase_ = ETransitionPhase::AbandonedForShutdown;
+    return true;
 }
 
 TSpaceHazardBinding::TSpaceHazardBinding(const TSharedCacheSpace* space, TSpaceHazard* hazard) noexcept

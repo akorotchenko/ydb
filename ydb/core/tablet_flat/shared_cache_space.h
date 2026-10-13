@@ -826,6 +826,125 @@ public:
     bool BeginHotResize(ui32 targetEffectiveHotSlots, THotResize& resize) noexcept;
     bool DrainHotResize(THotResize& resize, ui32& level, ui64& raw) noexcept;
 
+    bool PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept;
+
+    bool PublishMigrationView(TTransition& transition) noexcept;
+
+    bool TryDrainTransition(TTransition& transition) noexcept;
+
+    template <class THotRouter, class TColdRouter, class TKeepColdRouter>
+    bool FinalDrain(TTransition& transition, THotRouter&& hotRouter, TColdRouter&& coldRouter,
+        TKeepColdRouter&& keepColdRouter) noexcept {
+        if (transition.Phase_ != ETransitionPhase::FinalDrain || transition.NextHazardIndex_ != HazardSlotCount_ ||
+            transition.Generation_ != CurrentSpaceState().Generation() || !transition.OldView_)
+        {
+            return false;
+        }
+
+        ui32 remainingSlots = SharedCacheTransitionWorkBatch;
+        const ui64 oldHotSlotCount = transition.OldConfiguration_.HotSlotCount();
+        const ui64 oldHandleCount = transition.OldConfiguration_.HandleCount();
+        const ui64 oldColdSlotCount = transition.OldConfiguration_.ColdSlotCount();
+        const ui64 oldKeepColdSlotCount = transition.OldConfiguration_.KeepColdSlotCount();
+        const ui64 targetHandleCount = transition.TargetConfiguration_.HandleCount();
+        const ui64 targetColdSlotCount = transition.TargetConfiguration_.ColdSlotCount();
+        const ui64 targetKeepColdSlotCount = transition.TargetConfiguration_.KeepColdSlotCount();
+        while (remainingSlots != 0 && transition.FinalDrainStage_ != ESpaceMap::Done) {
+            switch (transition.FinalDrainStage_) {
+                case ESpaceMap::Hot:
+                    while (remainingSlots != 0 && transition.NextWorkIndex_ < oldHotSlotCount) {
+                        const ui64 slot = transition.NextWorkIndex_++;
+                        const ui64 raw = transition.OldView_->HotSlots[slot].exchange(0, std::memory_order_acquire);
+                        if (raw != 0) {
+                            hotRouter(HotLevelForSlot(slot, oldHotSlotCount), raw);
+                        }
+                        --remainingSlots;
+                    }
+                    if (transition.NextWorkIndex_ == oldHotSlotCount) {
+                        transition.FinalDrainStage_ = ESpaceMap::Cold;
+                        transition.NextWorkIndex_ = targetColdSlotCount;
+                    }
+                    break;
+
+                case ESpaceMap::Cold:
+                    while (remainingSlots != 0 && transition.NextWorkIndex_ < oldColdSlotCount) {
+                        const ui64 raw = transition.OldView_->ColdSlots[transition.NextWorkIndex_++].exchange(
+                            0, std::memory_order_acquire);
+                        if (raw != 0) {
+                            coldRouter(raw);
+                        }
+                        --remainingSlots;
+                    }
+                    if (transition.NextWorkIndex_ == oldColdSlotCount) {
+                        transition.FinalDrainStage_ = ESpaceMap::KeepCold;
+                        transition.NextWorkIndex_ = targetKeepColdSlotCount;
+                    }
+                    break;
+
+                case ESpaceMap::KeepCold:
+                    while (remainingSlots != 0 && transition.NextWorkIndex_ < oldKeepColdSlotCount) {
+                        const ui64 raw = transition.OldView_->KeepColdSlots[transition.NextWorkIndex_++].exchange(
+                            0, std::memory_order_acquire);
+                        if (raw != 0) {
+                            keepColdRouter(raw);
+                        }
+                        --remainingSlots;
+                    }
+                    if (transition.NextWorkIndex_ == oldKeepColdSlotCount) {
+                        transition.FinalDrainStage_ = ESpaceMap::Free;
+                        transition.NextWorkIndex_ = 0;
+                    }
+                    break;
+
+                case ESpaceMap::Free: {
+                    const ui64 cutCount = oldHandleCount - targetHandleCount;
+                    const TSpaceView& view = SpaceView(CurrentSpaceState());
+                    while (remainingSlots != 0 && transition.NextWorkIndex_ < oldHandleCount) {
+                        const ui64 workIndex = transition.NextWorkIndex_++;
+                        if (workIndex < cutCount) {
+                            const ui64 slot = targetHandleCount + workIndex;
+                            RouteFreeWord(view, FreeRingCursor_->Clear(&transition.OldView_->FreeSlots[slot]));
+                        } else {
+                            std::atomic<ui64>* currentSlot = &view.FreeSlots[workIndex - cutCount];
+                            ui64 raw = currentSlot->load(std::memory_order_relaxed);
+                            while (raw != 0 && !IsCurrentFreeWord(view, raw)) {
+                                if (FreeRingCursor_->ClearSafe(currentSlot, raw)) {
+                                    break;
+                                }
+                                raw = currentSlot->load(std::memory_order_relaxed);
+                            }
+                        }
+                        --remainingSlots;
+                    }
+                    if (transition.NextWorkIndex_ == oldHandleCount) {
+                        transition.FinalDrainStage_ = ESpaceMap::Done;
+                        transition.NextWorkIndex_ = 0;
+                    }
+                    break;
+                }
+
+                case ESpaceMap::Handles:
+                case ESpaceMap::Buckets:
+                case ESpaceMap::Done:
+                    Y_ABORT("Invalid shared-cache final-drain stage");
+            }
+        }
+        if (transition.FinalDrainStage_ == ESpaceMap::Done) {
+            transition.Phase_ = ETransitionPhase::Release;
+        }
+        return true;
+    }
+
+    bool PublishFinalView(TTransition& transition) noexcept;
+
+    bool AppendFreeHandles(TTransition& transition) noexcept;
+
+    bool TryReleaseTransition(TTransition& transition) noexcept;
+
+    bool CommitTransition(TTransition& transition) noexcept;
+
+    bool AbandonTransition(TTransition& transition) noexcept;
+
     Y_FORCE_INLINE bool RefreshSpaceState(TSpaceState& spaceState) const noexcept {
         const TSpaceState current = CurrentSpaceState();
         if (current == spaceState) {
@@ -852,9 +971,31 @@ private:
         }
     };
 
+    struct TPublishMigrationViewHook {
+        void* Context = nullptr;
+        void (*Function)(void*) noexcept = nullptr;
+
+        void Run() const noexcept {
+            Function(Context);
+        }
+    };
+
+    struct TReleaseHook {
+        void* Context = nullptr;
+        bool (*Function)(void*, ESpaceMap, const void*, size_t) noexcept = nullptr;
+
+        bool Run(ESpaceMap mapping, const void* begin, size_t size) const noexcept {
+            return Function(Context, mapping, begin, size);
+        }
+    };
+
     ui32 TryAllocateHandleWithHook(TSpaceOperation& spaceOp, TFreeExchangeHook hook) noexcept;
 
     bool ReturnFreeHandleWithHook(TSpaceOperation& spaceOp, ui32 index, ui32 version, TFreeExchangeHook hook) noexcept;
+
+    bool PublishMigrationViewWithHook(TTransition& transition, TPublishMigrationViewHook hook) noexcept;
+
+    bool TryReleaseTransitionWithHook(TTransition& transition, TReleaseHook hook) noexcept;
 
     bool AdvanceSpaceGeneration() noexcept;
 
@@ -865,7 +1006,28 @@ private:
     Y_FORCE_INLINE bool ReturnFreeHandleImpl(
         TSpaceOperation& spaceOp, ui32 index, ui32 version, TFreeExchangeHook hook) noexcept;
 
+    template <bool WithHook>
+    bool PublishMigrationViewImpl(TTransition& transition, TPublishMigrationViewHook hook) noexcept;
+
+    template <bool WithHook>
+    bool TryReleaseTransitionImpl(TTransition& transition, TReleaseHook hook) noexcept;
+
+    void ResetHazardScan(TTransition& transition) noexcept;
+
     static ui32 HotLevelForSlot(ui64 slot, ui64 hotSlotCount) noexcept;
+
+    template <bool WithHook>
+    bool TryReleaseOldMapping(ESpaceMap mapping, TTransition& transition, TReleaseHook hook) noexcept;
+
+    bool InitializeGrowth(TTransition& transition) noexcept;
+
+    bool IsCurrentFreeWord(const TSpaceView& view, ui64 raw) const noexcept;
+
+    void RouteFreeWord(const TSpaceView& view, ui64 raw) noexcept;
+
+    void CancelPreparedView(TSpaceView& view) noexcept;
+
+    void PublishPreparedView(THolder<TSpaceView> view, THolder<TSpaceView>& oldView) noexcept;
 
     void PrepareView(ui32 generation, TSpaceView view) noexcept;
 

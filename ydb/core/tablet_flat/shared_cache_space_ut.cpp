@@ -97,7 +97,78 @@ public:
                 },
             });
     }
+
+    template <class TCallback>
+    static bool PublishMigrationView(TSharedCacheSpace& space, TTransition& transition, TCallback& callback) noexcept {
+        return space.PublishMigrationViewWithHook(transition, {
+                                                                  .Context = &callback,
+                                                                  .Function = [](void* context) noexcept {
+                                                                      (*static_cast<TCallback*>(context))();
+                                                                  },
+                                                              });
+    }
+
+    template <class TCallback>
+    static bool TryReleaseTransition(TSharedCacheSpace& space, TTransition& transition, TCallback& callback) noexcept {
+        return space.TryReleaseTransitionWithHook(
+            transition, {
+                            .Context = &callback,
+                            .Function = [](void* context, ESpaceMap mapping, const void* begin, size_t size) noexcept {
+                                return (*static_cast<TCallback*>(context))(mapping, begin, size);
+                            },
+                        });
+    }
+
+    static bool FinalDrain(TSharedCacheSpace& space, TTransition& transition) noexcept {
+        bool sawWord = false;
+        const bool finished = space.FinalDrain(
+            transition,
+            [&](ui32, ui64) noexcept {
+                sawWord = true;
+            },
+            [&](ui64) noexcept {
+                sawWord = true;
+            },
+            [&](ui64) noexcept {
+                sawWord = true;
+            });
+        UNIT_ASSERT(!sawWord);
+        return finished;
+    }
 };
+
+void CompleteEmptyBucketResize(TSharedCacheSpace& space, ui8 targetAddressBits) {
+    UNIT_ASSERT(space.BeginBucketResize(targetAddressBits));
+    for (;;) {
+        TBucketResizeState state = TSharedCacheSpaceTestAccess::BucketResizeState(space);
+        const ui32 pairCount = state.PairCount();
+        UNIT_ASSERT(space.AdvanceBucketResizePhase(EBucketResizePhase::Activated));
+        UNIT_ASSERT(space.PublishBucketResizeCursor(state.Cursor() + 1));
+        if (state.Direction() == EBucketResize::Shrinking) {
+            UNIT_ASSERT(space.AdvanceBucketResizePhase(EBucketResizePhase::Closed));
+        }
+        state = TSharedCacheSpaceTestAccess::BucketResizeState(space);
+        if (state.Cursor() == pairCount) {
+            break;
+        }
+        UNIT_ASSERT(space.PrepareNextBucketResizePair());
+    }
+    UNIT_ASSERT(space.FinishBucketResize());
+}
+
+void CompleteGrowthAppend(TSharedCacheSpace& space, TTransition& transition) {
+    while (transition.Phase() == ETransitionPhase::AppendGrowth) {
+        UNIT_ASSERT(space.AppendFreeHandles(transition));
+    }
+    UNIT_ASSERT(transition.Phase() == ETransitionPhase::FinalDrain);
+}
+
+void CompleteFinalDrain(TSharedCacheSpace& space, TTransition& transition) {
+    while (transition.Phase() == ETransitionPhase::FinalDrain) {
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::FinalDrain(space, transition));
+    }
+    UNIT_ASSERT(transition.Phase() == ETransitionPhase::Release);
+}
 
 Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(SpaceStatePacking) {
@@ -179,6 +250,38 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(ring.Pop(), 2);
     }
 
+    Y_UNIT_TEST(KeepColdTailIsDrainedOnPhysicalShrink) {
+        TSharedCacheCapacity small;
+        TSharedCacheCapacity large;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 0, small));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 0, large));
+        auto space = TSharedCacheSpace::Create(large, large, 0);
+        UNIT_ASSERT(space);
+        const ui64 word = TCacheItem::Make(1, 2).Raw();
+        TSharedCacheSpaceTestAccess::KeepColdSlots(*space)[large.KeepColdSlotCount() - 1].store(word);
+
+        TTransition shrink;
+        UNIT_ASSERT(space->PrepareTransition(small, shrink));
+        UNIT_ASSERT(space->PublishMigrationView(shrink));
+        UNIT_ASSERT(space->TryDrainTransition(shrink));
+        CompleteEmptyBucketResize(*space, small.AddressBits);
+        UNIT_ASSERT(space->PublishFinalView(shrink));
+        UNIT_ASSERT(space->TryDrainTransition(shrink));
+
+        ui64 drained = 0;
+        UNIT_ASSERT(space->FinalDrain(
+            shrink,
+            [](ui32, ui64) noexcept {
+            },
+            [](ui64) noexcept {
+            },
+            [&](ui64 raw) noexcept {
+                drained = raw;
+            }));
+        UNIT_ASSERT_VALUES_EQUAL(drained, word);
+        UNIT_ASSERT(shrink.Phase() == ETransitionPhase::Release);
+    }
+
     Y_UNIT_TEST(FootprintRejectsInvalidInput) {
         TSharedCacheCapacity footprint;
         UNIT_ASSERT(!TryCalculateSharedCacheFootprint(4, 4096, 0, 0, footprint));
@@ -204,6 +307,26 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(next.AddressBits, 6);
 
         UNIT_ASSERT(!TryCalculateSharedCacheCapacity(fiveBits.TotalBytes - 1, 4096, 0, 2, next));
+    }
+
+    Y_UNIT_TEST(CapacityResizeDeltaBits) {
+        TSharedCacheCapacity current;
+        TSharedCacheCapacity doubled;
+        TSharedCacheCapacity quadrupled;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 0, current));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 0, doubled));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 0, quadrupled));
+        auto space = TSharedCacheSpace::Create(current, quadrupled, 0);
+        UNIT_ASSERT(space);
+
+        TTransition transition;
+        UNIT_ASSERT(space->PrepareTransition(doubled, transition));
+        UNIT_ASSERT_VALUES_EQUAL(transition.ResizeDeltaBits(), 1);
+        UNIT_ASSERT(space->AbandonTransition(transition));
+
+        UNIT_ASSERT(space->PrepareTransition(quadrupled, transition));
+        UNIT_ASSERT_VALUES_EQUAL(transition.ResizeDeltaBits(), 2);
+        UNIT_ASSERT(space->AbandonTransition(transition));
     }
 
     Y_UNIT_TEST(ActivityRegistration) {
@@ -408,6 +531,26 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT(!TSharedCacheSpace::Create(invalid, reserved, 0));
     }
 
+    Y_UNIT_TEST(TransitionRejectsChangedPageSizeEstimate) {
+        TSharedCacheCapacity current;
+        TSharedCacheCapacity reserved;
+        TSharedCacheCapacity changedEstimate;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, current));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, reserved));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 2048, 0, 1, changedEstimate));
+        auto space = TSharedCacheSpace::Create(current, reserved, 1);
+        UNIT_ASSERT(space);
+        const auto state = space->CurrentSpaceState();
+        const auto* handles = TSharedCacheSpaceTestAccess::Handles(*space);
+        TTransition transition;
+        UNIT_ASSERT(!space->PrepareTransition(changedEstimate, transition));
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::Idle);
+        UNIT_ASSERT(space->CurrentSpaceState() == state);
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::Handles(*space) == handles);
+        UNIT_ASSERT(space->PrepareTransition(reserved, transition));
+        UNIT_ASSERT(space->AbandonTransition(transition));
+    }
+
     Y_UNIT_TEST(AllocateAndReturnItem) {
         TSharedCacheCapacity capacity;
         UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
@@ -551,6 +694,93 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT(seen[returned]);
         UNIT_ASSERT_VALUES_EQUAL(count, capacity.HandleCount() - 2);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), 0);
+    }
+
+    Y_UNIT_TEST(CapacityGrowthAndShrinkAliasTheLivePrefix) {
+        TSharedCacheCapacity small;
+        TSharedCacheCapacity large;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, large));
+
+        auto space = TSharedCacheSpace::Create(small, large, 1);
+        UNIT_ASSERT(space);
+        auto binding = space->BindThreadHazard(0);
+        THandle* smallHandles = TSharedCacheSpaceTestAccess::Handles(*space);
+        smallHandles[2].Key0.store(17, std::memory_order_relaxed);
+
+        TTransition growth;
+        UNIT_ASSERT(space->PrepareTransition(large, growth));
+        UNIT_ASSERT(growth.Phase() == ETransitionPhase::Prepare);
+        UNIT_ASSERT_VALUES_EQUAL(growth.ResizeDeltaBits(), 1);
+        {
+            auto oldOperation = space->BeginOperation();
+            UNIT_ASSERT_VALUES_EQUAL(oldOperation.View().Generation, 0);
+            UNIT_ASSERT_VALUES_EQUAL(oldOperation.View().Handles, smallHandles);
+            UNIT_ASSERT_VALUES_EQUAL(oldOperation.View().HandleCount, small.HandleCount());
+            UNIT_ASSERT(space->PublishMigrationView(growth));
+            UNIT_ASSERT(growth.Phase() == ETransitionPhase::MigrationDrain);
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).HandleCount, small.HandleCount());
+            UNIT_ASSERT_VALUES_EQUAL(
+                TSharedCacheSpaceTestAccess::Handles(*space)[2].Key0.load(std::memory_order_relaxed), 17);
+            UNIT_ASSERT_VALUES_EQUAL(oldOperation.View().Handles, smallHandles);
+            UNIT_ASSERT_VALUES_EQUAL(oldOperation.View().HandleCount, small.HandleCount());
+            TSharedCacheSpaceTestAccess::Handles(*space)[2].Key1.store(29, std::memory_order_relaxed);
+            UNIT_ASSERT_VALUES_EQUAL(smallHandles[2].Key1.load(std::memory_order_relaxed), 29);
+            UNIT_ASSERT(!space->TryDrainTransition(growth));
+        }
+        UNIT_ASSERT(space->TryDrainTransition(growth));
+        UNIT_ASSERT(growth.Phase() == ETransitionPhase::Migrate);
+        {
+            auto migrationOperation = space->BeginOperation();
+            UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().Generation, 1);
+            UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().Handles, TSharedCacheSpaceTestAccess::Handles(*space));
+            UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().HandleCount, small.HandleCount());
+            UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().AllocationLimit, small.HandleCount());
+            CompleteEmptyBucketResize(*space, large.AddressBits);
+            UNIT_ASSERT(space->PublishFinalView(growth));
+            CompleteGrowthAppend(*space, growth);
+            UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().HandleCount, small.HandleCount());
+            UNIT_ASSERT(!space->TryDrainTransition(growth));
+        }
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).HandleCount, large.HandleCount());
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).AllocationLimit, large.HandleCount());
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), large.HandleCount() - 2);
+        UNIT_ASSERT(space->TryDrainTransition(growth));
+        CompleteFinalDrain(*space, growth);
+        UNIT_ASSERT(space->TryReleaseTransition(growth));
+        UNIT_ASSERT(growth.Phase() == ETransitionPhase::Commit);
+        UNIT_ASSERT(space->CommitTransition(growth));
+        UNIT_ASSERT(growth.Phase() == ETransitionPhase::Idle);
+
+        TTransition shrink;
+        UNIT_ASSERT(space->PrepareTransition(small, shrink));
+        THandle* largeHandles = TSharedCacheSpaceTestAccess::Handles(*space);
+        UNIT_ASSERT(space->PublishMigrationView(shrink));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).AllocationLimit, small.HandleCount());
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).HandleCount, large.HandleCount());
+        {
+            auto migrationOperation = space->BeginOperation();
+            UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().Generation, 3);
+            UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().Handles, largeHandles);
+            UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().HandleCount, large.HandleCount());
+            UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().AllocationLimit, small.HandleCount());
+            UNIT_ASSERT(space->TryDrainTransition(shrink));
+            CompleteEmptyBucketResize(*space, small.AddressBits);
+            UNIT_ASSERT(space->PublishFinalView(shrink));
+            UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().Handles, largeHandles);
+            UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().HandleCount, large.HandleCount());
+            UNIT_ASSERT(!space->TryDrainTransition(shrink));
+        }
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).HandleCount, small.HandleCount());
+        UNIT_ASSERT_VALUES_EQUAL(
+            TSharedCacheSpaceTestAccess::Handles(*space)[2].Key1.load(std::memory_order_relaxed), 29);
+        TSharedCacheSpaceTestAccess::Handles(*space)[2].Key0.store(41, std::memory_order_relaxed);
+        UNIT_ASSERT_VALUES_EQUAL(largeHandles[2].Key0.load(std::memory_order_relaxed), 41);
+        UNIT_ASSERT(space->TryDrainTransition(shrink));
+        CompleteFinalDrain(*space, shrink);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), small.HandleCount() - 2);
+        UNIT_ASSERT(space->TryReleaseTransition(shrink));
+        UNIT_ASSERT(space->CommitTransition(shrink));
     }
 }
 
