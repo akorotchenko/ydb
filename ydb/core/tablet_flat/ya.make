@@ -101,6 +101,20 @@ SRCS(
     tablet_flat_executed.cpp
 )
 
+IF (OS_LINUX OR OS_FREEBSD)
+    SRCS(
+        shared_cache_mapping_memfd.cpp
+    )
+ELSEIF (OS_WINDOWS)
+    SRCS(
+        shared_cache_mapping_win.cpp
+    )
+ELSE()
+    SRCS(
+        shared_cache_mapping_reserved.cpp
+    )
+ENDIF()
+
 GENERATE_ENUM_SERIALIZATION(flat_comp_gen.h)
 GENERATE_ENUM_SERIALIZATION(flat_executor_compaction_logic.h)
 GENERATE_ENUM_SERIALIZATION(flat_executor_recovery.h)
