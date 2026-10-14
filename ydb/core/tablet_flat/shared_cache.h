@@ -553,6 +553,11 @@ private:
         TTraits::Invoke(point, cacheItem);
     }
 
+    Y_FORCE_INLINE void InvokeHook(ESharedCacheHookPoint point, TColdCacheItem coldItem) noexcept {
+        // Scheduling hooks transport raw token bits; the production APIs keep their distinct types.
+        TTraits::Invoke(point, TCacheItem::FromRaw(coldItem.Raw()));
+    }
+
     void SetHooks(TTraits hooks) noexcept {
         static_cast<TTraits&>(*this) = std::move(hooks);
     }
@@ -692,7 +697,7 @@ private:
         return !candidate.CacheItem.IsNull();
     }
 
-    bool EraseCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
+    bool EraseCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
 
     bool ReclaimCold(TSpaceOperation& spaceOp) noexcept;
     bool DemoteKeepColdForSoftLimit(TSpaceOperation& spaceOp) noexcept;
@@ -797,6 +802,9 @@ private:
 
     TCollection* ReleaseTombstone(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
     TCollection* ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowKeepCold = true) noexcept;
+    void CompleteColdPageRelease(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
+    bool TryReleaseColdPageToKeepCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, ui64& expectedRaw) noexcept;
+    bool TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheItem, ui64& expectedRaw) noexcept;
 
     void ReleaseReplacing(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
@@ -862,16 +870,16 @@ private:
     bool WantsKeepCold(TSpaceOperation& spaceOp, const THandle& page) noexcept;
     static bool WantsStickyPage(const TCollection& collection) noexcept;
 
-    void RouteKeepCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
+    void RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
 
-    bool DemoteKeepCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
+    bool DemoteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem, TPageCacheItem expectedPage = {}) noexcept;
     void ReleaseColdDemotionPin(TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin) noexcept;
 
-    void WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
+    void WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
 
     static bool IsKeepColdQueued(const THandle& handle) noexcept;
 
-    bool MatchesKeepColdEntry(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
+    bool MatchesKeepColdEntry(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
 
     void AddStats(const TStats& stats) noexcept;
 
@@ -886,7 +894,7 @@ private:
     static bool AdvanceColdMembership(
         THandle& handle, ui32 expectedVersion, bool keepColdQueued, ui32& newVersion) noexcept;
 
-    void RouteCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
+    void RouteCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
 
     TCacheItem PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept;
 
