@@ -796,7 +796,7 @@ private:
     void Release(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
     TCollection* ReleaseTombstone(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
-    TCollection* ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
+    TCollection* ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowKeepCold = true) noexcept;
 
     void ReleaseReplacing(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
@@ -865,6 +865,7 @@ private:
     void RouteKeepCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
 
     bool DemoteKeepCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
+    void ReleaseColdDemotionPin(TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin) noexcept;
 
     void WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept;
 
