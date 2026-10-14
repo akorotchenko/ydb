@@ -1145,6 +1145,69 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TSharedCacheThreadBinding<TTestTraits> MainHazard;
     };
 
+    TSharedCacheKey ReviewKeyForBucket(TCollectionCacheItem collection, ui32 mask, ui32 bucket, ui64 startOffset,
+        const TSharedCacheKey* after = nullptr) {
+        for (ui64 offset = startOffset; offset - startOffset < (1u << 20); ++offset) {
+            const auto key = TSharedCacheKey::Page(collection, offset);
+            if ((key.Hash() & mask) == bucket && (!after || CompareSharedCacheKeys(*after, key) < 0)) {
+                return key;
+            }
+        }
+        UNIT_FAIL("Could not construct the review test's bucket key");
+        Y_UNREACHABLE();
+    }
+
+    void AssertReviewTerminal(TTestSharedCache & cache, TCacheItem owner, const char* finding) {
+        const auto terminal = TCacheItem::FromRaw(TSharedCacheTestAccess::HandleNext(cache, owner.Index()));
+        UNIT_ASSERT(terminal.IsNull());
+        // Check before Find: the broken terminal would make a miss lookup retry forever.
+        UNIT_ASSERT_C(TSharedCacheTestAccess::ValidateTerminalOwner(cache, owner, terminal),
+            TStringBuilder() << finding << ": terminal version " << terminal.Version() << " differs from owner version "
+                             << owner.Version());
+    }
+
+    void ReviewEmptyMarkerAfterReuse(bool grow) {
+        TFixture fixture(6, 8, grow ? 7 : 6);
+        TTransition growth;
+        if (grow) {
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, grow ? 7 : 5));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishBucketSplit(*fixture.Cache));
+        if (!grow) {
+            UNIT_ASSERT(TSharedCacheTestAccess::CloseBucketSplit(*fixture.Cache));
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::RemoveBucketSplit(*fixture.Cache));
+        const auto reused = TSharedCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex);
+        UNIT_ASSERT(reused.IsFree());
+        UNIT_ASSERT(reused.Version() != 0);
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+        const auto markerState = TSharedCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex);
+        const auto marker = TCacheItem::Make(markerState.Version(), ResizeMarkerIndex);
+        AssertReviewTerminal(*fixture.Cache, marker, "R1");
+        const auto resize = TSharedCacheTestAccess::BucketResizeState(*fixture.Space);
+        const auto missing = ReviewKeyForBucket(MakeCollectionCacheItem(101, 50001), (resize.SplitBit() << 1) - 1,
+            resize.Cursor() | resize.SplitBit(), 10000);
+        UNIT_ASSERT(FindPage(*fixture.Cache, missing).Status == ESharedCacheResultStatus::Miss);
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        if (grow) {
+            CommitTransition(*fixture.Cache, growth);
+        }
+    }
+
+    Y_UNIT_TEST(ReviewR1GrowthEmptyMarkerTerminal) {
+        ReviewEmptyMarkerAfterReuse(true);
+    }
+
+    Y_UNIT_TEST(ReviewR1ShrinkEmptyMarkerTerminal) {
+        ReviewEmptyMarkerAfterReuse(false);
+    }
+
     Y_UNIT_TEST(ShutdownReleasesPageBuffersBeforeCollectionMetadata) {
         bool pagesReleasedBeforeCollection = false;
         {
