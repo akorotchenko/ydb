@@ -456,7 +456,7 @@ namespace NTable {
                 const auto ref = up.Value.AsValue<ui64>();
 
                 if (auto blob = Env->Locate(MemTable, ref, up.Tag)) {
-                    const auto got = NPage::TLabelWrapper().Read(**blob);
+                    const auto got = NPage::TLabelWrapper().Read(blob.Data());
 
                     Y_ENSURE(got == NPage::ECodec::Plain && got.Version == 0);
 

@@ -23,8 +23,7 @@ struct TTableDump {
     ui64 Rows = 0;
     ui64 Erased = 0;
     ui64 Bytes = 0;
-    // False when the scan could not reach the end of the table because a page of some part is not in
-    // the input; the rows written before that point are still there.
+    // False when the scan could not reach the end of the table; rows already written remain available.
     bool Complete = true;
 };
 

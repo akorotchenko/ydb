@@ -438,6 +438,9 @@ private:
     }
 
     void ClearKey() {
+        for (auto& it : RunIters) {
+            it->ReleaseLocatedValues();
+        }
         LastKey.clear();
         LastKeyPage = {};
         LastKeyState = ERowOp::Absent;

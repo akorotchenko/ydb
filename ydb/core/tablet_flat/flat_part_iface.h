@@ -61,27 +61,27 @@ namespace NTable {
         struct TResult : private TMoveOnly {
             TResult(bool need, const TSharedData* data)
                 : Need(need)
-                , OwnsData_(false)
+                , Kind_(EKind::Borrowed)
                 , BorrowedData_(data)
-            {
-            }
+            {}
 
             TResult(bool need, TSharedData&& data)
                 : Need(need)
-                , OwnsData_(true)
+                , Kind_(EKind::Data)
             {
                 new (&Data_) TSharedData(std::move(data));
             }
 
             TResult(bool need, TSharedCachePageRef&& page)
-                : TResult(need, page ? page.BuildSharedData() : TSharedData())
+                : Need(need)
+                , Kind_(EKind::Page)
             {
-                page.Drop();
+                new (&Page_) TSharedCachePageRef(std::move(page));
             }
 
             TResult(TResult&& other) noexcept
                 : Need(other.Need)
-                , OwnsData_(other.OwnsData_)
+                , Kind_(other.Kind_)
             {
                 MovePayload(other);
             }
@@ -90,7 +90,7 @@ namespace NTable {
                 if (this != &other) {
                     DestroyPayload();
                     Need = other.Need;
-                    OwnsData_ = other.OwnsData_;
+                    Kind_ = other.Kind_;
                     MovePayload(other);
                 }
                 return *this;
@@ -100,38 +100,76 @@ namespace NTable {
                 DestroyPayload();
             }
 
-            explicit operator bool() const noexcept
-            {
-                return OwnsData_ ? bool(Data_) : bool(BorrowedData_);
+            explicit operator bool() const noexcept {
+                switch (Kind_) {
+                    case EKind::Borrowed:
+                        return bool(BorrowedData_);
+                    case EKind::Data:
+                        return bool(Data_);
+                    case EKind::Page:
+                        return bool(Page_);
+                }
+                Y_UNREACHABLE();
             }
 
-            const TSharedData* operator*() const noexcept
-            {
-                return OwnsData_ ? &Data_ : BorrowedData_;
+            TArrayRef<const char> Data() const noexcept {
+                switch (Kind_) {
+                    case EKind::Borrowed:
+                        return BorrowedData_ ? TArrayRef<const char>(*BorrowedData_) : TArrayRef<const char>();
+                    case EKind::Data:
+                        return Data_;
+                    case EKind::Page:
+                        return Page_ ? TArrayRef<const char>(Page_.data(), Page_.size()) : TArrayRef<const char>();
+                }
+                Y_UNREACHABLE();
+            }
+
+            bool HasOwner() const noexcept {
+                return Kind_ != EKind::Borrowed;
             }
 
             bool Need;
 
         private:
+            enum class EKind : ui8 {
+                Borrowed,
+                Data,
+                Page,
+            };
+
             void MovePayload(TResult& other) noexcept {
-                if (OwnsData_) {
-                    new (&Data_) TSharedData(std::move(other.Data_));
-                } else {
-                    BorrowedData_ = std::exchange(other.BorrowedData_, nullptr);
+                switch (Kind_) {
+                    case EKind::Borrowed:
+                        BorrowedData_ = std::exchange(other.BorrowedData_, nullptr);
+                        break;
+                    case EKind::Data:
+                        new (&Data_) TSharedData(std::move(other.Data_));
+                        break;
+                    case EKind::Page:
+                        new (&Page_) TSharedCachePageRef(std::move(other.Page_));
+                        break;
                 }
             }
 
             void DestroyPayload() noexcept {
-                if (OwnsData_) {
-                    Data_.~TSharedData();
+                switch (Kind_) {
+                    case EKind::Borrowed:
+                        break;
+                    case EKind::Data:
+                        Data_.~TSharedData();
+                        break;
+                    case EKind::Page:
+                        Page_.~TSharedCachePageRef();
+                        break;
                 }
             }
 
-            bool OwnsData_;
+            EKind Kind_;
 
             union {
                 const TSharedData* BorrowedData_;
                 TSharedData Data_;
+                TSharedCachePageRef Page_;
             };
         };
 

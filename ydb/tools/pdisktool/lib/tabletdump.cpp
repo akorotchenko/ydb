@@ -288,9 +288,9 @@ bool DumpTablet(NTable::TDatabase& db, NTable::IPages& env, const TDumpOptions& 
 
             if (!dump.Complete) {
                 ++stats.Incomplete;
-                issues.Warning("tablet-dump", TStringBuilder() << "Table " << id << " " << info.Name
-                    << " is truncated after " << dump.Rows << " row(s) because the data that follows"
-                    << " is not in the input");
+                issues.Warning("tablet-dump", TStringBuilder()
+                                                  << "Table " << id << " " << info.Name << " is truncated after "
+                                                  << dump.Rows << " row(s) because the scan could not continue");
             }
 
             stats.Rows += dump.Rows;
