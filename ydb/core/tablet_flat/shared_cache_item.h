@@ -141,6 +141,49 @@ private:
     ui64 Raw_ = 0;
 };
 
+// Cold and KeepCold rings carry membership generations, independently of native handle generations.
+class TColdCacheItem {
+public:
+    constexpr TColdCacheItem() noexcept = default;
+
+    static constexpr TColdCacheItem Make(ui32 coldVersion, ui32 index) noexcept {
+        return FromRaw(TCacheItem::Make(coldVersion, index).Raw());
+    }
+
+    static constexpr TColdCacheItem FromRaw(ui64 raw) noexcept {
+        return TColdCacheItem(raw);
+    }
+
+    constexpr ui64 Raw() const noexcept {
+        return Raw_;
+    }
+
+    constexpr ui32 ColdVersion() const noexcept {
+        return TCacheItem::FromRaw(Raw_).Version();
+    }
+
+    constexpr ui32 Index() const noexcept {
+        return TCacheItem::FromRaw(Raw_).Index();
+    }
+
+    constexpr bool IsNull() const noexcept {
+        return Index() == 0;
+    }
+
+    constexpr bool IsFrozen() const noexcept {
+        return TCacheItem::FromRaw(Raw_).IsFrozen();
+    }
+
+    friend constexpr bool operator==(const TColdCacheItem&, const TColdCacheItem&) noexcept = default;
+
+private:
+    explicit constexpr TColdCacheItem(ui64 raw) noexcept
+        : Raw_(raw)
+    {}
+
+    ui64 Raw_ = 0;
+};
+
 class THandleState {
 public:
     static constexpr ui64 RefsMask = 0x0000000000FFFFFFULL;
@@ -635,6 +678,10 @@ static_assert(sizeof(std::atomic<ui32>) == sizeof(ui32));
 
 static_assert(sizeof(TCacheItem) == sizeof(ui64));
 static_assert(std::is_trivially_copyable_v<TCacheItem>);
+static_assert(sizeof(TColdCacheItem) == sizeof(ui64));
+static_assert(std::is_trivially_copyable_v<TColdCacheItem>);
+static_assert(!std::is_convertible_v<TColdCacheItem, TCacheItem>);
+static_assert(!std::is_convertible_v<TCacheItem, TColdCacheItem>);
 static_assert(sizeof(THandleState) == sizeof(ui64));
 static_assert(std::is_trivially_copyable_v<THandleState>);
 static_assert(sizeof(TPageCacheItem) == sizeof(ui64));

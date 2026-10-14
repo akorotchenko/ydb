@@ -582,6 +582,10 @@ public:
         return !cacheItem.IsNull() && cacheItem.Index() < AccessibleHandleCount();
     }
 
+    Y_FORCE_INLINE bool Contains(TColdCacheItem coldItem) const noexcept {
+        return !coldItem.IsNull() && coldItem.Index() < AccessibleHandleCount();
+    }
+
     Y_FORCE_INLINE ui64 AllocationLimit() const noexcept {
         return View().AllocationLimit;
     }
@@ -608,9 +612,9 @@ public:
         return View().KeepCold();
     }
 
-    Y_FORCE_INLINE TCacheItem PutCold(TCacheItem cacheItem) const noexcept {
-        Y_DEBUG_ABORT_UNLESS(!cacheItem.IsNull() && !cacheItem.IsFrozen());
-        return TCacheItem::FromRaw(Cold().PutAndPop(cacheItem.Raw()));
+    Y_FORCE_INLINE TColdCacheItem PutCold(TColdCacheItem coldItem) const noexcept {
+        Y_DEBUG_ABORT_UNLESS(!coldItem.IsNull() && !coldItem.IsFrozen());
+        return TColdCacheItem::FromRaw(Cold().PutAndPop(coldItem.Raw()));
     }
 
     ui32 TryAllocateHandle() noexcept;

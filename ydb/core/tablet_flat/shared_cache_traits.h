@@ -22,6 +22,8 @@ enum class ESharedCacheHookPoint {
     AfterHotEvictionPublished, // Payload is the evicted item, before category accounting.
     AfterKeepColdDemoted, // Cold membership token, immediately after the demotion CAS.
     AfterKeepColdEntryMatched, // Cold membership token, before ReclaimKeepCold calls EraseCold.
+    AfterKeepColdQueued, // Cold membership token, after ring publication while the routing pin is held.
+    AfterKeepColdRefReleased, // Native page identity, after releasing its last KeepCold reference.
     BeforeColdExchange, // Payload is the Cold membership after occupancy accounting, before ring publication.
     BeforeColdRingPop, // No item payload; an occupied Cold ring is about to be probed.
     AfterGrowthBucketPublished, // Payload is the resize marker.

@@ -855,13 +855,13 @@ bool TSharedCache::AdvanceColdMembership(
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCache::RouteCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept {
+void TSharedCache::RouteCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
     if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen()) {
         return;
     }
 
     THandle& handle = spaceOp.Handles()[coldItem.Index()];
-    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.Version()) {
+    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
         return;
     }
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
@@ -871,7 +871,7 @@ void TSharedCache::RouteCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noex
 
     ColdRingEntries_.fetch_add(1, std::memory_order_relaxed);
     InvokeHook(ESharedCacheHookPoint::BeforeColdExchange, coldItem);
-    const TCacheItem displaced = spaceOp.PutCold(coldItem);
+    const TColdCacheItem displaced = spaceOp.PutCold(coldItem);
     if (!displaced.IsNull()) {
         const ui64 previous = ColdRingEntries_.fetch_sub(1, std::memory_order_relaxed);
         Y_ABORT_UNLESS(previous != 0);
@@ -894,19 +894,20 @@ bool TSharedCache::WantsStickyPage(const TCollection& collection) noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::DemoteKeepCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept {
+bool TSharedCache::DemoteKeepCold(
+    TSpaceOperation& spaceOp, TColdCacheItem coldItem, TPageCacheItem expectedPage) noexcept {
     if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen()) {
         return false;
     }
     THandle& handle = spaceOp.Handles()[coldItem.Index()];
-    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.Version()) {
+    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
         return false;
     }
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
     for (;;) {
         const THandleState expected = THandleState::FromRaw(expectedRaw);
-        if (!expected.IsKeepCold() || expected.Refs() != 0 ||
-            (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.Version())
+        if (!expected.IsKeepCold() || expected.Refs() != 0 || (expectedPage && !expectedPage.Matches(expected)) ||
+            (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion())
         {
             return false;
         }
@@ -944,7 +945,7 @@ void TSharedCache::ReleaseColdDemotionPin(TSpaceOperation& spaceOp, TOperationIt
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCache::WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept {
+void TSharedCache::WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
     if (DemoteKeepCold(spaceOp, coldItem)) {
         return;
     }
@@ -952,20 +953,20 @@ void TSharedCache::WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TCacheItem co
         return;
     }
     THandle& handle = spaceOp.Handles()[coldItem.Index()];
-    ui32 version;
-    if (!AdvanceColdMembership(handle, coldItem.Version(), false, version)) {
+    ui32 coldVersion;
+    if (!AdvanceColdMembership(handle, coldItem.ColdVersion(), false, coldVersion)) {
         return;
     }
-    DemoteKeepCold(spaceOp, TCacheItem::Make(version, coldItem.Index()));
+    DemoteKeepCold(spaceOp, TColdCacheItem::Make(coldVersion, coldItem.Index()));
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::MatchesKeepColdEntry(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept {
+bool TSharedCache::MatchesKeepColdEntry(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
     if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen()) {
         return false;
     }
     const THandle& handle = spaceOp.Handles()[coldItem.Index()];
-    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.Version()) {
+    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
         return false;
     }
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
@@ -978,44 +979,57 @@ bool TSharedCache::IsKeepColdQueued(const THandle& handle) noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCache::RouteKeepCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept {
+void TSharedCache::RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
     if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen()) {
         return;
     }
     THandle& handle = spaceOp.Handles()[coldItem.Index()];
-    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.Version()) {
+    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
         return;
     }
-    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    if (!state.IsKeepCold()) {
+    ui64 expectedRaw = handle.State.load(std::memory_order_acquire);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        if (!expected.IsKeepCold() ||
+            (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
+            return;
+        }
+        if (expected.Refs() != 0) {
+            // The caller took this page's ring entry; its last reference will process the withdrawal.
+            WithdrawKeepColdEntry(spaceOp, coldItem);
+            return;
+        }
+        if (handle.State.compare_exchange_weak(
+                expectedRaw, expected.IncrementRefs().Raw(), std::memory_order_acquire, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+    TOperationItemRef pin(spaceOp, TCacheItem::Make(THandleState::FromRaw(expectedRaw).Version(), coldItem.Index()));
+    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
         return;
     }
-    if (state.Refs() != 0) {
-        // The caller took this page's ring entry and the page cannot be demoted yet, so it is no longer queued:
-        // advancing the membership makes the word stale and lets the last release demote the page.
+    if (!WantsKeepCold(spaceOp, handle)) {
         WithdrawKeepColdEntry(spaceOp, coldItem);
         return;
     }
-    if (!WantsKeepCold(spaceOp, handle)) {
-        DemoteKeepCold(spaceOp, coldItem);
-        return;
-    }
     ui32 queuedVersion;
-    if (!AdvanceColdMembership(handle, coldItem.Version(), true, queuedVersion)) {
+    if (!AdvanceColdMembership(handle, coldItem.ColdVersion(), true, queuedVersion)) {
         return;
     }
-    const TCacheItem queuedItem = TCacheItem::Make(queuedVersion, coldItem.Index());
+    const TColdCacheItem queuedItem = TColdCacheItem::Make(queuedVersion, coldItem.Index());
     const ui64 displaced = spaceOp.KeepCold().PutAndPop(queuedItem.Raw());
+    InvokeHook(ESharedCacheHookPoint::AfterKeepColdQueued, queuedItem);
     if (displaced != 0) {
-        const TCacheItem word = TCacheItem::FromRaw(displaced);
-        if (!DemoteKeepCold(spaceOp, word)) {
+        const TColdCacheItem displacedItem = TColdCacheItem::FromRaw(displaced);
+        if (!DemoteKeepCold(spaceOp, displacedItem)) {
             // The displaced page stays KeepCold without a ring entry: demote it on its last release.
-            WithdrawKeepColdEntry(spaceOp, word);
+            WithdrawKeepColdEntry(spaceOp, displacedItem);
         }
     }
     if (!WantsKeepCold(spaceOp, handle)) {
-        DemoteKeepCold(spaceOp, queuedItem);
+        WithdrawKeepColdEntry(spaceOp, queuedItem);
     }
+    pin.Get().Drop(spaceOp);
     TrimKeepCold(spaceOp);
 }
 
@@ -1066,12 +1080,12 @@ bool TSharedCache::TrimKeepCold(TSpaceOperation& spaceOp) noexcept {
         if (raw == 0) {
             continue;
         }
-        const TCacheItem word = TCacheItem::FromRaw(raw);
-        if (DemoteKeepCold(spaceOp, word)) {
+        const TColdCacheItem coldItem = TColdCacheItem::FromRaw(raw);
+        if (DemoteKeepCold(spaceOp, coldItem)) {
             progress = true;
         } else {
             const ui64 keepColdBytes = KeepColdOwnedBytes_.load(std::memory_order_relaxed);
-            WithdrawKeepColdEntry(spaceOp, word);
+            WithdrawKeepColdEntry(spaceOp, coldItem);
             // A referenced page cannot be demoted yet, but its entry is gone now: advance the membership so
             // that the page leaves KeepCold on its last release. The withdrawal helper also demotes it if the
             // last release raced with the membership advance.
@@ -1237,7 +1251,7 @@ void TSharedCache::ReleaseHotEvictionPin(
                 expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
         {
             pin.Disarm();
-            RouteKeepCold(spaceOp, TCacheItem::Make(initialColdVersion, cacheItem.Index()));
+            RouteKeepCold(spaceOp, TColdCacheItem::Make(initialColdVersion, cacheItem.Index()));
             NotifyResourcesAvailable();
             return;
         }
@@ -3695,14 +3709,14 @@ ESharedCacheResultStatus TSharedCache::FindOrInsert(
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::EraseCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noexcept {
+bool TSharedCache::EraseCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
     if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen())
     {
         return false;
     }
 
     THandle& handle = spaceOp.Handles()[coldItem.Index()];
-    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.Version()) {
+    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
         return false;
     }
     TCollection* pageCollection = nullptr;
@@ -3712,7 +3726,7 @@ bool TSharedCache::EraseCold(TSpaceOperation& spaceOp, TCacheItem coldItem) noex
         const THandleState expected = THandleState::FromRaw(expectedRaw);
         if ((!expected.IsCold() && !expected.IsKeepCold()) || (expected.IsKeepCold() && expected.Refs() != 0) ||
             !expected.IsStickyNoneField() ||
-            (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.Version()) {
+            (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
             return false;
         }
         Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
@@ -4565,14 +4579,14 @@ typename TSharedCache::EShrinkCutStatus TSharedCache::ReclaimShrinkHandle(
         }
         if (state.Refs() == 0) {
             const ui32 coldVersion = spaceOp.Handles()[index].ColdVersion.load(std::memory_order_acquire);
-            if (EraseCold(spaceOp, TCacheItem::Make(coldVersion & MaxItemVersion, index))) {
+            if (EraseCold(spaceOp, TColdCacheItem::Make(coldVersion & MaxItemVersion, index))) {
                 return EShrinkCutStatus::Progress;
             }
         }
     }
     if (state.IsKeepCold()) {
         const ui32 coldVersion = spaceOp.Handles()[index].ColdVersion.load(std::memory_order_acquire);
-        if (DemoteKeepCold(spaceOp, TCacheItem::Make(coldVersion & MaxItemVersion, index))) {
+        if (DemoteKeepCold(spaceOp, TColdCacheItem::Make(coldVersion & MaxItemVersion, index))) {
             return EShrinkCutStatus::Progress;
         }
     }
@@ -4655,7 +4669,7 @@ bool TSharedCache::RunMaintenance() noexcept {
             for (ui64 index = 0; index < batch; ++index) {
                 const ui64 raw = spaceOp.KeepCold().Pop();
                 if (raw != 0) {
-                    RouteKeepCold(spaceOp, TCacheItem::FromRaw(raw));
+                    RouteKeepCold(spaceOp, TColdCacheItem::FromRaw(raw));
                 }
             }
             return true;
@@ -4725,10 +4739,10 @@ bool TSharedCache::FinalDrain(TTransition& transition) noexcept {
         [&](ui64 raw) noexcept {
             const ui64 previous = ColdRingEntries_.fetch_sub(1, std::memory_order_relaxed);
             Y_ABORT_UNLESS(previous != 0);
-            RouteCold(spaceOp, TCacheItem::FromRaw(raw));
+            RouteCold(spaceOp, TColdCacheItem::FromRaw(raw));
         },
         [&](ui64 raw) noexcept {
-            RouteKeepCold(spaceOp, TCacheItem::FromRaw(raw));
+            RouteKeepCold(spaceOp, TColdCacheItem::FromRaw(raw));
         });
 }
 
@@ -4789,12 +4803,12 @@ bool TSharedCache::ReclaimCold(TSpaceOperation& spaceOp) noexcept {
         if (ColdRingEntries_.load(std::memory_order_relaxed) == 0) {
             return false;
         }
-        InvokeHook(ESharedCacheHookPoint::BeforeColdRingPop, {});
+        InvokeHook(ESharedCacheHookPoint::BeforeColdRingPop, TCacheItem{});
         const ui64 rawItem = cold.Pop();
         if (rawItem != 0) {
             const ui64 previous = ColdRingEntries_.fetch_sub(1, std::memory_order_relaxed);
             Y_ABORT_UNLESS(previous != 0);
-            if (EraseCold(spaceOp, TCacheItem::FromRaw(rawItem))) {
+            if (EraseCold(spaceOp, TColdCacheItem::FromRaw(rawItem))) {
                 return true;
             }
         }
@@ -4810,7 +4824,7 @@ bool TSharedCache::DemoteKeepColdForSoftLimit(TSpaceOperation& spaceOp) noexcept
         if (raw == 0) {
             continue;
         }
-        const TCacheItem item = TCacheItem::FromRaw(raw);
+        const TColdCacheItem item = TColdCacheItem::FromRaw(raw);
         if (DemoteKeepCold(spaceOp, item)) {
             return true;
         }
@@ -4828,7 +4842,7 @@ bool TSharedCache::ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept {
         if (raw == 0) {
             continue;
         }
-        const TCacheItem item = TCacheItem::FromRaw(raw);
+        const TColdCacheItem item = TColdCacheItem::FromRaw(raw);
         if (!MatchesKeepColdEntry(spaceOp, item)) {
             continue;
         }
@@ -5016,85 +5030,117 @@ TCollection* TSharedCache::ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cach
                     expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed)) {
                 continue;
             }
-            TOperationItemRef ownerRef(spaceOp, cacheItem);
-            InvokeHook(ESharedCacheHookPoint::AfterTombstoneOwnerClaim, cacheItem);
-            if (TCollection* owner = PageCollection(spaceOp, handle);
-                owner && owner->CacheMode_.load(std::memory_order_acquire) == ECacheMode::TryKeepInMemory &&
-                owner->IsKeepAllowedPage(handle.Metadata.Page.Type)) {
-                this->NotifyKeepPageEviction(owner->Id(), owner->CacheItem, owner->KeepGeneration(),
-                    NTable::NPage::TPageLocation(
-                        NTable::NPage::TPageOffset::FromRaw(handle.Key1.load(std::memory_order_relaxed)),
-                        handle.Key2OrSize.load(std::memory_order_relaxed), handle.Metadata.Page.Type,
-                        handle.Metadata.Page.Crc32));
-            }
-            AdvanceColdMembership(handle);
-            Table_.CompleteTombstone(cacheItem, LoadSharedCacheKey(handle, EItemKind::Page), spaceOp);
+            CompleteColdPageRelease(spaceOp, cacheItem);
             return nullptr;
         }
         Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(expected) && expected.Refs() > 0);
         if (allowKeepCold && expected.IsCold() && expected.IsPageKind() && expected.Refs() == 1 &&
             WantsKeepCold(spaceOp, handle) && TryAddRetainedBytes(PageBytes(handle)))
         {
-            const ui64 bytes = PageBytes(handle);
-            TCollection* owner = PageCollection(spaceOp, handle);
-            if (owner) {
-                AddActivePageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
-            }
-            AddKeepColdOwnedBytes(bytes);
-            const THandleState desired = expected.DecrementRefs().WithState(EHandleState::KeepCold);
-            if (handle.State.compare_exchange_weak(
-                    expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
-            {
-                AdvanceColdMembership(handle);
-                TransferEstimatedBytes(ColdBytes_, KeepColdBytes_, bytes);
-                TransferEstimatedPages(ColdPages_, KeepColdPages_, EItemKind::Page);
-                ColdItems_.fetch_sub(1, std::memory_order_relaxed);
-                const ui32 version = handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
-                RouteKeepCold(spaceOp, TCacheItem::Make(version, cacheItem.Index()));
-                NotifyResourcesAvailable();
+            if (TryReleaseColdPageToKeepCold(spaceOp, cacheItem, expectedRaw)) {
                 return nullptr;
-            }
-            SubtractExactBytes(KeepColdOwnedBytes_, bytes);
-            SubtractExactBytes(RetainedBytes_, bytes);
-            if (owner) {
-                AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
             }
             continue;
         }
-        const bool publishCold = expected.IsCold() && expected.Refs() == 1;
-        const bool lastKeepColdRef = expected.IsKeepCold() && expected.Refs() == 1;
-        const ui64 coldBytes = publishCold ? PayloadBytes(handle, expected.Kind()) : 0;
-        // Capture while the native ref protects the payload; detach/reclaim may follow the final CAS.
-        const bool notifyCollectionRelease =
-            expected.IsCollectionKind() && expected.IsSticky() && expected.Refs() == 1 && expected.IsStickyField() &&
-            handle.Body.Collection->GetActorState() &&
-            handle.Body.Collection->StickyPageListHead.load(std::memory_order_acquire) != 0;
-        const TLogoBlobID collectionId = notifyCollectionRelease ? handle.Body.Collection->Id() : TLogoBlobID{};
-        const THandleState desired = expected.DecrementRefs();
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
-        {
-            if (notifyCollectionRelease) {
-                // No native metadata owner remains to hand these writer-held Sticky pages to an executor.
-                this->NotifyCollectionReleased(collectionId, TCollectionCacheItem::FromValidated(cacheItem));
-            }
-            UpdateColdReclaimable(coldBytes, expected, desired);
-            if (publishCold) {
-                const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire);
-                RouteCold(spaceOp, TCacheItem::Make(coldVersion & MaxItemVersion, cacheItem.Index()));
-            } else if (lastKeepColdRef && (!IsKeepColdQueued(handle) || !WantsKeepCold(spaceOp, handle)))
-            {
-                // Check after releasing the final ref: a concurrent trim may have withdrawn this page's ring entry
-                // while the ref was being dropped.
-                const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire);
-                DemoteKeepCold(spaceOp, TCacheItem::Make(coldVersion & MaxItemVersion, cacheItem.Index()));
-            }
-            if (expected.IsReady() && desired.Refs() == 0 && expected.IsStickyNoneField()) {
-                NotifyResourcesAvailable();
-            }
+        if (TryReleaseItemRef(spaceOp, cacheItem, expectedRaw)) {
             return nullptr;
         }
     }
+}
+
+SHARED_CACHE_TEMPLATE
+void TSharedCache::CompleteColdPageRelease(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    TOperationItemRef ownerRef(spaceOp, cacheItem);
+    InvokeHook(ESharedCacheHookPoint::AfterTombstoneOwnerClaim, cacheItem);
+    if (TCollection* owner = PageCollection(spaceOp, handle);
+        owner && owner->CacheMode_.load(std::memory_order_acquire) == ECacheMode::TryKeepInMemory &&
+        owner->IsKeepAllowedPage(handle.Metadata.Page.Type)) {
+        this->NotifyKeepPageEviction(owner->Id(), owner->CacheItem, owner->KeepGeneration(),
+            NTable::NPage::TPageLocation(
+                NTable::NPage::TPageOffset::FromRaw(handle.Key1.load(std::memory_order_relaxed)),
+                handle.Key2OrSize.load(std::memory_order_relaxed), handle.Metadata.Page.Type,
+                handle.Metadata.Page.Crc32));
+    }
+    AdvanceColdMembership(handle);
+    Table_.CompleteTombstone(cacheItem, LoadSharedCacheKey(handle, EItemKind::Page), spaceOp);
+}
+
+SHARED_CACHE_TEMPLATE
+bool TSharedCache::TryReleaseColdPageToKeepCold(
+    TSpaceOperation& spaceOp, TCacheItem cacheItem, ui64& expectedRaw) noexcept {
+    // The caller has charged RetainedBytes; a failed CAS must roll back every provisional charge.
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    const THandleState expected = THandleState::FromRaw(expectedRaw);
+    const ui64 bytes = PageBytes(handle);
+    TCollection* owner = PageCollection(spaceOp, handle);
+    if (owner) {
+        AddActivePageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
+    }
+    AddKeepColdOwnedBytes(bytes);
+    const THandleState desired = expected.DecrementRefs().WithState(EHandleState::KeepCold);
+    if (handle.State.compare_exchange_weak(
+            expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
+    {
+        AdvanceColdMembership(handle);
+        TransferEstimatedBytes(ColdBytes_, KeepColdBytes_, bytes);
+        TransferEstimatedPages(ColdPages_, KeepColdPages_, EItemKind::Page);
+        ColdItems_.fetch_sub(1, std::memory_order_relaxed);
+        const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
+        RouteKeepCold(spaceOp, TColdCacheItem::Make(coldVersion, cacheItem.Index()));
+        NotifyResourcesAvailable();
+        return true;
+    }
+    SubtractExactBytes(KeepColdOwnedBytes_, bytes);
+    SubtractExactBytes(RetainedBytes_, bytes);
+    if (owner) {
+        AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
+    }
+    return false;
+}
+
+SHARED_CACHE_TEMPLATE
+bool TSharedCache::TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheItem, ui64& expectedRaw) noexcept {
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    const THandleState expected = THandleState::FromRaw(expectedRaw);
+    const bool publishCold = expected.IsCold() && expected.Refs() == 1;
+    const bool lastKeepColdRef = expected.IsKeepCold() && expected.Refs() == 1;
+    const bool wantsKeepCold = lastKeepColdRef && WantsKeepCold(spaceOp, handle);
+    const ui64 coldBytes = publishCold ? PayloadBytes(handle, expected.Kind()) : 0;
+    // Capture while the native ref protects the payload; detach/reclaim may follow the final CAS.
+    const bool notifyCollectionRelease =
+        expected.IsCollectionKind() && expected.IsSticky() && expected.Refs() == 1 && expected.IsStickyField() &&
+        handle.Body.Collection->GetActorState() &&
+        handle.Body.Collection->StickyPageListHead.load(std::memory_order_acquire) != 0;
+    const TLogoBlobID collectionId = notifyCollectionRelease ? handle.Body.Collection->Id() : TLogoBlobID{};
+    const THandleState desired = expected.DecrementRefs();
+    if (handle.State.compare_exchange_weak(
+            expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
+    {
+        if (notifyCollectionRelease) {
+            // No native metadata owner remains to hand these writer-held Sticky pages to an executor.
+            this->NotifyCollectionReleased(collectionId, TCollectionCacheItem::FromValidated(cacheItem));
+        }
+        UpdateColdReclaimable(coldBytes, expected, desired);
+        if (publishCold) {
+            const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire);
+            RouteCold(spaceOp, TColdCacheItem::Make(coldVersion & MaxItemVersion, cacheItem.Index()));
+        } else if (lastKeepColdRef) {
+            InvokeHook(ESharedCacheHookPoint::AfterKeepColdRefReleased, cacheItem);
+            // Check after releasing the final ref: a concurrent trim may have withdrawn this page's ring entry
+            // while the ref was being dropped. Policy was read while the original page was still pinned.
+            if (!IsKeepColdQueued(handle) || !wantsKeepCold) {
+                const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire);
+                DemoteKeepCold(spaceOp, TColdCacheItem::Make(coldVersion & MaxItemVersion, cacheItem.Index()),
+                    TPageCacheItem::FromValidated(cacheItem));
+            }
+        }
+        if (expected.IsReady() && desired.Refs() == 0 && expected.IsStickyNoneField()) {
+            NotifyResourcesAvailable();
+        }
+        return true;
+    }
+    return false;
 }
 
 #undef TSharedCacheCollectionRef

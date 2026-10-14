@@ -265,12 +265,12 @@ public:
     static ui32 QueueKeepColdPageForTest(TTestSharedCache& cache, TPageCacheItem page) noexcept {
         return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
             THandle& handle = spaceOp.Handles()[page.Index()];
-            const ui32 version =
+            const ui32 coldVersion =
                 AdvanceColdVersion(handle.ColdVersion.load(std::memory_order_relaxed) & MaxItemVersion) |
                 KeepColdQueuedMask;
-            handle.ColdVersion.store(version, std::memory_order_relaxed);
-            spaceOp.KeepCold().PutAndPop(TCacheItem::Make(version & MaxItemVersion, page.Index()).Raw());
-            return version;
+            handle.ColdVersion.store(coldVersion, std::memory_order_relaxed);
+            spaceOp.KeepCold().PutAndPop(TColdCacheItem::Make(coldVersion & MaxItemVersion, page.Index()).Raw());
+            return coldVersion;
         });
     }
 
@@ -449,7 +449,7 @@ public:
         return operation.Handles()[collection.Index()].Body.Collection->References.load(std::memory_order_relaxed);
     }
 
-    static bool EraseCold(TTestSharedCache& cache, TCacheItem cacheItem) {
+    static bool EraseCold(TTestSharedCache& cache, TColdCacheItem cacheItem) {
         auto operation = cache.BeginOperation();
         return cache.EraseCold(operation, cacheItem);
     }
@@ -462,7 +462,7 @@ public:
         return cache.ReclaimKeepCold(operation);
     }
 
-    static bool DemoteKeepCold(TTestSharedCache& cache, TCacheItem item) noexcept {
+    static bool DemoteKeepCold(TTestSharedCache& cache, TColdCacheItem item) noexcept {
         auto operation = cache.BeginOperation();
         return cache.DemoteKeepCold(operation, item);
     }
@@ -750,8 +750,8 @@ namespace {
             TIntrusiveConstPtr<NPageCollection::IPageCollection>(new TTestPageCollection(id, backingSize)));
     }
 
-    TCacheItem MakeColdItem(TTestSharedCache& cache, ui32 index) {
-        return TCacheItem::Make(TSharedCacheTestAccess::ColdVersion(cache, index) & MaxItemVersion, index);
+    TColdCacheItem MakeColdItem(TTestSharedCache& cache, ui32 index) {
+        return TColdCacheItem::Make(TSharedCacheTestAccess::ColdVersion(cache, index) & MaxItemVersion, index);
     }
 
     ui64 AvailableFreeHandles(const TTestSharedCache& cache) {
@@ -781,6 +781,10 @@ namespace {
                 Arrived.store(false, std::memory_order_relaxed);
                 Continue.store(false, std::memory_order_relaxed);
                 Triggered.store(false, std::memory_order_relaxed);
+            }
+
+            void Arm(ESharedCacheHookPoint point, TColdCacheItem target) noexcept {
+                Arm(point, TCacheItem::FromRaw(target.Raw()));
             }
 
             void Wait() noexcept {
@@ -1454,6 +1458,111 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_C(TSharedCacheTestAccess::ColdVersion(*cache, replacement.Index()) == replacementMembership,
             "R5: demotion changed the replacement page's membership generation");
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionValue(*cache, a.Index())->ActivePageBytes(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR7KeepColdRoutingPinsPublishedPage) {
+        TFixture fixture;
+        const TLogoBlobID id(131, 132, 133);
+        const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::TryKeepInMemory));
+        const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(2 * bytes));
+        const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 1));
+
+        struct TContext {
+            TTestSharedCache& Cache;
+            TPageCacheItem Page;
+            bool Visited = false;
+            bool Reclaimed = false;
+            ui32 RefsAtPublication = 0;
+        } context{ *fixture.Cache, page };
+
+        TTestTraits hooks{ &context,
+            [](void* ptr, ESharedCacheHookPoint at, TCacheItem item) noexcept {
+                auto& ctx = *static_cast<TContext*>(ptr);
+                if (at == ESharedCacheHookPoint::AfterKeepColdQueued && item.Index() == ctx.Page.Index() &&
+                    !ctx.Visited) {
+                    ctx.Visited = true;
+                    ctx.RefsAtPublication = TSharedCacheTestAccess::HandleState(ctx.Cache, item.Index()).Refs();
+                    ctx.Reclaimed = TSharedCacheTestAccess::WithSpace(ctx.Cache, [&](TSpaceOperation& op) {
+                        return TSharedCacheTestAccess::ReclaimKeepCold(ctx.Cache, op);
+                    });
+                }
+            } };
+        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        UNIT_ASSERT(context.Visited);
+        UNIT_ASSERT_VALUES_EQUAL(context.RefsAtPublication, 1);
+        UNIT_ASSERT(!context.Reclaimed);
+        const auto state = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+        UNIT_ASSERT_VALUES_EQUAL(state.Version(), page.Version());
+        UNIT_ASSERT(state.IsCold()); // The consumer withdrew the token while the routing pin was held.
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdOwnedBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(
+            TSharedCacheTestAccess::CollectionValue(*fixture.Cache, collection.Index())->ActivePageBytes(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR7LastKeepColdReleaseDoesNotDemoteReusedHandle) {
+        TFixture fixture;
+        const TLogoBlobID aId(131, 132, 134);
+        const TLogoBlobID bId(131, 132, 135);
+        const auto a = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(aId));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, a, MakeCollection(aId)));
+        const auto b = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(bId));
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, b, MakeCollection(bId)));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(a, ECacheMode::TryKeepInMemory));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(b, ECacheMode::TryKeepInMemory));
+        const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(2 * bytes));
+        const auto sourceKey = TSharedCacheKey::Page(a, 1);
+        const auto source = InsertReadyPage(*fixture.Cache, sourceKey);
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, source));
+        auto held = TSharedCacheTestAccess::AcquireStructural(*fixture.Cache, source.CacheItem());
+        UNIT_ASSERT(held);
+        auto fillers = HoldReviewFillers(fixture, 63, sourceKey.Hash() & 63);
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(a, ECacheMode::Regular));
+
+        struct TContext {
+            TTestSharedCache& Cache;
+            TPageCacheItem Source;
+            TCollectionCacheItem ReplacementCollection;
+            bool Visited = false;
+            bool Reclaimed = false;
+            TPageCacheItem Replacement;
+            ui32 ReplacementMembership = 0;
+        } context{ *fixture.Cache, source, b };
+
+        TTestTraits hooks{ &context,
+            [](void* ptr, ESharedCacheHookPoint at, TCacheItem item) noexcept {
+                auto& ctx = *static_cast<TContext*>(ptr);
+                if (at == ESharedCacheHookPoint::AfterKeepColdRefReleased && item == ctx.Source.CacheItem() &&
+                    !ctx.Visited) {
+                    ctx.Visited = true;
+                    ctx.Reclaimed = TSharedCacheTestAccess::WithSpace(ctx.Cache, [&](TSpaceOperation& op) {
+                        return TSharedCacheTestAccess::ReclaimKeepCold(ctx.Cache, op);
+                    });
+                    Y_ABORT_UNLESS(ctx.Reclaimed);
+                    ctx.Replacement = InsertReadyPage(ctx.Cache, TSharedCacheKey::Page(ctx.ReplacementCollection, 1));
+                    Y_ABORT_UNLESS(ctx.Replacement.Index() == ctx.Source.Index());
+                    Y_ABORT_UNLESS(TSharedCacheTestAccess::EvictFromHot(ctx.Cache, ctx.Replacement));
+                    Y_ABORT_UNLESS(
+                        ctx.Cache.SetCollectionPagesCacheMode(ctx.ReplacementCollection, ECacheMode::Regular));
+                    ctx.ReplacementMembership = TSharedCacheTestAccess::ColdVersion(ctx.Cache, ctx.Replacement.Index());
+                }
+            } };
+        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+        held.Drop();
+        UNIT_ASSERT(context.Visited && context.Reclaimed);
+        UNIT_ASSERT(context.Replacement.Version() != source.Version());
+        const auto state = TSharedCacheTestAccess::HandleState(*fixture.Cache, context.Replacement.Index());
+        UNIT_ASSERT(state.IsKeepCold()); // The old release must not apply its policy to this new page.
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::ColdVersion(*fixture.Cache, context.Replacement.Index()),
+            context.ReplacementMembership);
+        UNIT_ASSERT_VALUES_EQUAL(
+            TSharedCacheTestAccess::CollectionValue(*fixture.Cache, b.Index())->ActivePageBytes(), bytes);
     }
 
     Y_UNIT_TEST(ShutdownReleasesPageBuffersBeforeCollectionMetadata) {
@@ -4065,7 +4174,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TCollectionCacheItem collection = MakeCollectionCacheItem(507, 508);
         const TPageCacheItem page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 0));
         TSharedCacheGate gate;
-        gate.Slots[0].Arm(ESharedCacheHookPoint::BeforeColdExchange, {});
+        gate.Slots[0].Arm(ESharedCacheHookPoint::BeforeColdExchange, TColdCacheItem{});
         TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
         auto cache = fixture.Cache;
         TGateThread publisher(gate, [&] {
@@ -4305,7 +4414,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             }
             const ui32 coldVersion = TSharedCacheTestAccess::ColdVersion(*fixture.Cache, page.Index());
             UNIT_ASSERT(TSharedCacheTestAccess::EraseCold(
-                *fixture.Cache, TCacheItem::Make(coldVersion & MaxItemVersion, page.Index())));
+                *fixture.Cache, TColdCacheItem::Make(coldVersion & MaxItemVersion, page.Index())));
             UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsFree());
         }
         const ui64 pageOwners = target.HandleCount() - 3;
@@ -4493,7 +4602,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
             const ui32 coldVersion = TSharedCacheTestAccess::ColdVersion(*fixture.Cache, page.Index());
             UNIT_ASSERT(TSharedCacheTestAccess::EraseCold(
-                *fixture.Cache, TCacheItem::Make(coldVersion & MaxItemVersion, page.Index())));
+                *fixture.Cache, TColdCacheItem::Make(coldVersion & MaxItemVersion, page.Index())));
         }
 
         const ui64 residentBytes = fixture.Cache->ResidentBytes();
