@@ -739,7 +739,7 @@ bool TSharedCacheTable::RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept {
     }
     const TCacheItem successor =
         TCacheItem::FromRaw(spaceOp.Handles()[ResizeMarkerIndex].Next.load(std::memory_order_acquire)).WithoutFrozen();
-    const TCacheItem replacement = successor.IsNull() ? TCacheItem{} : successor;
+    const TCacheItem replacement = successor.IsNull() ? TCacheItem::Make(markerLink.Owner.Version(), 0) : successor;
     ui64 expected = markerIdentity.Raw();
     if (!markerLink.Link->compare_exchange_strong(
             expected, replacement.Raw(), std::memory_order_release, std::memory_order_acquire))
