@@ -1157,6 +1157,23 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         Y_UNREACHABLE();
     }
 
+    TVector<TTestSharedCachePageRef> HoldReviewFillers(TFixture & fixture, ui32 excludedMask, ui32 excludedBucket) {
+        TVector<TTestSharedCachePageRef> held;
+        const auto collection = MakeCollectionCacheItem(100, 50000);
+        for (ui64 offset = 0; AvailableFreeHandles(*fixture.Cache) != 0; ++offset) {
+            UNIT_ASSERT(offset < (1u << 20));
+            const auto key = TSharedCacheKey::Page(collection, offset);
+            if ((key.Hash() & excludedMask) == excludedBucket) {
+                continue;
+            }
+            InsertReadyPage(*fixture.Cache, key);
+            auto found = FindPage(*fixture.Cache, key);
+            UNIT_ASSERT(found.Status == ESharedCacheResultStatus::Hit);
+            held.push_back(std::move(found.Ref));
+        }
+        return held;
+    }
+
     void AssertReviewTerminal(TTestSharedCache & cache, TCacheItem owner, const char* finding) {
         const auto terminal = TCacheItem::FromRaw(TSharedCacheTestAccess::HandleNext(cache, owner.Index()));
         UNIT_ASSERT(terminal.IsNull());
@@ -1206,6 +1223,34 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
     Y_UNIT_TEST(ReviewR1ShrinkEmptyMarkerTerminal) {
         ReviewEmptyMarkerAfterReuse(false);
+    }
+
+    Y_UNIT_TEST(ReviewR2MergePreservesRecycledTailTerminal) {
+        TFixture fixture;
+        const auto token = MakeCollectionCacheItem(102, 50002);
+        const auto key = ReviewKeyForBucket(token, 63, 0, 20000);
+        const auto original = InsertReadyPage(*fixture.Cache, key);
+        auto originalHold = FindPage(*fixture.Cache, key);
+        auto fillers = HoldReviewFillers(fixture, 31, 0);
+        originalHold.Ref.Drop();
+        if (TSharedCacheTestAccess::HandleState(*fixture.Cache, original.Index()).IsHot()) {
+            UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, original));
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::EraseCold(*fixture.Cache, MakeColdItem(*fixture.Cache, original.Index())));
+        const auto tail = InsertReadyPage(*fixture.Cache, key);
+        UNIT_ASSERT_VALUES_EQUAL(tail.Index(), original.Index());
+        UNIT_ASSERT(tail.Version() != original.Version());
+        UNIT_ASSERT(tail.Version() != 0);
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 5));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::CloseBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::RemoveBucketSplit(*fixture.Cache));
+        AssertReviewTerminal(*fixture.Cache, tail.CacheItem(), "R2");
+        const auto missing = ReviewKeyForBucket(token, 31, 0, 30000, &key);
+        UNIT_ASSERT(FindPage(*fixture.Cache, missing).Status == ESharedCacheResultStatus::Miss);
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
     }
 
     Y_UNIT_TEST(ShutdownReleasesPageBuffersBeforeCollectionMetadata) {
