@@ -910,12 +910,14 @@ bool TSharedCache::DemoteKeepCold(TSpaceOperation& spaceOp, TCacheItem coldItem)
         {
             return false;
         }
-        const ui64 bytes = PageBytes(handle);
-        const THandleState desired = expected.WithState(EHandleState::Cold);
+        // Claim the demotion and a native ref together: an already-matched consumer may still tombstone it.
+        const THandleState desired = expected.IncrementRefs().WithState(EHandleState::Cold);
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
         {
-            UpdateColdReclaimable(bytes, expected, desired);
+            TOperationItemRef pin(spaceOp, TCacheItem::Make(expected.Version(), coldItem.Index()));
+            InvokeHook(ESharedCacheHookPoint::AfterKeepColdDemoted, coldItem);
+            const ui64 bytes = PageBytes(handle);
             AdvanceColdMembership(handle);
             SubtractExactBytes(RetainedBytes_, bytes);
             TransferEstimatedBytes(KeepColdBytes_, ColdBytes_, bytes);
@@ -925,10 +927,19 @@ bool TSharedCache::DemoteKeepCold(TSpaceOperation& spaceOp, TCacheItem coldItem)
             if (TCollection* owner = PageCollection(spaceOp, handle)) {
                 AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
             }
-            const ui32 version = handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
-            RouteCold(spaceOp, TCacheItem::Make(version, coldItem.Index()));
+            ReleaseColdDemotionPin(spaceOp, pin);
             return true;
         }
+    }
+}
+
+SHARED_CACHE_TEMPLATE
+void TSharedCache::ReleaseColdDemotionPin(TSpaceOperation& spaceOp, TOperationItemRef& pin) noexcept {
+    const TCacheItem cacheItem = pin.CacheItem();
+    pin.Disarm();
+    // A policy demotion must not readmit the page to KeepCold when releasing its temporary ref.
+    if (TCollection* owner = ReleaseItem(spaceOp, cacheItem, false)) {
+        DropOwnerReference(spaceOp, *owner);
     }
 }
 
@@ -4821,6 +4832,7 @@ bool TSharedCache::ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept {
         if (!MatchesKeepColdEntry(spaceOp, item)) {
             continue;
         }
+        InvokeHook(ESharedCacheHookPoint::AfterKeepColdEntryMatched, item);
         if (EraseCold(spaceOp, item)) {
             return true;
         }
@@ -4972,7 +4984,7 @@ void TSharedCache::Release(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexc
 }
 
 SHARED_CACHE_TEMPLATE
-TCollection* TSharedCache::ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
+TCollection* TSharedCache::ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowKeepCold) noexcept {
     Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
@@ -5020,8 +5032,8 @@ TCollection* TSharedCache::ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cach
             return nullptr;
         }
         Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(expected) && expected.Refs() > 0);
-        if (expected.IsCold() && expected.IsPageKind() && expected.Refs() == 1 && WantsKeepCold(spaceOp, handle) &&
-            TryAddRetainedBytes(PageBytes(handle)))
+        if (allowKeepCold && expected.IsCold() && expected.IsPageKind() && expected.Refs() == 1 &&
+            WantsKeepCold(spaceOp, handle) && TryAddRetainedBytes(PageBytes(handle)))
         {
             const ui64 bytes = PageBytes(handle);
             TCollection* owner = PageCollection(spaceOp, handle);
