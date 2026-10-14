@@ -1565,6 +1565,87 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TSharedCacheTestAccess::CollectionValue(*fixture.Cache, b.Index())->ActivePageBytes(), bytes);
     }
 
+    void ReviewColdPromotion(bool reheat) {
+        TFixture fixture;
+        UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(fixture.Cache->HardLimit()));
+        const TLogoBlobID id(141, 142, 143);
+        const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+        const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(2 * bytes));
+        const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 1));
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsCold());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 1);
+        const auto coldItem = MakeColdItem(*fixture.Cache, page.Index());
+        auto held = TSharedCacheTestAccess::AcquireStructural(*fixture.Cache, page.CacheItem());
+        UNIT_ASSERT(held);
+        UNIT_ASSERT_VALUES_EQUAL(
+            TSharedCacheTestAccess::ColdVersion(*fixture.Cache, page.Index()), coldItem.ColdVersion());
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::TryKeepInMemory));
+
+        struct TContext {
+            TTestSharedCache& Cache;
+            TCollectionCacheItem Collection;
+            TPageCacheItem Page;
+            bool Reheat;
+            bool Visited = false;
+            bool Reclaimed = false;
+            ui32 RefsDuringPromotion = 0;
+            TTestSharedCachePageRef Reader;
+        } context{ *fixture.Cache, collection, page, reheat };
+
+        TTestTraits hooks{ &context,
+            [](void* ptr, ESharedCacheHookPoint at, TCacheItem item) noexcept {
+                auto& ctx = *static_cast<TContext*>(ptr);
+                if (at == ESharedCacheHookPoint::AfterKeepColdPromotion && item == ctx.Page.CacheItem() &&
+                    !ctx.Visited) {
+                    ctx.Visited = true;
+                    ctx.RefsDuringPromotion = TSharedCacheTestAccess::HandleState(ctx.Cache, item.Index()).Refs();
+                    if (ctx.Reheat) {
+                        Y_ABORT_UNLESS(ctx.Cache.Find(ctx.Collection, 1, ctx.Reader) == ESharedCacheResultStatus::Hit);
+                    }
+                    ctx.Reclaimed = TSharedCacheTestAccess::WithSpace(ctx.Cache, [&](TSpaceOperation& op) {
+                        return TSharedCacheTestAccess::ReclaimCold(ctx.Cache, op);
+                    });
+                }
+            } };
+        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+        held.Drop();
+        UNIT_ASSERT(context.Visited);
+        UNIT_ASSERT_VALUES_EQUAL(context.RefsDuringPromotion, 1);
+        UNIT_ASSERT(!context.Reclaimed);
+        const auto state = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+        UNIT_ASSERT_VALUES_EQUAL(state.Version(), page.Version());
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), reheat ? 1 : 0);
+        UNIT_ASSERT(reheat ? state.IsHot() : state.IsKeepCold());
+        const ui64 keepBytes = reheat ? 0 : bytes;
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdOwnedBytes(), keepBytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdBytes(), keepBytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdPages(), reheat ? 0 : 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->HotBytes(), reheat ? bytes : 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->HotPages(), reheat ? 1 : 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->RetainedBytes(), bytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdPages(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(
+            TSharedCacheTestAccess::CollectionValue(*fixture.Cache, collection.Index())->ActivePageBytes(), bytes);
+        if (!reheat) {
+            UNIT_ASSERT(TSharedCacheTestAccess::ColdVersion(*fixture.Cache, page.Index()) & KeepColdQueuedMask);
+        }
+    }
+
+    Y_UNIT_TEST(ReviewR8PromotionPinsPageAgainstOldColdToken) {
+        ReviewColdPromotion(false);
+    }
+
+    Y_UNIT_TEST(ReviewR8ReheatOvertakesPromotionAccounting) {
+        ReviewColdPromotion(true);
+    }
+
     Y_UNIT_TEST(ShutdownReleasesPageBuffersBeforeCollectionMetadata) {
         bool pagesReleasedBeforeCollection = false;
         {

@@ -823,14 +823,14 @@ void TSharedCache::UpdateColdReclaimable(ui64 payloadBytes, THandleState before,
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCache::AdvanceColdMembership(THandle& handle) noexcept {
+ui32 TSharedCache::AdvanceColdMembership(THandle& handle) noexcept {
     ui32 expected = handle.ColdVersion.load(std::memory_order_relaxed);
     for (;;) {
         const ui32 desired = AdvanceColdVersion(expected & MaxItemVersion);
         if (handle.ColdVersion.compare_exchange_weak(
                 expected, desired, std::memory_order_release, std::memory_order_relaxed))
         {
-            return;
+            return desired;
         }
     }
 }
@@ -1228,11 +1228,11 @@ Y_FORCE_INLINE void TSharedCache::CompleteHotEviction(TSpaceOperation& spaceOp, 
             }
         }
     }
-    ReleaseHotEvictionPin(spaceOp, pin, initialColdVersion);
+    ReleaseKeepColdPin(spaceOp, pin, initialColdVersion);
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCache::ReleaseHotEvictionPin(
+void TSharedCache::ReleaseKeepColdPin(
     TSpaceOperation& spaceOp, TOperationItemRef& pin, ui32 initialColdVersion) noexcept {
     const TCacheItem cacheItem = pin.CacheItem();
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
@@ -5078,17 +5078,18 @@ bool TSharedCache::TryReleaseColdPageToKeepCold(
         AddActivePageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
     }
     AddKeepColdOwnedBytes(bytes);
-    const THandleState desired = expected.DecrementRefs().WithState(EHandleState::KeepCold);
+    // Preserve this reference until membership and accounting are ready for the unreferenced handoff.
+    const THandleState desired = expected.WithState(EHandleState::KeepCold);
     if (handle.State.compare_exchange_weak(
             expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
     {
-        AdvanceColdMembership(handle);
+        TOperationItemRef pin(spaceOp, cacheItem);
+        InvokeHook(ESharedCacheHookPoint::AfterKeepColdPromotion, cacheItem);
+        const ui32 coldVersion = AdvanceColdMembership(handle);
         TransferEstimatedBytes(ColdBytes_, KeepColdBytes_, bytes);
         TransferEstimatedPages(ColdPages_, KeepColdPages_, EItemKind::Page);
         ColdItems_.fetch_sub(1, std::memory_order_relaxed);
-        const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
-        RouteKeepCold(spaceOp, TColdCacheItem::Make(coldVersion, cacheItem.Index()));
-        NotifyResourcesAvailable();
+        ReleaseKeepColdPin(spaceOp, pin, coldVersion);
         return true;
     }
     SubtractExactBytes(KeepColdOwnedBytes_, bytes);

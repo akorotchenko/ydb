@@ -874,6 +874,8 @@ private:
 
     bool DemoteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem, TPageCacheItem expectedPage = {}) noexcept;
     void ReleaseColdDemotionPin(TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin) noexcept;
+    void ReleaseKeepColdPin(
+        TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept;
 
     void WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
 
@@ -889,7 +891,7 @@ private:
 
     void UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept;
 
-    static void AdvanceColdMembership(THandle& handle) noexcept;
+    static ui32 AdvanceColdMembership(THandle& handle) noexcept;
 
     static bool AdvanceColdMembership(
         THandle& handle, ui32 expectedVersion, bool keepColdQueued, ui32& newVersion) noexcept;
@@ -905,8 +907,6 @@ private:
         THandle& handle, TCacheItem cacheItem, THandleState& state, ui8& frequency) noexcept;
     Y_FORCE_INLINE void CompleteHotEviction(TSpaceOperation& spaceOp, THandle& handle, THandleState coldState,
         ui64 bytes, TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept;
-    void ReleaseHotEvictionPin(
-        TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept;
 
     void ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept;
 
