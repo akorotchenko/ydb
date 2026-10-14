@@ -1253,6 +1253,31 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         CompleteBucketResize(*fixture.Cache, *fixture.Space);
     }
 
+    Y_UNIT_TEST(ReviewR3RelocatedTailUsesReplacementVersion) {
+        TFixture fixture;
+        const auto token = MakeCollectionCacheItem(103, 50003);
+        const auto sourceKey = ReviewKeyForBucket(token, 63, 0, 40000);
+        const auto spareKey = ReviewKeyForBucket(token, 63, 1, 50000);
+        const auto spare = InsertReadyPage(*fixture.Cache, spareKey);
+        auto spareHold = FindPage(*fixture.Cache, spareKey);
+        const auto source = InsertReadyPage(*fixture.Cache, sourceKey);
+        auto sourceHold = FindPage(*fixture.Cache, sourceKey);
+        auto fillers = HoldReviewFillers(fixture, 63, 0);
+        spareHold.Ref.Drop();
+        if (TSharedCacheTestAccess::HandleState(*fixture.Cache, spare.Index()).IsHot()) {
+            UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, spare));
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::EraseCold(*fixture.Cache, MakeColdItem(*fixture.Cache, spare.Index())));
+        UNIT_ASSERT(TSharedCacheTestAccess::RelocatePage(*fixture.Cache, source));
+        const auto replacement =
+            TCacheItem::FromRaw(TSharedCacheTestAccess::HandleNext(*fixture.Cache, source.Index())).WithoutFrozen();
+        UNIT_ASSERT_VALUES_EQUAL(replacement.Index(), spare.Index());
+        UNIT_ASSERT(replacement.Version() != source.Version());
+        AssertReviewTerminal(*fixture.Cache, replacement, "R3");
+        const auto missing = ReviewKeyForBucket(token, 63, 0, 60000, &sourceKey);
+        UNIT_ASSERT(FindPage(*fixture.Cache, missing).Status == ESharedCacheResultStatus::Miss);
+    }
+
     Y_UNIT_TEST(ShutdownReleasesPageBuffersBeforeCollectionMetadata) {
         bool pagesReleasedBeforeCollection = false;
         {

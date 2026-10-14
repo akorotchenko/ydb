@@ -4391,7 +4391,8 @@ EHandleState TSharedCache::PublishPageReplacement(
     THandle& source = spaceOp.Handles()[sourceItem.Index()];
     THandle& replacement = spaceOp.Handles()[replacementItem.Index()];
     const TCacheItem successor = Table_.FreezeNext(spaceOp, sourceItem).WithoutFrozen();
-    replacement.Next.store(successor.Raw(), std::memory_order_relaxed);
+    const TCacheItem next = successor.IsNull() ? TCacheItem::Make(replacementItem.Version(), 0) : successor;
+    replacement.Next.store(next.Raw(), std::memory_order_relaxed);
     source.Next.store(replacementItem.WithFrozen().Raw(), std::memory_order_release);
 
     ui64 expectedRaw = source.State.load(std::memory_order_relaxed);
