@@ -17,6 +17,10 @@
 
 #include <library/cpp/blockcodecs/codecs.h>
 
+#include <util/generic/hash_set.h>
+
+#include <cstring>
+
 #include <ydb/library/actors/core/actorsystem.h>
 #include <ydb/library/actors/core/executor_thread.h>
 
@@ -78,7 +82,7 @@ bool PlausibleMeta(TStringBuf raw) {
 // The offline application uses normal AppData owner resolution without starting actor workers.
 class TApplicationContext {
 public:
-    TApplicationContext()
+    explicit TApplicationContext(ui64 cacheBytes)
         : AppData_(0, 0, 0, 0, {}, nullptr, nullptr, nullptr, nullptr)
     {
         THolder<TActorSystemSetup> setup = MakeHolder<TActorSystemSetup>();
@@ -92,10 +96,12 @@ public:
             NSharedCache::TSharedCacheCapacity capacity;
             constexpr ui32 hazards = NActors::MaxWorkers;
             Y_ENSURE(NSharedCache::TryCalculateSharedCacheCapacity(
-                128_MB, NSharedCache::TSharedCache::ExpectedPageSize, 0, hazards, capacity));
+                cacheBytes, NSharedCache::TSharedCache::ExpectedPageSize, 0, hazards, capacity));
             auto core = NSharedCache::TSharedCache::Create(
                 NSharedCache::TSharedCacheSpace::Create(capacity, capacity, hazards), capacity.Limit);
             Y_ENSURE(core);
+            Y_ENSURE(core->UpdateSoftLimit(0));
+            Y_ENSURE(core->UpdateStickyLimit(0));
         } catch (...) {
             TlsActivationContext = Previous_;
             throw;
@@ -115,9 +121,7 @@ private:
     TActivationContext* Previous_ = nullptr;
 };
 
-// Pages read straight out of the blob store. This backs both NTable::TLoader while the parts are being
-// built and the iterators while the tables are being dumped, so what has been read is kept: a page is
-// touched again and again during a scan, and IPages hands out plain pointers that have to stay valid.
+// Synchronous offline reads use the normal cache; readers own the pages for as long as they use them.
 class TOfflinePages : public NTable::IPages {
 public:
     TOfflinePages(TBlobStore& store, TTabletBootStats& stats, TRepeatedIssues& repeated)
@@ -130,7 +134,6 @@ public:
         auto& cache = TSharedCache::Get();
         auto binding = cache.BindCurrentThreadHazard();
         for (auto& [_, entry] : Cache) {
-            entry.Pages.clear();
             if (entry.Collection) {
                 cache.DetachCollection(entry.Collection.CacheItem());
             }
@@ -205,33 +208,38 @@ public:
     TSharedCachePageRef GetPage(const TLogoBlobID& label,
         const TIntrusiveConstPtr<NPageCollection::IPageCollection>& pageCollection, const TPageLocation& location)
     {
-        auto& slot = Cache[label].Pages[location.Offset];
-        if (slot.Ref) {
-            return slot.Ref.Acquire();
-        }
-        if (slot.Failed) {
+        auto& failed = Cache[label].FailedPages;
+        if (failed.contains(location.Offset)) {
             return {};
         }
 
         auto& cache = TSharedCache::Get();
         auto binding = cache.BindCurrentThreadHazard();
         NSharedCache::TSharedCacheCollectionRef collection;
+        TSharedCachePageRef page;
         if (cache.Find(label, collection) == NSharedCache::ESharedCacheResultStatus::Hit &&
-            cache.Find(collection.CacheItem(), static_cast<ui64>(location.Offset), slot.Ref) ==
+            cache.Find(collection.CacheItem(), static_cast<ui64>(location.Offset), page) ==
                 NSharedCache::ESharedCacheResultStatus::Hit) {
-            return slot.Ref.Acquire();
+            return page;
         }
 
         TSharedData data;
         if (!Read(*pageCollection, label, location, data)) {
-            slot.Failed = true;
+            failed.insert(location.Offset);
             return {};
         }
-        slot.Ref = cache.AdmitPage(pageCollection, location, std::move(data),
-            NTable::TLoader::NeedIn(location.Type) || location.Type == EPage::FlatIndex);
-        Y_ENSURE(slot.Ref, "Cannot admit offline page " << location.Offset);
+        for (;;) {
+            const ui64 usage = cache.PageUsage();
+            // Admission bounds its reclamation work; keep the input for another synchronous attempt.
+            page = cache.AdmitPage(pageCollection, location, TSharedData(data));
+            if (page) {
+                break;
+            }
+            Y_ENSURE(
+                cache.PageUsage() < usage, "Offline cache capacity exhausted while reading page " << location.Offset);
+        }
         ++Stats.PagesRead;
-        return slot.Ref.Acquire();
+        return page;
     }
 
 private:
@@ -254,8 +262,8 @@ private:
             return false;
         }
 
-        TString body;
-        body.reserve(bound.Bytes);
+        TSharedData body = TSharedData::Uninitialized(bound.Bytes);
+        char* next = body.mutable_data();
         ui64 left = bound.Bytes;
         for (ui32 index = bound.Lo.Blob; index <= bound.Up.Blob && left; ++index) {
             NPageCollection::TGlobId glob;
@@ -279,7 +287,8 @@ private:
                 return false;
             }
             const ui64 take = Min(left, blob->size() - skip);
-            body.append(blob->data() + skip, take);
+            ::memcpy(next, blob->data() + skip, take);
+            next += take;
             left -= take;
         }
         if (left) {
@@ -301,22 +310,16 @@ private:
             return false;
         }
 
-        out = TSharedData::Copy(body.data(), body.size());
+        out = std::move(body);
         return true;
     }
 
     TBlobStore& Store;
     TTabletBootStats& Stats;
     TRepeatedIssues& Repeated;
-    // Node based, so the pointers handed out through IPages survive later insertions.
-    struct TPageEntry {
-        TSharedCachePageRef Ref;
-        bool Failed = false;
-    };
-
     struct TCollectionEntry {
         TSharedCacheCollectionRef Collection;
-        THashMap<TPageOffset, TPageEntry> Pages;
+        THashSet<TPageOffset> FailedPages;
     };
 
     THashMap<TLogoBlobID, TCollectionEntry> Cache;
@@ -326,8 +329,9 @@ private:
 
 class TTabletBoot::TImpl {
 public:
-    TImpl(TBlobStore& store, ui64 tabletId, TIssueLog& issues)
-        : Store(store)
+    TImpl(TBlobStore& store, ui64 tabletId, TIssueLog& issues, ui64 cacheBytes)
+        : ApplicationContext(cacheBytes)
+        , Store(store)
         , TabletId(tabletId)
         , Issues(issues)
         , Repeated("tablet-db", "blob")
@@ -1067,8 +1071,8 @@ bool TTabletBoot::TImpl::Run(const TTabletLogHistory& history) {
     return true;
 }
 
-TTabletBoot::TTabletBoot(TBlobStore& store, ui64 tabletId, TIssueLog& issues)
-    : Impl(MakeHolder<TImpl>(store, tabletId, issues))
+TTabletBoot::TTabletBoot(TBlobStore& store, ui64 tabletId, TIssueLog& issues, ui64 cacheBytes)
+    : Impl(MakeHolder<TImpl>(store, tabletId, issues, cacheBytes))
 {}
 
 TTabletBoot::~TTabletBoot() = default;

@@ -40,7 +40,7 @@ struct TTabletBootStats {
 // reported and skipped rather than ending the run.
 class TTabletBoot {
 public:
-    TTabletBoot(TBlobStore& store, ui64 tabletId, TIssueLog& issues);
+    TTabletBoot(TBlobStore& store, ui64 tabletId, TIssueLog& issues, ui64 cacheBytes = 128 * 1024 * 1024);
     ~TTabletBoot();
 
     bool Run(const TTabletLogHistory& history);

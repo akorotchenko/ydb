@@ -252,13 +252,13 @@ namespace {
                         Out << "nof";
                     }
 
-                    if (auto bytes = (blob ? (*blob)->size() : 0)) {
+                    if (auto bytes = (blob ? blob.Data().size() : 0)) {
                         Out << " raw " << bytes << "b";
                     } else {
                         Out << " -";
                     }
 
-                    if (frame.Size && blob && frame.Size != (*blob)->size()) {
+                    if (frame.Size && blob && frame.Size != blob.Data().size()) {
                         Out << " **"; /* error indicator */
                     }
 

@@ -1308,6 +1308,7 @@ namespace NTable {
     private:
         Y_FORCE_INLINE void ClearKey()
         {
+            LocatedValues.clear();
             KeyInitialized = false;
             SkipMainDeltas = 0;
             SkipMainVersion = false;
@@ -1379,11 +1380,14 @@ namespace NTable {
                 }
 
                 if (auto blob = Env->Locate(Part, ref, op)) {
-                    const auto got = NPage::TLabelWrapper().Read(**blob);
+                    const auto got = NPage::TLabelWrapper().Read(blob.Data());
 
                     Y_ENSURE(got == NPage::ECodec::Plain && got.Version == 0);
 
                     row.Set(pin.To, { ECellOp(op), ELargeObj::Inline }, TCell(*got));
+                    if (blob.HasOwner()) {
+                        LocatedValues.push_back(std::move(blob));
+                    }
                 } else if (op == ELargeObj::Outer) {
                     op = TCellOp(blob.Need ? ECellOp::Null : ECellOp(op), ELargeObj::Outer);
 
@@ -1409,6 +1413,10 @@ namespace NTable {
         IPages* const Env;
 
     private:
+        friend class TRunIter;
+
+        // Cells from every version of the current key may remain in compaction's saved rows.
+        mutable TVector<IPages::TResult> LocatedValues;
         const TPinout Pinout;
         const TIntrusiveConstPtr<TKeyCellDefaults> KeyCellDefaults;
 
@@ -1462,6 +1470,8 @@ namespace NTable {
 
         EReady Seek(const TCells key, ESeek seek)
         {
+            ReleaseLocatedValues();
+
             bool seekToSliceFirstRow = false;
             TRun::const_iterator pos;
 
@@ -1541,6 +1551,8 @@ namespace NTable {
 
         EReady SeekReverse(const TCells key, ESeek seek)
         {
+            ReleaseLocatedValues();
+
             bool seekToSliceLastRow = false;
             TRun::const_iterator pos;
 
@@ -1780,6 +1792,15 @@ namespace NTable {
         }
 
     private:
+        template <class TIteratorOps>
+        friend class TTableIterBase;
+
+        void ReleaseLocatedValues() {
+            if (CurrentIt) {
+                CurrentIt->LocatedValues.clear();
+            }
+        }
+
         Y_FORCE_INLINE void InitCurrent()
         {
             const auto* part = Current->Part.Get();
@@ -1796,6 +1817,7 @@ namespace NTable {
         Y_FORCE_INLINE void DropCurrent()
         {
             Y_DEBUG_ABORT_UNLESS(CurrentIt, "Dropping non-existant current iterator");
+            ReleaseLocatedValues();
             const auto* part = CurrentIt->Part;
             Cache[part] = std::move(CurrentIt);
         }
