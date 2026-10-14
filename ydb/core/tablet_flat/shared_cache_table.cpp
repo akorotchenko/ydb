@@ -480,7 +480,8 @@ bool TSharedCacheTable::PrepareSplitMarker(const TSpaceOperation& spaceOp, TCach
         return false;
     }
     Y_ABORT_UNLESS(expected.IsFree() && expected.Refs() == 0);
-    marker.Next.store(suffix.Raw(), std::memory_order_relaxed);
+    const TCacheItem next = suffix.IsNull() ? TCacheItem::Make(expected.Version(), 0) : suffix;
+    marker.Next.store(next.Raw(), std::memory_order_relaxed);
     const THandleState desired =
         expected.WithState(EHandleState::BucketSplit).WithFrequency(0).WithSticky(EStickyState::None).WithRefs(1);
     if (!marker.State.compare_exchange_strong(
@@ -598,7 +599,8 @@ bool TSharedCacheTable::ActivateBucketSplit(
             return false;
         }
     }
-    spaceOp.Handles()[ResizeMarkerIndex].Next.store(boundary.Expected.Raw(), std::memory_order_relaxed);
+    const TCacheItem next = boundary.Expected.IsNull() ? TCacheItem::Make(marker.Version(), 0) : boundary.Expected;
+    spaceOp.Handles()[ResizeMarkerIndex].Next.store(next.Raw(), std::memory_order_relaxed);
     ui64 expectedPeer = 0;
     if (!spaceOp.Buckets()[bucket | resize.SplitBit()].compare_exchange_strong(
             expectedPeer, marker.Raw(), std::memory_order_release, std::memory_order_acquire) &&
@@ -623,7 +625,8 @@ bool TSharedCacheTable::ActivateBucketMerge(
     const ui32 bucket = resize.Cursor();
     const TCacheItem highHead =
         TCacheItem::FromRaw(spaceOp.Buckets()[bucket | resize.SplitBit()].load(std::memory_order_acquire));
-    spaceOp.Handles()[ResizeMarkerIndex].Next.store(highHead.Raw(), std::memory_order_relaxed);
+    const TCacheItem next = highHead.IsNull() ? TCacheItem::Make(marker.Version(), 0) : highHead;
+    spaceOp.Handles()[ResizeMarkerIndex].Next.store(next.Raw(), std::memory_order_relaxed);
     TOrderedLink boundary;
     if (!FindSplitBoundary(spaceOp, bucket, 0, false, boundary)) {
         return false;
