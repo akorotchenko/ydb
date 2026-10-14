@@ -1278,6 +1278,75 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(FindPage(*fixture.Cache, missing).Status == ESharedCacheResultStatus::Miss);
     }
 
+    void ReviewBatchDetach(ESharedCacheHookPoint point) {
+        TFixture fixture;
+        const TLogoBlobID id(111, 112, 113);
+        const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+
+        struct TContext {
+            TFixture& Fixture;
+            TCollectionCacheItem Collection;
+            ESharedCacheHookPoint Point;
+            bool Detached = false;
+        } context{ fixture, collection, point };
+
+        TTestTraits hooks{ &context, [](void* ptr, ESharedCacheHookPoint at, TCacheItem item) noexcept {
+                              auto& ctx = *static_cast<TContext*>(ptr);
+                              if (at == ctx.Point && item == ctx.Collection.CacheItem() && !ctx.Detached) {
+                                  Y_ABORT_UNLESS(TSharedCacheTestAccess::CollectionReferences(
+                                                     *ctx.Fixture.Cache, ctx.Collection) == 2);
+                                  ctx.Detached = true;
+                                  Y_ABORT_UNLESS(TSharedCacheTestAccess::DetachCollection(
+                                      *ctx.Fixture.Cache, ctx.Fixture.Registry, ctx.Collection));
+                              }
+                          } };
+        TSharedCacheHookGuard hookGuard(*fixture.Cache, hooks);
+        TTestSharedCachePageRequest request(MakePageLocation(1), MakeIntrusive<TPageFetchWaiter>());
+        const bool admitted = fixture.Cache->FindOrInsertBatch(collection, { &request, 1 });
+        UNIT_ASSERT(context.Detached);
+        UNIT_ASSERT(admitted);
+        UNIT_ASSERT(request.Status() == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(request.Fetch().MakeReady(MakePageData(request.Fetch().CacheItem().Index())));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR4BatchSurvivesDetachAfterPreparation) {
+        ReviewBatchDetach(ESharedCacheHookPoint::AfterPageBatchPrepared);
+    }
+
+    Y_UNIT_TEST(ReviewR4BatchSurvivesDetachBeforeOwnerIncrement) {
+        ReviewBatchDetach(ESharedCacheHookPoint::AfterPageCollectionStateChecked);
+    }
+
+    Y_UNIT_TEST(ReviewR4BatchRejectsDetachedCollection) {
+        TFixture fixture;
+        const TLogoBlobID id(111, 112, 114);
+        const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
+        TTestSharedCachePageRequest request(MakePageLocation(1), MakeIntrusive<TPageFetchWaiter>());
+        UNIT_ASSERT(!fixture.Cache->FindOrInsertBatch(collection, { &request, 1 }));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR4RejectedBatchReleasesCollectionOwner) {
+        TFixture fixture;
+        const TLogoBlobID id(111, 112, 115);
+        const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        TTestSharedCachePageRequest request(
+            MakePageLocation(1, fixture.Cache->HardLimit()), MakeIntrusive<TPageFetchWaiter>());
+        UNIT_ASSERT(!fixture.Cache->FindOrInsertBatch(collection, { &request, 1 }));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection), 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+    }
+
     Y_UNIT_TEST(ShutdownReleasesPageBuffersBeforeCollectionMetadata) {
         bool pagesReleasedBeforeCollection = false;
         {

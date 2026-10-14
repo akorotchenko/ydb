@@ -11,6 +11,7 @@ namespace NKikimr::NSharedCache {
 enum class ESharedCacheHookPoint {
     BeforeKeepBytesPublished, // Payload is the collection whose contribution is being published.
     AfterPageBatchPrepared, // Payload is the collection after the batch presence checks.
+    AfterPageCollectionStateChecked, // Collection, before InitializePage increments its owner count.
     AfterInsertPositionFound, // Payload is the link owner, before candidate preparation or publication.
     BeforeTableLinkCas, // Payload is the link owner, may be null.
     AfterTableLinkCas, // Payload is the link owner, may be null.
