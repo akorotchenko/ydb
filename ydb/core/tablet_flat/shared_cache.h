@@ -589,6 +589,7 @@ private:
         ui32 Crc32 = 0;
         EStickyState Sticky = EStickyState::None;
         TCacheItem CacheItem;
+        bool CollectionOwnerHeld = false; // a batch owns the collection through candidate retries
         bool Prepare = false; // the page is absent from the table and needs an allocated pending item
         bool WaitForMemory = false;
         bool StickyBudgetDenied = false; // count only if this prepared page wins table insertion
@@ -727,7 +728,7 @@ private:
 
     void InitializePage(TSpaceOperation& spaceOp, TCacheItem cacheItem, TCollectionCacheItem collection, ui64 offset,
         ui64 size, NTable::NPage::EPage type, ui32 crc32, EStickyState sticky, bool reserved = true,
-        bool relocating = false) noexcept;
+        bool collectionOwnerHeld = false) noexcept;
 
     void InitializeCollection(
         TSpaceOperation& spaceOp, TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept;

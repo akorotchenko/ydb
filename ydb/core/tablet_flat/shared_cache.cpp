@@ -8,6 +8,7 @@
 #include <ydb/library/actors/core/thread_context.h>
 
 #include <util/generic/cast.h>
+#include <util/generic/scope.h>
 #include <util/system/spinlock.h>
 
 #include <cmath>
@@ -2053,7 +2054,7 @@ TCollectionCacheItem TSharedCache::AllocateCollection(const TLogoBlobID& id, ui6
 SHARED_CACHE_TEMPLATE
 void TSharedCache::InitializePage(TSpaceOperation& spaceOp, TCacheItem cacheItem, TCollectionCacheItem collection,
     ui64 offset, ui64 size, NTable::NPage::EPage type, ui32 crc32, EStickyState sticky, bool reserved,
-    bool relocating) noexcept {
+    bool collectionOwnerHeld) noexcept {
     Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AccessibleHandleCount());
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     const THandleState claimed = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
@@ -2068,7 +2069,8 @@ void TSharedCache::InitializePage(TSpaceOperation& spaceOp, TCacheItem cacheItem
     if (TCollection* owner = PageCollection(spaceOp, handle)) {
         const THandle& collection = spaceOp.Handles()[owner->CacheItem.CacheItem().Index()];
         const THandleState state = THandleState::FromRaw(collection.State.load(std::memory_order_acquire));
-        Y_ABORT_UNLESS(state.IsSticky() && (state.IsStickyField() || relocating));
+        Y_ABORT_UNLESS(state.IsSticky() && (state.IsStickyField() || collectionOwnerHeld));
+        InvokeHook(ESharedCacheHookPoint::AfterPageCollectionStateChecked, owner->CacheItem.CacheItem());
         const ui64 previous = owner->References.fetch_add(1, std::memory_order_relaxed);
         Y_ABORT_UNLESS(previous != 0);
     }
@@ -3287,7 +3289,7 @@ bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandida
                                 : admissionMode == ECacheMode::TryKeepInMemory                 ? EStickyState::None
                                                                                                : candidate.Sticky;
     InitializePage(spaceOp, cacheItem, collection, candidate.Key.Word(1), candidate.Size, candidate.Type,
-        candidate.Crc32, sticky, reserved);
+        candidate.Crc32, sticky, reserved, candidate.CollectionOwnerHeld);
     candidate.StickyBudgetDenied =
         sticky == EStickyState::Sticky &&
         !THandleState::FromRaw(spaceOp.Handles()[cacheItem.Index()].State.load(std::memory_order_relaxed))
@@ -3420,6 +3422,7 @@ bool TSharedCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollection& colle
 
         TPageInsertCandidate candidate = BuildPageInsertCandidate(
             collection.CacheItem, request.Location, request.Sticky ? EStickyState::Sticky : EStickyState::None);
+        candidate.CollectionOwnerHeld = true;
         // Only pages that are absent from the table need admission budget: a page that is already resident is
         // a hit or a pending subscription and must be admitted even when the cache is at its limit.
         TCacheItem resident;
@@ -3474,7 +3477,7 @@ bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& coll
                                         ? EStickyState::Sticky
                                         : EStickyState::None;
         InitializePage(spaceOp, cacheItem, collection.CacheItem, candidate.Key.Word(1), candidate.Size, candidate.Type,
-            candidate.Crc32, sticky, reserved);
+            candidate.Crc32, sticky, reserved, true);
         candidate.StickyBudgetDenied =
             sticky == EStickyState::Sticky &&
             !THandleState::FromRaw(spaceOp.Handles()[cacheItem.Index()].State.load(std::memory_order_relaxed))
@@ -3503,10 +3506,27 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
     }
     THandle& collectionHandle = spaceOp.Handles()[collection.Index()];
     const THandleState collectionState = THandleState::FromRaw(collectionHandle.State.load(std::memory_order_acquire));
-    if (!collection.Matches(collectionState) || !collectionState.IsReady() || !collectionHandle.Body.Collection) {
+    if (!collection.Matches(collectionState) || !collectionState.IsSticky() || !collectionState.IsStickyField() ||
+        !collectionHandle.Body.Collection) {
         return false;
     }
     TCollection& owner = *collectionHandle.Body.Collection;
+    // A handle ref protects the object, but only an owner ref prevents detach from making it reclaimable.
+    // Never revive zero: detach may have already dropped the last owner after the state check above.
+    ui64 owners = owner.References.load(std::memory_order_relaxed);
+    do {
+        if (owners == 0) {
+            return false;
+        }
+    } while (!owner.References.compare_exchange_weak(
+        owners, owners + 1, std::memory_order_acquire, std::memory_order_relaxed));
+    Y_DEFER {
+        DropOwnerReference(spaceOp, owner);
+    };
+    const THandleState admittedState = THandleState::FromRaw(collectionHandle.State.load(std::memory_order_acquire));
+    if (!collection.Matches(admittedState) || !admittedState.IsSticky() || !admittedState.IsStickyField()) {
+        return false;
+    }
     if (!PreparePageBatch(spaceOp, owner, requests, candidates, reservedBytes)) {
         return false;
     }
