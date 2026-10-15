@@ -1867,7 +1867,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 if (dispatched) {
                     UNIT_ASSERT(fetch.Dispatch());
                 }
-                fixture.MainHazard.Reset();
+                fixture.MainHazard = {};
                 UNIT_ASSERT(!TTestSharedCache::TryGet());
             }
             UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
@@ -1893,7 +1893,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                         EStickyState::None, firstWaiter, hit, first) == ESharedCacheResultStatus::Inserted);
         UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, collection, MakePageLocation(11),
                         EStickyState::None, secondWaiter, hit, second) == ESharedCacheResultStatus::Inserted);
-        fixture.MainHazard.Reset();
+        fixture.MainHazard = {};
         first = std::move(second);
         UNIT_ASSERT(first);
         UNIT_ASSERT(!second);
@@ -1918,7 +1918,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, MakeCollectionCacheItem(65, 66),
                             MakePageLocation(12), EStickyState::None, waiter, hit,
                             fetch) == ESharedCacheResultStatus::Inserted);
-            fixture.MainHazard.Reset();
+            fixture.MainHazard = {};
             fixture.Cache.Drop();
             UNIT_ASSERT_VALUES_EQUAL(waiter->RefCount(), 1);
             UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
@@ -1955,7 +1955,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(!fetch);
             UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
             UNIT_ASSERT_VALUES_EQUAL(waiter->RefCount(), 2);
-            fixture.MainHazard.Reset();
+            fixture.MainHazard = {};
             structural.Drop();
             fixture.Cache.Drop();
             UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
