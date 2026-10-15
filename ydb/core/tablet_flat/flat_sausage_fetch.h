@@ -15,7 +15,7 @@ namespace NPageCollection {
     struct TPagesWaitPad : public TThrRefBase {
         ui64 PendingRequests = 0;
         ui64 WorkingSetBytes = 0; // Immutable page budget for retry after releasing this attempt's pins.
-        // Set by the executor or fetch completions for non-Sticky pins; stays set for this attempt.
+        // Set by page clients or fetch completions when the attempt retains pins; stays set for this attempt.
         std::atomic<bool> HasPinnedPages{ false };
         bool PostponedForResources = false; // Cache-actor-owned; closes late requests of the abandoned attempt.
     };

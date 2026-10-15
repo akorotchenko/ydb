@@ -7,8 +7,9 @@
 namespace NKikimr {
 namespace NTable {
 
-bool BuildStats(const TSubset& subset, TStats& stats, ui64 rowCountResolution, ui64 dataSizeResolution, ui32 histogramBucketsCount, IPages* env, 
-    TBuildStatsYieldHandler yieldHandler, const TString& logPrefix)
+bool BuildStats(const TSubset& subset, TStats& stats, ui64 rowCountResolution, ui64 dataSizeResolution,
+    ui32 histogramBucketsCount, IPages* env, TBuildStatsYieldHandler yieldHandler, const TString& logPrefix,
+    NStats::TPageTracker* pageTracker)
 {
     stats.Clear();
 
@@ -22,8 +23,8 @@ bool BuildStats(const TSubset& subset, TStats& stats, ui64 rowCountResolution, u
     LOG_BUILD_STATS("starting for " << (mixedIndex ? "mixed" : "b-tree") << " index");
 
     auto ready = mixedIndex
-        ? BuildStatsMixedIndex(subset, stats, rowCountResolution, dataSizeResolution, env, yieldHandler)
-        : BuildStatsBTreeIndex(subset, stats, histogramBucketsCount, env, yieldHandler, logPrefix);
+        ? BuildStatsMixedIndex(subset, stats, rowCountResolution, dataSizeResolution, env, yieldHandler, pageTracker)
+        : BuildStatsBTreeIndex(subset, stats, histogramBucketsCount, env, yieldHandler, logPrefix, pageTracker);
 
     LOG_BUILD_STATS("finished for " << (mixedIndex ? "mixed" : "b-tree") << " index"
         << " ready: " << ready

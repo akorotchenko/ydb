@@ -75,6 +75,10 @@ namespace NPage {
             Parse();
         }
 
+        const TSharedCachePageRef& GetPageRef() const noexcept {
+            return Ref;
+        }
+
     private:
         TArrayRef<const char> Bytes() const noexcept {
             return Ref ? TArrayRef<const char>(Ref.data(), Ref.size()) : TArrayRef<const char>(Raw);

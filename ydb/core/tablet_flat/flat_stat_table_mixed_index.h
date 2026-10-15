@@ -8,7 +8,9 @@
 namespace NKikimr {
 namespace NTable {
 
-inline bool BuildStatsMixedIndex(const TSubset& subset, TStats& stats, ui64 rowCountResolution, ui64 dataSizeResolution, IPages* env, TBuildStatsYieldHandler yieldHandler) {
+inline bool BuildStatsMixedIndex(const TSubset& subset, TStats& stats, ui64 rowCountResolution,
+    ui64 dataSizeResolution, IPages* env, TBuildStatsYieldHandler yieldHandler,
+    NStats::TPageTracker* pageTracker = nullptr) {
     stats.Clear();
 
     TDataStats iteratorStats = { };
@@ -25,8 +27,9 @@ inline bool BuildStatsMixedIndex(const TSubset& subset, TStats& stats, ui64 rowC
         for (const auto& [_, bloom] : part->ByKeyPrefixes) {
             if (bloom) stats.ByKeyFilterSize += bloom->Raw.size();
         }
-        TAutoPtr<TStatsScreenedPartIterator> iter = new TStatsScreenedPartIterator(part, env, subset.Scheme->Keys, part->Small, part->Large, 
-            rowCountResolution / resolutionDivider, dataSizeResolution / resolutionDivider);
+        TAutoPtr<TStatsScreenedPartIterator> iter =
+            new TStatsScreenedPartIterator(part, env, subset.Scheme->Keys, part->Small, part->Large,
+                rowCountResolution / resolutionDivider, dataSizeResolution / resolutionDivider, pageTracker);
         auto ready = iter->Start();
         if (ready == EReady::Page) {
             started = false;
