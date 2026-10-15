@@ -495,15 +495,35 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
 
         UpsertRows(server, sender);
 
-        TBlockEvents<NSharedCache::TEvResult> block(runtime, [&](const NSharedCache::TEvResult::TPtr& event) {
-            return runtime.FindActorName(event->GetRecipientRewrite()) == "DATASHARD_STATS_BUILDER";
+        // Cached pages do not send a reply; force a statistics page miss after compaction.
+        auto& cache = *runtime.GetAppData().SharedCache;
+        TBlockEvents<NMemory::TEvConsumerLimit> limits(runtime, [&](const auto& event) {
+            return event->GetRecipientRewrite() == NSharedCache::MakeSharedPageCacheId() && event->Sender != sender;
+        });
+        runtime.Send(new IEventHandle(NSharedCache::MakeSharedPageCacheId(), sender,
+            new NMemory::TEvConsumerLimit(0, cache.HardLimit(), cache.CurrentLimit())));
+        runtime.WaitFor("disabled cache retention", [&] {
+            return cache.SoftLimit() == 0;
+        }, TDuration::Seconds(10));
+        std::deque<NSharedCache::TEvResult::TPtr> blocked;
+        auto block = runtime.AddObserver<NSharedCache::TEvResult>([&](auto& event) {
+            if (runtime.FindActorName(event->GetRecipientRewrite()) == "DATASHARD_STATS_BUILDER") {
+                blocked.emplace_back(std::move(event));
+            }
         });
 
         CompactTable(runtime, shard1, tableId1, false);
 
-        runtime.WaitFor("blocked read", [&]{ return block.size(); }, TDuration::Seconds(10));
+        runtime.WaitFor("blocked read", [&] {
+            return !blocked.empty();
+        }, TDuration::Seconds(10));
 
-        block.Stop().Unblock();
+        block.Remove();
+        while (!blocked.empty()) {
+            const ui32 nodeIndex = blocked.front()->GetRecipientRewrite().NodeId() - runtime.GetFirstNodeId();
+            runtime.Send(blocked.front().Release(), nodeIndex, true);
+            blocked.pop_front();
+        }
 
         {
             Cerr << "Waiting stats.." << Endl;
@@ -580,6 +600,11 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
         UNIT_ASSERT(cache.UpdateStickyLimit(0));
         const auto statsActor = requests.front()->Sender;
         const auto collection = requests.front()->Get()->PageCollection;
+        if (mode == EStatsPageBudget::TooSmall) {
+            const auto stats = GetTableStats(runtime, shard, tableId.PathId.LocalPathId);
+            UNIT_ASSERT_VALUES_EQUAL(stats.GetIndexSize(), 0);
+            UNIT_ASSERT(stats.GetRowCountHistogram().GetBuckets().empty());
+        }
         ui64 pageBudget = 0;
         ui64 indexBytes = 0;
         for (ui32 page = 0; page < collection->Total(); ++page) {
@@ -589,6 +614,7 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
                 indexBytes += info.Size;
             }
         }
+        pageBudget = Max(pageBudget, requests.front()->Get()->Pages.front().Size + NActors::TSharedData::OverheadSize);
         UNIT_ASSERT_GT(indexBytes, 4 * pageBudget);
         {
             auto binding = cache.BindCurrentThreadHazard();
@@ -596,7 +622,7 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
             }
         }
         const ui64 baselineBytes = cache.PageUsage();
-        const ui64 targetLimit = baselineBytes + (fits ? 32 * pageBudget : pageBudget);
+        ui64 targetLimit = baselineBytes + 32 * pageBudget;
         UNIT_ASSERT_C(indexBytes > targetLimit, "Index bytes " << indexBytes << " must exceed budget " << targetLimit
                                                                << " (baseline " << baselineBytes
                                                                << ", maximum page charge " << pageBudget << ")");
@@ -633,15 +659,45 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
             }
         });
         TIntrusivePtr<NPageCollection::TPagesWaitPad> waitingPad;
-        TBlockEvents<NSharedCache::TEvResult> ready(runtime, [&](const auto& event) {
-            return event->GetRecipientRewrite() == statsActor && event->Get()->ResourcesReady &&
-                   event->Get()->WaitPad == waitingPad;
+        std::deque<NSharedCache::TEvResult::TPtr> ready;
+        std::deque<NSharedCache::TEvResult::TPtr> pressure;
+        std::deque<NSharedCache::TEvResult::TPtr> initialPages;
+        bool blockInitialPages = mode == EStatsPageBudget::TooSmall;
+        bool blockReady = true;
+        bool blockPressure = mode == EStatsPageBudget::EarlyReady;
+        auto delayedResults = runtime.AddObserver<NSharedCache::TEvResult>([&](auto& event) {
+            if (event->GetRecipientRewrite() != statsActor) {
+                return;
+            }
+            if (blockReady && event->Get()->ResourcesReady && event->Get()->WaitPad == waitingPad) {
+                ready.emplace_back(std::move(event));
+            } else if (blockPressure && event->Get()->ResourcePressure) {
+                pressure.emplace_back(std::move(event));
+            } else if (blockInitialPages && !event->Get()->Pages.empty()) {
+                initialPages.emplace_back(std::move(event));
+            }
         });
-        TBlockEvents<NSharedCache::TEvResult> pressure(runtime, [&](const auto& event) {
-            return mode == EStatsPageBudget::EarlyReady && event->GetRecipientRewrite() == statsActor &&
-                   event->Get()->ResourcePressure;
-        });
-        if (retry) {
+        const auto release = [&](auto& events) {
+            while (!events.empty()) {
+                runtime.Send(events.front().Release(), 0, true);
+                events.pop_front();
+            }
+        };
+        if (mode == EStatsPageBudget::TooSmall) {
+            requests.Stop().Unblock();
+            runtime.WaitFor("initial statistics page before reducing its frontier budget", [&] {
+                return !initialPages.empty();
+            }, TDuration::Seconds(10));
+            // The root is already admitted; the next miss must need more than this whole budget.
+            targetLimit = initialPages.front()->Get()->Pages.front().Size + NActors::TSharedData::OverheadSize;
+            runtime.Send(new IEventHandle(NSharedCache::MakeSharedPageCacheId(), sender,
+                new NMemory::TEvConsumerLimit(0, cache.HardLimit(), targetLimit)));
+            runtime.WaitFor("statistics budget only fits its retained root", [&] {
+                return cache.CurrentLimit() == targetLimit;
+            }, TDuration::Seconds(10));
+            blockInitialPages = false;
+            release(initialPages);
+        } else if (retry) {
             while (!requests.front()->Get()->WaitPad->HasPinnedPages.load(std::memory_order_acquire)) {
                 requests.Unblock(1);
                 runtime.WaitFor("statistics request with a retained frontier", [&] {
@@ -679,7 +735,8 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
             UNIT_ASSERT(!completed);
             UNIT_ASSERT(requests.empty());
             if (mode == EStatsPageBudget::Cancel) {
-                ready.Stop().Unblock();
+                blockReady = false;
+                release(ready);
                 runtime.Send(new IEventHandle(statsActor, sender, new TEvents::TEvPoison));
                 runtime.WaitFor("statistics cancellation unregisters its resource gate", [&] {
                     return completed;
@@ -696,13 +753,15 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
                 }, TDuration::Seconds(10));
                 UNIT_ASSERT(ready.front()->Get()->WaitPad == pad);
                 UNIT_ASSERT_VALUES_EQUAL(pad->WorkingSetBytes, workingSetBytes);
-                ready.Stop().Unblock();
+                blockReady = false;
+                release(ready);
                 if (mode == EStatsPageBudget::EarlyReady) {
                     runtime.SimulateSleep(TDuration::MilliSeconds(1));
                     UNIT_ASSERT(!completed);
                     UNIT_ASSERT(requests.empty());
                 }
-                pressure.Stop().Unblock();
+                blockPressure = false;
+                release(pressure);
                 runtime.WaitFor("same statistics actor restarts with a fresh pad", [&] {
                     return !requests.empty() || completed;
                 }, TDuration::Seconds(10));
@@ -721,6 +780,11 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
         }, TDuration::Seconds(30));
         UNIT_ASSERT_VALUES_EQUAL(resourcePressure, retry);
         UNIT_ASSERT_VALUES_EQUAL(cache.CurrentLimit(), targetLimit);
+        if (!fits) {
+            const auto stats = GetTableStats(runtime, shard, tableId.PathId.LocalPathId);
+            UNIT_ASSERT_VALUES_EQUAL(stats.GetIndexSize(), 0);
+            UNIT_ASSERT(stats.GetRowCountHistogram().GetBuckets().empty());
+        }
         if (fits && mode != EStatsPageBudget::Cancel) {
             const auto stats = GetTableStats(runtime, shard, tableId.PathId.LocalPathId);
             UNIT_ASSERT_VALUES_EQUAL(stats.GetRowCount(), rows);
