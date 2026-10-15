@@ -1710,7 +1710,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TCollectionCacheItem ReplacementCollection;
             bool Visited = false;
             bool Reclaimed = false;
-            TPageCacheItem Replacement;
+            TPageCacheItem Replacement = {};
             ui32 ReplacementMembership = 0;
         } context{ *fixture.Cache, source, b };
 
@@ -1773,7 +1773,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             bool Visited = false;
             bool Reclaimed = false;
             ui32 RefsDuringPromotion = 0;
-            TTestSharedCachePageRef Reader;
+            TTestSharedCachePageRef Reader = {};
         } context{ *fixture.Cache, collection, page, reheat };
 
         TTestTraits hooks{ &context,

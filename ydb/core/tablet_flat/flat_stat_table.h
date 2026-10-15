@@ -223,8 +223,9 @@ using TBuildStatsYieldHandler = std::function<void()>;
     } while (0)
 #endif
 
-bool BuildStats(const TSubset& subset, TStats& stats, ui64 rowCountResolution, ui64 dataSizeResolution, ui32 histogramBucketsCount, IPages* env, 
-    TBuildStatsYieldHandler yieldHandler, const TString& logPrefix = {});
+bool BuildStats(const TSubset& subset, TStats& stats, ui64 rowCountResolution, ui64 dataSizeResolution,
+    ui32 histogramBucketsCount, IPages* env, TBuildStatsYieldHandler yieldHandler, const TString& logPrefix = {},
+    NStats::TPageTracker* pageTracker = nullptr);
 
 void GetPartOwners(const TSubset& subset, THashSet<ui64>& partOwners);
 

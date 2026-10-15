@@ -227,7 +227,8 @@ bool AddDataSize(const TPartView& part, TStats& stats, IPages* env, TBuildStatsY
 
 }
 
-bool BuildStatsBTreeIndex(const TSubset& subset, TStats& stats, ui32 histogramBucketsCount, IPages* env, TBuildStatsYieldHandler yieldHandler, const TString& logPrefix) {
+bool BuildStatsBTreeIndex(const TSubset& subset, TStats& stats, ui32 histogramBucketsCount, IPages* env,
+    TBuildStatsYieldHandler yieldHandler, const TString& logPrefix, NStats::TPageTracker* pageTracker) {
     stats.Clear();
 
     bool ready = true;
@@ -244,9 +245,8 @@ bool BuildStatsBTreeIndex(const TSubset& subset, TStats& stats, ui32 histogramBu
         return false;
     }
 
-    ready &= BuildStatsHistogramsBTreeIndex(subset, stats, 
-        stats.RowCount / histogramBucketsCount, stats.DataSize.Size / histogramBucketsCount, 
-        env, yieldHandler, logPrefix);
+    ready &= BuildStatsHistogramsBTreeIndex(subset, stats, stats.RowCount / histogramBucketsCount,
+        stats.DataSize.Size / histogramBucketsCount, env, yieldHandler, logPrefix, pageTracker);
 
     return ready;
 }

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "flat_stat_part_group_iter_iface.h"
-#include "flat_page_btree_index.h"
+#include "flat_stat_page.h"
 #include "flat_table_part.h"
 
 namespace NKikimr::NTable {
@@ -13,7 +13,7 @@ class TStatsPartGroupBtreeIndexIter : public IStatsPartGroupIter {
     using TRecIdx = NPage::TRecIdx;
     using TChild = TBtreeIndexNode::TChild;
     using TColumns = TBtreeIndexNode::TColumns;
-    using TCellsIterable = TBtreeIndexNode::TCellsIterable;
+    using TKeyView = NStats::TKeyView;
     using TCellsIter = TBtreeIndexNode::TCellsIter;
     using TBtreeIndexMeta = NPage::TBtreeIndexMeta;
 
@@ -21,26 +21,27 @@ class TStatsPartGroupBtreeIndexIter : public IStatsPartGroupIter {
         TPageRef Ref;
         TRowId BeginRowId;
         TRowId EndRowId;
-        TCellsIterable BeginKey;
+        TKeyView BeginKey;
         ui64 BeginDataSize;
         ui64 EndDataSize;
 
-        TNodeState(TPageRef ref, TRowId beginRowId, TRowId endRowId, TCellsIterable beginKey, ui64 beginDataSize, ui64 endDataSize)
+        TNodeState(
+            TPageRef ref, TRowId beginRowId, TRowId endRowId, TKeyView beginKey, ui64 beginDataSize, ui64 endDataSize)
             : Ref(std::move(ref))
             , BeginRowId(beginRowId)
             , EndRowId(endRowId)
-            , BeginKey(beginKey)
+            , BeginKey(std::move(beginKey))
             , BeginDataSize(beginDataSize)
             , EndDataSize(endDataSize)
-        {
-        }
+        {}
     };
 
 public:
-    TStatsPartGroupBtreeIndexIter(const TPart* part, IPages* env, TGroupId groupId,
-            ui64 rowCountResolution, ui64 dataSizeResolution, const TVector<TRowId>& splitPoints)
+    TStatsPartGroupBtreeIndexIter(const TPart* part, IPages* env, TGroupId groupId, ui64 rowCountResolution,
+        ui64 dataSizeResolution, const TVector<TRowId>& splitPoints, NStats::TPageTracker* pageTracker = nullptr)
         : Part(part)
         , Env(env)
+        , PageTracker(pageTracker)
         , GroupId(groupId)
         , GroupInfo(part->Scheme->GetLayout(groupId))
         , Meta(groupId.IsHistoric() ? part->IndexPages.BTreeHistoric[groupId.Index] : part->IndexPages.BTreeGroups[groupId.Index])
@@ -52,16 +53,14 @@ public:
     {
         Y_DEBUG_ABORT_UNLESS(std::is_sorted(SplitPoints.begin(), SplitPoints.end()));
     }
-    
-    EReady Start() override {
-        const static TCellsIterable EmptyKey(static_cast<const char*>(nullptr), TColumns());
 
+    EReady Start() override {
         bool ready = true;
         TVector<TNodeState> nextNodes;
         auto rootLoc = GetBTreeRootLocation(Meta,
             Part->GetPageCollection(0),               // btree index pages always room 0
             Part->GetPageCollection(GroupId.Index));  // data pages in the group's room
-        Nodes.emplace_back(TPageRef(rootLoc), 0, GetEndRowId(), EmptyKey, 0, Meta.GetDataSize());
+        Nodes.emplace_back(TPageRef(rootLoc), 0, GetEndRowId(), TKeyView(), 0, Meta.GetDataSize());
 
         for (ui32 height = 0; height < Meta.LevelCount(); height++) {
             bool hasChanges = false;
@@ -75,7 +74,7 @@ public:
                     // split node and go deeper
                 } else if (nodeState.EndRowId - nodeState.BeginRowId <= RowCountResolution
                         && nodeState.EndDataSize - nodeState.BeginDataSize <= DataSizeResolution) {
-                    nextNodes.push_back(nodeState); // lift current node on the next level as-is
+                    nextNodes.push_back(std::move(nodeState)); // lift current node on the next level as-is
                     continue; // don't go deeper
                 }
 
@@ -85,7 +84,8 @@ public:
                     ready = false;
                     continue; // continue requesting other nodes
                 }
-                TBtreeIndexNode node(std::move(page), Meta.HasRootV2());
+                auto pageOwner = MakeIntrusive<NStats::TIndexPage>(std::move(page), Meta.HasRootV2(), PageTracker);
+                const auto& node = pageOwner->Node;
 
                 bool isLeafLevel = (height + 1 == Meta.LevelCount());
 
@@ -94,11 +94,14 @@ public:
 
                     TRowId beginRowId = pos ? node.GetChildRowCount(pos - 1) : nodeState.BeginRowId;
                     TRowId endRowId = node.GetChildRowCount(pos);
-                    TCellsIterable beginKey = pos ? node.GetKeyCellsIterable(pos - 1, GroupInfo.ColsKeyIdx) : nodeState.BeginKey;
+                    TKeyView beginKey =
+                        pos ? TKeyView(node.GetKeyCellsIterable(pos - 1, GroupInfo.ColsKeyIdx), pageOwner)
+                            : std::move(nodeState.BeginKey);
                     ui64 beginDataSize = pos ? node.GetPrevChildDataSize(pos) : nodeState.BeginDataSize;
                     ui64 endDataSize = node.GetChildDataSize(pos);
 
-                    nextNodes.emplace_back(std::move(ref), beginRowId, endRowId, beginKey, beginDataSize, endDataSize);
+                    nextNodes.emplace_back(
+                        std::move(ref), beginRowId, endRowId, std::move(beginKey), beginDataSize, endDataSize);
                     hasChanges = true;
                 }
             }
@@ -122,6 +125,7 @@ public:
     EReady Next() override {
         Y_ENSURE(IsValid());
 
+        Nodes[NodeIndex].BeginKey = {};
         NodeIndex++;
 
         Y_DEBUG_ABORT_UNLESS(NodeIndex == Nodes.size() || Nodes[NodeIndex - 1].EndRowId == Nodes[NodeIndex].BeginRowId);
@@ -181,6 +185,7 @@ private:
 private:
     const TPart* const Part;
     IPages* const Env;
+    NStats::TPageTracker* const PageTracker;
     const TGroupId GroupId;
     const TPartScheme::TGroupInfo& GroupInfo;
     const TBtreeIndexMeta Meta;

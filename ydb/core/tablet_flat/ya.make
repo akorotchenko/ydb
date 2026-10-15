@@ -65,6 +65,7 @@ SRCS(
     flat_range_cache.cpp
     flat_row_versions.cpp
     flat_stat_part.h
+    flat_stat_page.h
     flat_stat_table.h
     flat_stat_table.cpp
     flat_stat_table_btree_index.cpp

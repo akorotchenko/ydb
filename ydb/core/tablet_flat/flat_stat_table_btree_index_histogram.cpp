@@ -1,6 +1,7 @@
 #include "flat_stat_table.h"
 #include "flat_table_subset.h"
 #include "flat_page_btree_index_writer.h"
+#include "flat_stat_page.h"
 #include <util/stream/format.h>
 
 namespace NKikimr::NTable {
@@ -13,10 +14,8 @@ using TBtreeIndexNode = NPage::TBtreeIndexNode;
 using TChild = TBtreeIndexNode::TChild;
 using TColumns = TBtreeIndexNode::TColumns;
 using TCells = NPage::TCells;
-using TCellsIterable = TBtreeIndexNode::TCellsIterable;
+using TKeyView = NStats::TKeyView;
 using TCellsIter = TBtreeIndexNode::TCellsIter;
-
-const static TCellsIterable EmptyKey(static_cast<const char*>(nullptr), TColumns());
 
 enum class ENodeState : ui8 {
     Initial = 0,
@@ -32,11 +31,11 @@ class TTableHistogramBuilderBtreeIndex {
         ui32 Level;
         TRowId BeginRowId, EndRowId;
         ui64 BeginDataSize, EndDataSize;
-        TCellsIterable BeginKey, EndKey;
+        TKeyView BeginKey, EndKey;
         ENodeState State = ENodeState::Initial;
 
         TNodeState(const TPart* part, TPageRef ref, ui32 level, TRowId beginRowId, TRowId endRowId,
-                   TRowId beginDataSize, TRowId endDataSize, TCellsIterable beginKey, TCellsIterable endKey)
+            TRowId beginDataSize, TRowId endDataSize, TKeyView beginKey, TKeyView endKey)
             : Part(part)
             , Ref(std::move(ref))
             , Level(level)
@@ -44,10 +43,9 @@ class TTableHistogramBuilderBtreeIndex {
             , EndRowId(endRowId)
             , BeginDataSize(beginDataSize)
             , EndDataSize(endDataSize)
-            , BeginKey(beginKey)
-            , EndKey(endKey)
-        {
-        }
+            , BeginKey(std::move(beginKey))
+            , EndKey(std::move(endKey))
+        {}
 
         TString ToString(const TKeyCellDefaults &keyDefaults) const {
             NPage::TPageOffset offset = std::visit([](const auto& val) -> NPage::TPageOffset {
@@ -113,14 +111,21 @@ class TTableHistogramBuilderBtreeIndex {
                 openedDataSize -= dataSize;
                 closedRowCount += rowCount;
                 closedDataSize += dataSize;
+                ReleaseKeys();
                 return true;
             } else if (Y_UNLIKELY(State == ENodeState::Initial)) {
                 State = ENodeState::Closed;
                 closedRowCount += GetRowCount();
                 closedDataSize += GetDataSize();
+                ReleaseKeys();
                 return true;
             }
             return false;
+        }
+
+        void ReleaseKeys() {
+            BeginKey = {};
+            EndKey = {};
         }
 
         bool IgnoreOpened(ui64& openedRowCount, ui64& openedDataSize) {
@@ -141,6 +146,13 @@ class TTableHistogramBuilderBtreeIndex {
     struct TEvent {
         TNodeState* Node;
         bool IsBegin;
+        TKeyView Key;
+
+        TEvent(TNodeState* node, bool isBegin)
+            : Node(node)
+            , IsBegin(isBegin)
+            , Key(isBegin ? node->BeginKey : node->EndKey)
+        {}
 
         TString ToString(const TKeyCellDefaults &keyDefaults) const {
             return TStringBuilder()
@@ -148,8 +160,8 @@ class TTableHistogramBuilderBtreeIndex {
                 << " " << Node->ToString(keyDefaults);
         }
 
-        const TCellsIterable& GetKey() const {
-            return IsBegin ? Node->BeginKey : Node->EndKey;
+        const TKeyView& GetKey() const {
+            return Key;
         }
     };
 
@@ -218,7 +230,8 @@ class TTableHistogramBuilderBtreeIndex {
     };
 
 public:
-    TTableHistogramBuilderBtreeIndex(const TSubset& subset, ui64 rowCountResolution, ui64 dataSizeResolution, IPages* env, TBuildStatsYieldHandler yieldHandler, const TString& logPrefix)
+    TTableHistogramBuilderBtreeIndex(const TSubset& subset, ui64 rowCountResolution, ui64 dataSizeResolution,
+        IPages* env, TBuildStatsYieldHandler yieldHandler, const TString& logPrefix, NStats::TPageTracker* pageTracker)
         : Subset(subset)
         , KeyDefaults(*Subset.Scheme->Keys)
         , RowCountResolution(rowCountResolution)
@@ -226,12 +239,12 @@ public:
         , RowCountResolutionGap(RowCountResolution / 2)
         , DataSizeResolutionGap(DataSizeResolution / 2)
         , Env(env)
+        , PageTracker(pageTracker)
         , YieldHandler(yieldHandler)
         , logPrefix(logPrefix)
         , NodeEventKeyGreater{KeyDefaults}
         , FutureEvents(NodeEventKeyGreater)
-    {
-    }
+    {}
 
     bool Build(TStats& stats) {
         bool ready = true;
@@ -244,18 +257,18 @@ public:
                 LOG_BUILD_STATS("slicing part " << part->Label << ": " << NFmt::Do(*part.Slices, KeyDefaults));
             }
             auto& meta = part->IndexPages.GetBTree({});
-            TCellsIterable beginKey = EmptyKey;
+            TKeyView beginKey;
             if (part.Slices && part.Slices->front().FirstKey.GetCells()) {
                 beginKey = MakeCellsIterableKey(part.Part.Get(), part.Slices->front().FirstKey);
             }
-            TCellsIterable endKey = EmptyKey;
+            TKeyView endKey;
             if (part.Slices && part.Slices->back().LastKey.GetCells()) {
                 endKey = MakeCellsIterableKey(part.Part.Get(), part.Slices->back().LastKey);
             }
             auto* pageColl = part->GetPageCollection(0);
             auto rootLoc = GetBTreeRootLocation(meta, pageColl, pageColl);
-            LoadedStateNodes.emplace_back(part.Part.Get(), TPageRef(rootLoc), meta.LevelCount(), 0, meta.GetRowCount(), 0,
-                                          meta.GetTotalDataSize(), beginKey, endKey);
+            LoadedStateNodes.emplace_back(part.Part.Get(), TPageRef(rootLoc), meta.LevelCount(), 0, meta.GetRowCount(),
+                0, meta.GetTotalDataSize(), std::move(beginKey), std::move(endKey));
             if (part.Slices) ready &= SlicePart(*part.Slices, LoadedStateNodes.back());
         }
 
@@ -282,6 +295,7 @@ private:
         if (it == slices.end() || node.EndRowId <= it->BeginRowId() || it->EndRowId() <= node.BeginRowId) {
             // skip the node
             LOG_BUILD_STATS("slicing node " << node.ToString(KeyDefaults) << " => skip");
+            node.ReleaseKeys();
             return true;
         }
 
@@ -305,6 +319,7 @@ private:
                 AddFutureEvents(node);
             } else {
                 LOG_BUILD_STATS("slicing node " << node.ToString(KeyDefaults) << " => skip leaf");
+                node.ReleaseKeys();
             }
             return true;
         }
@@ -400,7 +415,7 @@ private:
                         currentKeyPointerOpens.push_back(event.Node);
                     }
                 } else { // event didn't yet happen
-                    FutureEvents.push(event);
+                    FutureEvents.push(std::move(event));
                 }
             };
             const auto addNode = [&](TNodeState& node) {
@@ -530,7 +545,7 @@ private:
         return true;
     }
 
-    void AddKey(THistogram& histogram, const TCellsIterable& key, ui64 value) {
+    void AddKey(THistogram& histogram, const TKeyView& key, ui64 value) {
         TVector<TCell> keyCells;
 
         // add columns that are present in the part:
@@ -547,20 +562,21 @@ private:
 
         TString serializedKey = TSerializedCellVec::Serialize(keyCells);
 
-        histogram.push_back({serializedKey, value});
+        histogram.push_back({ std::move(serializedKey), value });
     }
 
-    static TNodeState BuildChildState(const TNodeState& parent, const TBtreeIndexNode& node, NPage::TRecIdx pos, bool isLeafLevel, TColumns colsKeyData) {
+    static TNodeState BuildChildState(TNodeState& parent, const TIntrusivePtr<NStats::TIndexPage>& pageOwner,
+        NPage::TRecIdx pos, bool isLeafLevel, TColumns colsKeyData) {
+        const auto& node = pageOwner->Node;
         return TNodeState(parent.Part, node.GetChild(pos, isLeafLevel), parent.Level - 1,
-            pos ? node.GetChildRowCount(pos - 1) : parent.BeginRowId,
-            node.GetChildRowCount(pos),
-            pos ? node.GetChildTotalDataSize(pos - 1) : parent.BeginDataSize,
-            node.GetChildTotalDataSize(pos),
-            pos ? node.GetKeyCellsIterable(pos - 1, colsKeyData) : parent.BeginKey,
-            pos < node.GetKeysCount() ? node.GetKeyCellsIterable(pos, colsKeyData) : parent.EndKey);
+            pos ? node.GetChildRowCount(pos - 1) : parent.BeginRowId, node.GetChildRowCount(pos),
+            pos ? node.GetChildTotalDataSize(pos - 1) : parent.BeginDataSize, node.GetChildTotalDataSize(pos),
+            pos ? TKeyView(node.GetKeyCellsIterable(pos - 1, colsKeyData), pageOwner) : std::move(parent.BeginKey),
+            pos < node.GetKeysCount() ? TKeyView(node.GetKeyCellsIterable(pos, colsKeyData), pageOwner)
+                                      : std::move(parent.EndKey));
     }
 
-    bool TryLoadNode(const TNodeState& parent, const auto& addNode) {
+    bool TryLoadNode(TNodeState& parent, const auto& addNode) {
         Y_ENSURE(parent.Level);
 
         auto location = ResolvePageLocation(parent.Part, parent.Ref, {});
@@ -569,16 +585,23 @@ private:
             return false;
         }
 
-        bool v2Format = parent.Part->IndexPages.GetBTree({}).HasRootV2();
-        LoadedBTreeNodes.emplace_back(std::move(page), v2Format);
-        auto &bTreeNode = LoadedBTreeNodes.back();
+        const bool v2Format = parent.Part->IndexPages.GetBTree({}).HasRootV2();
+        auto pageOwner = MakeIntrusive<NStats::TIndexPage>(std::move(page), v2Format, PageTracker);
         auto& groupInfo = parent.Part->Scheme->GetLayout({});
+        const bool isLeafLevel = (parent.Level == 1);
+        const auto childCount = pageOwner->Node.GetChildrenCount();
+        const size_t firstChild = LoadedStateNodes.size();
 
-        bool isLeafLevel = (parent.Level == 1);
+        for (auto pos : xrange(childCount)) {
+            LoadedStateNodes.emplace_back(BuildChildState(parent, pageOwner, pos, isLeafLevel, groupInfo.ColsKeyData));
+        }
 
-        for (auto pos : xrange(bTreeNode.GetChildrenCount())) {
-            auto& child = LoadedStateNodes.emplace_back(BuildChildState(parent, bTreeNode, pos, isLeafLevel, groupInfo.ColsKeyData));
-            addNode(child);
+        // addNode() may recursively load more pages; release temporary owners before calling it.
+        pageOwner.Drop();
+        parent.ReleaseKeys();
+
+        for (auto pos : xrange(childCount)) {
+            addNode(LoadedStateNodes[firstChild + pos]);
         }
 
         return true;
@@ -596,7 +619,7 @@ private:
     }
     
 private:
-    TCellsIterable MakeCellsIterableKey(const TPart* part, TSerializedCellVec serializedKey) {
+    TKeyView MakeCellsIterableKey(const TPart* part, const TSerializedCellVec& serializedKey) {
         // Note: this method is only called for root nodes and don't worth optimizing
         // so let's simply create a new fake b-tree index node with a given key
         // writeV2=false is fine: key encoding is same in V1/V2, children are dummy
@@ -605,11 +628,11 @@ private:
         writer.AddKey(serializedKey.GetCells());
         writer.AddChild({2, 2, 2, 0, 0});
         TSharedData serializedNode = writer.Finish();
-        LoadedBTreeNodes.emplace_back(serializedNode, /*v2Format=*/false);
-        return LoadedBTreeNodes.back().GetKeyCellsIterable(0, part->Scheme->GetLayout({}).ColsKeyData);
+        LoadedBTreeNodes.emplace_back(std::move(serializedNode), /*v2Format=*/false);
+        return TKeyView(LoadedBTreeNodes.back().GetKeyCellsIterable(0, part->Scheme->GetLayout({}).ColsKeyData), {});
     }
 
-    static int CompareKeys(const TCellsIterable& left_, const TCellsIterable& right_, const TKeyCellDefaults& keyDefaults) {
+    static int CompareKeys(const TKeyView& left_, const TKeyView& right_, const TKeyCellDefaults& keyDefaults) {
         Y_ENSURE(left_);
         Y_ENSURE(right_);
 
@@ -634,9 +657,10 @@ private:
     const ui64 RowCountResolution, DataSizeResolution;
     const ui64 RowCountResolutionGap, DataSizeResolutionGap;
     IPages* const Env;
+    NStats::TPageTracker* const PageTracker;
     const TBuildStatsYieldHandler YieldHandler;
     const TString& logPrefix; // naming style satisfies LOG_BUILD_STATS macros
-    TDeque<TBtreeIndexNode> LoadedBTreeNodes; // keep nodes to use TCellsIterable references
+    TDeque<TBtreeIndexNode> LoadedBTreeNodes; // Synthetic slice-key nodes; native pages are owned by key views.
     TDeque<TNodeState> LoadedStateNodes; // keep nodes to use their references
     TNodeEventKeyGreater NodeEventKeyGreater;
     TPriorityQueue<TEvent, TVector<TEvent>, TNodeEventKeyGreater> FutureEvents;
@@ -644,10 +668,11 @@ private:
 
 }
 
-bool BuildStatsHistogramsBTreeIndex(const TSubset& subset, TStats& stats, ui64 rowCountResolution, ui64 dataSizeResolution, IPages* env, 
-    TBuildStatsYieldHandler yieldHandler, const TString& logPrefix) 
-{
-    TTableHistogramBuilderBtreeIndex builder(subset, rowCountResolution, dataSizeResolution, env, yieldHandler, logPrefix);
+bool BuildStatsHistogramsBTreeIndex(const TSubset& subset, TStats& stats, ui64 rowCountResolution,
+    ui64 dataSizeResolution, IPages* env, TBuildStatsYieldHandler yieldHandler, const TString& logPrefix,
+    NStats::TPageTracker* pageTracker) {
+    TTableHistogramBuilderBtreeIndex builder(
+        subset, rowCountResolution, dataSizeResolution, env, yieldHandler, logPrefix, pageTracker);
 
     if (!builder.Build(stats)) {
         return false;
@@ -655,5 +680,4 @@ bool BuildStatsHistogramsBTreeIndex(const TSubset& subset, TStats& stats, ui64 r
 
     return true;
 }
-
 }

@@ -172,10 +172,10 @@ public:
 
     void Bootstrap() {
         Become(&TThis::StateWork);
-        Logic = MakeHolder<TExecutorBootLogic>(this, SelfId(), BootAttempt, Info.Get(), 1_MB);
+        Logic.Reset(new TExecutorBootLogic(this, SelfId(), BootAttempt, Info.Get(), 1_MB));
         if (Follower) {
-            Send(SelfId(),
-                new TEvTablet::TEvFBoot(Info->TabletID, 1, 1, TActorId{}, new TEvTablet::TDependencyGraph, Info));
+            Send(SelfId(), new TEvTablet::TEvFBoot(
+                               Info->TabletID, 1, 1, TActorId{}, new TEvTablet::TDependencyGraph({ 0, 0 }), Info));
         } else {
             Send(SelfId(), new TEvTablet::TEvBoot(Info->TabletID, 1, nullptr, TActorId{}, Info));
         }
@@ -1787,6 +1787,55 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection1, { _P(2) });
         sharedCache.CheckResults(
             { TFetch{ 2, sharedCache.Collection1, { _P(2) } }, TFetch{ 3, sharedCache.Collection1, { _P(2) } } });
+    }
+
+    void ReviewStatsResourceWait(bool joinWaitingFetch) {
+        TSharedPageCacheMock sharedCache;
+        sharedCache.SetLimit(2 * PAGE_TOTAL_SIZE, 0, 2 * PAGE_TOTAL_SIZE);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(0), _P(1) });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(0), _P(1) } } });
+        sharedCache.Provide(sharedCache.Collection1, { _P(0), _P(1) });
+        auto held = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(0), _P(1) } } });
+        if (joinWaitingFetch) {
+            sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(2) });
+            sharedCache.CheckFetches({});
+        }
+        auto pad = MakeIntrusive<TPagesWaitPad>();
+        pad->WorkingSetBytes = 2 * PAGE_TOTAL_SIZE;
+        pad->HasPinnedPages.store(true);
+        const ui64 cookie = sharedCache.RequestId + 1;
+        sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, { _P(2) }, EPriority::Fast, 0, pad);
+        sharedCache.Runtime.WaitFor("statistics resource-pressure reply", [&] {
+            return !sharedCache.Results.empty();
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->ResourcePressure);
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->WaitPad == pad);
+        sharedCache.CheckResults({ TFetch{ cookie, sharedCache.Collection1, {} } }, NKikimrProto::RACE);
+        // Release the stats attempt's pin; an unrelated owner still occupies half the budget.
+        held.erase(0);
+        if (joinWaitingFetch) {
+            sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(2) } } });
+            sharedCache.Provide(sharedCache.Collection1, { _P(2) });
+            sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { _P(2) } } });
+        }
+        sharedCache.Wakeup();
+        UNIT_ASSERT(sharedCache.Results.empty());
+        held.clear();
+        sharedCache.Runtime.WaitFor("statistics working-set readiness", [&] {
+            return !sharedCache.Results.empty();
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->ResourcesReady);
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->WaitPad == pad);
+        sharedCache.Results.clear();
+        sharedCache.CheckFetches({});
+    }
+
+    Y_UNIT_TEST(ReviewR11NewFetchWaitsForResources) {
+        ReviewStatsResourceWait(false);
+    }
+
+    Y_UNIT_TEST(ReviewR11JoinedFetchWaitsForResources) {
+        ReviewStatsResourceWait(true);
     }
 
     Y_UNIT_TEST(ResourceWaitKeepsFetchAfterOriginalRequesterUnregisters) {
