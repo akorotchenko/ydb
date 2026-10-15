@@ -263,6 +263,7 @@ Y_UNIT_TEST_SUITE(BuildStatsPageLifetime) {
                     UNIT_ASSERT_VALUES_EQUAL(workingSet.Bytes, pageSize + TSharedData::OverheadSize);
                     UNIT_ASSERT_VALUES_EQUAL(workingSet.TotalBytes, workingSet.Bytes);
                 }
+                auto binding = cache.BindCurrentThreadHazard();
                 NSharedCache::TSharedCacheCollectionRef collectionRef;
                 UNIT_ASSERT(
                     cache.Find(collection->Label(), collectionRef) == NSharedCache::ESharedCacheResultStatus::Hit);
