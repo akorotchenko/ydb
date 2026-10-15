@@ -3105,7 +3105,12 @@ bool TSharedCache::IsPageSticky(TPageCacheItem page) const noexcept {
         }
         if (state.IsReplacing() || state.IsReplaced()) {
             const TCacheItem next = TCacheItem::FromRaw(handle.Next.load(std::memory_order_acquire));
-            if (!next.IsFrozen() || next.WithoutFrozen().IsNull()) {
+            if (!next.IsFrozen()) {
+                InvokeHook(ESharedCacheHookPoint::BeforePageReplacementRetry, item);
+                SpinLockPause();
+                continue;
+            }
+            if (next.WithoutFrozen().IsNull()) {
                 return false;
             }
             // The held predecessor ref keeps its replacement chain alive.
@@ -3147,7 +3152,12 @@ bool TSharedCache::AcquirePage(TPageCacheItem page, TSharedCachePageRefImpl<TTra
         }
         if (state.IsReplacing() || state.IsReplaced()) {
             const TCacheItem replacement = TCacheItem::FromRaw(handle.Next.load(std::memory_order_acquire));
-            if (!replacement.IsFrozen() || replacement.WithoutFrozen().IsNull()) {
+            if (!replacement.IsFrozen()) {
+                InvokeHook(ESharedCacheHookPoint::BeforePageReplacementRetry, cacheItem);
+                SpinLockPause();
+                continue;
+            }
+            if (replacement.WithoutFrozen().IsNull()) {
                 return false;
             }
             cacheItem = replacement.WithoutFrozen();
@@ -4377,20 +4387,25 @@ TSharedCacheItemRef TSharedCache::TryAcquirePageForRelocation(TSpaceOperation& s
 
 SHARED_CACHE_TEMPLATE
 TCacheItem TSharedCache::PreparePageReplacement(TSpaceOperation& spaceOp, TCacheItem sourceItem) noexcept {
+    THandle& source = spaceOp.Handles()[sourceItem.Index()];
+    const THandleState sourceState = THandleState::FromRaw(source.State.load(std::memory_order_acquire));
+    const bool restoreSticky = sourceState.IsSticky() && sourceState.IsTransitionField();
+    if (!restoreSticky && (!(sourceState.IsHot() || sourceState.IsCold()) || !sourceState.IsStickyNoneField())) {
+        return {};
+    }
+    // Allocate may reclaim this Cold source. Its native reference keeps the payload alive,
+    // but only the later Replacing claim can exclude logical deletion.
     const TCacheItem replacementItem = Allocate(spaceOp);
     if (replacementItem.IsNull()) {
         return {};
     }
 
-    THandle& source = spaceOp.Handles()[sourceItem.Index()];
     const TCollectionCacheItem collection =
         TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(source.Key0.load(std::memory_order_relaxed)));
     const ui64 offset = source.Key1.load(std::memory_order_relaxed);
     const ui64 size = source.Key2OrSize.load(std::memory_order_relaxed);
     const NTable::NPage::EPage type = source.Metadata.Page.Type;
     const ui32 crc32 = source.Metadata.Page.Crc32;
-    const THandleState sourceState = THandleState::FromRaw(source.State.load(std::memory_order_relaxed));
-    const bool restoreSticky = sourceState.IsSticky() && sourceState.IsTransitionField();
     NActors::TSharedData data = source.Body.PageBuffer.Share(size);
 
     // Relocation transfers the source's sticky charge; claiming a second budget slot would double count it.
@@ -4420,8 +4435,9 @@ SHARED_CACHE_TEMPLATE
 void TSharedCache::DiscardPageReplacement(TSpaceOperation& spaceOp, TCacheItem replacementItem) noexcept {
     THandle& replacement = spaceOp.Handles()[replacementItem.Index()];
     const THandleState state = THandleState::FromRaw(replacement.State.load(std::memory_order_relaxed));
-    Y_DEBUG_ABORT_UNLESS(replacementItem.Matches(state) && state.IsPageKind() && state.IsSticky() &&
-                         state.Refs() == 1 && replacement.NextInOwner.load(std::memory_order_relaxed) == 0);
+    Y_DEBUG_ABORT_UNLESS(replacementItem.Matches(state) && state.IsPageKind() &&
+                         (state.IsSticky() || state.IsHot() || state.IsCold()) && state.Refs() == 1 &&
+                         replacement.NextInOwner.load(std::memory_order_relaxed) == 0);
     DropPageItemRef(spaceOp, replacement);
     replacement.Body.PageBuffer.~TBuffer();
     replacement.Body.Fetch = nullptr;
@@ -4431,44 +4447,54 @@ void TSharedCache::DiscardPageReplacement(TSpaceOperation& spaceOp, TCacheItem r
 }
 
 SHARED_CACHE_TEMPLATE
-EHandleState TSharedCache::PublishPageReplacement(
-    TSpaceOperation& spaceOp, TCacheItem sourceItem, TCacheItem replacementItem) noexcept {
+bool TSharedCache::PublishPageReplacement(
+    TSpaceOperation& spaceOp, TCacheItem sourceItem, TCacheItem replacementItem, EHandleState& oldState) noexcept {
     THandle& source = spaceOp.Handles()[sourceItem.Index()];
     THandle& replacement = spaceOp.Handles()[replacementItem.Index()];
-    const TCacheItem successor = Table_.FreezeNext(spaceOp, sourceItem).WithoutFrozen();
-    const TCacheItem next = successor.IsNull() ? TCacheItem::Make(replacementItem.Version(), 0) : successor;
-    replacement.Next.store(next.Raw(), std::memory_order_relaxed);
-    source.Next.store(replacementItem.WithFrozen().Raw(), std::memory_order_release);
 
     ui64 expectedRaw = source.State.load(std::memory_order_relaxed);
     for (;;) {
         const THandleState expected = THandleState::FromRaw(expectedRaw);
-        Y_DEBUG_ABORT_UNLESS(sourceItem.Matches(expected) && expected.IsPageKind() &&
-                             (((expected.IsHot() || expected.IsCold()) && expected.IsStickyNoneField()) ||
-                                 (expected.IsSticky() && expected.IsTransitionField())) &&
-                             expected.Refs() > 0);
+        const bool ordinary = (expected.IsHot() || expected.IsCold()) && expected.IsStickyNoneField();
+        const bool unsticky = expected.IsSticky() && expected.IsTransitionField();
+        Y_DEBUG_ABORT_UNLESS(sourceItem.Matches(expected) && expected.IsPageKind() && expected.Refs() > 0);
+        if (!ordinary && !unsticky) {
+            return false;
+        }
         const THandleState desired = expected.WithState(EHandleState::Replacing).WithFrequency(0);
         if (source.State.compare_exchange_weak(
-                expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
-        {
-            // A held Cold page may have been promoted while the replacement was prepared.
-            // Match the source class before the replacement becomes discoverable.
-            ui64 replacementRaw = replacement.State.load(std::memory_order_relaxed);
-            for (;;) {
-                const THandleState prepared = THandleState::FromRaw(replacementRaw);
-                const EHandleState destination = expected.State();
-                if (destination == prepared.State() ||
-                    replacement.State.compare_exchange_weak(replacementRaw, prepared.WithState(destination).Raw(),
-                        std::memory_order_release, std::memory_order_relaxed)) {
-                    break;
-                }
-            }
-            InvokeHook(ESharedCacheHookPoint::AfterReplacingPublished, sourceItem);
-            const TSharedCacheKey key = LoadSharedCacheKey(source, EItemKind::Page);
-            Table_.PublishPageReplacement(sourceItem, replacementItem, key, spaceOp);
-            return expected.State();
+                expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            oldState = expected.State();
+            break;
         }
     }
+
+    // A held Cold page may have been promoted while the replacement was prepared.
+    // A Sticky replacement may already have been drained to Hot by its collection.
+    if (oldState != EHandleState::Sticky) {
+        const THandleState prepared = THandleState::FromRaw(replacement.State.load(std::memory_order_relaxed));
+        replacement.State.store(prepared.WithState(oldState).Raw(), std::memory_order_release);
+    }
+
+    // Replacing with an unfrozen Next makes readers retry. Freeze only the forwarder:
+    // freezing the old successor would make readers mistake it for the replacement.
+    ui64 successorRaw = source.Next.load(std::memory_order_acquire);
+    for (;;) {
+        const TCacheItem successor = TCacheItem::FromRaw(successorRaw);
+        Y_DEBUG_ABORT_UNLESS(!successor.IsFrozen());
+        const TCacheItem next = successor.IsNull() ? TCacheItem::Make(replacementItem.Version(), 0) : successor;
+        replacement.Next.store(next.Raw(), std::memory_order_relaxed);
+        InvokeHook(ESharedCacheHookPoint::BeforePageReplacementLinkCas, sourceItem);
+        if (source.Next.compare_exchange_weak(successorRaw, replacementItem.WithFrozen().Raw(),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            break;
+        }
+        // An insertion that already owned this link may have changed the successor.
+    }
+    InvokeHook(ESharedCacheHookPoint::AfterReplacingPublished, sourceItem);
+    const TSharedCacheKey key = LoadSharedCacheKey(source, EItemKind::Page);
+    Table_.PublishPageReplacement(sourceItem, replacementItem, key, spaceOp);
+    return true;
 }
 
 SHARED_CACHE_TEMPLATE
@@ -4502,7 +4528,11 @@ bool TSharedCache::RelocatePage(TSpaceOperation& spaceOp, ui32 index) noexcept {
     }
 
     THandle& source = spaceOp.Handles()[sourceItem.Index()];
-    const EHandleState oldState = PublishPageReplacement(spaceOp, sourceItem, replacementItem);
+    EHandleState oldState;
+    if (!PublishPageReplacement(spaceOp, sourceItem, replacementItem, oldState)) {
+        DiscardPageReplacement(spaceOp, replacementItem);
+        return false;
+    }
     if (oldState == EHandleState::Cold) {
         AdvanceColdMembership(source);
     }

@@ -40,6 +40,8 @@ enum class ESharedCacheHookPoint {
     AfterStickyPageListHeadPublished, // Payload is the owning collection after its retained list is published.
     AfterFetchWaiterSubscribed, // Payload is the pending page while the subscriber still owns its structural ref.
     BeforeCollectionHotPublished, // Payload is the collection before insertion into a Hot ring.
+    BeforePageReplacementRetry, // Source, while a held-page reader waits for its forwarder.
+    BeforePageReplacementLinkCas, // Source, after preparing the successor but before freezing the forwarder.
     AfterReplacingPublished, // Payload is the old forwarding item before its incoming link is replaced.
     AfterReplacedPublished, // Payload is the completed old replacement before its owner ref is dropped.
     AfterCollectionOwnerReferenceDropped, // Payload is the collection after its owner count is decremented.

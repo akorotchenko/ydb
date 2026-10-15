@@ -1287,6 +1287,185 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(FindPage(*fixture.Cache, missing).Status == ESharedCacheResultStatus::Miss);
     }
 
+    void ReviewRelocationLosesToDeletion(bool reclaimDuringAllocation) {
+        TFixture fixture;
+        const TLogoBlobID id(151, 152, 153);
+        const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        const auto sourceKey = TSharedCacheKey::Page(collection, 1);
+        const auto source = InsertReadyPage(*fixture.Cache, sourceKey);
+        auto sourceHold = FindPage(*fixture.Cache, sourceKey);
+        TPageCacheItem spare;
+        TPageResult spareHold;
+        TVector<TTestSharedCachePageRef> fillers;
+        if (reclaimDuringAllocation) {
+            const auto spareKey = TSharedCacheKey::Page(collection, 2);
+            spare = InsertReadyPage(*fixture.Cache, spareKey);
+            spareHold = FindPage(*fixture.Cache, spareKey);
+            fillers = HoldReviewFillers(fixture, 63, sourceKey.Hash() & 63);
+        }
+        sourceHold.Ref.Drop();
+        if (TSharedCacheTestAccess::HandleState(*fixture.Cache, source.Index()).IsHot()) {
+            UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, source));
+        }
+        const auto coldItem = MakeColdItem(*fixture.Cache, source.Index());
+        auto structural = TSharedCacheTestAccess::AcquireStructural(*fixture.Cache, source.CacheItem());
+        UNIT_ASSERT(structural);
+        if (reclaimDuringAllocation) {
+            spareHold.Ref.Drop();
+            if (TSharedCacheTestAccess::HandleState(*fixture.Cache, spare.Index()).IsHot()) {
+                UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, spare));
+            }
+            UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), 0);
+        }
+        const ui64 freeBefore = AvailableFreeHandles(*fixture.Cache);
+        const ui64 residentBefore = fixture.Cache->ResidentBytes();
+        const ui32 ownersBefore = TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection);
+
+        struct TContext {
+            TTestSharedCache& Cache;
+            TCollectionCacheItem Collection;
+            TColdCacheItem ColdItem;
+            bool ReclaimDuringAllocation;
+            bool Visited = false;
+            bool Deleted = false;
+        } context{ *fixture.Cache, collection, coldItem, reclaimDuringAllocation };
+
+        TTestTraits hooks{ &context,
+            [](void* ptr, ESharedCacheHookPoint at, TCacheItem item) noexcept {
+                auto& ctx = *static_cast<TContext*>(ptr);
+                if (ctx.ReclaimDuringAllocation) {
+                    if (at == ESharedCacheHookPoint::AfterTombstoneOwnerClaim && item.Index() == ctx.ColdItem.Index()) {
+                        ctx.Deleted = true;
+                    }
+                } else if (at == ESharedCacheHookPoint::AfterPageCollectionStateChecked &&
+                           item == ctx.Collection.CacheItem() && !ctx.Visited) {
+                    ctx.Visited = true;
+                    ctx.Deleted = TSharedCacheTestAccess::EraseCold(ctx.Cache, ctx.ColdItem);
+                }
+            } };
+        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+        UNIT_ASSERT(!TSharedCacheTestAccess::RelocatePage(*fixture.Cache, source));
+        UNIT_ASSERT(context.Deleted);
+        const auto state = TSharedCacheTestAccess::HandleState(*fixture.Cache, source.Index());
+        UNIT_ASSERT(state.IsTombstone());
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 1);
+        UNIT_ASSERT(FindPage(*fixture.Cache, sourceKey).Status == ESharedCacheResultStatus::Miss);
+        const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT_VALUES_EQUAL(
+            fixture.Cache->ResidentBytes(), residentBefore - (reclaimDuringAllocation ? bytes : 0));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection),
+            ownersBefore - (reclaimDuringAllocation ? 1 : 0));
+        UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), freeBefore + (reclaimDuringAllocation ? 1 : 0));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+        structural.Drop();
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, source.Index()).IsFree());
+        UNIT_ASSERT_VALUES_EQUAL(
+            fixture.Cache->ResidentBytes(), residentBefore - (reclaimDuringAllocation ? 2 * bytes : bytes));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::CollectionReferences(*fixture.Cache, collection),
+            ownersBefore - (reclaimDuringAllocation ? 2 : 1));
+    }
+
+    Y_UNIT_TEST(ReviewR10DeletionDuringReplacementPreparation) {
+        ReviewRelocationLosesToDeletion(false);
+    }
+
+    Y_UNIT_TEST(ReviewR10AllocationReclaimsRelocationSource) {
+        ReviewRelocationLosesToDeletion(true);
+    }
+
+    Y_UNIT_TEST(ReviewR10RelocationPreservesConcurrentSuccessorInsertion) {
+        TFixture fixture;
+        const auto collection = MakeCollectionCacheItem(151, 50051);
+        const auto keys = MakeAdjacentKeys(*fixture.Space, collection, 100000);
+        const auto source = InsertReadyPage(*fixture.Cache, keys[0]);
+        auto sourceHold = FindPage(*fixture.Cache, keys[0]);
+        TSharedCacheGate gate;
+        gate.Slots[0].Arm(ESharedCacheHookPoint::BeforeTableLinkCas, source.CacheItem());
+        gate.Slots[1].Arm(ESharedCacheHookPoint::BeforePageReplacementLinkCas, source.CacheItem());
+        TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
+        TPageCacheItem inserted;
+        TGateThread insertion(gate, [&] {
+            auto binding = fixture.Cache->BindThreadHazard(0);
+            inserted = InsertReadyPage(*fixture.Cache, keys[1]);
+        });
+        gate.Slots[0].Wait();
+        bool relocated = false;
+        TGateThread relocation(gate, [&] {
+            auto binding = fixture.Cache->BindThreadHazard(1);
+            relocated = TSharedCacheTestAccess::RelocatePage(*fixture.Cache, source);
+        });
+        gate.Slots[1].Wait();
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, source.Index()).IsReplacing());
+        UNIT_ASSERT(
+            !TCacheItem::FromRaw(TSharedCacheTestAccess::HandleNext(*fixture.Cache, source.Index())).IsFrozen());
+        gate.Slots[0].Release();
+        insertion.Join();
+        UNIT_ASSERT(TCacheItem::FromRaw(TSharedCacheTestAccess::HandleNext(*fixture.Cache, source.Index())) ==
+                    inserted.CacheItem());
+        gate.Slots[1].Release();
+        relocation.Join();
+        UNIT_ASSERT(relocated);
+        auto replacement = FindPage(*fixture.Cache, keys[0]);
+        UNIT_ASSERT(replacement.Status == ESharedCacheResultStatus::Hit);
+        UNIT_ASSERT(replacement.Ref.CacheItem() != source);
+        UNIT_ASSERT_VALUES_EQUAL(replacement.Ref.data(), sourceHold.Ref.data());
+        AssertPageHit(*fixture.Cache, keys[1], inserted);
+        AssertReviewTerminal(*fixture.Cache, inserted.CacheItem(), "R10");
+    }
+
+    void ReviewHeldPageWaitsForForwarder(bool querySticky) {
+        TFixture fixture;
+        const TLogoBlobID id(151, 152, 154);
+        const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        const auto key = TSharedCacheKey::Page(collection, 1);
+        const auto source = InsertReadyPage(*fixture.Cache, key);
+        auto sourceHold = FindPage(*fixture.Cache, key);
+        if (querySticky) {
+            UNIT_ASSERT(TSharedCacheTestAccess::MakePageSticky(*fixture.Cache, source));
+            UNIT_ASSERT(TSharedCacheTestAccess::UnstickyCutPages(*fixture.Cache, source, source.Index()));
+        }
+        TSharedCacheGate gate;
+        gate.Slots[0].Arm(ESharedCacheHookPoint::BeforePageReplacementLinkCas, source.CacheItem());
+        gate.Slots[1].Arm(ESharedCacheHookPoint::BeforePageReplacementRetry, source.CacheItem());
+        TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
+        bool relocated = false;
+        TGateThread relocation(gate, [&] {
+            auto binding = fixture.Cache->BindThreadHazard(0);
+            relocated = TSharedCacheTestAccess::RelocatePage(*fixture.Cache, source);
+        });
+        gate.Slots[0].Wait();
+        bool acquired = false;
+        TTestSharedCachePageRef page;
+        TGateThread reader(gate, [&] {
+            auto binding = fixture.Cache->BindThreadHazard(1);
+            acquired = querySticky ? sourceHold.Ref.IsSticky()
+                                   : TSharedCacheTestAccess::AcquirePage(*fixture.Cache, source, page);
+        });
+        gate.Slots[1].Wait();
+        gate.Slots[0].Release();
+        relocation.Join();
+        gate.Slots[1].Release();
+        reader.Join();
+        UNIT_ASSERT(relocated);
+        UNIT_ASSERT(acquired);
+        if (!querySticky) {
+            UNIT_ASSERT(page.CacheItem() != source);
+            UNIT_ASSERT_VALUES_EQUAL(page.data(), sourceHold.Ref.data());
+        }
+    }
+
+    Y_UNIT_TEST(ReviewR10AcquirePageWaitsForForwarder) {
+        ReviewHeldPageWaitsForForwarder(false);
+    }
+
+    Y_UNIT_TEST(ReviewR10StickyQueryWaitsForForwarder) {
+        ReviewHeldPageWaitsForForwarder(true);
+    }
+
     void ReviewBatchDetach(ESharedCacheHookPoint point) {
         TFixture fixture;
         const TLogoBlobID id(111, 112, 113);

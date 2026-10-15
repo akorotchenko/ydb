@@ -549,11 +549,11 @@ private:
     friend class TRequestPageWaiter;
     friend class TCompactedPageWaiter;
 
-    Y_FORCE_INLINE void InvokeHook(ESharedCacheHookPoint point, TCacheItem cacheItem) noexcept {
+    Y_FORCE_INLINE void InvokeHook(ESharedCacheHookPoint point, TCacheItem cacheItem) const noexcept {
         TTraits::Invoke(point, cacheItem);
     }
 
-    Y_FORCE_INLINE void InvokeHook(ESharedCacheHookPoint point, TColdCacheItem coldItem) noexcept {
+    Y_FORCE_INLINE void InvokeHook(ESharedCacheHookPoint point, TColdCacheItem coldItem) const noexcept {
         // Scheduling hooks transport raw token bits; the production APIs keep their distinct types.
         TTraits::Invoke(point, TCacheItem::FromRaw(coldItem.Raw()));
     }
@@ -928,7 +928,8 @@ private:
     TSharedCacheItemRefImpl<TTraits> TryAcquirePageForRelocation(TSpaceOperation& spaceOp, ui32 index) noexcept;
     TCacheItem PreparePageReplacement(TSpaceOperation& spaceOp, TCacheItem source) noexcept;
     void DiscardPageReplacement(TSpaceOperation& spaceOp, TCacheItem replacement) noexcept;
-    EHandleState PublishPageReplacement(TSpaceOperation& spaceOp, TCacheItem source, TCacheItem replacement) noexcept;
+    bool PublishPageReplacement(
+        TSpaceOperation& spaceOp, TCacheItem source, TCacheItem replacement, EHandleState& oldState) noexcept;
     void CompletePageReplacement(TSpaceOperation& spaceOp, TCacheItem source) noexcept;
     bool RelocatePage(TSpaceOperation& spaceOp, ui32 index) noexcept;
     bool DemoteUnlinkedStickyPage(TSpaceOperation& spaceOp, ui32 index) noexcept;
