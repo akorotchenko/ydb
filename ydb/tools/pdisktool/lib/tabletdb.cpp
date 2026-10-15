@@ -101,7 +101,6 @@ public:
                 NSharedCache::TSharedCacheSpace::Create(capacity, capacity, hazards), capacity.Limit);
             Y_ENSURE(core);
             Y_ENSURE(core->UpdateSoftLimit(0));
-            Y_ENSURE(core->UpdateStickyLimit(0));
         } catch (...) {
             TlsActivationContext = Previous_;
             throw;
@@ -229,14 +228,14 @@ public:
             return {};
         }
         for (;;) {
-            const ui64 usage = cache.PageUsage();
+            const ui64 usage = cache.PayloadUsage();
             // Admission bounds its reclamation work; keep the input for another synchronous attempt.
             page = cache.AdmitPage(pageCollection, location, TSharedData(data));
             if (page) {
                 break;
             }
-            Y_ENSURE(
-                cache.PageUsage() < usage, "Offline cache capacity exhausted while reading page " << location.Offset);
+            Y_ENSURE(cache.PayloadUsage() < usage,
+                "Offline cache capacity exhausted while reading page " << location.Offset);
         }
         ++Stats.PagesRead;
         return page;

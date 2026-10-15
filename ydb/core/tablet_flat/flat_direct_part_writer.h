@@ -258,10 +258,10 @@ namespace NTabletFlatExecutor {
                     auto resultingPageCollection = sharedCache.AdmitCollection(pageCollection.PageCollection);
                     auto saveCompactedPages = MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);
                     for (auto &page : pageCollection.StickyPages) {
-                        saveCompactedPages->AddPage(sharedCache, std::move(page), true);
+                        saveCompactedPages->AddWrittenPage(sharedCache, std::move(page), true);
                     }
                     for (auto &page : pageCollection.RegularPages) {
-                        saveCompactedPages->AddPage(sharedCache, std::move(page), false);
+                        saveCompactedPages->AddWrittenPage(sharedCache, std::move(page), false);
                     }
 
                     ctx.Send(MakeSharedPageCacheId(), saveCompactedPages.Release());

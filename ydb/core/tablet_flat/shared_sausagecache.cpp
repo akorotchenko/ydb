@@ -282,7 +282,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (CacheCore) {
             Y_ENSURE(CacheCore->UpdateCurrentLimit(GetTargetCacheCurrentLimitBytes()));
             UpdateCoreSoftLimit();
-            Y_ENSURE(CacheCore->UpdateStickyLimit(CacheCore->HardLimit()));
         }
         return bool(CacheCore);
     }
@@ -342,7 +341,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 Y_ENSURE(CacheCore->UpdateHardLimit(hardLimit),
                     "Shared-cache capacity change exceeds reserved space: requested "
                         << hardLimit << " reserved " << CacheCore->ReservationLimit());
-                Y_ENSURE(CacheCore->UpdateStickyLimit(hardLimit));
             }
             Y_ENSURE(CacheCore->UpdateCurrentLimit(coreLimit));
             UpdateCoreSoftLimit();

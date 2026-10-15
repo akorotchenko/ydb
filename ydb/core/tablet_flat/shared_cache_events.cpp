@@ -56,6 +56,16 @@ public:
 
 TSharedCachePageRef TEvSaveCompactedPages::AddPage(
     TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
+    return AddPage(cachePages, std::move(page), sticky, TSharedCache::EPageAdmission::Bounded);
+}
+
+TSharedCachePageRef TEvSaveCompactedPages::AddWrittenPage(
+    TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
+    return AddPage(cachePages, std::move(page), sticky, TSharedCache::EPageAdmission::Written);
+}
+
+TSharedCachePageRef TEvSaveCompactedPages::AddPage(
+    TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky, TSharedCache::EPageAdmission admission) {
     auto binding = cachePages.BindCurrentThreadHazard();
     if (!CacheItem) {
         auto collection = cachePages.AdmitCollection(PageCollection);
@@ -64,7 +74,10 @@ TSharedCachePageRef TEvSaveCompactedPages::AddPage(
     Pages.push_back(page.Location);
     auto waiter = MakeIntrusive<TCompactedPageWaiter>();
     TSharedCachePageRequest request(page.Location, waiter, sticky);
-    if (!cachePages.FindOrInsertBatch(CacheItem, { &request, 1 }, false)) {
+    const bool admitted = admission == TSharedCache::EPageAdmission::Written
+                              ? cachePages.FindOrInsertWrittenBatch(CacheItem, { &request, 1 })
+                              : cachePages.FindOrInsertBatch(CacheItem, { &request, 1 }, false);
+    if (!admitted) {
         Y_ENSURE(!sticky, "Cannot admit Sticky compacted page " << page.Location.Offset);
         return {};
     }

@@ -318,13 +318,13 @@ void AssertResidentWithinLimit(TMyEnvBase& env, const THolder<TSharedPageCacheCo
     UNIT_ASSERT(core);
     const i64 softBound = static_cast<i64>(limit + (limit ? 1_MB : 0));
     const ui64 currentBound = core->CurrentLimit() + 1_MB;
-    for (ui32 step = 0; step < 400 && (counters->ActiveBytes->Val() > softBound || core->PageUsage() > currentBound);
+    for (ui32 step = 0; step < 400 && (counters->ActiveBytes->Val() > softBound || core->PayloadUsage() > currentBound);
          ++step) {
         WakeupSharedCache(env);
     }
     // Cold is outside soft retention; physical usage also includes Cold and in-flight commitments.
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), softBound);
-    UNIT_ASSERT_LE(core->PageUsage(), currentBound);
+    UNIT_ASSERT_LE(core->PayloadUsage(), currentBound);
 }
 
 // Waits until the shared cache has nothing in flight, i.e. the in-memory preload (and the walk
@@ -1220,9 +1220,9 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Basics) {
 
     // make second table to try to preempt first table from cache
     env.SendSync(new NFake::TEvExecute{ new TTxInitSchema(Table2Id, false) });
-    // The Regular working set fills the cache by itself, so it still applies eviction pressure.
+    // The Regular working set exceeds CurrentLimit by itself, so reads must face eviction pressure.
     for (i64 key = 0; key < 100; ++key) {
-        TString value(size_t(200 * 1024), char('a' + key % 26));
+        TString value(size_t(400 * 1024), char('a' + key % 26));
         env.SendSync(new NFake::TEvExecute{ new TTxWriteRow(Table2Id, key, std::move(value)) });
     }
     Cerr << "...compacting second table" << Endl;
@@ -1745,9 +1745,9 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Enabling) {
 
     // make second table to try to preempt first table from cache
     env.SendSync(new NFake::TEvExecute{ new TTxInitSchema(Table2Id, false) });
-    // The Regular working set fills the cache by itself, so it still applies eviction pressure.
+    // The Regular working set exceeds CurrentLimit by itself, so reads must face eviction pressure.
     for (i64 key = 0; key < 100; ++key) {
-        TString value(size_t(200 * 1024), char('a' + key % 26));
+        TString value(size_t(400 * 1024), char('a' + key % 26));
         env.SendSync(new NFake::TEvExecute{ new TTxWriteRow(Table2Id, key, std::move(value)) });
     }
     Cerr << "...compacting second table" << Endl;

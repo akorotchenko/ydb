@@ -1045,15 +1045,7 @@ void TSharedCache::RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldIt
 
 SHARED_CACHE_TEMPLATE
 void TSharedCache::AddKeepColdOwnedBytes(ui64 bytes) noexcept {
-    ui64 owned = KeepColdOwnedBytes_.load(std::memory_order_relaxed);
-    for (;;) {
-        Y_ABORT_UNLESS(owned <= Max<ui64>() - bytes);
-        if (KeepColdOwnedBytes_.compare_exchange_weak(
-                owned, owned + bytes, std::memory_order_relaxed, std::memory_order_relaxed))
-        {
-            return;
-        }
-    }
+    KeepColdOwnedBytes_.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -2113,10 +2105,8 @@ void TSharedCache::InitializePage(TSpaceOperation& spaceOp, TCacheItem cacheItem
     handle.Body.Fetch->Ref();
     handle.Next.store(TCacheItem::Make(claimed.Version(), 0).Raw(), std::memory_order_relaxed);
     handle.NextInOwner.store(0, std::memory_order_relaxed);
-    // A page enters Sticky only while it fits the sticky budget; otherwise it is admitted with StickyNone and follows
-    // the ordinary policy. The check and the exact sticky counter are one step, so concurrent admissions cannot overshoot.
-    if (sticky == EStickyState::Sticky && !TryAddStickyOwnedBytes(AccountedPageBytes(size))) {
-        sticky = EStickyState::None;
+    if (sticky == EStickyState::Sticky) {
+        AddStickyOwnedBytes(AccountedPageBytes(size));
     }
     const THandleState initialized = claimed.WithState(reserved ? EHandleState::Begin : EHandleState::WaitingForMemory)
                                          .WithKind(EItemKind::Page)
@@ -2597,27 +2587,16 @@ bool TSharedCache::MakePageSticky(TSpaceOperation& spaceOp, TCacheItem pageItem)
         return false;
     }
     const ui64 bytes = PageBytes(page);
-    bool stickyBudgetClaimed = false;
     if (THandleState::FromRaw(page.State.load(std::memory_order_acquire)).IsCold()) {
-        if (!TryAddStickyOwnedBytes(bytes)) {
-            return false;
-        }
-        stickyBudgetClaimed = true;
         PromoteCold(spaceOp, pageItem, true);
     }
     ui64 expectedRaw = page.State.load(std::memory_order_acquire);
     for (;;) {
         const THandleState expected = THandleState::FromRaw(expectedRaw);
         if (!pageItem.Matches(expected) || !expected.IsPageKind()) {
-            if (stickyBudgetClaimed) {
-                SubStickyOwnedBytes(EItemKind::Page, bytes);
-            }
             return false;
         }
         if (expected.IsSticky() && expected.IsStickyField()) {
-            if (stickyBudgetClaimed) {
-                SubStickyOwnedBytes(EItemKind::Page, bytes);
-            }
             return true;
         }
         const bool pending = expected.IsPending();
@@ -2625,14 +2604,9 @@ bool TSharedCache::MakePageSticky(TSpaceOperation& spaceOp, TCacheItem pageItem)
             return true;
         }
         if ((!expected.IsHot() && !pending) || !expected.IsStickyNoneField()) {
-            if (stickyBudgetClaimed) {
-                SubStickyOwnedBytes(EItemKind::Page, bytes);
-            }
             return false;
         }
-        if (!stickyBudgetClaimed && !TryAddStickyOwnedBytes(bytes)) {
-            return false;
-        }
+        AddStickyOwnedBytes(bytes);
         const THandleState claimed = expected.WithSticky(EStickyState::Sticky);
         if (page.State.compare_exchange_weak(
                 expectedRaw, claimed.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
@@ -2645,7 +2619,6 @@ bool TSharedCache::MakePageSticky(TSpaceOperation& spaceOp, TCacheItem pageItem)
             break;
         }
         SubStickyOwnedBytes(EItemKind::Page, bytes);
-        stickyBudgetClaimed = false;
     }
 
     TransferEstimatedBytes(HotBytes_, StickyBytes_, bytes);
@@ -3314,7 +3287,13 @@ bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandida
     const ui64 reservedBytes = AccountedPageBytes(candidate.Size);
     bool reserved = true;
     TCacheItem cacheItem;
-    if (candidate.WaitForMemory) {
+    if (candidate.Admission == EPageAdmission::Written) {
+        AccountWrittenMemory(reservedBytes, 1);
+        cacheItem = Allocate(spaceOp);
+        if (cacheItem.IsNull()) {
+            ReleaseReservation(reservedBytes, 1);
+        }
+    } else if (candidate.WaitForMemory) {
         reserved = TryReserve(spaceOp, reservedBytes, 1);
         cacheItem = Allocate(spaceOp);
         if (cacheItem.IsNull() && reserved) {
@@ -3330,15 +3309,13 @@ bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandida
         TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(candidate.Key.Word(0)));
     TCollection* owner = PageCollection(spaceOp, collection);
     const ECacheMode admissionMode = owner ? owner->CacheMode_.load(std::memory_order_acquire) : ECacheMode::Regular;
-    const EStickyState sticky = candidate.WaitForMemory && admissionMode == ECacheMode::Sticky ? EStickyState::Sticky
-                                : admissionMode == ECacheMode::TryKeepInMemory                 ? EStickyState::None
-                                                                                               : candidate.Sticky;
+    const bool stickyCollection =
+        (candidate.WaitForMemory || candidate.CollectionOwnerHeld) && admissionMode == ECacheMode::Sticky;
+    const EStickyState sticky = stickyCollection                               ? EStickyState::Sticky
+                                : admissionMode == ECacheMode::TryKeepInMemory ? EStickyState::None
+                                                                               : candidate.Sticky;
     InitializePage(spaceOp, cacheItem, collection, candidate.Key.Word(1), candidate.Size, candidate.Type,
         candidate.Crc32, sticky, reserved, candidate.CollectionOwnerHeld);
-    candidate.StickyBudgetDenied =
-        sticky == EStickyState::Sticky &&
-        !THandleState::FromRaw(spaceOp.Handles()[cacheItem.Index()].State.load(std::memory_order_relaxed))
-             .IsStickyField();
     candidate.CacheItem = cacheItem;
     return true;
 }
@@ -3486,12 +3463,18 @@ bool TSharedCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollection& colle
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& collection,
-    TVector<TPageInsertCandidate>& candidates, ui64 reservedBytes, bool waitForMemory) noexcept {
+    TVector<TPageInsertCandidate>& candidates, ui64 reservedBytes, bool waitForMemory,
+    EPageAdmission admission) noexcept {
     ui64 preparedPages = 0;
     for (const TPageInsertCandidate& candidate : candidates) {
         preparedPages += candidate.Prepare ? 1 : 0;
     }
-    const bool reserved = TryReserve(spaceOp, reservedBytes, preparedPages);
+    bool reserved = true;
+    if (admission == EPageAdmission::Written) {
+        AccountWrittenMemory(reservedBytes, preparedPages);
+    } else {
+        reserved = TryReserve(spaceOp, reservedBytes, preparedPages);
+    }
     if (!reserved && !waitForMemory) {
         return false;
     }
@@ -3523,10 +3506,6 @@ bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& coll
                                         : EStickyState::None;
         InitializePage(spaceOp, cacheItem, collection.CacheItem, candidate.Key.Word(1), candidate.Size, candidate.Type,
             candidate.Crc32, sticky, reserved, true);
-        candidate.StickyBudgetDenied =
-            sticky == EStickyState::Sticky &&
-            !THandleState::FromRaw(spaceOp.Handles()[cacheItem.Index()].State.load(std::memory_order_relaxed))
-                 .IsStickyField();
         candidate.CacheItem = cacheItem;
         initializedBytes += AccountedPageBytes(candidate.Size);
         ++initializedPages;
@@ -3537,6 +3516,19 @@ bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& coll
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
     TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests, bool recordStats, bool waitForMemory) noexcept {
+    return FindOrInsertBatch(collection, requests, recordStats, waitForMemory, EPageAdmission::Bounded);
+}
+
+SHARED_CACHE_TEMPLATE
+bool TSharedCache::FindOrInsertWrittenBatch(
+    TCollectionCacheItem collection, TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests) noexcept {
+    return FindOrInsertBatch(collection, requests, false, false, EPageAdmission::Written);
+}
+
+SHARED_CACHE_TEMPLATE
+bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
+    TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests, bool recordStats, bool waitForMemory,
+    EPageAdmission admission) noexcept {
     if (requests.empty()) {
         return true;
     }
@@ -3575,8 +3567,11 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
     if (!PreparePageBatch(spaceOp, owner, requests, candidates, reservedBytes)) {
         return false;
     }
+    for (auto& candidate : candidates) {
+        candidate.Admission = admission;
+    }
     InvokeHook(ESharedCacheHookPoint::AfterPageBatchPrepared, collection.CacheItem());
-    if (!AllocatePageBatch(spaceOp, owner, candidates, reservedBytes, waitForMemory)) {
+    if (!AllocatePageBatch(spaceOp, owner, candidates, reservedBytes, waitForMemory, admission)) {
         return false;
     }
 
@@ -3707,11 +3702,6 @@ ESharedCacheResultStatus TSharedCache::FindOrInsert(
         Y_DEBUG_ABORT_UNLESS(acquireStatus == EAcquireStatus::Pending || acquireStatus == EAcquireStatus::Ready);
 
         if (inserted) {
-            if constexpr (std::is_same_v<TKeyedCandidate, TPageInsertCandidate>) {
-                if (candidate.StickyBudgetDenied) {
-                    StickyAdmissionFailures_.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
             RefillSpareItem(spaceOp);
             ref = acquired.Take();
             return ESharedCacheResultStatus::Inserted;
@@ -3938,15 +3928,6 @@ void TSharedCache::RefreshEvictableByteBudget() noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::UpdateStickyLimit(ui64 limit) noexcept {
-    if (limit > HardLimit_.load(std::memory_order_relaxed)) {
-        return false;
-    }
-    StickyLimit_.store(limit, std::memory_order_relaxed);
-    return true;
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::UpdateKeepColdLimit(ui64 limit) noexcept {
     if (limit > HardLimit_.load(std::memory_order_relaxed)) {
         return false;
@@ -4020,19 +4001,8 @@ bool TSharedCache::PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, b
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::TryAddStickyOwnedBytes(ui64 bytes) noexcept {
-    ui64 owned = StickyOwnedBytes_.load(std::memory_order_relaxed);
-    for (;;) {
-        const ui64 limit = StickyLimit_.load(std::memory_order_relaxed);
-        if (bytes > limit || owned > limit - bytes) {
-            return false;
-        }
-        if (StickyOwnedBytes_.compare_exchange_weak(
-                owned, owned + bytes, std::memory_order_relaxed, std::memory_order_relaxed))
-        {
-            return true;
-        }
-    }
+void TSharedCache::AddStickyOwnedBytes(ui64 bytes) noexcept {
+    StickyOwnedBytes_.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -4082,6 +4052,18 @@ bool TSharedCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) 
             return true;
         }
     }
+}
+
+SHARED_CACHE_TEMPLATE
+void TSharedCache::AccountWrittenMemory(ui64 bytes, ui64 pages) noexcept {
+    if (bytes == 0 && pages == 0) {
+        return;
+    }
+    // The writer already owns these buffers; transfer their charge before publishing native page items.
+    PageUsage_.fetch_add(bytes, std::memory_order_relaxed);
+    OverallUsage_.fetch_add(bytes, std::memory_order_relaxed);
+    ReservedBytes_.fetch_add(bytes, std::memory_order_relaxed);
+    ReservedPages_.fetch_add(pages, std::memory_order_relaxed);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -4135,7 +4117,7 @@ bool TSharedCache::EnforceCurrentLimit() noexcept {
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes, bool forceShrinkHot) noexcept {
     const ui64 softLimit = SoftLimit_.load(std::memory_order_relaxed);
-    const bool hadCurrentPressure = ExceedsLimit(PageUsage(), CurrentLimit(), bytes);
+    const bool hadCurrentPressure = ExceedsLimit(PayloadUsage(), CurrentLimit(), bytes);
     const ui32 resizeStep = HotResizeStep(static_cast<ui32>(spaceOp.EffectiveHotSlots()));
     // Retained cache bytes drive soft pressure; total page commitment independently drives current pressure.
     const bool enforceSoftLimit =
@@ -4143,14 +4125,14 @@ bool TSharedCache::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes, boo
 
     bool progress = false;
     if (hadCurrentPressure) {
-        for (ui32 attempt = 0; attempt < resizeStep && ExceedsLimit(PageUsage(), CurrentLimit(), bytes); ++attempt) {
+        for (ui32 attempt = 0; attempt < resizeStep && ExceedsLimit(PayloadUsage(), CurrentLimit(), bytes); ++attempt) {
             if (!ReclaimCold(spaceOp)) {
                 break;
             }
             progress = true;
         }
     }
-    const bool enforceCurrentLimit = ExceedsLimit(PageUsage(), CurrentLimit(), bytes);
+    const bool enforceCurrentLimit = ExceedsLimit(PayloadUsage(), CurrentLimit(), bytes);
     if (auto hotResize = HotResize_.TryLock()) {
         // Publication uses the same lock, so Hot maintenance can route newly added handles safely.
         auto hotSpaceOp = BeginOperation();
@@ -4161,7 +4143,7 @@ bool TSharedCache::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes, boo
             progress = DrainHotResize(hotSpaceOp) || progress;
         } else {
             const ui64 pageUsage = RetainedBytes();
-            const ui64 physicalUsage = PageUsage();
+            const ui64 physicalUsage = PayloadUsage();
             const ui64 currentLimit = CurrentLimit();
             const ui64 freeBytes = currentLimit - Min(currentLimit, physicalUsage);
             const ui64 coldBytes = LoadEstimatedBytes(ColdReclaimableBytes_);
@@ -4329,7 +4311,7 @@ SHARED_CACHE_TEMPLATE
 bool TSharedCache::ReclaimToLimits(ui64 softLimit, ui32 step, TSpaceOperation& spaceOp, ui64 bytes) noexcept {
     bool progress = false;
     for (ui32 attempt = 0; attempt < step; ++attempt) {
-        if (ExceedsLimit(PageUsage(), CurrentLimit(), bytes)) {
+        if (ExceedsLimit(PayloadUsage(), CurrentLimit(), bytes)) {
             if (!ReclaimCold(spaceOp) && !ReclaimKeepCold(spaceOp)) {
                 break;
             }

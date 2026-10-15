@@ -1,6 +1,8 @@
 #include "flat_executor_ut_common.h"
 #include "flat_direct_part_writer.h"
+#include "shared_sausagecache.h"
 
+#include <ydb/core/testlib/actors/wait_events.h>
 #include <library/cpp/testing/unittest/registar.h>
 
 namespace NKikimr::NTable {
@@ -463,6 +465,34 @@ TVector<std::pair<i64, TString>> MakeBigRows(i64 count, size_t valueSize) {
 } // namespace
 
 Y_UNIT_TEST_SUITE(TDirectPartWrite) {
+
+    Y_UNIT_TEST(ReviewR13DirectWriteRegistersExistingBuffersAboveTarget) {
+        for (bool btree : { false, true }) {
+            TDirectWriteEnv env(8_MB, 0);
+            env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndex(btree);
+            env->GetAppData().FeatureFlags.SetEnableLocalDBFlatIndex(!btree);
+            env.FireWriteTablet();
+            env.SendSync(new NFake::TEvExecute{ new TTxInitSchema({ 101 }) });
+            const auto setLimit = [&](ui64 bytes) {
+                TWaitForFirstEvent<NMemory::TEvConsumerLimit> wait(*env);
+                env->Send(
+                    NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 0, bytes));
+                wait.Wait();
+            };
+            setLimit(1);
+            const auto rows = MakeRows(500);
+            env.SendAsync(new TEvStartDirectWrite(101, rows, ModeCommit));
+            auto done = env.GrabEdgeEvent<TEvDirectWriteDone>();
+            UNIT_ASSERT_C(done->Get()->Ok, done->Get()->Error);
+            const auto& cache = *env->GetAppData().SharedCache;
+            UNIT_ASSERT_VALUES_EQUAL(cache.CurrentLimit(), 1);
+            UNIT_ASSERT_GT(cache.PayloadUsage(), 1);
+            setLimit(8_MB);
+            UNIT_ASSERT_VALUES_EQUAL(env.ReadAll(101), rows);
+            env.RestartWriteTablet();
+            UNIT_ASSERT_VALUES_EQUAL(env.ReadAll(101), rows);
+        }
+    }
 
     Y_UNIT_TEST(HappyPath) {
         TDirectWriteEnv env;

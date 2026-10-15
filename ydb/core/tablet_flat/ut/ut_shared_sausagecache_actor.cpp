@@ -1104,6 +1104,63 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { _P(1) } } });
     }
 
+    void ReviewWrittenAdmission(bool stickyInput) {
+        TSharedPageCacheMock sharedCache;
+        sharedCache.SetLimit(2 * PAGE_TOTAL_SIZE, 0, 2 * PAGE_TOTAL_SIZE);
+        if (stickyInput) {
+            sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Sticky, {}, true);
+        }
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(0), _P(1) });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(0), _P(1) } } });
+        sharedCache.Provide(sharedCache.Collection1, { _P(0), _P(1) });
+        auto held = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(0), _P(1) } } });
+        if (stickyInput) {
+            held.erase(1); // Sticky retention protects this page without a reader reference.
+        }
+        auto& cache = TSharedCache::Get();
+        const ui64 handles = cache.PhysicalHandleCount();
+        const ui64 overallBefore = cache.OverallUsage();
+        TEvSaveCompactedPages saved(sharedCache.Collection2);
+        TPageData refused(_P(0), TSharedData::Copy(TString(10, 'w')));
+        UNIT_ASSERT(!saved.AddPage(cache, std::move(refused), false));
+        UNIT_ASSERT_VALUES_EQUAL(refused.Data.size(), 10);
+        const char* pointer = refused.Data.data();
+        auto sticky = saved.AddWrittenPage(cache, std::move(refused), true);
+        UNIT_ASSERT(sticky && sticky.IsSticky());
+        UNIT_ASSERT_VALUES_EQUAL(sticky.data(), pointer);
+        auto regular = saved.AddWrittenPage(cache, { _P(1), TSharedData::Copy(TString(10, 'n')) }, false);
+        UNIT_ASSERT(regular && !regular.IsSticky());
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 4 * PAGE_TOTAL_SIZE);
+        UNIT_ASSERT_VALUES_EQUAL(cache.OverallUsage(), overallBefore + 2 * PAGE_TOTAL_SIZE);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.CurrentLimit(), 2 * PAGE_TOTAL_SIZE);
+        UNIT_ASSERT_VALUES_EQUAL(cache.PhysicalHandleCount(), handles);
+        UNIT_ASSERT(!cache.AdmitPage(sharedCache.Collection2, _P(2), TSharedData::Copy(TString(10, 'b'))));
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 4 * PAGE_TOTAL_SIZE);
+        regular.Drop();
+        sharedCache.Wakeup();
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 3 * PAGE_TOTAL_SIZE);
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(held.at(0).data(), held.at(0).size()), TStringBuf("xxxxxxxxxx"));
+        if (stickyInput) {
+            auto binding = cache.BindCurrentThreadHazard();
+            TSharedCacheCollectionRef collection;
+            UNIT_ASSERT(cache.Find(sharedCache.Collection1->Label(), collection) == ESharedCacheResultStatus::Hit);
+            TSharedCachePageRef unreferenced;
+            UNIT_ASSERT(cache.Find(collection.CacheItem(), static_cast<ui64>(_P(1).Offset), unreferenced) ==
+                        ESharedCacheResultStatus::Hit);
+            UNIT_ASSERT(unreferenced.IsSticky());
+        }
+    }
+
+    Y_UNIT_TEST(ReviewR13WrittenAdmissionPreservesStickyInput) {
+        ReviewWrittenAdmission(true);
+    }
+
+    Y_UNIT_TEST(ReviewR13WrittenAdmissionPreservesPinnedInput) {
+        ReviewWrittenAdmission(false);
+    }
+
     Y_UNIT_TEST(CoreCompactedBufferRemainsAccountedUntilLastReference) {
         TSharedPageCacheMock sharedCache;
         auto saved = MakeHolder<TEvSaveCompactedPages>(sharedCache.Collection1);
@@ -1118,16 +1175,16 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.SetLimit(0);
         sharedCache.Wakeup();
         auto* core = &NSharedCache::TSharedCache::Get();
-        UNIT_ASSERT_GT(core->PageUsage(), 0);
+        UNIT_ASSERT_GT(core->PayloadUsage(), 0);
         UNIT_ASSERT_VALUES_EQUAL(pinned.BuildSharedData().Slice(), TStringBuf("xxxxxxxxxx"));
         TSharedCachePageRef last = std::move(pinned);
         UNIT_ASSERT(!pinned);
         sharedCache.Wakeup();
-        UNIT_ASSERT_GT(core->PageUsage(), 0);
+        UNIT_ASSERT_GT(core->PayloadUsage(), 0);
         UNIT_ASSERT_VALUES_EQUAL(last.BuildSharedData().Slice(), TStringBuf("xxxxxxxxxx"));
         last.Drop();
         sharedCache.Wakeup();
-        UNIT_ASSERT_VALUES_EQUAL(core->PageUsage(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(core->PayloadUsage(), 0);
     }
 
     Y_UNIT_TEST(CoreRegularCollectionRetainsSelectedBTreeIndexPage) {

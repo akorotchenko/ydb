@@ -447,7 +447,7 @@ public:
         return OverallUsage_.load(std::memory_order_relaxed);
     }
 
-    ui64 PageUsage() const noexcept {
+    ui64 PayloadUsage() const noexcept {
         return PageUsage_.load(std::memory_order_relaxed);
     }
 
@@ -464,14 +464,6 @@ public:
     ui64 ReservedPages() const noexcept {
         return ReservedPages_.load(std::memory_order_relaxed);
     }
-
-    // Pages may be kept only while they fit this budget; a page that does not fit is admitted with StickyNone and
-    // follows ordinary policy. StickyOwnedBytes() is the exact counter the limit is applied to.
-    ui64 StickyLimit() const noexcept {
-        return StickyLimit_.load(std::memory_order_relaxed);
-    }
-
-    bool UpdateStickyLimit(ui64 limit) noexcept;
 
     bool UpdateKeepColdLimit(ui64 limit) noexcept;
 
@@ -511,7 +503,6 @@ public:
         ui64 HitBytes = 0;
         ui64 MissPages = 0;
         ui64 MissBytes = 0;
-        ui64 StickyAdmissionFailures = 0; // page insertions that requested Sticky but fell back to ordinary on budget
 
         void AddAdmission(ESharedCacheResultStatus status, ui64 bytes) noexcept {
             ++RequestedPages;
@@ -534,7 +525,6 @@ public:
             .HitBytes = HitBytes_.load(std::memory_order_relaxed),
             .MissPages = MissPages_.load(std::memory_order_relaxed),
             .MissBytes = MissBytes_.load(std::memory_order_relaxed),
-            .StickyAdmissionFailures = StickyAdmissionFailures_.load(std::memory_order_relaxed),
         };
     }
 
@@ -548,6 +538,7 @@ private:
     friend class TPageFetchImpl<TTraits>;
     friend class TRequestPageWaiter;
     friend class TCompactedPageWaiter;
+    friend struct TEvSaveCompactedPages;
 
     Y_FORCE_INLINE void InvokeHook(ESharedCacheHookPoint point, TCacheItem cacheItem) const noexcept {
         TTraits::Invoke(point, cacheItem);
@@ -587,6 +578,11 @@ private:
         Complete,
     };
 
+    enum class EPageAdmission {
+        Bounded,
+        Written,
+    };
+
     struct TPageInsertCandidate {
         TSharedCacheKey Key;
         ui64 Size = 0;
@@ -597,7 +593,7 @@ private:
         bool CollectionOwnerHeld = false; // a batch owns the collection through candidate retries
         bool Prepare = false; // the page is absent from the table and needs an allocated pending item
         bool WaitForMemory = false;
-        bool StickyBudgetDenied = false; // count only if this prepared page wins table insertion
+        EPageAdmission Admission = EPageAdmission::Bounded;
     };
 
     struct TCollectionInsertCandidate {
@@ -681,7 +677,11 @@ private:
         TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests, TVector<TPageInsertCandidate>& candidates,
         ui64& reservedBytes) noexcept;
     bool AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& collection, TVector<TPageInsertCandidate>& candidates,
-        ui64 reservedBytes, bool waitForMemory) noexcept;
+        ui64 reservedBytes, bool waitForMemory, EPageAdmission admission) noexcept;
+    bool FindOrInsertWrittenBatch(
+        TCollectionCacheItem collection, TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests) noexcept;
+    bool FindOrInsertBatch(TCollectionCacheItem collection, TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests,
+        bool recordStats, bool waitForMemory, EPageAdmission admission) noexcept;
     ESharedCacheResultStatus FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
         const TCollectionLocation& collection, TCollectionCacheItem& inserted,
         TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
@@ -708,6 +708,7 @@ private:
     bool AdvanceBucketResize() noexcept;
 
     bool TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages = 0) noexcept;
+    void AccountWrittenMemory(ui64 bytes, ui64 pages) noexcept;
     bool ReserveFetchMemory(TSpaceOperation& spaceOp, TCacheItem item, TPageFetchState& fetch) noexcept;
     void NotifyResourcesAvailable() noexcept;
     void ReleaseReservation(ui64 bytes, ui64 pages = 0) noexcept;
@@ -849,14 +850,14 @@ private:
     static void SubtractEstimatedPages(std::atomic<i64>& counter, EItemKind kind) noexcept;
     static void SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept;
 
-    // The sticky budget covers pages only: collection records move through the sticky estimate but never consume it.
+    // Sticky ownership counts page payloads; collection records contribute only to the resident-state estimates.
     void SubStickyOwnedBytes(EItemKind kind, ui64 bytes) noexcept {
         if (kind == EItemKind::Page) {
             SubtractExactBytes(StickyOwnedBytes_, bytes);
         }
     }
 
-    bool TryAddStickyOwnedBytes(ui64 bytes) noexcept;
+    void AddStickyOwnedBytes(ui64 bytes) noexcept;
     bool TryAddRetainedBytes(ui64 bytes) noexcept;
     bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool force = false) noexcept;
     bool ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept;
@@ -966,7 +967,6 @@ private:
     std::atomic<ui64> RetainedBytes_{ 0 };
     std::atomic<ui64> ReservedBytes_{ 0 };
     std::atomic<ui64> ReservedPages_{ 0 };
-    std::atomic<ui64> StickyLimit_{ Max<ui64>() };
     std::atomic<ui64> StickyOwnedBytes_{ 0 };
     std::atomic<ui64> KeepColdMaxBytes_{ 0 }; // Configured ceiling; repeated updates preserve pressure shrinkage.
     std::atomic<ui64> KeepColdLimit_{ 0 }; // Effective budget, resized according to Cold+Free headroom.
@@ -988,7 +988,6 @@ private:
     std::atomic<ui64> HitBytes_{ 0 };
     std::atomic<ui64> MissPages_{ 0 };
     std::atomic<ui64> MissBytes_{ 0 };
-    std::atomic<ui64> StickyAdmissionFailures_{ 0 };
     std::atomic<bool> KeepColdPressure_{ false };
     std::atomic<bool> KeepColdTrimActive_{ false };
     std::atomic<bool> ResourceWaitArmed_{ false };

@@ -243,7 +243,7 @@ Y_UNIT_TEST_SUITE(BuildStatsPageLifetime) {
             while (cache.EnforceCurrentLimit()) {
             }
         }
-        UNIT_ASSERT_VALUES_EQUAL(cache.PageUsage(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
         {
             const auto root = GetBTreeRootLocation(part->IndexPages.GetBTree({}), collection, collection);
             auto page = referenceEnv.TryGetPage(part.Get(), root, {});
@@ -292,7 +292,7 @@ Y_UNIT_TEST_SUITE(BuildStatsPageLifetime) {
             view = {};
             assignedView = {};
             UNIT_ASSERT_VALUES_EQUAL(indexPage->RefCount(), 1);
-            UNIT_ASSERT_GT(cache.PageUsage(), 0);
+            UNIT_ASSERT_GT(cache.PayloadUsage(), 0);
             UNIT_ASSERT_VALUES_EQUAL(copiedView.Iter().Next().Data(), key.Data());
             copiedView = {};
             UNIT_ASSERT(tracker.Empty());
@@ -301,7 +301,7 @@ Y_UNIT_TEST_SUITE(BuildStatsPageLifetime) {
                 while (cache.EnforceCurrentLimit()) {
                 }
             }
-            UNIT_ASSERT_VALUES_EQUAL(cache.PageUsage(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
         }
         TStatsPageEnv env;
         TStats actual;
@@ -309,11 +309,11 @@ Y_UNIT_TEST_SUITE(BuildStatsPageLifetime) {
         UNIT_ASSERT(build(actual, &env, [&] {
             const auto workingSet = tracker.WorkingSet();
             sawPinnedFrontier |= workingSet.Pages > 0;
-            UNIT_ASSERT_LE(workingSet.TotalBytes, cache.PageUsage());
+            UNIT_ASSERT_LE(workingSet.TotalBytes, cache.PayloadUsage());
         }));
         UNIT_ASSERT(sawPinnedFrontier);
         UNIT_ASSERT(tracker.Empty());
-        UNIT_ASSERT_VALUES_EQUAL(cache.PageUsage(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
         UNIT_ASSERT_GT(env.Touched.size(), 8);
         if (!mixed) {
             UNIT_ASSERT_C(env.ReadBytes > frontierBudget,
@@ -337,7 +337,7 @@ Y_UNIT_TEST_SUITE(BuildStatsPageLifetime) {
         UNIT_ASSERT_EXCEPTION(build(abandoned, &pressureEnv, [] {
         }), TStopTraversal);
         UNIT_ASSERT(tracker.Empty());
-        UNIT_ASSERT_VALUES_EQUAL(cache.PageUsage(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
     }
 
     Y_UNIT_TEST(ReviewR11FlatIndexesTrackLivePages) {

@@ -204,7 +204,7 @@ void Restore(const TString& dir, TRestored& out, TMaybe<TErasureType> erasure = 
     out.FinalCacheHandles = NSharedCache::TSharedCache::Get().PhysicalHandleCount();
     out.FinalCacheBytes = NSharedCache::TSharedCache::Get().CurrentLimit();
     UNIT_ASSERT_VALUES_EQUAL(NSharedCache::TSharedCache::Get().SoftLimit(), 0u);
-    UNIT_ASSERT_VALUES_EQUAL(NSharedCache::TSharedCache::Get().PageUsage(), 0u);
+    UNIT_ASSERT_VALUES_EQUAL(NSharedCache::TSharedCache::Get().PayloadUsage(), 0u);
 }
 
 // A database to take scheme deltas and redo bodies from, standing in for the tablet that wrote the log.
@@ -822,9 +822,9 @@ Y_UNIT_TEST_SUITE(TPDiskToolRestoreTablet) {
         cache.RunMaintenance();
         UNIT_ASSERT_VALUES_EQUAL(newer.Get(1).AsBuf(), rows[0].second);
         UNIT_ASSERT_VALUES_EQUAL(older.Get(1).AsBuf(), rows[1].second);
-        UNIT_ASSERT(cache.PageUsage() >= rows[0].second.size() + rows[1].second.size());
+        UNIT_ASSERT(cache.PayloadUsage() >= rows[0].second.size() + rows[1].second.size());
         UNIT_ASSERT(it.Next() == NTable::EReady::Gone);
-        UNIT_ASSERT(cache.PageUsage() < rows[0].second.size());
+        UNIT_ASSERT(cache.PayloadUsage() < rows[0].second.size());
     }
 
     Y_UNIT_TEST(PointSelectRetainsExternalValues) {
@@ -843,13 +843,13 @@ Y_UNIT_TEST_SUITE(TPDiskToolRestoreTablet) {
             UNIT_ASSERT(db.Select(TableId, { &keyValue, 1 }, tags, row) == NTable::EReady::Data);
             cache.RunMaintenance();
             UNIT_ASSERT_VALUES_EQUAL(row.Get(1).AsBuf(), value);
-            UNIT_ASSERT(cache.PageUsage() >= value.size());
+            UNIT_ASSERT(cache.PayloadUsage() >= value.size());
         }
         const ui64 missing = 100;
         const TRawTypeValue keyValue(&missing, sizeof(missing), NScheme::NTypeIds::Uint64);
         NTable::TRowState row;
         UNIT_ASSERT(db.Select(TableId, { &keyValue, 1 }, tags, row) == NTable::EReady::Gone);
-        UNIT_ASSERT(cache.PageUsage() < rows.back().second.size());
+        UNIT_ASSERT(cache.PayloadUsage() < rows.back().second.size());
     }
 
     Y_UNIT_TEST(ScanReleasesPagesBeyondInitialCapacity) {
@@ -910,7 +910,7 @@ Y_UNIT_TEST_SUITE(TPDiskToolRestoreTablet) {
         }
         UNIT_ASSERT(cache.ColdReclaimableItems() > NSharedCache::SharedCacheTransitionWorkBatch);
         const ui64 smallPageBytes = 4096 + 128 + NActors::TSharedData::OverheadSize;
-        UNIT_ASSERT(cache.PageUsage() + rows.back().second.size() >
+        UNIT_ASSERT(cache.PayloadUsage() + rows.back().second.size() >
                     cache.CurrentLimit() + NSharedCache::SharedCacheTransitionWorkBatch * smallPageBytes);
         UNIT_ASSERT(it->Next(NTable::ENext::Data) == NTable::EReady::Data);
         UNIT_ASSERT_VALUES_EQUAL(it->Row().Get(1).AsBuf(), rows.back().second);

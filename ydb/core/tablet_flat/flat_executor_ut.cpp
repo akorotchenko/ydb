@@ -4058,10 +4058,10 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_Follower) {
             UNIT_ASSERT(core->SetCollectionPagesCacheMode(collection.CacheItem(), ECacheMode::Regular));
         }
         SetSharedCacheSize(env, 0);
-        for (ui32 step = 0; step < 400 && core->PageUsage() != 0; ++step) {
+        for (ui32 step = 0; step < 400 && core->PayloadUsage() != 0; ++step) {
             WakeupSharedCache(env);
         }
-        UNIT_ASSERT_VALUES_EQUAL(core->PageUsage(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(core->PayloadUsage(), 0);
         SetSharedCacheSize(env, 8_MB);
 
         Cerr << "... starting follower" << Endl;
@@ -6697,6 +6697,35 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_StickyPages) {
         }
     }
 
+    Y_UNIT_TEST(ReviewR13CompactionWithFullStickyInputCache) {
+        TMyEnvBase env(8_MB, 0);
+        TRowsModel rows;
+        SetupEnvironment(env, false);
+        env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
+        env.SendSync(rows.MakeScheme(new TCompactionPolicy()));
+        env.SendSync(new NFake::TEvExecute{ new TTxKeepFamilyInMemory(0) });
+        env.SendSync(rows.RowTo(0).MakeRows(100, 950));
+        env.SendSync(new NFake::TEvCompact(TRowsModel::TableId));
+        env.WaitFor<NFake::TEvCompacted>();
+        int failedAttempts = 0;
+        DoFullScan(env, failedAttempts);
+        env.SendSync(rows.RowTo(0).MakeRows(1, 950));
+        auto& cache = *env->GetAppData().SharedCache;
+        const ui64 limit = cache.PayloadUsage();
+        UNIT_ASSERT(limit && limit == cache.StickyBytes());
+        {
+            TWaitForFirstEvent<NMemory::TEvConsumerLimit> wait(*env);
+            env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 0, limit));
+            wait.Wait();
+        }
+        const ui64 handles = cache.PhysicalHandleCount();
+        env.SendSync(new NFake::TEvCompact(TRowsModel::TableId));
+        env.WaitFor<NFake::TEvCompacted>();
+        UNIT_ASSERT_VALUES_EQUAL(cache.CurrentLimit(), limit);
+        UNIT_ASSERT_VALUES_EQUAL(cache.PhysicalHandleCount(), handles);
+        DoFullScan(env, failedAttempts);
+    }
+
     Y_UNIT_TEST(TestNonSticky_FlatIndex) {
         TMyEnvBase env(32_MB);
         TRowsModel rows;
@@ -8636,10 +8665,10 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_BTreeIndex) {
         env.SendSync(new TEvents::TEvPoison, false, true);
         SetSharedCacheSize(env, 0);
         auto* core = &NSharedCache::TSharedCache::Get();
-        for (ui32 step = 0; step < 400 && core->PageUsage() != 0; ++step) {
+        for (ui32 step = 0; step < 400 && core->PayloadUsage() != 0; ++step) {
             WakeupSharedCache(env);
         }
-        UNIT_ASSERT_VALUES_EQUAL(core->PageUsage(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(core->PayloadUsage(), 0);
         SetSharedCacheSize(env, 8_MB);
         appData.FeatureFlags.SetEnableLocalDBBtreeIndexV2(false);
         watchRequests = true;
