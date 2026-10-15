@@ -8,6 +8,7 @@
 #include "import_s3_engine.h"
 
 #include <ydb/core/tablet_flat/flat_direct_part_writer.h>
+#include <ydb/core/tablet_flat/flat_bio_stats.h>
 
 #include <ydb/core/backup/common/checksum.h>
 #include <ydb/core/backup/common/encryption.h>
@@ -59,7 +60,7 @@ using namespace Aws;
 //                             |                              |
 //                          Finalize                       Finalize
 //                             v                              v
-//                         Finalizing --(all puts acked)--> Complete --ExtractResult--> HandedOff
+//                         Finalizing --(puts + metadata ready)--> Complete --ExtractResult--> HandedOff
 //
 // Any writer error moves to Failed.
 class TDirectImportWriter {
@@ -71,8 +72,8 @@ public:
         Pending,     // reserved on the shard; awaiting the writer (begin in flight)
         Writing,     // accepting rows
         Paused,      // backpressure: waiting for blob puts to drain before more rows
-        Finalizing,  // all rows fed; draining the remaining blob puts
-        Complete,    // all puts acked; the part can be extracted
+        Finalizing, // all rows fed; awaiting blob puts and output metadata
+        Complete, // blobs durable and metadata loaded; the part can be extracted
         HandedOff,   // result extracted and handed to the finish transaction
         Failed,      // the writer reported an error
     };
@@ -132,8 +133,20 @@ public:
         State_ = Writer->IsComplete() ? EState::Complete : EState::Finalizing;
     }
 
-    // Account a finished blob put; transitions Finalizing -> Complete once drained.
+    // Account a finished blob put; completion also requires the output metadata.
     void OnPutResult(TEvBlobStorage::TEvPutResult& msg, const TActorContext& ctx) {
+        if (!Writer) {
+            return;
+        }
+        Writer->Handle(msg, ctx);
+        if (Writer->HasError()) {
+            State_ = EState::Failed;
+        } else if (State_ == EState::Finalizing && Writer->IsComplete()) {
+            State_ = EState::Complete;
+        }
+    }
+
+    void OnPageResult(NSharedCache::TEvResult& msg, const TActorContext& ctx) {
         if (!Writer) {
             return;
         }
@@ -943,12 +956,34 @@ class TS3Downloader: public TActorBootstrapped<TS3Downloader<TSettings>> {
         }
     }
 
+    void Handle(NTabletFlatExecutor::NBlockIO::TEvStat::TPtr& ev) {
+        ev->Rewrite(ev->GetTypeRewrite(), DataShard);
+        TActivationContext::Send(ev.Release());
+    }
+
+    void Handle(NSharedCache::TEvResult::TPtr& ev) {
+        if (!DirectImport) {
+            return;
+        }
+        DirectImport->OnPageResult(*ev->Get(), TActivationContext::AsActorContext());
+        if (DirectImport->IsFailed()) {
+            return Finish(false,
+                TStringBuilder() << Settings.GetDataKey(DataFormat, CompressionCodec) << ": " << DirectImport->Error());
+        }
+        if (DirectImport->IsComplete()) {
+            CompleteDirectImport();
+        }
+    }
+
     // Release the reserved write's GC barrier if we own it and never handed it off.
     void AbortDirectImportIfNeeded() {
         if (DirectImport && DirectImport->NeedsAbort()) {
             this->Send(DataShard, new TEvDataShard::TEvS3DirectWriteAbort(TxId, DirectImport->Step()));
         }
-        DirectImport.Reset();
+        if (DirectImport) {
+            DirectImport.Reset();
+            this->Send(NSharedCache::MakeSharedPageCacheId(), new NSharedCache::TEvUnregister);
+        }
     }
 
     void UploadRows() {
@@ -1269,6 +1304,8 @@ public:
             hFunc(TEvDataShard::TEvS3DirectWriteBeginResult, Handle);
             hFunc(TEvDataShard::TEvS3DirectWriteFinishResult, Handle);
             hFunc(TEvBlobStorage::TEvPutResult, Handle);
+            hFunc(NSharedCache::TEvResult, Handle);
+            hFunc(NTabletFlatExecutor::NBlockIO::TEvStat, Handle);
 
             hFunc(TEvents::TEvWakeup, Handle);
             sFunc(TEvents::TEvPoisonPill, NotifyDied);

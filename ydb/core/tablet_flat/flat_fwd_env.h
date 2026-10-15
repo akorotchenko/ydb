@@ -210,6 +210,28 @@ namespace NFwd {
             return this;
         }
 
+        void ReleaseReadPages() {
+            if (ReadPagesReleased) {
+                return;
+            }
+            if (Conf.Trace) {
+                FinishedTraces = GrabTraces();
+            }
+            Total = Stats();
+            Pending = 0;
+            ++Epoch; // Late read-ahead replies no longer belong to a live reading queue.
+            FetchingQueues.Clear();
+            PartGroupQueues.clear();
+            PartIndexPageLocator.clear();
+            GroupQueues.clear();
+            ColdParts.clear();
+            ReadPagesReleased = true;
+        }
+
+        bool IsReadFinished() const noexcept {
+            return ReadPagesReleased;
+        }
+
         TStat Stats() const
         {
             auto aggr = [](auto &&stat, const TPartGroupLoadingQueue &q) {
@@ -245,6 +267,9 @@ namespace NFwd {
 
         TAutoPtr<TSeen> GrabTraces()
         {
+            if (ReadPagesReleased) {
+                return std::move(FinishedTraces);
+            }
             TDeque<TSieve> sieves(PartGroupQueues.size() - ColdParts.size() + 1);
 
             sieves.back() = MemTable->Traced(); /* blobs of memtable */
@@ -420,6 +445,8 @@ namespace NFwd {
         // Wrapper for memtable blobs
         TAutoPtr<TMemTableHandler> MemTable;
         TIntrusiveList<TPartGroupLoadingQueue> FetchingQueues;
+        bool ReadPagesReleased = false;
+        TAutoPtr<TSeen> FinishedTraces;
         // Pending pages to load
         ui64 Pending = 0;
         // Accumulated stats on resets

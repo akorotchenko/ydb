@@ -1104,6 +1104,27 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { _P(1) } } });
     }
 
+    Y_UNIT_TEST(ReviewR13StickyCompactedPageAdmissionPreservesDataUnderPressure) {
+        TSharedPageCacheMock sharedCache;
+        sharedCache.SetLimit(PAGE_TOTAL_SIZE, 0, PAGE_TOTAL_SIZE);
+        sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, { _P(0) });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection2, { _P(0) } } });
+        sharedCache.Provide(sharedCache.Collection2, { _P(0) });
+        auto held = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection2, { _P(0) } } });
+        UNIT_ASSERT_VALUES_EQUAL(held.size(), 1);
+
+        TEvSaveCompactedPages saved(sharedCache.Collection1);
+        TPageData metadata(_P(1, EPage::Schem2), TSharedData::Copy(TString(10, 'm')));
+        const char* const body = metadata.Data.data();
+        auto& core = TSharedCache::Get();
+        UNIT_ASSERT_VALUES_EQUAL(core.PageUsage(), PAGE_TOTAL_SIZE);
+        UNIT_ASSERT(!saved.AddPage(core, std::move(metadata), true));
+        UNIT_ASSERT(metadata.Data.data() == body);
+        UNIT_ASSERT_VALUES_EQUAL(metadata.Data.Slice(), TStringBuf("mmmmmmmmmm"));
+        UNIT_ASSERT_VALUES_EQUAL(core.PageUsage(), PAGE_TOTAL_SIZE);
+        UNIT_ASSERT_VALUES_EQUAL(saved.Pages.size(), 1);
+    }
+
     Y_UNIT_TEST(CoreCompactedBufferRemainsAccountedUntilLastReference) {
         TSharedPageCacheMock sharedCache;
         auto saved = MakeHolder<TEvSaveCompactedPages>(sharedCache.Collection1);

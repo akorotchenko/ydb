@@ -37,10 +37,10 @@ namespace NTable {
         };
 
         struct TLoaderEnv : public IPages {
-            TLoaderEnv(TSharedCacheCollectionRef pageCollection)
+            TLoaderEnv(TSharedCacheCollectionRef pageCollection, bool stickyMetadata = true)
                 : PageCollection(std::move(pageCollection))
-            {
-            }
+                , StickyMetadata(stickyMetadata)
+            {}
 
             TResult Locate(const TMemTable*, ui64, ui32) override
             {
@@ -67,7 +67,7 @@ namespace NTable {
 
                 if (savedPage == SavedPages.end() || !savedPage->second) {
                     if (auto page = PageCollection->TryGetPage(
-                            location, NeedIn(location.Type) || location.Type == EPage::FlatIndex)) {
+                            location, StickyMetadata && (NeedIn(location.Type) || location.Type == EPage::FlatIndex))) {
                         // Retain the page while decoding, even if its cache entry is withdrawn.
                         AddSavedPage(location.Offset, std::move(page));
                         savedPage = SavedPages.find(location.Offset);
@@ -96,7 +96,7 @@ namespace NTable {
                     TVector<bool> sticky;
                     sticky.reserve(pages.size());
                     for (const auto& page : pages) {
-                        sticky.push_back(NeedIn(page.Type) || page.Type == EPage::FlatIndex);
+                        sticky.push_back(StickyMetadata && (NeedIn(page.Type) || page.Type == EPage::FlatIndex));
                     }
                     return {
                         .PageCollection = PageCollection->PageCollection(),
@@ -114,7 +114,7 @@ namespace NTable {
                 NeedPages.erase(it);
                 SavedPages[page.Location.Offset] =
                     TSharedCache::Get().AdmitPage(PageCollection->PageCollection(), page.Location, std::move(page.Data),
-                        NeedIn(page.Location.Type) || page.Location.Type == EPage::FlatIndex);
+                        StickyMetadata && (NeedIn(page.Location.Type) || page.Location.Type == EPage::FlatIndex));
             }
 
             void Save(NSharedCache::TEvResult::TLoaded&& loaded)
@@ -127,6 +127,8 @@ namespace NTable {
             }
 
         private:
+            friend class TLoader;
+
             void AddSavedPage(TPageOffset offset, TSharedCachePageRef&& page)
             {
                 SavedPages[offset] = std::move(page);
@@ -140,6 +142,7 @@ namespace NTable {
 
             const TPart* Part = nullptr;
             TSharedCacheCollectionRef PageCollection;
+            const bool StickyMetadata;
             THashMap<TPageOffset, TSharedCachePageRef> SavedPages;
             // Dedup by offset — keep Size/Type for the fetch request
             THashSet<TPageLocation, NPage::TPageLocationByOffsetHash, TPageLocationByOffsetEq> NeedPages;
@@ -155,7 +158,8 @@ namespace NTable {
             bool PreloadData = false;
         };
 
-        TLoader(TPartComponents components, TVector<TSharedCacheCollectionRef> prebuiltPageCollections = {});
+        TLoader(TPartComponents components, TVector<TSharedCacheCollectionRef> prebuiltPageCollections = {},
+            bool stickyMetadata = true);
         ~TLoader();
 
         TFetch Run(TRunOptions options)
@@ -196,6 +200,16 @@ namespace NTable {
         }
 
         void Save(TVector<NSharedCache::TEvResult::TLoaded>&& pages);
+
+        ui64 PinnedBytes() const {
+            ui64 bytes = 0;
+            for (const auto& [_, page] : LoaderEnv->SavedPages) {
+                if (page) {
+                    bytes += page.size() + TSharedData::OverheadSize;
+                }
+            }
+            return bytes;
+        }
 
         constexpr static bool NeedIn(EPage page) noexcept
         {
@@ -276,6 +290,7 @@ namespace NTable {
 
     private:
         TVector<TSharedCacheCollectionRef> PageCollections;
+        const bool StickyMetadata;
         TPartComponents Components;
         const TString Legacy;
         const TString Opaque;

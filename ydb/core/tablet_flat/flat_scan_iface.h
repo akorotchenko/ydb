@@ -81,6 +81,9 @@ namespace NTable {
         // Stops scan and calls IScan::Finish(const std::exception&)
         virtual void Throw(const std::exception& exc) = 0;
 
+        // After the final seek, release input pages before waiting for output cache capacity.
+        virtual void ReleaseReadPages() {}
+
         virtual ui64 GetTotalCpuTimeUs() const = 0;
     };
 

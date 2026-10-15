@@ -9,8 +9,10 @@
 namespace NKikimr {
 namespace NTable {
 
-TLoader::TLoader(TPartComponents components, TVector<TSharedCacheCollectionRef> prebuiltPageCollections)
+TLoader::TLoader(
+    TPartComponents components, TVector<TSharedCacheCollectionRef> prebuiltPageCollections, bool stickyMetadata)
     : PageCollections(std::move(prebuiltPageCollections))
+    , StickyMetadata(stickyMetadata)
     , Components(std::move(components))
     , Legacy(std::move(Components.Legacy))
     , Opaque(std::move(Components.Opaque))
@@ -218,7 +220,7 @@ void TLoader::StageParseMeta()
         PageCollections.back() = std::move(cache);
     }
 
-    LoaderEnv = MakeHolder<TLoaderEnv>(PageCollections[0].Acquire());
+    LoaderEnv = MakeHolder<TLoaderEnv>(PageCollections[0].Acquire(), StickyMetadata);
 
     if (!HasBasics() || (Rooted && SchemeId != meta.TotalPages() - 1)
         || (LargeId == Max<TPageId>()) != (GlobsId == Max<TPageId>())

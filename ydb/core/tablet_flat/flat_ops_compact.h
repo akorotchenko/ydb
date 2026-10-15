@@ -7,6 +7,7 @@
 #include "flat_row_misc.h"
 #include "flat_part_writer.h"
 #include "flat_part_loader.h"
+#include "flat_written_part.h"
 #include "util_fmt_abort.h"
 #include "util_fmt_logger.h"
 #include "util_fmt_desc.h"
@@ -30,10 +31,7 @@ namespace NKikimr {
 namespace NTabletFlatExecutor {
 
     struct TProdCompact: public IDestructable {
-        struct TResult {
-            NTable::TPartView Part;
-            TDeque<NTable::TScreen::THole> Growth;
-        };
+        using TResult = TWrittenPartLoader::TResult;
 
         using TResults = TDeque<TResult>;
 
@@ -583,6 +581,7 @@ namespace NTabletFlatExecutor {
                     Y_ENSURE(WriteStats.Parts == Results.size());
                     WriteTxStatus();
                     Finished = true;
+                    Driver->ReleaseReadPages();
                 }
 
                 return Flush(true /* final flush, sleep or finish */);
@@ -838,55 +837,14 @@ namespace NTabletFlatExecutor {
 
             if (fail) {
                 Results.clear(); /* shouldn't sent w/o fixation in bs */
-            }
-
-            for (auto &result : Results) {
-                Y_ENSURE(result.PageCollections, "Compaction produced a part without page collections");
-                TVector<TSharedCacheCollectionRef> resultingPageCollections;
-                auto& sharedCache = NSharedCache::TSharedCache::Get();
-                for (auto& pageCollection : result.PageCollections) {
-                    auto resultingPageCollection = sharedCache.AdmitCollection(pageCollection.PageCollection);
-                    auto saveCompactedPages = MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);
-                    for (auto &page : pageCollection.StickyPages) {
-                        saveCompactedPages->AddPage(sharedCache, std::move(page), true);
-                    }
-                    for (auto &page : pageCollection.RegularPages) {
-                        saveCompactedPages->AddPage(sharedCache, std::move(page), false);
-                    }
-
-                    Send(MakeSharedPageCacheId(), saveCompactedPages.Release());
-
-                    resultingPageCollections.push_back(std::move(resultingPageCollection));
+                if (OutputLoader) {
+                    OutputLoader->Cancel(ActorContext());
                 }
-
-                TVector<NTable::TPageCollectionComponents> comps(result.PageCollections.size());
-                NTable::TPartComponents parts{
-                    .PageCollectionComponents = std::move(comps),
-                    .Opaque = std::move(result.Overlay),
-                    .Epoch = NTable::TEpoch::Max(),
-                };
-
-                // Pass collection metadata; the loader reads admitted pages from core.
-                NTable::TLoader loader(
-                    std::move(parts),
-                    std::move(resultingPageCollections));
-
-                // do not preload index as it may be already offloaded
-                auto fetch = loader.Run({.PreloadIndex = false, .PreloadData = false});
-
-                if (Y_UNLIKELY(fetch)) {
-                    TStringBuilder error;
-                    error << "Just compacted part needs to load page collection " << fetch.PageCollection->Label() << " pages";
-                    for (auto page : fetch.Pages) {
-                        error << " " << page;
-                    }
-                    Y_TABLET_ERROR(error);
-                }
-
-                auto& res = prod->Results.emplace_back();
-                res.Part = loader.Result();
-                res.Growth = std::move(result.Growth);
-                Y_ENSURE(res.Part, "Unexpected result without a part after compaction");
+                OutputLoader.Reset();
+            } else {
+                Y_ENSURE(OutputLoader && OutputLoader->IsComplete());
+                prod->Results = OutputLoader->ExtractResults();
+                OutputLoader.Reset();
             }
 
             prod->TxStatus = std::move(TxStatus);
@@ -935,6 +893,7 @@ namespace NTabletFlatExecutor {
 
             Driver = nullptr;
 
+            ActorContext().Send(MakeSharedPageCacheId(), new NSharedCache::TEvUnregister);
             PassAway();
 
             return prod;
@@ -957,7 +916,10 @@ namespace NTabletFlatExecutor {
             EScan scan = EScan::Sleep;
 
             if (last) {
-                scan = (Flushing > 0 ? EScan::Sleep : EScan::Final);
+                if (Flushing == 0) {
+                    PrepareResult();
+                }
+                scan = Failed || (OutputLoader && OutputLoader->IsComplete()) ? EScan::Final : EScan::Sleep;
             } else {
                 scan = (Flushing >= MaxFlight ? EScan::Sleep : EScan::Feed);
             }
@@ -971,6 +933,19 @@ namespace NTabletFlatExecutor {
         {
             if (auto *ev = eh->CastAsLocal<TEvPutResult>()) {
                 Handle(*ev);
+            } else if (eh->CastAsLocal<NBlockIO::TEvStat>()) {
+                eh->Rewrite(eh->GetTypeRewrite(), Owner);
+                TActivationContext::Send(eh.Release());
+            } else if (auto* ev = eh->CastAsLocal<NSharedCache::TEvResult>()) {
+                if (OutputLoader) {
+                    OutputLoader->Handle(*ev, ActorContext());
+                    if (OutputLoader->HasError()) {
+                        Failed = true;
+                    }
+                    if (Failed || OutputLoader->IsComplete()) {
+                        Driver->Touch(EScan::Final);
+                    }
+                }
             } else if (eh->CastAsLocal<TEvents::TEvUndelivered>()) {
                 if (auto logl = Logger->Log(ELnLev::Error)) {
                     logl
@@ -1039,10 +1014,24 @@ namespace NTabletFlatExecutor {
 
                 if (Flushing == 0) {
                     Spent->Alter(true /* resource available again */);
-                    Driver->Touch(Finished ? EScan::Final : EScan::Feed);
+                    if (Finished) {
+                        PrepareResult();
+                        if (Failed || OutputLoader->IsComplete()) {
+                            Driver->Touch(EScan::Final);
+                        }
+                    } else {
+                        Driver->Touch(EScan::Feed);
+                    }
                 }
             } else if (!std::exchange(Failed, true)) {
                 Driver->Touch(EScan::Final);
+            }
+        }
+
+        void PrepareResult() {
+            if (!OutputLoader) {
+                OutputLoader = MakeHolder<TWrittenPartLoader>(std::move(Results), ActorContext());
+                Failed = OutputLoader->HasError();
             }
         }
 
@@ -1104,6 +1093,7 @@ namespace NTabletFlatExecutor {
         TIntrusivePtr<TPartWriter> Writer;
         NTable::TWriteStats WriteStats;
         TVector<TBundle::TResult> Results;
+        THolder<TWrittenPartLoader> OutputLoader;
         TVector<TIntrusiveConstPtr<NTable::TTxStatusPart>> TxStatus;
         const NScheme::TTypeRegistry * Registry = nullptr;
 

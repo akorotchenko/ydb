@@ -3,6 +3,7 @@
 #include "flat_writer_bundle.h"
 #include "flat_part_writer.h"
 #include "flat_part_loader.h"
+#include "flat_written_part.h"
 #include "flat_row_scheme.h"
 #include "flat_row_state.h"
 #include "flat_part_laid.h"
@@ -57,7 +58,7 @@ namespace NTabletFlatExecutor {
      * memtable and compaction. Created by the executor (which reserves a step and
      * holds a GC barrier) and handed off to an arbitrary actor that:
      *   - feeds rows one at a time in strictly ascending key order via AddRow(),
-     *   - forwards TEvPutResult events to Handle(),
+     *   - forwards TEvPutResult and shared-cache TEvResult events to Handle(),
      *   - calls Finalize() once all rows are fed and, after IsComplete() becomes
      *     true, ExtractResult() to obtain the part(s) for the commit transaction.
      *
@@ -93,8 +94,10 @@ namespace NTabletFlatExecutor {
         // complete (TEvPutResult) before feeding more rows.
         bool CanFeed() const noexcept { return !Failed && !Finishing && Flushing < MaxFlight; }
 
-        // True once all rows have been fed (Finalize called) and all blobs acked.
-        bool IsComplete() const noexcept { return !Failed && Finishing && Flushing == 0; }
+        // True once all blobs are durable and the output parts have been assembled.
+        bool IsComplete() const noexcept {
+            return !Failed && Finishing && Flushing == 0 && OutputLoader && OutputLoader->IsComplete();
+        }
 
         /**
          * Append a single committed row from parsed cells, laying it out by the
@@ -165,7 +168,7 @@ namespace NTabletFlatExecutor {
 
         /**
          * Signal that all rows have been fed. Finalizes pages/index and starts
-         * draining the remaining blobs. After this the owner must wait until
+         * draining the remaining blobs, then loads output metadata. The owner must wait until
          * IsComplete() before calling ExtractResult().
          */
         bool Finalize(const TActorContext& ctx)
@@ -185,6 +188,7 @@ namespace NTabletFlatExecutor {
 
             Finishing = true;
             DrainBlobs(ctx);
+            PrepareResult(ctx);
             return !Failed;
         }
 
@@ -230,6 +234,18 @@ namespace NTabletFlatExecutor {
                 SendToBs(std::move(WriteQueue.front()), ctx);
                 WriteQueue.pop_front();
             }
+            PrepareResult(ctx);
+        }
+
+        bool Handle(NSharedCache::TEvResult& msg, const TActorContext& ctx) {
+            if (!Failed && OutputLoader) {
+                const bool handled = OutputLoader->Handle(msg, ctx);
+                if (OutputLoader->HasError()) {
+                    Fail(OutputLoader->Error());
+                }
+                return handled;
+            }
+            return false;
         }
 
         /**
@@ -249,48 +265,26 @@ namespace NTabletFlatExecutor {
             result->YellowMoveChannels = std::move(YellowMoveChannels);
             result->YellowStopChannels = std::move(YellowStopChannels);
 
-            for (auto &res : Results) {
-                Y_ENSURE(res.PageCollections, "Direct write produced a part without page collections");
-
-                TVector<TSharedCacheCollectionRef> pageCollections;
-                auto& sharedCache = NSharedCache::TSharedCache::Get();
-                for (auto& pageCollection : res.PageCollections) {
-                    auto resultingPageCollection = sharedCache.AdmitCollection(pageCollection.PageCollection);
-                    auto saveCompactedPages = MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);
-                    for (auto &page : pageCollection.StickyPages) {
-                        saveCompactedPages->AddPage(sharedCache, std::move(page), true);
-                    }
-                    for (auto &page : pageCollection.RegularPages) {
-                        saveCompactedPages->AddPage(sharedCache, std::move(page), false);
-                    }
-
-                    ctx.Send(MakeSharedPageCacheId(), saveCompactedPages.Release());
-
-                    pageCollections.push_back(std::move(resultingPageCollection));
-                }
-
-                TVector<NTable::TPageCollectionComponents> comps(res.PageCollections.size());
-                NTable::TPartComponents parts{
-                    .PageCollectionComponents = std::move(comps),
-                    .Opaque = std::move(res.Overlay),
-                    .Epoch = NTable::TEpoch::Max(),
-                };
-
-                // Pass pre-built collections so the shared cache sees active refs for the written pages.
-                NTable::TLoader loader(std::move(parts), std::move(pageCollections));
-
-                auto fetch = loader.Run({.PreloadIndex = false, .PreloadData = false});
-                Y_ENSURE(!fetch, "Just written part needs to load page collection pages");
-
-                result->Parts.push_back(loader.Result());
+            Y_UNUSED(ctx);
+            for (auto& res : OutputLoader->ExtractResults()) {
+                result->Parts.push_back(std::move(res.Part));
                 result->Growth.push_back(std::move(res.Growth));
-                Y_ENSURE(result->Parts.back(), "Unexpected result without a part after direct write");
             }
+            OutputLoader.Reset();
 
             return result;
         }
 
     private:
+        void PrepareResult(const TActorContext& ctx) {
+            if (!Failed && Finishing && Flushing == 0 && !OutputLoader) {
+                OutputLoader = MakeHolder<TWrittenPartLoader>(std::move(Results), ctx);
+                if (OutputLoader->HasError()) {
+                    Fail(OutputLoader->Error());
+                }
+            }
+        }
+
         bool Fail(const TString& text)
         {
             if (!Failed) {
@@ -363,6 +357,7 @@ namespace NTabletFlatExecutor {
         TAutoPtr<TPartWriter> Writer;
         NTable::TWriteStats WriteStats;
         TVector<TBundle::TResult> Results;
+        THolder<TWrittenPartLoader> OutputLoader;
 
         TOwnedCellVec PrevKey;
         bool HavePrevKey = false;

@@ -634,6 +634,53 @@ void WakeupSharedCache(TMyEnvBase& env) {
  * 5. Check number of scanned rows.
  */
 Y_UNIT_TEST_SUITE(TFlatTableExecutor_CompactionScan) {
+    Y_UNIT_TEST(ReviewR13CompactionWaitsForMetadataCapacity) {
+        for (bool bTreeIndex : { false, true }) {
+            TMyEnvBase env(8_MB, 0);
+            TRowsModel rows;
+            auto& appData = env->GetAppData();
+            appData.FeatureFlags.SetEnableLocalDBBtreeIndex(bTreeIndex);
+            appData.FeatureFlags.SetEnableLocalDBBtreeIndexV2(bTreeIndex);
+            appData.FeatureFlags.SetEnableLocalDBFlatIndex(true);
+            env.FireTablet(env.Edge, env.Tablet, [&env](const TActorId& tablet, TTabletStorageInfo* info) {
+                return new TTestFlatTablet(env.Edge, tablet, info);
+            });
+            env.WaitForWakeUp();
+            env.SendSync(rows.MakeScheme(new TCompactionPolicy()));
+            env.SendSync(rows.MakeRows(100, 950));
+
+            const ui64 currentLimit = appData.SharedCache->CurrentLimit();
+            {
+                TWaitForFirstEvent<NMemory::TEvConsumerLimit> wait(*env);
+                env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 0, 1));
+                wait.Wait();
+            }
+            bool metadataRequested = false, completed = false;
+            auto requests = env->AddObserver<NSharedCache::TEvRequest>([&](const auto& ev) {
+                metadataRequested |= bool(ev->Get()->WaitPad);
+            });
+            auto completion = env->AddObserver<NFake::TEvCompacted>([&](const auto&) {
+                completed = true;
+            });
+            TWaitForFirstEvent<NSharedCache::TEvRequest> waiting(*env);
+            env.SendSync(new NFake::TEvCompact(TRowsModel::TableId));
+            waiting.Wait();
+            UNIT_ASSERT(metadataRequested);
+            UNIT_ASSERT(!completed);
+            UNIT_ASSERT_VALUES_EQUAL(appData.SharedCache->CurrentLimit(), 1);
+            {
+                TWaitForFirstEvent<NMemory::TEvConsumerLimit> wait(*env);
+                env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 0, currentLimit));
+                wait.Wait();
+            }
+            env.WaitFor<NFake::TEvCompacted>();
+            requests.Remove();
+            completion.Remove();
+            env.SendAsync(new TEvTestFlatTablet::TEvQueueScan(100));
+            env.WaitFor<TEvTestFlatTablet::TEvScanFinished>();
+        }
+    }
+
     Y_UNIT_TEST(TestCompactionScan) {
         TMyEnvBase env;
         TRowsModel data;

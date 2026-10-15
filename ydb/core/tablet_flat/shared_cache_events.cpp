@@ -65,7 +65,6 @@ TSharedCachePageRef TEvSaveCompactedPages::AddPage(
     auto waiter = MakeIntrusive<TCompactedPageWaiter>();
     TSharedCachePageRequest request(page.Location, waiter, sticky);
     if (!cachePages.FindOrInsertBatch(CacheItem, { &request, 1 }, false)) {
-        Y_ENSURE(!sticky, "Cannot admit Sticky compacted page " << page.Location.Offset);
         return {};
     }
     if (request.Status() == ESharedCacheResultStatus::Hit) {

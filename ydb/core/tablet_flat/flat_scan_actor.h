@@ -616,6 +616,9 @@ namespace NOps {
 
         void Handle(NSharedCache::TEvResult::TPtr& ev)
         {
+            if (Cache->IsReadFinished()) {
+                return;
+            }
             auto& msg = *ev->Get();
 
             auto lvl = msg.Status ? ELnLev::Error : ELnLev::Debug;
@@ -713,6 +716,10 @@ namespace NOps {
         void Throw(const std::exception& exc) override
         {
             OnUnhandledException(exc);
+        }
+
+        void ReleaseReadPages() override {
+            Cache->ReleaseReadPages();
         }
 
         void SendToSelf(THolder<IEventBase> event)
