@@ -48,6 +48,7 @@ TExecutorBootLogic::~TExecutorBootLogic()
 
     Loads.clear();
     EntriesToLoad.clear();
+    SharedCacheWaiter.Drop();
 
     Steps->Execute(); /* should flush all jobs in internal queue */
 
@@ -169,6 +170,12 @@ void TExecutorBootLogic::PrepareEnv(bool follower, ui32 gen, TExecutorCaches cac
     }
 }
 
+void TExecutorBootLogic::WaitForSharedCache(NBoot::TStages* step) {
+    Y_ENSURE(!SharedCacheWaiter);
+    SharedCacheWaiter = step;
+    Ops->Send(NSharedCache::MakeSharedPageCacheId(), new NSharedCache::TEvCacheReadyRequest, 0, BootAttempt);
+}
+
 void TExecutorBootLogic::LoadEntry(TIntrusivePtr<NBoot::TLoadBlobs> entry) {
     if (auto logl = Steps->Logger()->Log(ELnLev::Debug)) {
         logl
@@ -286,13 +293,22 @@ void TExecutorBootLogic::SeenBlob(const TLogoBlobID& id) {
 
 TExecutorBootLogic::EOpResult TExecutorBootLogic::Receive(::NActors::IEventHandle &ev)
 {
-    if (auto *msg = ev.CastAsLocal<TEvBlobStorage::TEvGetResult>()) {
-        if (!LoadBlobQueue.ProcessResult(msg))
+    if (ev.CastAsLocal<NSharedCache::TEvCacheReady>()) {
+        if (ev.Cookie != BootAttempt || !SharedCacheWaiter) {
+            return OpResultUnhandled;
+        }
+        SharedCacheWaiter.Get()->HandleSharedCacheReady();
+        SharedCacheWaiter.Drop();
+        Steps->Execute();
+    } else if (auto* msg = ev.CastAsLocal<TEvBlobStorage::TEvGetResult>()) {
+        if (!LoadBlobQueue.ProcessResult(msg)) {
             return OpResultBroken;
+        }
 
     } else if (auto *msg = ev.CastAsLocal<NSharedCache::TEvResult>()) {
-        if (ERequestTypeCookie(ev.Cookie) != ERequestTypeCookie::BootLogic)
+        if (ERequestTypeCookie(ev.Cookie) != ERequestTypeCookie::BootLogic) {
             return OpResultUnhandled;
+        }
 
         if (msg->Cookie != BootAttempt)
             return OpResultUnhandled;

@@ -44,6 +44,8 @@ namespace NKikimr::NSharedCache {
         EvResourcesAvailable,
         EvCollectionReleased,
         EvCollectionBytesChanged,
+        EvCacheReadyRequest,
+        EvCacheReady,
 
         EvEnd
 
@@ -62,6 +64,10 @@ namespace NKikimr::NSharedCache {
     static_assert(EvEnd < EventSpaceEnd(TKikimrEvents::ES_FLAT_EXECUTOR), "");
 
     struct TEvUnregister : public TEventLocal<TEvUnregister, EvUnregister> {};
+
+    struct TEvCacheReadyRequest : public TEventLocal<TEvCacheReadyRequest, EvCacheReadyRequest> {};
+
+    struct TEvCacheReady : public TEventLocal<TEvCacheReady, EvCacheReady> {};
 
     struct TEvDetach : public TEventLocal<TEvDetach, EvDetach> {
         const TLogoBlobID PageCollectionId;

@@ -595,6 +595,11 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         PruneCoreQueues();
     }
 
+    void Handle(NSharedCache::TEvCacheReadyRequest::TPtr& ev, const TActorContext&) {
+        // StateFunc defers this request until the configured cache owner is fully initialized.
+        Send(ev->Sender, new NSharedCache::TEvCacheReady, 0, ev->Cookie);
+    }
+
     void Handle(NSharedCache::TEvAttach::TPtr &ev, const TActorContext& ctx) {
         auto*msg = ev->Get();
         TCollection& collection = AttachCollection(msg->PageCollection, ev->Sender);
@@ -1698,6 +1703,7 @@ public:
             return;
         }
         switch (ev->GetTypeRewrite()) {
+            HFunc(NSharedCache::TEvCacheReadyRequest, Handle);
             HFunc(NSharedCache::TEvAttach, Handle);
             HFunc(NSharedCache::TEvSaveCompactedPages, Handle);
             HFunc(NSharedCache::TEvRequest, Handle);
