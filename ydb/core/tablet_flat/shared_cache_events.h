@@ -149,11 +149,16 @@ namespace NKikimr::NSharedCache {
         TCollectionCacheItem CacheItem;
 
         TSharedCachePageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky);
+        TSharedCachePageRef AddWrittenPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky);
 
         TEvSaveCompactedPages(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection)
             : PageCollection(std::move(pageCollection))
         {
         }
+
+    private:
+        TSharedCachePageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky,
+            TSharedCache::EPageAdmission admission);
     };
 
     struct TEvRequest : public TEventLocal<TEvRequest, EvRequest> {

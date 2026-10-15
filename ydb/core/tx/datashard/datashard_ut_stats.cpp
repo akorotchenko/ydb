@@ -575,10 +575,8 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
         UpsertRows(server, sender, 0, rows);
         auto& cache = *runtime.GetAppData().SharedCache;
         const ui64 savedLimit = cache.CurrentLimit();
-        const ui64 savedSticky = cache.StickyLimit();
         Y_DEFER {
             cache.UpdateCurrentLimit(savedLimit);
-            cache.UpdateStickyLimit(savedSticky);
             cache.UpdateSoftLimit(Max<ui64>());
         };
         // Keep the actor's limit stable while the test exercises one-page admission.
@@ -597,7 +595,6 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
         runtime.WaitFor("statistics page request", [&] {
             return !requests.empty();
         }, TDuration::Seconds(10));
-        UNIT_ASSERT(cache.UpdateStickyLimit(0));
         const auto statsActor = requests.front()->Sender;
         const auto collection = requests.front()->Get()->PageCollection;
         if (mode == EStatsPageBudget::TooSmall) {
@@ -621,7 +618,7 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
             while (cache.EnforceCurrentLimit()) {
             }
         }
-        const ui64 baselineBytes = cache.PageUsage();
+        const ui64 baselineBytes = cache.PayloadUsage();
         ui64 targetLimit = baselineBytes + 32 * pageBudget;
         UNIT_ASSERT_C(indexBytes > targetLimit, "Index bytes " << indexBytes << " must exceed budget " << targetLimit
                                                                << " (baseline " << baselineBytes
@@ -720,7 +717,7 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
             }, TDuration::Seconds(10));
             if (mode != EStatsPageBudget::EarlyReady) {
                 runtime.WaitFor("statistics attempt releases its frontier before readiness", [&] {
-                    return cache.PageUsage() <= baselineBytes;
+                    return cache.PayloadUsage() <= baselineBytes;
                 }, TDuration::Seconds(10));
             }
             UNIT_ASSERT(!completed);
@@ -793,7 +790,7 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
             UNIT_ASSERT_GT(readBytes, targetLimit);
         }
         runtime.WaitFor("statistics native-page release", [&] {
-            return cache.PageUsage() <= baselineBytes;
+            return cache.PayloadUsage() <= baselineBytes;
         }, TDuration::Seconds(10));
     }
 
