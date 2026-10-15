@@ -1846,6 +1846,126 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(pagesReleasedBeforeCollection);
     }
 
+    Y_UNIT_TEST(ReviewR12UnboundFetchDestructionAbandonsWaiters) {
+        for (bool dispatched : { false, true }) {
+            std::atomic<ui32> completed = 0;
+            std::atomic<ui32> ready = 0;
+            std::atomic<ui64> completedItem = 0;
+            auto first = MakeIntrusive<TTestPageFetchWaiter>(completed, ready, completedItem);
+            auto second = MakeIntrusive<TTestPageFetchWaiter>(completed, ready, completedItem);
+            TFixture fixture;
+            const auto collection = MakeCollectionCacheItem(63, 64);
+            const auto location = MakePageLocation(9);
+            {
+                TTestSharedCachePageRef hit;
+                TTestPageFetch fetch;
+                TTestPageFetch duplicate;
+                UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, collection, location,
+                                EStickyState::None, first, hit, fetch) == ESharedCacheResultStatus::Inserted);
+                UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, collection, location,
+                                EStickyState::None, second, hit, duplicate) == ESharedCacheResultStatus::Pending);
+                if (dispatched) {
+                    UNIT_ASSERT(fetch.Dispatch());
+                }
+                fixture.MainHazard.Reset();
+                UNIT_ASSERT(!TTestSharedCache::TryGet());
+            }
+            UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(first->RefCount(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(second->RefCount(), 1);
+            fixture.Cache.Drop();
+            UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
+        }
+    }
+
+    Y_UNIT_TEST(ReviewR12UnboundFetchMoveAssignmentAbandonsPreviousWaiters) {
+        std::atomic<ui32> completed = 0;
+        std::atomic<ui32> ready = 0;
+        std::atomic<ui64> completedItem = 0;
+        auto firstWaiter = MakeIntrusive<TTestPageFetchWaiter>(completed, ready, completedItem);
+        auto secondWaiter = MakeIntrusive<TTestPageFetchWaiter>(completed, ready, completedItem);
+        TFixture fixture;
+        const auto collection = MakeCollectionCacheItem(64, 65);
+        TTestSharedCachePageRef hit;
+        TTestPageFetch first;
+        TTestPageFetch second;
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, collection, MakePageLocation(10),
+                        EStickyState::None, firstWaiter, hit, first) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, collection, MakePageLocation(11),
+                        EStickyState::None, secondWaiter, hit, second) == ESharedCacheResultStatus::Inserted);
+        fixture.MainHazard.Reset();
+        first = std::move(second);
+        UNIT_ASSERT(first);
+        UNIT_ASSERT(!second);
+        UNIT_ASSERT_VALUES_EQUAL(firstWaiter->RefCount(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(secondWaiter->RefCount(), 2);
+        first = {};
+        UNIT_ASSERT_VALUES_EQUAL(secondWaiter->RefCount(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
+        fixture.Cache.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR12FetchOutlivesCacheWithoutCallbacks) {
+        std::atomic<ui32> completed = 0;
+        std::atomic<ui32> ready = 0;
+        std::atomic<ui64> completedItem = 0;
+        auto waiter = MakeIntrusive<TTestPageFetchWaiter>(completed, ready, completedItem);
+        TTestPageFetch fetch;
+        {
+            TFixture fixture;
+            TTestSharedCachePageRef hit;
+            UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, MakeCollectionCacheItem(65, 66),
+                            MakePageLocation(12), EStickyState::None, waiter, hit,
+                            fetch) == ESharedCacheResultStatus::Inserted);
+            fixture.MainHazard.Reset();
+            fixture.Cache.Drop();
+            UNIT_ASSERT_VALUES_EQUAL(waiter->RefCount(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
+        }
+        UNIT_ASSERT(fetch);
+        fetch = {};
+        UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR12FinalSweepAbandonsDeferredCompletions) {
+        for (bool successful : { false, true }) {
+            std::atomic<ui32> completed = 0;
+            std::atomic<ui32> ready = 0;
+            std::atomic<ui64> completedItem = 0;
+            auto waiter = MakeIntrusive<TTestPageFetchWaiter>(completed, ready, completedItem);
+            NActors::TSharedData payload;
+            TFixture fixture;
+            const auto collection = MakeCollectionCacheItem(66, 67);
+            const auto location = MakePageLocation(13);
+            TTestSharedCachePageRef hit;
+            TTestPageFetch fetch;
+            UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, collection, location, EStickyState::None,
+                            waiter, hit, fetch) == ESharedCacheResultStatus::Inserted);
+            auto structural = TSharedCacheTestAccess::AcquirePending(
+                *fixture.Cache, TSharedCacheKey::Page(collection, static_cast<ui64>(location.Offset)));
+            UNIT_ASSERT(structural);
+            if (successful) {
+                auto data = MakePageData(fetch.CacheItem().Index());
+                payload = data;
+                UNIT_ASSERT(fetch.MakeReady(std::move(data)));
+            } else {
+                UNIT_ASSERT(fetch.FailReady());
+            }
+            UNIT_ASSERT(!fetch);
+            UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(waiter->RefCount(), 2);
+            fixture.MainHazard.Reset();
+            structural.Drop();
+            fixture.Cache.Drop();
+            UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(waiter->RefCount(), 1);
+            if (successful) {
+                UNIT_ASSERT(payload.IsPrivate());
+            }
+        }
+    }
+
     Y_UNIT_TEST(OwnedCollectionRegistryLifecycle) {
         TFixture fixture;
         const TCollectionLocation location{ .Id = TLogoBlobID(12, 34, 56) };

@@ -242,13 +242,19 @@ bool TPageFetch::FailReady() noexcept {
     if (!FetchState_) {
         return false;
     }
-    TSharedCache& cache = TSharedCache::Get();
+    TSharedCache* cache = TSharedCache::TryGet();
+    if (!cache) {
+        // Missing actor context is terminal shutdown, as for native item references.
+        FetchState_->AbandonWaiters();
+        FetchState_.Drop();
+        return false;
+    }
     bool failed;
     {
-        auto binding = cache.BindCurrentThreadHazard();
-        auto spaceOp = cache.BeginOperation();
+        auto binding = cache->BindCurrentThreadHazard();
+        auto spaceOp = cache->BeginOperation();
         TOperationItemRef owner(spaceOp, FetchState_->Page().CacheItem());
-        failed = cache.FailFetch(owner, *FetchState_);
+        failed = cache->FailFetch(owner, *FetchState_);
     }
     FetchState_.Drop();
     return failed;
@@ -485,6 +491,10 @@ TSharedCache::~TSharedCacheImpl() {
         if (state.IsReplacing() || state.IsReplaced()) {
             DeleteReplacedPage(handle);
         } else if (state.IsPending() || state.IsCompleting()) {
+            // The actor system may already be gone; final cleanup cannot deliver completions.
+            if (TPageFetchState* fetch = handle.Body.Fetch) {
+                fetch->AbandonWaiters();
+            }
             DeletePendingFetch(handle);
         } else if (state.IsReady() || state.IsTombstone()) {
             DeletePayload(handle, state.Kind(), state.State());

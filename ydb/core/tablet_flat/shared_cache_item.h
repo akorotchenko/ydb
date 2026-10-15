@@ -563,6 +563,11 @@ private:
     template <class>
     friend class TSharedCacheImpl;
 
+    void AbandonWaiters() noexcept {
+        CloseWaiters([](TIntrusivePtr<TPageFetchWaiter>) {
+        });
+    }
+
     bool HasActiveWaiters() const noexcept {
         // The move-only fetch owner holds a pending item ref, preventing waiter-list closure and reclamation.
         // Subscribers only prepend nodes; existing links remain unchanged until that owner releases its ref.
