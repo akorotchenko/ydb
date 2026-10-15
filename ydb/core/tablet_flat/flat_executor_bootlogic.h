@@ -70,6 +70,7 @@ private:
 
 private:
     bool Restored = false;
+    TIntrusivePtr<NBoot::TStages> SharedCacheWaiter;
 
     IOps * const Ops = nullptr;
     const TActorId SelfId;
@@ -95,6 +96,7 @@ private:
     EOpResult CheckCompletion();
 
     void PrepareEnv(bool follower, ui32 generation, TExecutorCaches caches);
+    void WaitForSharedCache(NBoot::TStages* step);
     void StartLeaseWaiter(TMonotonic bootTimestamp, const TEvTablet::TDependencyGraph& graph);
     ui32 GetBSGroupFor(const TLogoBlobID &logo) const;
     ui32 GetBSGroupID(ui32 channel, ui32 generation);

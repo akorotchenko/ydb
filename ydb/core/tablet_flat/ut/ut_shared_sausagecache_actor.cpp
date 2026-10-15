@@ -6,10 +6,12 @@
 #include <ydb/core/testlib/actor_helpers.h>
 #include <ydb/core/testlib/actors/wait_events.h>
 #include <ydb/core/testlib/basics/appdata.h>
+#include <ydb/core/testlib/basics/helpers.h>
 #include <ydb/library/actors/testlib/test_runtime.h>
 #include <library/cpp/testing/unittest/registar.h>
 
 #include <flat_sausagecache.h>
+#include <flat_executor_bootlogic.h>
 #include <shared_cache.h>
 #include <shared_cache_counters.h>
 #include <shared_cache_events.h>
@@ -147,6 +149,90 @@ private:
 
     std::deque<NSharedCache::TEvResult::TPtr>& Results;
     std::deque<NSharedCache::TEvResult::TPtr>& StickyResults;
+};
+
+struct TBootReadinessState {
+    bool Started = false;
+    bool Completed = false;
+    bool Cancelled = false;
+    bool CacheAvailable = false;
+    ui32 ReadyMessages = 0;
+    ui32 UnhandledReadyMessages = 0;
+};
+
+class TBootReadinessActor : public TActorBootstrapped<TBootReadinessActor> {
+public:
+    static constexpr ui64 BootAttempt = 42;
+
+    TBootReadinessActor(TBootReadinessState& state, bool follower)
+        : State(state)
+        , Follower(follower)
+        , Info(CreateTestTabletInfo(1, TTabletTypes::DataShard))
+    {}
+
+    void Bootstrap() {
+        Become(&TThis::StateWork);
+        Logic = MakeHolder<TExecutorBootLogic>(this, SelfId(), BootAttempt, Info.Get(), 1_MB);
+        if (Follower) {
+            Send(SelfId(),
+                new TEvTablet::TEvFBoot(Info->TabletID, 1, 1, TActorId{}, new TEvTablet::TDependencyGraph, Info));
+        } else {
+            Send(SelfId(), new TEvTablet::TEvBoot(Info->TabletID, 1, nullptr, TActorId{}, Info));
+        }
+    }
+
+private:
+    STFUNC(StateWork) {
+        switch (ev->GetTypeRewrite()) {
+            hFunc(TEvTablet::TEvBoot, Handle);
+            hFunc(TEvTablet::TEvFBoot, Handle);
+            hFunc(TEvTablet::TEvRestored, Handle);
+            cFunc(TEvents::TEvPoison::EventType, HandlePoison);
+            default:
+                if (ev->GetTypeRewrite() == TEvCacheReady::EventType) {
+                    ++State.ReadyMessages;
+                    const auto result = Logic->Receive(*ev);
+                    State.UnhandledReadyMessages += result == TExecutorBootLogic::OpResultUnhandled;
+                    CheckResult(result);
+                }
+                break;
+        }
+    }
+
+    void Handle(TEvTablet::TEvBoot::TPtr& ev) {
+        CheckResult(Logic->ReceiveBoot(ev, {}));
+        State.Started = true;
+        Send(SelfId(), new TEvTablet::TEvRestored(Info->TabletID, 1, SelfId(), false));
+    }
+
+    void Handle(TEvTablet::TEvFBoot::TPtr& ev) {
+        CheckResult(Logic->ReceiveFollowerBoot(ev, {}));
+        State.Started = true;
+    }
+
+    void Handle(TEvTablet::TEvRestored::TPtr& ev) {
+        CheckResult(Logic->ReceiveRestored(ev));
+    }
+
+    void CheckResult(TExecutorBootLogic::EOpResult result) {
+        Y_ABORT_UNLESS(result != TExecutorBootLogic::OpResultBroken);
+        if (result == TExecutorBootLogic::OpResultComplete) {
+            State.Completed = true;
+            State.CacheAvailable = TSharedCache::TryGet() != nullptr;
+        }
+    }
+
+    void HandlePoison() {
+        Logic->Cancel();
+        Logic.Reset();
+        State.Cancelled = true;
+        PassAway();
+    }
+
+    TBootReadinessState& State;
+    const bool Follower;
+    TIntrusivePtr<TTabletStorageInfo> Info;
+    THolder<TExecutorBootLogic> Logic;
 };
 
 struct TSharedPageCacheMock {
@@ -450,6 +536,74 @@ struct TSharedPageCacheMock {
 };
 
 Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
+    void ReviewBootWaitsForCache(bool follower) {
+        TBootReadinessState state;
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        config.ClearMemoryLimit();
+        TSharedPageCacheMock sharedCache(config);
+        sharedCache.Runtime.RegisterService(MakeSharedPageCacheId(), sharedCache.ActorId);
+        const auto bootActor = sharedCache.Runtime.Register(new TBootReadinessActor(state, follower));
+        sharedCache.Runtime.WaitFor("boot readiness request", [&] {
+            return state.Started;
+        });
+        sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
+        UNIT_ASSERT(!state.Completed);
+        UNIT_ASSERT(!TSharedCache::TryGet());
+
+        sharedCache.Runtime.Send(new IEventHandle(
+            bootActor, sharedCache.Sender1, new TEvCacheReady, 0, TBootReadinessActor::BootAttempt - 1));
+        sharedCache.Runtime.WaitFor("stale cache acknowledgement", [&] {
+            return state.ReadyMessages == 1;
+        });
+        UNIT_ASSERT_VALUES_EQUAL(state.UnhandledReadyMessages, 1);
+        UNIT_ASSERT(!state.Completed);
+        UNIT_ASSERT(!TSharedCache::TryGet());
+
+        sharedCache.SetLimit(0, 32_MB);
+        sharedCache.Runtime.WaitFor("boot after cache initialization", [&] {
+            return state.Completed;
+        });
+        UNIT_ASSERT(state.CacheAvailable);
+        UNIT_ASSERT(TSharedCache::TryGet());
+
+        sharedCache.Runtime.Send(
+            new IEventHandle(bootActor, sharedCache.Sender1, new TEvCacheReady, 0, TBootReadinessActor::BootAttempt));
+        sharedCache.Runtime.WaitFor("duplicate cache acknowledgement", [&] {
+            return state.ReadyMessages == 3;
+        });
+        UNIT_ASSERT_VALUES_EQUAL(state.UnhandledReadyMessages, 2);
+    }
+
+    Y_UNIT_TEST(ReviewR9LeaderBootWaitsForCacheInitialization) {
+        ReviewBootWaitsForCache(false);
+    }
+
+    Y_UNIT_TEST(ReviewR9FollowerBootWaitsForCacheInitialization) {
+        ReviewBootWaitsForCache(true);
+    }
+
+    Y_UNIT_TEST(ReviewR9CancellationDropsPendingReadinessStage) {
+        TBootReadinessState state;
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        config.ClearMemoryLimit();
+        TSharedPageCacheMock sharedCache(config);
+        sharedCache.Runtime.RegisterService(MakeSharedPageCacheId(), sharedCache.ActorId);
+        const auto bootActor = sharedCache.Runtime.Register(new TBootReadinessActor(state, true));
+        sharedCache.Runtime.WaitFor("boot waiting for cache", [&] {
+            return state.Started;
+        });
+        sharedCache.Runtime.Send(new IEventHandle(bootActor, sharedCache.Sender1, new TEvents::TEvPoison));
+        sharedCache.Runtime.WaitFor("boot cancelled before cache initialization", [&] {
+            return state.Cancelled;
+        });
+        UNIT_ASSERT(!state.Completed);
+        UNIT_ASSERT(!TSharedCache::TryGet());
+        sharedCache.SetLimit(0, 32_MB);
+        sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
+        UNIT_ASSERT(!state.Completed);
+        UNIT_ASSERT(TSharedCache::TryGet());
+    }
+
     Y_UNIT_TEST(ZeroMemoryLimitRejected) {
         TSharedCacheConfig config = TSharedPageCacheMock::DefaultConfig();
         config.SetMemoryLimit(0);

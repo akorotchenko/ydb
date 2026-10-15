@@ -43,10 +43,14 @@ namespace NBoot {
 
         }
 
+        void HandleSharedCacheReady() {
+            Execute();
+        }
+
     private: /* IStep, boot logic DSL actor interface   */
         void Start() override
         {
-            Execute();
+            Logic->WaitForSharedCache(this);
         }
 
         void HandleStep(TIntrusivePtr<IStep>) override
