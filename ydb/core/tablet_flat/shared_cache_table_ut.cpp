@@ -4734,6 +4734,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         CompleteBucketResize(*fixture.Cache, *fixture.Space);
         CommitTransition(*fixture.Cache, growth);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.ReservedCapacity.StaticBytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->TargetHandleCount(), fixture.ReservedCapacity.HandleCount());
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.ReservedCapacity.StaticBytes);
 
@@ -4748,6 +4749,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         CompleteBucketResize(*fixture.Cache, *fixture.Space);
         CommitTransition(*fixture.Cache, shrink);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.Capacity.StaticBytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->TargetHandleCount(), fixture.Capacity.HandleCount());
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Capacity.StaticBytes);
     }

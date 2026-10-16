@@ -4849,6 +4849,7 @@ bool TSharedCache::CommitTransition(TTransition& transition) noexcept {
     const ui64 oldStaticBytes = transition.OldConfiguration().StaticBytes;
     const ui64 targetStaticBytes = transition.TargetConfiguration().StaticBytes;
     const ui64 targetLimit = transition.TargetConfiguration().Limit;
+    const ui64 targetHandleCount = transition.TargetConfiguration().HandleCount();
     const bool commitTargetLimit = &transition != &HardTransition_;
     if (!Space_->CommitTransition(transition)) {
         return false;
@@ -4864,7 +4865,7 @@ bool TSharedCache::CommitTransition(TTransition& transition) noexcept {
         SubtractExactBytes(OverallUsage_, delta);
     }
     if (commitTargetLimit) {
-        TargetHandleCount_.store(transition.TargetConfiguration().HandleCount(), std::memory_order_relaxed);
+        TargetHandleCount_.store(targetHandleCount, std::memory_order_relaxed);
         HardLimit_.store(targetLimit, std::memory_order_relaxed);
     }
     RefreshSoftLimit();
