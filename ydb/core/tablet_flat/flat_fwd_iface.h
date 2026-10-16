@@ -27,7 +27,7 @@ namespace NFwd {
     class IPageLoadingLogic {
     public:
         struct TResult {
-            const TSharedCachePageRef *Page;
+            const TSharedPageRef* Page;
             bool Grow; /* Should give more pages on Forward() */
             bool Need; /* Is vital to client to make progress */
         };
@@ -36,7 +36,7 @@ namespace NFwd {
 
         virtual TResult Get(IPageLoadingQueue *head, TPageOffset offset, EPage type, ui64 lower) = 0;
         virtual void Forward(IPageLoadingQueue *head, ui64 upper) = 0;
-        virtual void Fill(TSharedCachePageRef&& page, EPage type) = 0;
+        virtual void Fill(TSharedPageRef&& page, EPage type) = 0;
 
         IPageLoadingQueue* Head = nullptr; /* will be set outside of IPageLoadingLogic impl */
         TStat Stat;

@@ -182,7 +182,7 @@ Y_UNIT_TEST_SUITE(TIterator) {
             return NTest::TTestEnv::Locate(part, ref, lob);
         }
 
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto pageId = ResolvePageId(part, location, groupId);
             if (AutoLoad) {
                 if (Loaded[groupId].insert(pageId).second) {

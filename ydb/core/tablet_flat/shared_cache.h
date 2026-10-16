@@ -11,6 +11,11 @@
 
 namespace NKikimr::NSharedCache {
 
+struct TSharedCacheHandleRequirement {
+    TLogoBlobID CollectionId;
+    TArrayRef<const NTable::NPage::TPageLocation> Pages;
+};
+
 template <class TTraits>
 class TSharedCacheThreadBinding {
 public:
@@ -35,11 +40,11 @@ private:
 };
 
 template <class TTraits = TProdTraits>
-class TSharedCachePageRefImpl : private TMoveOnly {
+class TSharedPageRefImpl : private TMoveOnly {
 public:
-    TSharedCachePageRefImpl() noexcept = default;
-    TSharedCachePageRefImpl(TSharedCachePageRefImpl&& other) noexcept;
-    TSharedCachePageRefImpl& operator=(TSharedCachePageRefImpl&& other) noexcept;
+    TSharedPageRefImpl() noexcept = default;
+    TSharedPageRefImpl(TSharedPageRefImpl&& other) noexcept;
+    TSharedPageRefImpl& operator=(TSharedPageRefImpl&& other) noexcept;
 
     explicit operator bool() const noexcept {
         return bool(Ref_);
@@ -50,9 +55,10 @@ public:
     size_t size() const noexcept;
     NActors::TSharedData BuildSharedData() const noexcept;
     // Construct an independent owner only when moving or borrowing cannot preserve the required lifetime.
-    TSharedCachePageRefImpl Acquire() const& noexcept;
+    TSharedPageRefImpl Acquire() const& noexcept;
     NTable::NPage::TPageOffset GetOffset() const noexcept;
     NTable::NPage::TPageLocation GetLocation() const noexcept;
+    TLogoBlobID GetCollectionId() const noexcept;
     NTable::NPage::EPage GetType() const noexcept;
     bool IsSticky() const noexcept;
     void Drop() noexcept;
@@ -60,7 +66,7 @@ public:
 private:
     friend class TSharedCacheImpl<TTraits>;
 
-    explicit TSharedCachePageRefImpl(TSharedCacheItemRefImpl<TTraits>&& ref) noexcept;
+    explicit TSharedPageRefImpl(TSharedCacheItemRefImpl<TTraits>&& ref) noexcept;
 
     template <class TCallback>
     decltype(auto) WithHandle(TCallback&& callback) const noexcept;
@@ -151,7 +157,7 @@ struct TSharedCachePageRequestImpl {
         , Waiter(std::move(waiter))
         , Sticky(sticky)
     {
-        new (&Storage_.Page) TSharedCachePageRefImpl<TTraits>();
+        new (&Storage_.Page) TSharedPageRefImpl<TTraits>();
     }
 
     TSharedCachePageRequestImpl(TSharedCachePageRequestImpl&& other) noexcept
@@ -178,12 +184,12 @@ struct TSharedCachePageRequestImpl {
         return Status_;
     }
 
-    TSharedCachePageRefImpl<TTraits>& Page() noexcept {
+    TSharedPageRefImpl<TTraits>& Page() noexcept {
         Y_ABORT_UNLESS(Status_ == ESharedCacheResultStatus::Hit);
         return Storage_.Page;
     }
 
-    const TSharedCachePageRefImpl<TTraits>& Page() const noexcept {
+    const TSharedPageRefImpl<TTraits>& Page() const noexcept {
         Y_ABORT_UNLESS(Status_ == ESharedCacheResultStatus::Hit);
         return Storage_.Page;
     }
@@ -193,9 +199,9 @@ struct TSharedCachePageRequestImpl {
         return Storage_.Fetch;
     }
 
-    void SetHit(TSharedCachePageRefImpl<TTraits>&& page) noexcept {
+    void SetHit(TSharedPageRefImpl<TTraits>&& page) noexcept {
         Destroy();
-        new (&Storage_.Page) TSharedCachePageRefImpl<TTraits>(std::move(page));
+        new (&Storage_.Page) TSharedPageRefImpl<TTraits>(std::move(page));
         Status_ = ESharedCacheResultStatus::Hit;
     }
 
@@ -212,7 +218,7 @@ struct TSharedCachePageRequestImpl {
 
     void Reset() noexcept {
         Destroy();
-        new (&Storage_.Page) TSharedCachePageRefImpl<TTraits>();
+        new (&Storage_.Page) TSharedPageRefImpl<TTraits>();
         Status_ = ESharedCacheResultStatus::Miss;
     }
 
@@ -221,7 +227,7 @@ private:
         if (Status_ == ESharedCacheResultStatus::Inserted) {
             Storage_.Fetch.~TPageFetchImpl<TTraits>();
         } else {
-            Storage_.Page.~TSharedCachePageRefImpl<TTraits>();
+            Storage_.Page.~TSharedPageRefImpl<TTraits>();
         }
     }
 
@@ -230,7 +236,7 @@ private:
         if (other.Status_ == ESharedCacheResultStatus::Inserted) {
             new (&Storage_.Fetch) TPageFetchImpl<TTraits>(std::move(other.Storage_.Fetch));
         } else {
-            new (&Storage_.Page) TSharedCachePageRefImpl<TTraits>(std::move(other.Storage_.Page));
+            new (&Storage_.Page) TSharedPageRefImpl<TTraits>(std::move(other.Storage_.Page));
         }
         Status_ = other.Status_;
     }
@@ -243,7 +249,7 @@ private:
 
         ~TStorage() {}
 
-        TSharedCachePageRefImpl<TTraits> Page;
+        TSharedPageRefImpl<TTraits> Page;
         TPageFetchImpl<TTraits> Fetch;
     } Storage_;
 };
@@ -275,7 +281,7 @@ public:
         TIntrusiveConstPtr<NPageCollection::IPageCollection> collection)
         requires std::is_same_v<TTraits, TProdTraits>;
 
-    TSharedCachePageRefImpl<TTraits> AdmitPage(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
+    TSharedPageRefImpl<TTraits> AdmitPage(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
         NTable::NPage::TPageLocation location, NActors::TSharedData&& data, bool sticky = false)
         requires std::is_same_v<TTraits, TProdTraits>;
 
@@ -313,7 +319,7 @@ public:
     bool AcknowledgeCollectionBytes(TCollectionCacheItem collection) noexcept;
 
     ESharedCacheResultStatus Find(
-        TCollectionCacheItem collection, ui64 offset, TSharedCachePageRefImpl<TTraits>& page) noexcept;
+        TCollectionCacheItem collection, ui64 offset, TSharedPageRefImpl<TTraits>& page) noexcept;
 
     ESharedCacheResultStatus Find(const TLogoBlobID& id, TSharedCacheCollectionRefImpl<TTraits>& collection) noexcept;
 
@@ -340,6 +346,7 @@ public:
     void ArmResourceWait(ui64 generation) noexcept;
     bool TryReserveFetchBatch(TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept;
     bool CanAdmitWorkingSet(ui64 bytes) noexcept;
+    bool CanAdmitPageHandles(TArrayRef<const TSharedCacheHandleRequirement> requirements) noexcept;
 
     void DisarmResourceWait() noexcept {
         ResourceWaitArmed_.store(false, std::memory_order_release);
@@ -533,7 +540,7 @@ private:
     friend class TCollection;
     friend class TSharedCacheItemRefImpl<TTraits>;
     friend class TSharedCacheTableImpl<TTraits>;
-    friend class TSharedCachePageRefImpl<TTraits>;
+    friend class TSharedPageRefImpl<TTraits>;
     friend class TSharedCacheCollectionRefImpl<TTraits>;
     friend class TPageFetchImpl<TTraits>;
     friend class TRequestPageWaiter;
@@ -661,9 +668,9 @@ private:
         TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page, EStickyState sticky) noexcept;
 
     ESharedCacheResultStatus FindOrInsert(TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page,
-        EStickyState sticky, TPageCacheItem& inserted, TSharedCachePageRefImpl<TTraits>& hit) noexcept;
+        EStickyState sticky, TPageCacheItem& inserted, TSharedPageRefImpl<TTraits>& hit) noexcept;
     ESharedCacheResultStatus FindOrInsert(TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page,
-        EStickyState sticky, TIntrusivePtr<TPageFetchWaiter> waiter, TSharedCachePageRefImpl<TTraits>& hit,
+        EStickyState sticky, TIntrusivePtr<TPageFetchWaiter> waiter, TSharedPageRefImpl<TTraits>& hit,
         TPageFetchImpl<TTraits>& fetch) noexcept;
     ESharedCacheResultStatus FindOrInsert(TCollectionRegistry& registry, const TCollectionLocation& collection,
         TCollectionCacheItem& inserted, TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
@@ -671,7 +678,7 @@ private:
         TCollectionCacheItem& inserted, TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
 
     ESharedCacheResultStatus FindOrInsertPage(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate,
-        TIntrusivePtr<TPageFetchWaiter> waiter, TSharedCachePageRefImpl<TTraits>& hit,
+        TIntrusivePtr<TPageFetchWaiter> waiter, TSharedPageRefImpl<TTraits>& hit,
         TPageFetchImpl<TTraits>& fetch) noexcept;
     bool PreparePageBatch(TSpaceOperation& spaceOp, TCollection& collection,
         TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests, TVector<TPageInsertCandidate>& candidates,
@@ -789,12 +796,12 @@ private:
     void UnlinkCollectionRegistry(TCollectionRegistry& registry, TOperationItemRef<TTraits>& collection) noexcept;
 
     bool IsPageSticky(TPageCacheItem page) const noexcept;
-    TSharedCachePageRefImpl<TTraits> BuildPageRef(
+    TSharedPageRefImpl<TTraits> BuildPageRef(
         const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
-    TSharedCachePageRefImpl<TTraits> AcquireHeldPage(TCacheItem item) noexcept;
+    TSharedPageRefImpl<TTraits> AcquireHeldPage(TCacheItem item) noexcept;
     TSharedCacheCollectionRefImpl<TTraits> AcquireHeldCollection(TCacheItem item) noexcept;
 
-    bool AcquirePage(TPageCacheItem page, TSharedCachePageRefImpl<TTraits>& result) noexcept;
+    bool AcquirePage(TPageCacheItem page, TSharedPageRefImpl<TTraits>& result) noexcept;
 
     TSharedCacheCollectionRefImpl<TTraits> BuildCollectionRef(
         const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;

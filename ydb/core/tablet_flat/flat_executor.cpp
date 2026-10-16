@@ -2386,6 +2386,7 @@ void TExecutor::PostponeTransaction(TSeat* seat, TPageCollectionTxEnv &env,
     TransactionWaitPads[waitPad.Get()] = waitPad;
 
     for (const auto& page : seat->Pinned) {
+        waitPad->WorkingSetPages[page.GetCollectionId()].push_back(page.GetLocation());
         if (!page.IsSticky()) {
             waitPad->WorkingSetBytes += page.size() + NActors::TSharedData::OverheadSize;
         }
@@ -2396,6 +2397,7 @@ void TExecutor::PostponeTransaction(TSeat* seat, TPageCollectionTxEnv &env,
         const auto collection = FindPageCollection(collectionId);
         Y_ENSURE(collection, "Trying to get unknown page collection " << collectionId);
         for (const auto& location : locations) {
+            waitPad->WorkingSetPages[collectionId].push_back(location);
             if (collection->GetCacheMode() != ECacheMode::Sticky) {
                 waitPad->WorkingSetBytes += location.Size + NActors::TSharedData::OverheadSize;
             }

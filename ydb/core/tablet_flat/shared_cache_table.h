@@ -117,7 +117,7 @@ public:
 private:
     friend class TSharedCacheTableImpl<TTraits>;
     friend class TSharedCacheImpl<TTraits>;
-    friend class TSharedCachePageRefImpl<TTraits>;
+    friend class TSharedPageRefImpl<TTraits>;
     friend class TSharedCacheCollectionRefImpl<TTraits>;
     friend class TOperationItemRef<TTraits>;
 

@@ -51,8 +51,7 @@ namespace NTabletFlatExecutor {
             return { !ReadMissingReferences, std::move(page) };
         }
 
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
-        {
+        TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto *partStore = CheckedCast<const NTable::TPartStore*>(part);
 
             return TryGetPage(location, partStore->PageCollections.at(groupId.Index).Get());
@@ -85,7 +84,7 @@ namespace NTabletFlatExecutor {
             }
         }
 
-        TSharedCachePageRef TryGetPage(const TPageLocation& location, TCollection* pageCollection)
+        TSharedPageRef TryGetPage(const TPageLocation& location, TCollection* pageCollection)
         {
             auto sharedBody = pageCollection->TryGetPage(location);
 

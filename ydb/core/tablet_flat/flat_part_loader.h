@@ -58,8 +58,7 @@ namespace NTable {
                 Part = part;
             }
 
-            TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
-            {
+            TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 Y_ENSURE(part == Part, "Unsupported part");
                 Y_ENSURE(groupId.Index == 0, "Unsupported column group");
 
@@ -127,7 +126,7 @@ namespace NTable {
             }
 
         private:
-            void AddSavedPage(TPageOffset offset, TSharedCachePageRef&& page)
+            void AddSavedPage(TPageOffset offset, TSharedPageRef&& page)
             {
                 SavedPages[offset] = std::move(page);
             }
@@ -140,7 +139,7 @@ namespace NTable {
 
             const TPart* Part = nullptr;
             TSharedCacheCollectionRef PageCollection;
-            THashMap<TPageOffset, TSharedCachePageRef> SavedPages;
+            THashMap<TPageOffset, TSharedPageRef> SavedPages;
             // Dedup by offset — keep Size/Type for the fetch request
             THashSet<TPageLocation, NPage::TPageLocationByOffsetHash, TPageLocationByOffsetEq> NeedPages;
         };

@@ -86,7 +86,7 @@ public:
         Y_ENSURE(false, "IPages::Locate(TPart*, ...) shouldn't be used here");
     }
 
-    TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         Y_ENSURE(groupId.IsMain(), "Unsupported column group");
 
         auto partStore = CheckedCast<const TPartStore*>(part);
@@ -108,6 +108,8 @@ public:
         CheckWorkingSet();
         RequestPad = MakeIntrusive<NPageCollection::TPagesWaitPad>();
         RequestPad->WorkingSetBytes = RequestWorkingSet.Bytes;
+        PageTracker.CollectPageLocations(RequestPad->WorkingSetPages);
+        RequestPad->WorkingSetPages[info->Id()].push_back(location);
         // Sticky pages may be demoted while this request waits, so publish every retained pin.
         RequestPad->HasPinnedPages.store(workingSet.Pages != 0, std::memory_order_release);
         ResourcesReady = false;

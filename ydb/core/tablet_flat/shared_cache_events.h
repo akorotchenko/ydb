@@ -148,8 +148,8 @@ namespace NKikimr::NSharedCache {
         TVector<TPageLocation> Pages;
         TCollectionCacheItem CacheItem;
 
-        TSharedCachePageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky);
-        TSharedCachePageRef AddWrittenPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky);
+        TSharedPageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky);
+        TSharedPageRef AddWrittenPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky);
 
         TEvSaveCompactedPages(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection)
             : PageCollection(std::move(pageCollection))
@@ -157,7 +157,7 @@ namespace NKikimr::NSharedCache {
         }
 
     private:
-        TSharedCachePageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky,
+        TSharedPageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky,
             TSharedCache::EPageAdmission admission);
     };
 
@@ -209,7 +209,7 @@ namespace NKikimr::NSharedCache {
         }
 
         struct TLoaded {
-            TLoaded(NTable::NPage::TPageOffset offset, size_t size, TSharedCachePageRef page)
+            TLoaded(NTable::NPage::TPageOffset offset, size_t size, TSharedPageRef page)
                 : Offset(offset)
                 , Size(size)
                 , Page(std::move(page))
@@ -217,7 +217,7 @@ namespace NKikimr::NSharedCache {
 
             NTable::NPage::TPageOffset Offset;
             size_t Size;
-            TSharedCachePageRef Page;
+            TSharedPageRef Page;
         };
 
         bool ResourcePressure = false;
@@ -252,7 +252,7 @@ namespace NKikimr::NSharedCache {
     public:
         explicit TRequestCompletion(TRequestCompletionParams&& params) noexcept;
 
-        void Complete(ui32 index, TSharedCachePageRef page, EPageFetchCompletion completion) noexcept;
+        void Complete(ui32 index, TSharedPageRef page, EPageFetchCompletion completion) noexcept;
         void Cancel(bool replyImmediately = false) noexcept;
         void PostponeForResources() noexcept;
         void NotifyResourcesReady() noexcept;
@@ -261,12 +261,20 @@ namespace NKikimr::NSharedCache {
             return Status_.load(std::memory_order_acquire) == NKikimrProto::RACE;
         }
 
+        bool HasFailed() const noexcept {
+            return Status_.load(std::memory_order_acquire) == NKikimrProto::ERROR;
+        }
+
         const TIntrusivePtr<NPageCollection::TPagesWaitPad>& WaitPad() const noexcept {
             return WaitPad_;
         }
 
         const TVector<TPageLocation>& Locations() const noexcept {
             return Locations_;
+        }
+
+        const TIntrusiveConstPtr<NPageCollection::IPageCollection>& PageCollection() const noexcept {
+            return PageCollection_;
         }
 
     private:
@@ -280,7 +288,7 @@ namespace NKikimr::NSharedCache {
         const ui64 RequestId_;
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
         TVector<TPageLocation> Locations_;
-        TVector<TSharedCachePageRef> Pages_;
+        TVector<TSharedPageRef> ReadyPages_;
         TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad_;
         const ui64 Cookie_;
         const NActors::TActorId Notify_;
@@ -289,7 +297,7 @@ namespace NKikimr::NSharedCache {
         mutable TMutex Mutex_;
         bool ResourcePressure_ = false;
         std::atomic<TEvResult::EStatus> Status_{ NKikimrProto::OK };
-        std::atomic<ui32> Remaining_;
+        std::atomic<ui32> RemainingPages_;
         std::atomic<bool> ResultSent_{ false };
     };
 

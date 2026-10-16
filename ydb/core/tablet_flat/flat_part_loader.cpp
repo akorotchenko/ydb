@@ -242,12 +242,12 @@ TLoader::TFetch TLoader::StageCreatePartView(bool preloadIndex)
     Y_ENSURE(!PartView, "PartView already initialized in CreatePartView stage");
     Y_ENSURE(PageCollections && PageCollections.front());
 
-    auto getPage = [&](TPageId pageId) -> TSharedCachePageRef {
+    auto getPage = [&](TPageId pageId) -> TSharedPageRef {
         return pageId == Max<TPageId>()
-            ? TSharedCachePageRef()
+                   ? TSharedPageRef()
                    : LoaderEnv->TryGetPage(nullptr, PageCollections[0]->PageCollection()->GetLocation(pageId), {});
     };
-    auto getMetaPage = [&](const NPage::TBtreeIndexMeta& meta) -> TSharedCachePageRef {
+    auto getMetaPage = [&](const NPage::TBtreeIndexMeta& meta) -> TSharedPageRef {
         return meta.HasRootV2() ? LoaderEnv->TryGetPage(nullptr, meta.RootV2, {})
                                 : getPage(meta.RootV1PageId());
     };

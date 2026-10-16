@@ -126,8 +126,7 @@ namespace NTest {
             return { true, TTestEnv::TryGetPage(part, collection->GetLocation(ref), TGroupId(room)) };
         }
 
-        TSharedCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
-        {
+        TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto* storedPart = CheckedCast<const TPartStore*>(part);
             auto* data = storedPart->Store->GetPage(groupId.Index, location.Offset);
             auto* collection = storedPart->GetPageCollection(groupId.Index);

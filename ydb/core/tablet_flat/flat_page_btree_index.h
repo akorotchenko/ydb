@@ -454,14 +454,14 @@ namespace NKikimr::NTable::NPage {
             Parse();
         }
 
-        TBtreeIndexNode(TSharedCachePageRef&& ref, bool v2Format)
+        TBtreeIndexNode(TSharedPageRef&& ref, bool v2Format)
             : Ref(std::move(ref))
             , IsV2Format(v2Format)
         {
             Parse();
         }
 
-        const TSharedCachePageRef& GetPageRef() const noexcept {
+        const TSharedPageRef& GetPageRef() const noexcept {
             return Ref;
         }
 
@@ -495,7 +495,7 @@ namespace NKikimr::NTable::NPage {
         }
 
     public:
-        TSharedCachePageRef&& TakePageRef() noexcept {
+        TSharedPageRef&& TakePageRef() noexcept {
             return std::move(Ref);
         }
 
@@ -824,7 +824,7 @@ namespace NKikimr::NTable::NPage {
         }
 
     private:
-        TSharedCachePageRef Ref;
+        TSharedPageRef Ref;
         TSharedData Raw;
         const THeader* Header = nullptr;
         const void* Keys = nullptr;

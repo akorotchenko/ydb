@@ -3,6 +3,7 @@
 #include "flat_page_btree_index.h"
 
 #include <util/generic/ptr.h>
+#include <util/generic/hash.h>
 #include <util/generic/hash_set.h>
 #include <util/generic/vector.h>
 
@@ -27,7 +28,7 @@ public:
 
     class TRegistration {
     public:
-        TRegistration(TPageTracker* tracker, const TSharedCachePageRef& page)
+        TRegistration(TPageTracker* tracker, const TSharedPageRef& page)
             : Tracker_(page ? tracker : nullptr)
             , Page_(&page)
         {
@@ -53,7 +54,7 @@ public:
         friend class TPageTracker;
 
         TPageTracker* const Tracker_;
-        const TSharedCachePageRef* const Page_;
+        const TSharedPageRef* const Page_;
         size_t Slot_ = 0;
     };
 
@@ -75,6 +76,13 @@ public:
         return result;
     }
 
+    void CollectPageLocations(THashMap<TLogoBlobID, TVector<NPage::TPageLocation>>& locations) const {
+        for (const auto* registration : Pages_) {
+            const auto& page = *registration->Page_;
+            locations[page.GetCollectionId()].push_back(page.GetLocation());
+        }
+    }
+
     bool Empty() const noexcept {
         return Pages_.empty();
     }
@@ -85,7 +93,7 @@ private:
 
 // Traversal-owned references are serialized, including across coroutine worker changes.
 struct TIndexPage final : TRefCounted<TIndexPage, TExplicitSimpleCounter> {
-    explicit TIndexPage(TSharedCachePageRef page, bool v2Format, TPageTracker* tracker = nullptr)
+    explicit TIndexPage(TSharedPageRef page, bool v2Format, TPageTracker* tracker = nullptr)
         : Node(std::move(page), v2Format)
         , Registration(tracker, Node.GetPageRef())
     {}

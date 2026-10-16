@@ -29,8 +29,7 @@ namespace NTable {
             return { true, nullptr };
         }
 
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
-        {
+        TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto *partStore = CheckedCast<const NTable::TPartStore*>(part);
             auto *collection = partStore->PageCollections.at(groupId.Index).Get();
 

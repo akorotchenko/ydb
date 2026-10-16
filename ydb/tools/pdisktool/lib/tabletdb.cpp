@@ -187,8 +187,7 @@ public:
         return {true, GetPage(collection, collection->PageCollection()->GetLocation(ref))};
     }
 
-    TSharedCachePageRef TryGetPage(const NTable::TPart* part, const TPageLocation& location,
-            TGroupId groupId) override
+    TSharedPageRef TryGetPage(const NTable::TPart* part, const TPageLocation& location, TGroupId groupId) override
     {
         const auto* partStore = dynamic_cast<const NTable::TPartStore*>(part);
         if (!partStore || groupId.Index >= partStore->PageCollections.size()) {
@@ -197,14 +196,14 @@ public:
         return GetPage(partStore->PageCollections[groupId.Index].Get(), location);
     }
 
-    TSharedCachePageRef GetPage(const TCollection* collection, const TPageLocation& location) {
+    TSharedPageRef GetPage(const TCollection* collection, const TPageLocation& location) {
         if (!collection || !collection->PageCollection()) {
             return {};
         }
         return GetPage(collection->Id(), collection->PageCollection(), location);
     }
 
-    TSharedCachePageRef GetPage(const TLogoBlobID& label,
+    TSharedPageRef GetPage(const TLogoBlobID& label,
         const TIntrusiveConstPtr<NPageCollection::IPageCollection>& pageCollection, const TPageLocation& location)
     {
         auto& failed = Cache[label].FailedPages;
@@ -215,7 +214,7 @@ public:
         auto& cache = TSharedCache::Get();
         auto binding = cache.BindCurrentThreadHazard();
         NSharedCache::TSharedCacheCollectionRef collection;
-        TSharedCachePageRef page;
+        TSharedPageRef page;
         if (cache.Find(label, collection) == NSharedCache::ESharedCacheResultStatus::Hit &&
             cache.Find(collection.CacheItem(), static_cast<ui64>(location.Offset), page) ==
                 NSharedCache::ESharedCacheResultStatus::Hit) {

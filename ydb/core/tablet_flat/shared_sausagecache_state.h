@@ -10,7 +10,7 @@
 
 namespace NKikimr::NSharedCache {
 
-struct TCoreKeepPreloadRequest {
+struct TKeepPreloadRequest {
     ui64 Generation = 0;
     ui64 ChargedBytes = 0;
     TVector<NTable::NPage::TPageLocation> Locations;
@@ -22,7 +22,7 @@ struct TCollectionActorState {
     TSet<TActorId> InMemoryOwners;
     TSet<TActorId> StickyOwners;
     TSet<TActorId> Owners;
-    THashMap<ui64, TCoreKeepPreloadRequest> KeepPreloadRequests;
+    THashMap<ui64, TKeepPreloadRequest> KeepPreloadRequests;
     ui64 PendingRequests = 0;
     ui64 ReportedResidentBytes = 0;
 };

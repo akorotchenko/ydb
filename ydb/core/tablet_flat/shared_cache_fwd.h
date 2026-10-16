@@ -8,13 +8,13 @@ class TSharedCacheImpl;
 using TSharedCache = TSharedCacheImpl<TProdTraits>;
 
 template <class TTraits>
-class TSharedCachePageRefImpl;
+class TSharedPageRefImpl;
 template <class TTraits>
 class TSharedCacheCollectionRefImpl;
 template <class TTraits>
 class TPageFetchImpl;
 
-using TSharedCachePageRef = TSharedCachePageRefImpl<TProdTraits>;
+using TSharedPageRef = TSharedPageRefImpl<TProdTraits>;
 using TSharedCacheCollectionRef = TSharedCacheCollectionRefImpl<TProdTraits>;
 using TPageFetch = TPageFetchImpl<TProdTraits>;
 
@@ -24,6 +24,6 @@ namespace NKikimr {
 
 using NSharedCache::TSharedCache;
 using NSharedCache::TSharedCacheCollectionRef;
-using NSharedCache::TSharedCachePageRef;
+using NSharedCache::TSharedPageRef;
 
 } // namespace NKikimr

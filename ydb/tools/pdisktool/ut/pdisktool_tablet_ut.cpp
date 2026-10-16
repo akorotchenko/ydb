@@ -218,7 +218,7 @@ struct TSourceDb {
             return {true, nullptr};
         }
 
-        TSharedCachePageRef TryGetPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
+        TSharedPageRef TryGetPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
             return {};
         }
     };

@@ -34,7 +34,7 @@ TSharedCacheCollectionRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitCollectio
 }
 
 template <class TTraits>
-TSharedCachePageRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitPage(
+TSharedPageRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitPage(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, NTable::NPage::TPageLocation location,
     NActors::TSharedData&& data, bool sticky)
     requires std::is_same_v<TTraits, TProdTraits>
@@ -51,20 +51,20 @@ public:
         Y_ABORT_UNLESS(TSharedCache::Get().AcquirePage(item, Page));
     }
 
-    TSharedCachePageRef Page;
+    TSharedPageRef Page;
 };
 
-TSharedCachePageRef TEvSaveCompactedPages::AddPage(
+TSharedPageRef TEvSaveCompactedPages::AddPage(
     TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
     return AddPage(cachePages, std::move(page), sticky, TSharedCache::EPageAdmission::Bounded);
 }
 
-TSharedCachePageRef TEvSaveCompactedPages::AddWrittenPage(
+TSharedPageRef TEvSaveCompactedPages::AddWrittenPage(
     TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
     return AddPage(cachePages, std::move(page), sticky, TSharedCache::EPageAdmission::Written);
 }
 
-TSharedCachePageRef TEvSaveCompactedPages::AddPage(
+TSharedPageRef TEvSaveCompactedPages::AddPage(
     TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky, TSharedCache::EPageAdmission admission) {
     auto binding = cachePages.BindCurrentThreadHazard();
     if (!CacheItem) {
@@ -97,28 +97,28 @@ TRequestCompletion::TRequestCompletion(TRequestCompletionParams&& params) noexce
     , RequestId_(params.RequestId)
     , PageCollection_(std::move(params.PageCollection))
     , Locations_(std::move(params.Pages))
-    , Pages_(Locations_.size())
+    , ReadyPages_(Locations_.size())
     , WaitPad_(std::move(params.WaitPad))
     , Cookie_(params.Cookie)
     , Notify_(params.Notify)
     , CoreRoute_(params.CoreRoute)
     , CompletionId_(params.CompletionId)
-    , Remaining_(static_cast<ui32>(Locations_.size()))
+    , RemainingPages_(static_cast<ui32>(Locations_.size()))
 {
     Y_DEBUG_ABORT_UNLESS(Locations_.size() <= Max<ui32>());
     Y_DEBUG_ABORT_UNLESS(ActorSystem_ && ReplyTo_ && PageCollection_);
-    if (Remaining_.load(std::memory_order_relaxed) == 0) {
+    if (RemainingPages_.load(std::memory_order_relaxed) == 0) {
         SendResult();
     }
 }
 
-void TRequestCompletion::Complete(ui32 index, TSharedCachePageRef page, EPageFetchCompletion completion) noexcept {
-    Y_DEBUG_ABORT_UNLESS(index < Pages_.size());
+void TRequestCompletion::Complete(ui32 index, TSharedPageRef page, EPageFetchCompletion completion) noexcept {
+    Y_DEBUG_ABORT_UNLESS(index < ReadyPages_.size());
     Y_DEBUG_ABORT_UNLESS(completion != EPageFetchCompletion::Pending);
     TGuard<TMutex> guard(Mutex_);
     if (completion == EPageFetchCompletion::Ready && Status_.load(std::memory_order_relaxed) == NKikimrProto::OK) {
         Y_DEBUG_ABORT_UNLESS(page);
-        Pages_[index] = std::move(page);
+        ReadyPages_[index] = std::move(page);
         if (WaitPad_) {
             WaitPad_->HasPinnedPages.store(true, std::memory_order_release);
         }
@@ -127,7 +127,7 @@ void TRequestCompletion::Complete(ui32 index, TSharedCachePageRef page, EPageFet
         Status_.compare_exchange_strong(expected, NKikimrProto::ERROR, std::memory_order_relaxed);
     }
 
-    const ui32 remaining = Remaining_.fetch_sub(1, std::memory_order_acq_rel);
+    const ui32 remaining = RemainingPages_.fetch_sub(1, std::memory_order_acq_rel);
     Y_DEBUG_ABORT_UNLESS(remaining != 0);
     if (remaining == 1) {
         SendResult();
@@ -137,7 +137,7 @@ void TRequestCompletion::Complete(ui32 index, TSharedCachePageRef page, EPageFet
 void TRequestCompletion::Cancel(bool replyImmediately) noexcept {
     TGuard<TMutex> guard(Mutex_);
     Status_.store(NKikimrProto::RACE, std::memory_order_relaxed);
-    for (auto& page : Pages_) {
+    for (auto& page : ReadyPages_) {
         page.Drop();
     }
     if (replyImmediately) {
@@ -149,7 +149,7 @@ void TRequestCompletion::PostponeForResources() noexcept {
     TGuard<TMutex> guard(Mutex_);
     ResourcePressure_ = true;
     Status_.store(NKikimrProto::RACE, std::memory_order_relaxed);
-    for (auto& page : Pages_) {
+    for (auto& page : ReadyPages_) {
         page.Drop();
     }
     SendResult();
@@ -173,11 +173,11 @@ void TRequestCompletion::SendResult() noexcept {
     result->WaitPad = WaitPad_;
     result->ResourcePressure = ResourcePressure_;
     if (status == NKikimrProto::OK) {
-        result->Pages.reserve(Pages_.size());
-        for (ui32 index = 0; index < Pages_.size(); ++index) {
+        result->Pages.reserve(ReadyPages_.size());
+        for (ui32 index = 0; index < ReadyPages_.size(); ++index) {
             const NTable::NPage::TPageLocation& location = Locations_[index];
-            Y_DEBUG_ABORT_UNLESS(Pages_[index]);
-            result->Pages.emplace_back(location.Offset, location.Size, std::move(Pages_[index]));
+            Y_DEBUG_ABORT_UNLESS(ReadyPages_[index]);
+            result->Pages.emplace_back(location.Offset, location.Size, std::move(ReadyPages_[index]));
         }
     }
     if (Notify_) {
@@ -198,9 +198,9 @@ bool TRequestPageWaiter::IsActive() const noexcept {
 }
 
 void TRequestPageWaiter::Complete(TPageCacheItem page, EPageFetchCompletion completion) noexcept {
-    TSharedCachePageRef result;
+    TSharedPageRef result;
     if (completion == EPageFetchCompletion::Ready) {
-        TSharedCachePageRef cachePage;
+        TSharedPageRef cachePage;
         if (TSharedCache* cache = TSharedCache::TryGet()) {
             auto binding = cache->BindCurrentThreadHazard();
             if (cache->AcquirePage(page, cachePage)) {
@@ -218,7 +218,7 @@ void TRequestPageWaiter::Complete(TPageCacheItem page, EPageFetchCompletion comp
 
 template TSharedCacheCollectionRef TSharedCacheImpl<TProdTraits>::AdmitCollection(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection);
-template TSharedCachePageRef TSharedCacheImpl<TProdTraits>::AdmitPage(
+template TSharedPageRef TSharedCacheImpl<TProdTraits>::AdmitPage(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, NTable::NPage::TPageLocation location,
     NActors::TSharedData&& data, bool sticky);
 
