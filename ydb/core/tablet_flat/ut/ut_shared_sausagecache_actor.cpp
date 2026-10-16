@@ -2043,6 +2043,75 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckFetches({});
     }
 
+    Y_UNIT_TEST(ReviewR14StickyPartialBatchesResumeAfterDemotion) {
+        TSharedPageCacheMock sharedCache(TSharedPageCacheMock::DefaultConfig(), true);
+        sharedCache.SetLimit(0, 0, 2 * PAGE_TOTAL_SIZE);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Sticky, {}, true);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(0), _P(1) });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(0), _P(1) } } });
+        sharedCache.Provide(sharedCache.Collection1, { _P(0), _P(1) });
+        auto held = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(0), _P(1) } } });
+        UNIT_ASSERT(held.at(0).IsSticky());
+        UNIT_ASSERT(held.at(1).IsSticky());
+        held.clear();
+
+        auto firstPad = MakeIntrusive<TPagesWaitPad>();
+        auto secondPad = MakeIntrusive<TPagesWaitPad>();
+        for (const auto& pad : { firstPad, secondPad }) {
+            pad->PendingRequests = 1;
+            pad->WorkingSetBytes = 2 * PAGE_TOTAL_SIZE;
+            UNIT_ASSERT(!pad->HasPinnedPages.load());
+        }
+        // Each attempt fits alone; together their partial Sticky hits block both missing pages.
+        sharedCache.Request(
+            sharedCache.Sender1, sharedCache.Collection1, { _P(0), _P(2) }, EPriority::Fast, 0, firstPad);
+        sharedCache.Request(
+            sharedCache.Sender2, sharedCache.Collection1, { _P(1), _P(3) }, EPriority::Fast, 0, secondPad);
+        sharedCache.Runtime.WaitFor("Sticky partial batches release their pins", [&] {
+            return sharedCache.Results.size() == 2;
+        }, TDuration::Seconds(5));
+        for (const auto& result : sharedCache.Results) {
+            const auto& pad = result->Get()->WaitPad;
+            UNIT_ASSERT(pad == firstPad || pad == secondPad);
+            UNIT_ASSERT(pad->HasPinnedPages.load());
+            UNIT_ASSERT(pad->PostponedForResources);
+            UNIT_ASSERT(result->Get()->ResourcePressure);
+            UNIT_ASSERT(!result->Get()->ResourcesReady);
+        }
+        sharedCache.CheckResults(
+            { TFetch{ 2, sharedCache.Collection1, {} }, TFetch{ 3, sharedCache.Collection1, {} } }, NKikimrProto::RACE);
+        sharedCache.CheckFetches({});
+        UNIT_ASSERT(sharedCache.Results.empty());
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCache::Get().StickyBytes(), 2 * PAGE_TOTAL_SIZE);
+
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular);
+        sharedCache.Runtime.WaitFor("both attempts resume after Sticky demotion", [&] {
+            return sharedCache.Results.size() == 2;
+        }, TDuration::Seconds(5));
+        for (const auto& pad : { firstPad, secondPad }) {
+            ui32 replies = 0;
+            for (const auto& result : sharedCache.Results) {
+                UNIT_ASSERT_VALUES_EQUAL(result->Get()->Status, NKikimrProto::OK);
+                UNIT_ASSERT(result->Get()->ResourcesReady);
+                UNIT_ASSERT(!result->Get()->ResourcePressure);
+                UNIT_ASSERT(result->Get()->Pages.empty());
+                replies += result->Get()->WaitPad == pad;
+            }
+            UNIT_ASSERT_VALUES_EQUAL(replies, 1);
+        }
+        sharedCache.Results.clear();
+
+        // Readiness is advisory: finish one retry and release its pins before running the other.
+        for (ui32 index = 0; index < 2; ++index) {
+            const TVector<TPageLocation> pages{ _P(index), _P(index + 2) };
+            sharedCache.Request(index ? sharedCache.Sender2 : sharedCache.Sender1, sharedCache.Collection1, pages);
+            sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, pages } });
+            sharedCache.Provide(sharedCache.Collection1, pages);
+            auto loaded = sharedCache.CheckResults({ TFetch{ 4 + index, sharedCache.Collection1, pages } });
+            UNIT_ASSERT_VALUES_EQUAL(loaded.size(), 2);
+        }
+    }
+
     Y_UNIT_TEST(ResourceWaitReportsTransactionPinsWithoutStorageFailure) {
         TSharedPageCacheMock sharedCache;
         sharedCache.SetLimit(2 * PAGE_TOTAL_SIZE, 0, 2 * PAGE_TOTAL_SIZE);

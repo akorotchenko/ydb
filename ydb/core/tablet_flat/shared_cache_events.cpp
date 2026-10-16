@@ -119,7 +119,7 @@ void TRequestCompletion::Complete(ui32 index, TSharedCachePageRef page, EPageFet
     if (completion == EPageFetchCompletion::Ready && Status_.load(std::memory_order_relaxed) == NKikimrProto::OK) {
         Y_DEBUG_ABORT_UNLESS(page);
         Pages_[index] = std::move(page);
-        if (WaitPad_ && !Pages_[index].IsSticky()) {
+        if (WaitPad_) {
             WaitPad_->HasPinnedPages.store(true, std::memory_order_release);
         }
     } else {

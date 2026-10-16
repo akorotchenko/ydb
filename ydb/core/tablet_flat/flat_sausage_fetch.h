@@ -16,6 +16,7 @@ namespace NPageCollection {
         ui64 PendingRequests = 0;
         ui64 WorkingSetBytes = 0; // Immutable page budget for retry after releasing this attempt's pins.
         // Set by page clients or fetch completions when the attempt retains pins; stays set for this attempt.
+        // Includes Sticky pins: their collection mode may change while the attempt waits.
         std::atomic<bool> HasPinnedPages{ false };
         bool PostponedForResources = false; // Cache-actor-owned; closes late requests of the abandoned attempt.
     };
