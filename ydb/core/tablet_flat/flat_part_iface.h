@@ -72,11 +72,11 @@ namespace NTable {
                 new (&Data_) TSharedData(std::move(data));
             }
 
-            TResult(bool need, TSharedCachePageRef&& page)
+            TResult(bool need, TSharedPageRef&& page)
                 : Need(need)
                 , Kind_(EKind::Page)
             {
-                new (&Page_) TSharedCachePageRef(std::move(page));
+                new (&Page_) TSharedPageRef(std::move(page));
             }
 
             TResult(TResult&& other) noexcept
@@ -146,7 +146,7 @@ namespace NTable {
                         new (&Data_) TSharedData(std::move(other.Data_));
                         break;
                     case EKind::Page:
-                        new (&Page_) TSharedCachePageRef(std::move(other.Page_));
+                        new (&Page_) TSharedPageRef(std::move(other.Page_));
                         break;
                 }
             }
@@ -159,7 +159,7 @@ namespace NTable {
                         Data_.~TSharedData();
                         break;
                     case EKind::Page:
-                        Page_.~TSharedCachePageRef();
+                        Page_.~TSharedPageRef();
                         break;
                 }
             }
@@ -169,7 +169,7 @@ namespace NTable {
             union {
                 const TSharedData* BorrowedData_;
                 TSharedData Data_;
-                TSharedCachePageRef Page_;
+                TSharedPageRef Page_;
             };
         };
 
@@ -181,7 +181,7 @@ namespace NTable {
         /**
          * Returns a data page of the column group, or an empty reference if it is not loaded yet
          */
-        virtual TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
+        virtual TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
 
         /**
          * Returns an index page (flat or b-tree) of the column group, or an empty reference if it is not loaded yet
@@ -189,7 +189,7 @@ namespace NTable {
          * Index pages may be stored in another page collection than data pages of the same group,
          * so the page collection is chosen by the part (TPart::IndexSlot) rather than the caller
          */
-        virtual TSharedCachePageRef TryGetIndexPage(
+        virtual TSharedPageRef TryGetIndexPage(
             const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
 
         /**

@@ -268,15 +268,15 @@ TLoader::TFetch TLoader::StageCreatePartView(bool preloadIndex)
     const auto slots = GetSlots();
 
     // Root, bloom, frames, globs and stats pages
-    auto getPage = [&](TPageId pageId) -> TSharedCachePageRef {
+    auto getPage = [&](TPageId pageId) -> TSharedPageRef {
         const ui32 slot = slots.DescriptorSlot();
         return pageId == Max<TPageId>()
-                   ? TSharedCachePageRef()
+                   ? TSharedPageRef()
                    : LoaderEnv->TryGetSlotPage(slot, PageCollections[slot]->PageCollection()->GetLocation(pageId));
     };
-    auto getIndexPage = [&](TPageId pageId, NPage::TGroupId groupId) -> TSharedCachePageRef {
+    auto getIndexPage = [&](TPageId pageId, NPage::TGroupId groupId) -> TSharedPageRef {
         return pageId == Max<TPageId>()
-                   ? TSharedCachePageRef()
+                   ? TSharedPageRef()
                    : LoaderEnv->TryGetIndexPage(nullptr,
                          PageCollections[slots.IndexSlot(groupId)]->PageCollection()->GetLocation(pageId), groupId);
     };

@@ -29,7 +29,7 @@ namespace NTable {
             return { true, nullptr };
         }
 
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
+        TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
         {
             Y_ENSURE(!NPage::IsIndexPage(location.Type), "Index page " << location << " is requested as a data page");
 
@@ -41,7 +41,7 @@ namespace NTable {
             return {};
         }
 
-        TSharedCachePageRef TryGetIndexPage(
+        TSharedPageRef TryGetIndexPage(
             const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             // need index pages to continue counting
             // do not count index

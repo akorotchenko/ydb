@@ -23,7 +23,7 @@ namespace {
     using namespace NTest;
 
     struct TTouchEnv : public NTest::TTestEnv {
-        TSharedCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
+        TSharedPageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
         {
             auto type = location.Type;
             if (type == EPage::Undef && location.Offset.IsPageIndex()) {
@@ -32,7 +32,7 @@ namespace {
             return Touch(part, location, groupId, type, NTest::TTestEnv::TryGetPage(part, location, groupId));
         }
 
-        TSharedCachePageRef TryGetIndexPage(
+        TSharedPageRef TryGetIndexPage(
             const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto type = location.Type;
             if (type == EPage::Undef && location.Offset.IsPageIndex()) {
@@ -42,8 +42,8 @@ namespace {
             return Touch(part, location, TGroupId(part->IndexSlot(groupId)), type, NTest::TTestEnv::TryGetIndexPage(part, location, groupId));
         }
 
-        TSharedCachePageRef Touch(
-            const TPart* part, const TPageLocation& location, TGroupId groupId, EPage type, TSharedCachePageRef page)
+        TSharedPageRef Touch(
+            const TPart* part, const TPageLocation& location, TGroupId groupId, EPage type, TSharedPageRef page)
         {
             bool newTouch = Touched[{part, groupId}].insert(location.Offset).second;
 
@@ -161,7 +161,7 @@ Y_UNIT_TEST_SUITE(BuildStatsPageLifetime) {
 
     class TStatsPageEnv : public TTestEnv {
     public:
-        TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             if (StopAfterPages && Touched.size() >= StopAfterPages) {
                 throw TStopTraversal{};
             }
@@ -363,8 +363,7 @@ Y_UNIT_TEST_SUITE(BuildStatsPageLifetime) {
                 : Tracker(tracker)
             {}
 
-            TSharedCachePageRef TryGetPage(
-                const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+            TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 const auto workingSet = Tracker.WorkingSet();
                 SawRetainedIndex |= workingSet.Pages != 0;
                 return TTestEnv::TryGetPage(part, location, groupId);

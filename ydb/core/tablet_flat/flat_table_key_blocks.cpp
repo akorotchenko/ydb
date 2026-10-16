@@ -183,11 +183,11 @@ public:
         return Inner->Locate(part, ref, lob);
     }
 
-    TSharedCachePageRef TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
+    TSharedPageRef TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
         Y_TABLET_ERROR("key-block iterator requested a data page");
     }
 
-    TSharedCachePageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TSharedPageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         Y_ENSURE(NPage::IsIndexPage(location.Type), "key-block iterator requested a non-index page");
         auto page = Inner->TryGetIndexPage(part, location, groupId);
         if (page) {

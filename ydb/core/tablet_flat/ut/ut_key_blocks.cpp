@@ -107,12 +107,12 @@ void ReplaceSlices(TPartView& view, TVector<TSlice> slices) {
 }
 
 struct TIndexOnlyEnv : TTestEnv {
-    TSharedCachePageRef TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
+    TSharedPageRef TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
         UNIT_FAIL("key-block iterator fetched a data page");
         return {};
     }
 
-    TSharedCachePageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TSharedPageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         UNIT_ASSERT_C(NPage::IsIndexPage(location.Type), "key-block iterator fetched a data page");
         return TTestEnv::TryGetIndexPage(part, location, groupId);
     }
@@ -122,7 +122,7 @@ struct TTrackingIndexEnv : TIndexOnlyEnv {
     using TPage = std::tuple<const TPart*, ui32, TPageOffset>;
     std::set<TPage> Pages;
 
-    TSharedCachePageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TSharedPageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         Pages.emplace(part, part->IndexSlot(groupId), location.Offset);
         return TIndexOnlyEnv::TryGetIndexPage(part, location, groupId);
     }
@@ -132,7 +132,7 @@ struct TLoadOnRetryEnv : TTrackingIndexEnv {
     std::set<TPage> Requested;
     ui32 Faults = 0;
 
-    TSharedCachePageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TSharedPageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         if (Requested.emplace(part, part->IndexSlot(groupId), location.Offset).second) {
             ++Faults;
             return {};

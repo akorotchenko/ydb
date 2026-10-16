@@ -23,7 +23,7 @@ namespace {
     using namespace NTest;
 
     // Loads a page of the main group requested by a forward cache, which queues both index and data pages
-    TSharedCachePageRef LoadQueuedPage(TTestEnv& env, const TPart* part, const NPage::TPageLocation& location) {
+    TSharedPageRef LoadQueuedPage(TTestEnv& env, const TPart* part, const NPage::TPageLocation& location) {
         return NPage::IsIndexPage(location.Type)
             ? env.TryGetIndexPage(part, location, { })
             : env.TryGetPage(part, location, { });
@@ -119,7 +119,7 @@ namespace {
                 Cache->Forward(this, AheadHi);
             }
 
-            TVector<TSharedCachePageRef> load;
+            TVector<TSharedPageRef> load;
 
             for (auto& qp : std::exchange(Pages, TDeque<TQueuedPage>{})) {
                 if (qp.Size >= Edge) {
@@ -284,7 +284,7 @@ namespace {
 
             UNIT_ASSERT_VALUES_EQUAL_C(Queue.size(), pageIds.size(), CurrentStepStr());
 
-            TVector<TSharedCachePageRef> load;
+            TVector<TSharedPageRef> load;
             NTest::TTestEnv testEnv;
             size_t i = 0;
             for (auto& loc : std::exchange(Queue, TDeque<TPageLocation>{})) {
@@ -322,7 +322,7 @@ namespace {
 
         TCacheWrap& Apply(const TVector<TPageId>& pageIds, NFwd::TStat stat)
         {
-            TVector<TSharedCachePageRef> load;
+            TVector<TSharedPageRef> load;
             NTest::TTestEnv testEnv;
             for (auto pageId : pageIds) {
                 NFwd::TPageOffset offset = Part->GetPageLocation(pageId, { }).Offset;
@@ -1722,7 +1722,7 @@ struct TCacheWrapV2 : public NTest::TSteps<TCacheWrapV2>, protected NFwd::IPageL
 
         UNIT_ASSERT_VALUES_EQUAL_C(Queue.size(), offsets.size(), CurrentStepStr());
 
-        TVector<TSharedCachePageRef> load;
+        TVector<TSharedPageRef> load;
         NTest::TTestEnv testEnv;
         size_t i = 0;
         for (auto& loc : std::exchange(Queue, TDeque<NPage::TPageLocation>{})) {
@@ -1755,7 +1755,7 @@ struct TCacheWrapV2 : public NTest::TSteps<TCacheWrapV2>, protected NFwd::IPageL
 
     TCacheWrapV2& Apply(const TVector<NFwd::TPageOffset>& offsets)
     {
-        TVector<TSharedCachePageRef> load;
+        TVector<TSharedPageRef> load;
         NTest::TTestEnv testEnv;
         for (auto offset : offsets) {
             NPage::TPageLocation location;

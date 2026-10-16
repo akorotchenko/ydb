@@ -7,6 +7,7 @@
 #include <ydb/library/actors/util/shared_data.h>
 
 #include <util/generic/xrange.h>
+#include <util/generic/hash.h>
 #include "shared_cache.h"
 
 namespace NKikimr {
@@ -15,6 +16,7 @@ namespace NPageCollection {
     struct TPagesWaitPad : public TThrRefBase {
         ui64 PendingRequests = 0;
         ui64 WorkingSetBytes = 0; // Immutable page budget for retry after releasing this attempt's pins.
+        THashMap<TLogoBlobID, TVector<TPageLocation>> WorkingSetPages; // Immutable identities, including Sticky pages.
         // Set by page clients or fetch completions when the attempt retains pins; stays set for this attempt.
         // Includes Sticky pins: their collection mode may change while the attempt waits.
         std::atomic<bool> HasPinnedPages{ false };

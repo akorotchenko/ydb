@@ -221,7 +221,7 @@ namespace NPage {
             Set(raw);
         }
 
-        explicit TDataPage(TSharedCachePageRef&& ref) {
+        explicit TDataPage(TSharedPageRef&& ref) {
             Set(std::move(ref));
         }
 
@@ -250,7 +250,7 @@ namespace NPage {
             return Parse(raw ? *raw : TSharedData());
         }
 
-        TDataPage& Set(TSharedCachePageRef&& ref) {
+        TDataPage& Set(TSharedPageRef&& ref) {
             TSharedData raw = ref ? ref.BuildSharedData() : TSharedData();
             ref.Drop();
             return Parse(std::move(raw));

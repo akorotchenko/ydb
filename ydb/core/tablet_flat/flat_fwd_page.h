@@ -51,7 +51,7 @@ namespace NFwd {
             return Offset < offset;
         }
 
-        ui32 Settle(TSharedCachePageRef&& page)
+        ui32 Settle(TSharedPageRef&& page)
         {
             const auto was = std::exchange(Fetch, EFetch::Done);
 
@@ -70,7 +70,7 @@ namespace NFwd {
             return SharedPageRef.size();
         }
 
-        const TSharedCachePageRef* Touch(TPageOffset offset, TStat &stat)
+        const TSharedPageRef* Touch(TPageOffset offset, TStat& stat)
         {
             if (Offset != offset || (!SharedPageRef && Fetch == EFetch::Done)) {
                 Y_TABLET_ERROR("Touching page that doesn't fit to this action");
@@ -105,7 +105,7 @@ namespace NFwd {
         const ui16 Tag  = Max<ui16>();
         EUsage Usage    = EUsage::None;
         EFetch Fetch    = EFetch::None;
-        TSharedCachePageRef SharedPageRef;
+        TSharedPageRef SharedPageRef;
     };
 
 }

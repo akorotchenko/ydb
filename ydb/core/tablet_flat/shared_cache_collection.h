@@ -84,7 +84,7 @@ public:
     void SetSkipBTreeIndexV1Shadow(bool skip);
     void DrainStickyPages();
 
-    TSharedCachePageRef TryGetPage(const NTable::NPage::TPageLocation& location, bool sticky = false) const;
+    TSharedPageRef TryGetPage(const NTable::NPage::TPageLocation& location, bool sticky = false) const;
 
     ui64 TotalSize() const noexcept {
         return NActors::TSharedData::OverheadSize * PageCollection_->Total() + PageCollection_->BackingSize();

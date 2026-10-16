@@ -18,7 +18,7 @@ namespace {
     using TChild = TBtreeIndexNode::TChild;
 
     struct TTouchEnv : public NTest::TTestEnv {
-        TSharedCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
+        TSharedPageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
         {
             if (Touch(groupId, ResolvePageId(part, location, part->DataSlot(groupId)))) {
                 return NTest::TTestEnv::TryGetPage(part, location, groupId);
@@ -26,7 +26,7 @@ namespace {
             return {};
         }
 
-        TSharedCachePageRef TryGetIndexPage(
+        TSharedPageRef TryGetIndexPage(
             const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             // index pages are tracked as pages of their page collection
             const ui32 slot = part->IndexSlot(groupId);
@@ -340,17 +340,17 @@ namespace {
         explicit TTouchEnvV2(const TPartStore* part)
             : Part(part) {}
 
-        TSharedCachePageRef TryGetPage(const TPart* part, const NPage::TPageLocation& location,
+        TSharedPageRef TryGetPage(const TPart* part, const NPage::TPageLocation& location,
                 NPage::TGroupId groupId) override {
             return TryGetRoomPage(location, part->DataSlot(groupId));
         }
 
-        TSharedCachePageRef TryGetIndexPage(
+        TSharedPageRef TryGetIndexPage(
             const TPart* part, const NPage::TPageLocation& location, NPage::TGroupId groupId) override {
             return TryGetRoomPage(location, part->IndexSlot(groupId));
         }
 
-        TSharedCachePageRef TryGetRoomPage(const NPage::TPageLocation& location, ui32 room) {
+        TSharedPageRef TryGetRoomPage(const NPage::TPageLocation& location, ui32 room) {
             // Type-aware on every access, cache hits included: the store knows the
             // true page type for this offset/room. Validate the charger's requested
             // Type before serving from cache, so a same-offset request that later

@@ -69,13 +69,13 @@ namespace NPage {
             Parse();
         }
 
-        explicit TFlatIndex(TSharedCachePageRef&& ref)
+        explicit TFlatIndex(TSharedPageRef&& ref)
             : Ref(std::move(ref))
         {
             Parse();
         }
 
-        const TSharedCachePageRef& GetPageRef() const noexcept {
+        const TSharedPageRef& GetPageRef() const noexcept {
             return Ref;
         }
 
@@ -288,7 +288,7 @@ namespace NPage {
         }
 
     private:
-        TSharedCachePageRef Ref;
+        TSharedPageRef Ref;
         TSharedData Raw;
         TBlock Page;
         const TRecord* LastKey;

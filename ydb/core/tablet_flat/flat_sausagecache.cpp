@@ -5,7 +5,7 @@
 
 namespace NKikimr::NSharedCache {
 
-TSharedCachePageRef TCollection::TryGetPage(const NTable::NPage::TPageLocation& location, bool sticky) const {
+TSharedPageRef TCollection::TryGetPage(const NTable::NPage::TPageLocation& location, bool sticky) const {
     auto* cache = TSharedCache::TryGet();
     if (!cache) {
         return {};
@@ -16,7 +16,7 @@ TSharedCachePageRef TCollection::TryGetPage(const NTable::NPage::TPageLocation& 
         return {};
     }
     const TCollectionCacheItem item = collection.CacheItem();
-    TSharedCachePageRef page;
+    TSharedPageRef page;
     if (cache->Find(item, static_cast<ui64>(location.Offset), page) != ESharedCacheResultStatus::Hit) {
         return {};
     }

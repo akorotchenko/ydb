@@ -8,6 +8,7 @@
 #include <ydb/library/actors/core/thread_context.h>
 
 #include <util/generic/cast.h>
+#include <util/generic/hash_set.h>
 #include <util/generic/scope.h>
 #include <util/system/spinlock.h>
 
@@ -299,20 +300,19 @@ TIntrusivePtr<TSharedCache> TSharedCache::Create(THolder<TSharedCacheSpace> spac
 }
 
 SHARED_CACHE_TEMPLATE
-TSharedCachePageRefImpl<TTraits>::TSharedCachePageRefImpl(TSharedCacheItemRef&& ref) noexcept
+TSharedPageRefImpl<TTraits>::TSharedPageRefImpl(TSharedCacheItemRef&& ref) noexcept
     : Ref_(std::move(ref))
 {
     Y_DEBUG_ABORT_UNLESS(Ref_);
 }
 
 SHARED_CACHE_TEMPLATE
-TSharedCachePageRefImpl<TTraits>::TSharedCachePageRefImpl(TSharedCachePageRefImpl&& other) noexcept
+TSharedPageRefImpl<TTraits>::TSharedPageRefImpl(TSharedPageRefImpl&& other) noexcept
     : Ref_(std::move(other.Ref_))
 {}
 
 SHARED_CACHE_TEMPLATE
-TSharedCachePageRefImpl<TTraits>& TSharedCachePageRefImpl<TTraits>::operator=(
-    TSharedCachePageRefImpl&& other) noexcept {
+TSharedPageRefImpl<TTraits>& TSharedPageRefImpl<TTraits>::operator=(TSharedPageRefImpl&& other) noexcept {
     if (this != &other) {
         Drop();
         Ref_ = std::move(other.Ref_);
@@ -321,14 +321,14 @@ TSharedCachePageRefImpl<TTraits>& TSharedCachePageRefImpl<TTraits>::operator=(
 }
 
 SHARED_CACHE_TEMPLATE
-TPageCacheItem TSharedCachePageRefImpl<TTraits>::CacheItem() const noexcept {
+TPageCacheItem TSharedPageRefImpl<TTraits>::CacheItem() const noexcept {
     Y_DEBUG_ABORT_UNLESS(Ref_);
     return TPageCacheItem::FromValidated(Ref_.CacheItem_);
 }
 
 SHARED_CACHE_TEMPLATE
 template <class TCallback>
-decltype(auto) TSharedCachePageRefImpl<TTraits>::WithHandle(TCallback&& callback) const noexcept {
+decltype(auto) TSharedPageRefImpl<TTraits>::WithHandle(TCallback&& callback) const noexcept {
     Y_DEBUG_ABORT_UNLESS(Ref_);
     TSharedCache& cache = TSharedCache::Get();
     auto binding = cache.BindCurrentThreadHazard();
@@ -341,14 +341,14 @@ decltype(auto) TSharedCachePageRefImpl<TTraits>::WithHandle(TCallback&& callback
 }
 
 SHARED_CACHE_TEMPLATE
-const char* TSharedCachePageRefImpl<TTraits>::data() const noexcept {
+const char* TSharedPageRefImpl<TTraits>::data() const noexcept {
     return WithHandle([](const THandle& handle) {
         return handle.Body.PageBuffer.data();
     });
 }
 
 SHARED_CACHE_TEMPLATE
-size_t TSharedCachePageRefImpl<TTraits>::size() const noexcept {
+size_t TSharedPageRefImpl<TTraits>::size() const noexcept {
     if (!Ref_) {
         return 0;
     }
@@ -358,14 +358,14 @@ size_t TSharedCachePageRefImpl<TTraits>::size() const noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
-NActors::TSharedData TSharedCachePageRefImpl<TTraits>::BuildSharedData() const noexcept {
+NActors::TSharedData TSharedPageRefImpl<TTraits>::BuildSharedData() const noexcept {
     return WithHandle([](const THandle& handle) {
         return handle.Body.PageBuffer.Share(handle.Key2OrSize.load(std::memory_order_relaxed));
     });
 }
 
 SHARED_CACHE_TEMPLATE
-TSharedCachePageRefImpl<TTraits> TSharedCachePageRefImpl<TTraits>::Acquire() const& noexcept {
+TSharedPageRefImpl<TTraits> TSharedPageRefImpl<TTraits>::Acquire() const& noexcept {
     if (!Ref_) {
         return {};
     }
@@ -375,14 +375,14 @@ TSharedCachePageRefImpl<TTraits> TSharedCachePageRefImpl<TTraits>::Acquire() con
 }
 
 SHARED_CACHE_TEMPLATE
-NTable::NPage::TPageOffset TSharedCachePageRefImpl<TTraits>::GetOffset() const noexcept {
+NTable::NPage::TPageOffset TSharedPageRefImpl<TTraits>::GetOffset() const noexcept {
     return WithHandle([](const THandle& handle) {
         return NTable::NPage::TPageOffset::FromRaw(handle.Key1.load(std::memory_order_relaxed));
     });
 }
 
 SHARED_CACHE_TEMPLATE
-NTable::NPage::TPageLocation TSharedCachePageRefImpl<TTraits>::GetLocation() const noexcept {
+NTable::NPage::TPageLocation TSharedPageRefImpl<TTraits>::GetLocation() const noexcept {
     return WithHandle([](const THandle& handle) {
         return NTable::NPage::TPageLocation(
             NTable::NPage::TPageOffset::FromRaw(handle.Key1.load(std::memory_order_relaxed)),
@@ -391,14 +391,23 @@ NTable::NPage::TPageLocation TSharedCachePageRefImpl<TTraits>::GetLocation() con
 }
 
 SHARED_CACHE_TEMPLATE
-NTable::NPage::EPage TSharedCachePageRefImpl<TTraits>::GetType() const noexcept {
+NTable::NPage::EPage TSharedPageRefImpl<TTraits>::GetType() const noexcept {
     return WithHandle([](const THandle& handle) {
         return handle.Metadata.Page.Type;
     });
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCachePageRefImpl<TTraits>::IsSticky() const noexcept {
+TLogoBlobID TSharedPageRefImpl<TTraits>::GetCollectionId() const noexcept {
+    TSharedCache& cache = TSharedCache::Get();
+    auto binding = cache.BindCurrentThreadHazard();
+    auto spaceOp = cache.BeginOperation();
+    const THandle& page = spaceOp.Handles()[CacheItem().Index()];
+    return cache.PageCollection(spaceOp, page)->Id();
+}
+
+SHARED_CACHE_TEMPLATE
+bool TSharedPageRefImpl<TTraits>::IsSticky() const noexcept {
     if (!Ref_) {
         return false;
     }
@@ -408,7 +417,7 @@ bool TSharedCachePageRefImpl<TTraits>::IsSticky() const noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCachePageRefImpl<TTraits>::Drop() noexcept {
+void TSharedPageRefImpl<TTraits>::Drop() noexcept {
     Ref_.Drop();
 }
 
@@ -1766,6 +1775,65 @@ bool TSharedCache::CanAdmitWorkingSet(ui64 bytes) noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
+bool TSharedCache::CanAdmitPageHandles(TArrayRef<const TSharedCacheHandleRequirement> requirements) noexcept {
+    auto spaceOp = BeginOperation();
+    TVector<TCacheItem> allocated;
+    Y_DEFER {
+        for (const TCacheItem item : allocated) {
+            const THandleState state =
+                THandleState::FromRaw(spaceOp.Handles()[item.Index()].State.load(std::memory_order_relaxed));
+            DiscardCandidate(spaceOp, item, state.Kind(), 0);
+        }
+    };
+    const auto countMissing = [&](ui64& count) {
+        count = 0;
+        THashMap<TLogoBlobID, THashSet<ui64>> seen;
+        for (const auto& requirement : requirements) {
+            TCacheItem item;
+            TCollectionCacheItem collection;
+            if (Table_.Find(spaceOp, TSharedCacheKey::Collection(requirement.CollectionId), item) !=
+                ESharedCacheResultStatus::Miss) {
+                const THandleState state =
+                    THandleState::FromRaw(spaceOp.Handles()[item.Index()].State.load(std::memory_order_acquire));
+                if (!item.Matches(state) || !state.IsCollectionKind() || !state.IsReady()) {
+                    return false;
+                }
+                collection = TCollectionCacheItem::FromValidated(item);
+            }
+            auto [it, first] = seen.try_emplace(requirement.CollectionId);
+            count += first && !collection;
+            for (const auto& location : requirement.Pages) {
+                const ui64 offset = static_cast<ui64>(location.Offset);
+                if (!it->second.insert(offset).second) {
+                    continue;
+                }
+                TCacheItem present;
+                count += !collection || Table_.Find(spaceOp, TSharedCacheKey::Page(collection, offset), present) ==
+                                            ESharedCacheResultStatus::Miss;
+            }
+        }
+        return true;
+    };
+    for (;;) {
+        ui64 missing = 0;
+        if (!countMissing(missing)) {
+            return false;
+        }
+        if (missing <= allocated.size()) {
+            return true;
+        }
+        while (allocated.size() < missing) {
+            const TCacheItem item = Allocate(spaceOp);
+            if (item.IsNull()) {
+                return false;
+            }
+            allocated.push_back(item);
+        }
+        // Cooperative reclamation may have evicted another required page; include it before reporting readiness.
+    }
+}
+
+SHARED_CACHE_TEMPLATE
 bool TSharedCache::DispatchFetch(TSpaceOperation& spaceOp, TCacheItem cacheItem, TPageFetchState& fetch) noexcept {
     Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
@@ -3105,7 +3173,7 @@ bool TSharedCache::IsPageSticky(TPageCacheItem page) const noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
-TSharedCachePageRefImpl<TTraits> TSharedCache::BuildPageRef(
+TSharedPageRefImpl<TTraits> TSharedCache::BuildPageRef(
     const TSpaceOperation& spaceOp, TSharedCacheItemRef&& ref) const noexcept {
     Y_DEBUG_ABORT_UNLESS(&Get() == this && ref);
     const TCacheItem cacheItem = ref.CacheItem_;
@@ -3115,11 +3183,11 @@ TSharedCachePageRefImpl<TTraits> TSharedCache::BuildPageRef(
     Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(state) && state.IsPageKind() &&
                          (state.IsReady() || state.IsReplacing() || state.IsReplaced() || state.IsTombstone()) &&
                          state.Refs() > 0 && handle.Body.PageBuffer.data());
-    return TSharedCachePageRefImpl<TTraits>(std::move(ref));
+    return TSharedPageRefImpl<TTraits>(std::move(ref));
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::AcquirePage(TPageCacheItem page, TSharedCachePageRefImpl<TTraits>& result) noexcept {
+bool TSharedCache::AcquirePage(TPageCacheItem page, TSharedPageRefImpl<TTraits>& result) noexcept {
     result.Drop();
     TCacheItem cacheItem = page.CacheItem();
     auto spaceOp = BeginOperation();
@@ -3161,7 +3229,7 @@ bool TSharedCache::AcquirePage(TPageCacheItem page, TSharedCachePageRefImpl<TTra
 }
 
 SHARED_CACHE_TEMPLATE
-TSharedCachePageRefImpl<TTraits> TSharedCache::AcquireHeldPage(TCacheItem item) noexcept {
+TSharedPageRefImpl<TTraits> TSharedCache::AcquireHeldPage(TCacheItem item) noexcept {
     auto spaceOp = BeginOperation();
     THandle& handle = spaceOp.Handles()[item.Index()];
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
@@ -3212,7 +3280,7 @@ TSharedCacheCollectionRef TSharedCache::BuildCollectionRef(
 
 SHARED_CACHE_TEMPLATE
 ESharedCacheResultStatus TSharedCache::Find(
-    TCollectionCacheItem collection, ui64 offset, TSharedCachePageRefImpl<TTraits>& page) noexcept {
+    TCollectionCacheItem collection, ui64 offset, TSharedPageRefImpl<TTraits>& page) noexcept {
     page.Drop();
     auto spaceOp = BeginOperation();
     TOperationItemRef ref(spaceOp);
@@ -3348,7 +3416,7 @@ typename TSharedCache::TPageInsertCandidate TSharedCache::BuildPageInsertCandida
 SHARED_CACHE_TEMPLATE
 ESharedCacheResultStatus TSharedCache::FindOrInsert(TCollectionCacheItem collection,
     const NTable::NPage::TPageLocation& page, EStickyState sticky, TPageCacheItem& inserted,
-    TSharedCachePageRefImpl<TTraits>& hit) noexcept {
+    TSharedPageRefImpl<TTraits>& hit) noexcept {
     Y_DEBUG_ABORT_UNLESS(page && page.Type != NTable::NPage::EPage::Undef);
     Y_DEBUG_ABORT_UNLESS(sticky == EStickyState::None || sticky == EStickyState::Sticky);
     inserted = {};
@@ -3374,7 +3442,7 @@ ESharedCacheResultStatus TSharedCache::FindOrInsert(TCollectionCacheItem collect
 SHARED_CACHE_TEMPLATE
 ESharedCacheResultStatus TSharedCache::FindOrInsert(TCollectionCacheItem collection,
     const NTable::NPage::TPageLocation& page, EStickyState sticky, TIntrusivePtr<TPageFetchWaiter> waiter,
-    TSharedCachePageRefImpl<TTraits>& hit, TPageFetchImpl<TTraits>& fetch) noexcept {
+    TSharedPageRefImpl<TTraits>& hit, TPageFetchImpl<TTraits>& fetch) noexcept {
     Y_DEBUG_ABORT_UNLESS(page && page.Type != NTable::NPage::EPage::Undef && waiter);
     Y_DEBUG_ABORT_UNLESS(sticky == EStickyState::None || sticky == EStickyState::Sticky);
     auto spaceOp = BeginOperation();
@@ -3388,8 +3456,7 @@ ESharedCacheResultStatus TSharedCache::FindOrInsert(TCollectionCacheItem collect
 
 SHARED_CACHE_TEMPLATE
 ESharedCacheResultStatus TSharedCache::FindOrInsertPage(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate,
-    TIntrusivePtr<TPageFetchWaiter> waiter, TSharedCachePageRefImpl<TTraits>& hit,
-    TPageFetchImpl<TTraits>& fetch) noexcept {
+    TIntrusivePtr<TPageFetchWaiter> waiter, TSharedPageRefImpl<TTraits>& hit, TPageFetchImpl<TTraits>& fetch) noexcept {
     hit.Drop();
     fetch = {};
     TOperationItemRef ref(spaceOp);
@@ -3437,6 +3504,7 @@ bool TSharedCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollection& colle
     }
     reservedBytes = 0;
     candidates.reserve(requests.size());
+    THashSet<ui64> preparedOffsets;
     for (const TSharedCachePageRequestImpl<TTraits>& request : requests) {
         Y_DEBUG_ABORT_UNLESS(
             request.Location && request.Location.Type != NTable::NPage::EPage::Undef && request.Waiter);
@@ -3448,7 +3516,8 @@ bool TSharedCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollection& colle
         // Only pages that are absent from the table need admission budget: a page that is already resident is
         // a hit or a pending subscription and must be admitted even when the cache is at its limit.
         TCacheItem resident;
-        candidate.Prepare = Table_.Find(spaceOp, candidate.Key, resident) == ESharedCacheResultStatus::Miss;
+        candidate.Prepare = Table_.Find(spaceOp, candidate.Key, resident) == ESharedCacheResultStatus::Miss &&
+                            preparedOffsets.insert(static_cast<ui64>(request.Location.Offset)).second;
         if (candidate.Prepare) {
             const ui64 pageBytes = AccountedPageBytes(candidate.Size);
             if (reservedBytes > Max<ui64>() - pageBytes) {
@@ -3580,7 +3649,7 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
     for (ui32 index = 0; index < requests.size(); ++index) {
         TSharedCachePageRequestImpl<TTraits>& request = requests[index];
         request.Reset();
-        TSharedCachePageRefImpl<TTraits> page;
+        TSharedPageRefImpl<TTraits> page;
         TPageFetchImpl<TTraits> fetch;
         const ESharedCacheResultStatus status =
             FindOrInsertPage(spaceOp, candidates[index], std::move(request.Waiter), page, fetch);
@@ -3594,7 +3663,9 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
         } else if (status == ESharedCacheResultStatus::Pending) {
             request.SetPending();
         }
-        stats.AddAdmission(status, request.Location.Size);
+        if (status != ESharedCacheResultStatus::Miss || !waitForMemory) {
+            stats.AddAdmission(status, request.Location.Size);
+        }
     }
     if (recordStats) {
         AddStats(stats);
@@ -4937,6 +5008,7 @@ TCollection* TSharedCache::ReleaseTombstone(TSpaceOperation& spaceOp, TCacheItem
             Y_ABORT_UNLESS(handle.NextInOwner.load(std::memory_order_acquire) == 0);
             DeletePayload(handle, expected.Kind(), expected.State(), owner);
             Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(cacheItem.Index(), nextVersion));
+            NotifyResourcesAvailable();
             if (expected.IsCollectionKind()) {
                 this->NotifyCollectionReleased(
                     TLogoBlobID(key.Word(0), key.Word(1), key.Word(2)), TCollectionCacheItem::FromValidated(cacheItem));
@@ -5006,6 +5078,7 @@ void TSharedCache::ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheIte
                 DropOwnerReference(spaceOp, *owner);
             }
             Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(cacheItem.Index(), nextVersion));
+            NotifyResourcesAvailable();
             return;
         }
     }
@@ -5174,12 +5247,12 @@ bool TSharedCache::TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheI
 #undef SHARED_CACHE_TEMPLATE
 
 template class TSharedCacheThreadBinding<TProdTraits>;
-template class TSharedCachePageRefImpl<TProdTraits>;
+template class TSharedPageRefImpl<TProdTraits>;
 template class TSharedCacheCollectionRefImpl<TProdTraits>;
 template class TPageFetchImpl<TProdTraits>;
 template class TSharedCacheImpl<TProdTraits>;
 template class TSharedCacheThreadBinding<TTestTraits>;
-template class TSharedCachePageRefImpl<TTestTraits>;
+template class TSharedPageRefImpl<TTestTraits>;
 template class TSharedCacheCollectionRefImpl<TTestTraits>;
 template class TPageFetchImpl<TTestTraits>;
 template class TSharedCacheImpl<TTestTraits>;

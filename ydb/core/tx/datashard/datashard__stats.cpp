@@ -86,11 +86,11 @@ public:
         Y_ENSURE(false, "IPages::Locate(TPart*, ...) shouldn't be used here");
     }
 
-    TSharedCachePageRef TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
+    TSharedPageRef TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
         Y_ENSURE(false, "IPages::TryGetPage(...) shouldn't be used here");
     }
 
-    TSharedCachePageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TSharedPageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         auto partStore = CheckedCast<const TPartStore*>(part);
         auto info = partStore->PageCollections.at(part->IndexSlot(groupId)).Get();
         Y_ENSURE(NPage::IsIndexPage(location.Type));
@@ -109,6 +109,8 @@ public:
         CheckWorkingSet();
         RequestPad = MakeIntrusive<NPageCollection::TPagesWaitPad>();
         RequestPad->WorkingSetBytes = RequestWorkingSet.Bytes;
+        PageTracker.CollectPageLocations(RequestPad->WorkingSetPages);
+        RequestPad->WorkingSetPages[info->Id()].push_back(location);
         // Sticky pages may be demoted while this request waits, so publish every retained pin.
         RequestPad->HasPinnedPages.store(workingSet.Pages != 0, std::memory_order_release);
         ResourcesReady = false;

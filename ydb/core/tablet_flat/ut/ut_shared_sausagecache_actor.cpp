@@ -444,7 +444,8 @@ struct TSharedPageCacheMock {
         return *this;
     }
 
-    THashMap<TPageId, TSharedCachePageRef> CheckResults(TVector<TFetch> expected, NKikimrProto::EReplyStatus status = NKikimrProto::OK) {
+    THashMap<TPageId, TSharedPageRef> CheckResults(
+        TVector<TFetch> expected, NKikimrProto::EReplyStatus status = NKikimrProto::OK) {
         if (expected.empty()) {
             Runtime.SimulateSleep(TDuration::Seconds(1));
         } else {
@@ -454,7 +455,7 @@ struct TSharedPageCacheMock {
 
         SyncCacheContext();
         TVector<TFetch> actual;
-        THashMap<TPageId, TSharedCachePageRef> pages;
+        THashMap<TPageId, TSharedPageRef> pages;
         for (auto& r : Results) {
             UNIT_ASSERT_VALUES_EQUAL(r->Get()->Status, status);
             auto& result = *r->Get();
@@ -653,7 +654,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(core->HardLimit(), 64_MB);
         UNIT_ASSERT_VALUES_EQUAL(core->CurrentLimit(), 16_MB);
         UNIT_ASSERT_VALUES_EQUAL(core->SoftLimit(), 0);
-        TSharedCachePageRef pinned = std::move(pages.at(0));
+        TSharedPageRef pinned = std::move(pages.at(0));
         UNIT_ASSERT_VALUES_EQUAL(pinned.BuildSharedData().size(), 10);
         sharedCache.SetLimit(0, 64_MB);
         UNIT_ASSERT_VALUES_EQUAL(core->CurrentLimit(), 16_MB);
@@ -1146,7 +1147,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             auto binding = cache.BindCurrentThreadHazard();
             TSharedCacheCollectionRef collection;
             UNIT_ASSERT(cache.Find(sharedCache.Collection1->Label(), collection) == ESharedCacheResultStatus::Hit);
-            TSharedCachePageRef unreferenced;
+            TSharedPageRef unreferenced;
             UNIT_ASSERT(cache.Find(collection.CacheItem(), static_cast<ui64>(_P(1).Offset), unreferenced) ==
                         ESharedCacheResultStatus::Hit);
             UNIT_ASSERT(unreferenced.IsSticky());
@@ -1167,7 +1168,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         const TPageLocation location = _P(1, EPage::DataPage);
         auto page = saved->AddPage(TSharedCache::Get(), { location, TSharedData::Copy(TString(10, 'x')) }, false);
         UNIT_ASSERT(page && !page.IsSticky());
-        TSharedCachePageRef pinned = std::move(page);
+        TSharedPageRef pinned = std::move(page);
         UNIT_ASSERT(!page && pinned);
         sharedCache.Send(sharedCache.Sender1, saved.Release());
         TWaitForFirstEvent<TEvSaveCompactedPages> waiter(sharedCache.Runtime);
@@ -1177,7 +1178,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto* core = &NSharedCache::TSharedCache::Get();
         UNIT_ASSERT_GT(core->PayloadUsage(), 0);
         UNIT_ASSERT_VALUES_EQUAL(pinned.BuildSharedData().Slice(), TStringBuf("xxxxxxxxxx"));
-        TSharedCachePageRef last = std::move(pinned);
+        TSharedPageRef last = std::move(pinned);
         UNIT_ASSERT(!pinned);
         sharedCache.Wakeup();
         UNIT_ASSERT_GT(core->PayloadUsage(), 0);
@@ -1410,7 +1411,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true);
         sharedCache.Detach(sharedCache.Sender1, sharedCache.Collection1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 0);
-        TSharedCachePageRef pinned = std::move(heldPages.at(1));
+        TSharedPageRef pinned = std::move(heldPages.at(1));
         UNIT_ASSERT_VALUES_EQUAL(pinned.BuildSharedData().size(), 10);
 
         heldPages.clear();
@@ -1428,7 +1429,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto* core = &NSharedCache::TSharedCache::Get();
         auto binding = core->BindCurrentThreadHazard();
         UNIT_ASSERT(pages.at(0).IsSticky());
-        TSharedCachePageRef copy;
+        TSharedPageRef copy;
         TSharedCacheCollectionRef collection;
         UNIT_ASSERT(core->Find(sharedCache.Collection1->Label(), collection) == ESharedCacheResultStatus::Hit);
         UNIT_ASSERT(
@@ -1828,6 +1829,193 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 1);
     }
 
+    TSharedCacheConfig ReviewHandlePressureConfig() {
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(64_KB);
+        return config;
+    }
+
+    TVector<TSharedPageRef> HoldAllReviewPageHandles(TSharedPageCacheMock & sharedCache) {
+        sharedCache.Collection1 = new TPageCollectionMock(1, 10000);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true, false, false);
+        auto& core = TSharedCache::Get();
+        TVector<TSharedPageRef> held;
+        for (ui32 index = 0; index < core.TargetHandleCount(); ++index) {
+            auto page = core.AdmitPage(sharedCache.Collection1, _P(index), TSharedData::Copy(TString(10, 'x')));
+            if (!page) {
+                break;
+            }
+            held.push_back(std::move(page));
+        }
+        UNIT_ASSERT_GT(held.size(), 2);
+        UNIT_ASSERT_LT(core.PayloadUsage() + PAGE_TOTAL_SIZE, core.CurrentLimit());
+        return held;
+    }
+
+    Y_UNIT_TEST(ReviewR15ReadWaitsForHandleWithoutStorageFailure) {
+        TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
+        auto held = HoldAllReviewPageHandles(sharedCache);
+        const auto requestedBefore = sharedCache.Counters->RequestedPages->Val();
+        const auto coreRequestedBefore = TSharedCache::Get().Stats().RequestedPages;
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(9000) });
+        sharedCache.CheckFetches({});
+        UNIT_ASSERT(sharedCache.Results.empty());
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->RequestedPages->Val(), requestedBefore);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCache::Get().Stats().RequestedPages, coreRequestedBefore);
+
+        held.pop_back();
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(9000) } } });
+        sharedCache.Provide(sharedCache.Collection1, { _P(9000) });
+        auto loaded = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(9000) } } });
+        UNIT_ASSERT_VALUES_EQUAL(loaded.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->RequestedPages->Val(), requestedBefore + 1);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCache::Get().Stats().RequestedPages, coreRequestedBefore + 1);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR15ReadWaitsBeforeCollectionRegistration) {
+        TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
+        auto held = HoldAllReviewPageHandles(sharedCache);
+        sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, { _P(0) });
+        sharedCache.CheckFetches({});
+        UNIT_ASSERT(sharedCache.Results.empty());
+        held.pop_back();
+        sharedCache.CheckFetches({});
+        UNIT_ASSERT(sharedCache.Results.empty());
+        // The new collection and its page need two handles together.
+        held.pop_back();
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection2, { _P(0) } } });
+        sharedCache.Provide(sharedCache.Collection2, { _P(0) });
+        auto loaded = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection2, { _P(0) } } });
+        UNIT_ASSERT_VALUES_EQUAL(loaded.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
+    }
+
+    void ReviewCancelUnregisteredHandleWait(bool unregister) {
+        TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
+        auto held = HoldAllReviewPageHandles(sharedCache);
+        sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, { _P(0) });
+        sharedCache.CheckFetches({});
+        UNIT_ASSERT(sharedCache.Results.empty());
+        if (unregister) {
+            sharedCache.Unregister(sharedCache.Sender2);
+        } else {
+            sharedCache.Detach(sharedCache.Sender2, sharedCache.Collection2);
+        }
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection2, {} } }, NKikimrProto::RACE);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
+        held.pop_back();
+        held.pop_back();
+        sharedCache.CheckFetches({});
+        UNIT_ASSERT(sharedCache.Results.empty());
+        auto& core = TSharedCache::Get();
+        auto binding = core.BindCurrentThreadHazard();
+        TSharedCacheCollectionRef collection;
+        UNIT_ASSERT(core.Find(sharedCache.Collection2->Label(), collection) == ESharedCacheResultStatus::Miss);
+    }
+
+    Y_UNIT_TEST(ReviewR15UnregisterCancelsUnregisteredHandleWait) {
+        ReviewCancelUnregisteredHandleWait(true);
+    }
+
+    Y_UNIT_TEST(ReviewR15DetachCancelsUnregisteredHandleWait) {
+        ReviewCancelUnregisteredHandleWait(false);
+    }
+
+    Y_UNIT_TEST(ReviewR15HandleReadinessIncludesReleasedTransactionPins) {
+        TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
+        auto held = HoldAllReviewPageHandles(sharedCache);
+        const auto pinnedLocation = held.back().GetLocation();
+        auto pad = MakeIntrusive<TPagesWaitPad>();
+        pad->PendingRequests = 1;
+        pad->WorkingSetBytes = 2 * PAGE_TOTAL_SIZE;
+        pad->WorkingSetPages[sharedCache.Collection1->Label()] = { pinnedLocation, _P(9000) };
+        pad->HasPinnedPages.store(true);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(9000) }, EPriority::Fast, 0, pad);
+        sharedCache.Runtime.WaitFor("handle pressure releases transaction pins", [&] {
+            return sharedCache.Results.size() == 1;
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->ResourcePressure);
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->WaitPad == pad);
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, {} } }, NKikimrProto::RACE);
+
+        held.pop_back(); // Unwind the attempt; foreign pins still leave only one handle.
+        sharedCache.CheckFetches({});
+        UNIT_ASSERT(sharedCache.Results.empty());
+        held.pop_back();
+        sharedCache.Runtime.WaitFor("two-page handle working set fits", [&] {
+            return sharedCache.Results.size() == 1;
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->ResourcesReady);
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->WaitPad == pad);
+        sharedCache.Results.clear();
+
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { pinnedLocation, _P(9000) });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { pinnedLocation, _P(9000) } } });
+        sharedCache.Provide(sharedCache.Collection1, { pinnedLocation, _P(9000) });
+        auto loaded = sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { pinnedLocation, _P(9000) } } });
+        UNIT_ASSERT_VALUES_EQUAL(loaded.size(), 2);
+    }
+
+    Y_UNIT_TEST(ReviewR15DetachRetiresGateForAnotherWorkingSetCollection) {
+        TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection2);
+        auto held = HoldAllReviewPageHandles(sharedCache);
+        auto pad = MakeIntrusive<TPagesWaitPad>();
+        pad->PendingRequests = 2;
+        pad->WorkingSetBytes = 3 * PAGE_TOTAL_SIZE;
+        pad->WorkingSetPages[sharedCache.Collection1->Label()] = { held.back().GetLocation(), _P(9000) };
+        pad->WorkingSetPages[sharedCache.Collection2->Label()] = { _P(0) };
+        pad->HasPinnedPages.store(true);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(9000) }, EPriority::Fast, 0, pad);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection2, { _P(0) }, EPriority::Fast, 0, pad);
+        sharedCache.CheckResults(
+            { TFetch{ 1, sharedCache.Collection1, {} }, TFetch{ 2, sharedCache.Collection2, {} } }, NKikimrProto::RACE);
+        sharedCache.CheckFetches({});
+        UNIT_ASSERT(sharedCache.Results.empty());
+
+        sharedCache.Detach(sharedCache.Sender1, sharedCache.Collection2);
+        sharedCache.Runtime.WaitFor("detaching a non-anchor collection retires the resource gate", [&] {
+            return sharedCache.Results.size() == 1;
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->ResourcesReady);
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->WaitPad == pad);
+        sharedCache.Results.clear();
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR15KeepCancellationDrainsHandleWait) {
+        TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
+        auto collection = MakeIntrusive<TPageCollectionMock>(2ul, 1u);
+        collection->PageTypes = { EPage::Skip };
+        sharedCache.Collection2 = collection;
+        sharedCache.Attach(sharedCache.Sender2, collection);
+        auto held = HoldAllReviewPageHandles(sharedCache);
+        TEvAttach::TBtreeSeed seed;
+        seed.IndexCollectionId = collection->Label();
+        seed.DataCollectionId = collection->Label();
+        seed.Root = _P(0, EPage::DataPage);
+        seed.LevelCount = 0;
+        seed.QueueDataPages = true;
+        sharedCache.Attach(sharedCache.Sender2, collection, ECacheMode::TryKeepInMemory, { seed });
+        sharedCache.Runtime.WaitFor("Keep preload is waiting before a handle exists", [&] {
+            return sharedCache.Counters->PendingRequests->Val() != 0;
+        }, TDuration::Seconds(5));
+        sharedCache.CheckFetches({});
+        UNIT_ASSERT(sharedCache.Results.empty());
+
+        sharedCache.Attach(sharedCache.Sender2, collection, ECacheMode::Regular);
+        sharedCache.Runtime.WaitFor("cancelled Keep request releases its bookkeeping", [&] {
+            return sharedCache.Counters->PendingRequests->Val() == 0;
+        }, TDuration::Seconds(5));
+        held.pop_back();
+        sharedCache.CheckFetches({});
+        UNIT_ASSERT(sharedCache.Results.empty());
+    }
+
     Y_UNIT_TEST(ResourceWaitResumesAfterHeldPagesAreReleased) {
         TSharedPageCacheMock sharedCache;
         sharedCache.SetLimit(2 * PAGE_TOTAL_SIZE, 0, 2 * PAGE_TOTAL_SIZE);
@@ -1941,7 +2129,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             auto binding = core->BindCurrentThreadHazard();
             TSharedCacheCollectionRef collection;
             UNIT_ASSERT(core->Find(sharedCache.Collection1->Label(), collection) == ESharedCacheResultStatus::Hit);
-            TSharedCachePageRef page;
+            TSharedPageRef page;
             UNIT_ASSERT(core->Find(collection.CacheItem(), static_cast<ui64>(_P(2).Offset), page) ==
                         ESharedCacheResultStatus::Miss);
         }

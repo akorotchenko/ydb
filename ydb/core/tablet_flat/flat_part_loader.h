@@ -62,13 +62,12 @@ namespace NTable {
                 Part = part;
             }
 
-            TSharedCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
-            {
+            TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 Y_ENSURE(part == Part, "Unsupported part");
                 return TryGetSlotPage(Slots.DataSlot(groupId), location);
             }
 
-            TSharedCachePageRef TryGetIndexPage(
+            TSharedPageRef TryGetIndexPage(
                 const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 Y_ENSURE(part == Part, "Unsupported part");
                 return TryGetSlotPage(Slots.IndexSlot(groupId), location);
@@ -77,7 +76,7 @@ namespace NTable {
             /**
              * Loads a page of the page collection, the outer page collection is not supported
              */
-            TSharedCachePageRef TryGetSlotPage(ui32 slot, const TPageLocation& location)
+            TSharedPageRef TryGetSlotPage(ui32 slot, const TPageLocation& location)
             {
                 Y_ENSURE(slot < Slots.SlotsCount(), "Unsupported page collection " << slot);
 
@@ -154,7 +153,7 @@ namespace NTable {
             }
 
         private:
-            void AddSavedPage(ui32 slot, TPageOffset offset, TSharedCachePageRef&& page)
+            void AddSavedPage(ui32 slot, TPageOffset offset, TSharedPageRef&& page)
             {
                 SavedPages[slot][offset] = std::move(page);
             }
@@ -168,7 +167,7 @@ namespace NTable {
             const TPart* Part = nullptr;
             const TVector<TSharedCacheCollectionRef> PageCollections;
             const TPartSlots Slots;
-            TVector<THashMap<TPageOffset, TSharedCachePageRef>> SavedPages;
+            TVector<THashMap<TPageOffset, TSharedPageRef>> SavedPages;
             // Dedup by offset — keep Size/Type for the fetch request
             TVector<THashSet<TPageLocation, NPage::TPageLocationByOffsetHash, TPageLocationByOffsetEq>> NeedPages;
             ui32 FetchSlot = Max<ui32>(); // page collection of the last fetch

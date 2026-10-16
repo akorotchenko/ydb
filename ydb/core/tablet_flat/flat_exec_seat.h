@@ -26,13 +26,13 @@ namespace NTabletFlatExecutor {
 
     struct TSeat : public TIntrusiveListItem<TSeat> {
         struct TPageRefHash {
-            size_t operator()(const TSharedCachePageRef& page) const noexcept {
+            size_t operator()(const TSharedPageRef& page) const noexcept {
                 return THash<ui64>()(page.CacheItem().CacheItem().Raw());
             }
         };
 
         struct TPageRefEqual {
-            bool operator()(const TSharedCachePageRef& a, const TSharedCachePageRef& b) const noexcept {
+            bool operator()(const TSharedPageRef& a, const TSharedPageRef& b) const noexcept {
                 return a.CacheItem() == b.CacheItem();
             }
         };
@@ -84,7 +84,7 @@ namespace NTabletFlatExecutor {
         const TTxType TxType;
         NWilson::TSpan WaitingSpan;
         ui64 Retries = 0;
-        THashSet<TSharedCachePageRef, TPageRefHash, TPageRefEqual> Pinned;
+        THashSet<TSharedPageRef, TPageRefHash, TPageRefEqual> Pinned;
 
         THPTimer LatencyTimer;
         THPTimer CommitTimer;

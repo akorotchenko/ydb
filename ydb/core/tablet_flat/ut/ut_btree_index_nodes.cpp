@@ -2324,17 +2324,17 @@ Y_UNIT_TEST_SUITE(TBTreePartWalker) {
                 Y_TABLET_ERROR("Unused");
             }
 
-            TSharedCachePageRef TryGetPage(
+            TSharedPageRef TryGetPage(
                 const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 return TryGetSlotPage(location, part->DataSlot(groupId));
             }
 
-            TSharedCachePageRef TryGetIndexPage(
+            TSharedPageRef TryGetIndexPage(
                 const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 return TryGetSlotPage(location, part->IndexSlot(groupId));
             }
 
-            TSharedCachePageRef TryGetSlotPage(const TPageLocation& location, ui32 slot) {
+            TSharedPageRef TryGetSlotPage(const TPageLocation& location, ui32 slot) {
                 if (Loaded.count(location.GetByteOffset())) {
                     return NTest::TTestEnv::TryGetSlotPage(Part, location, slot);
                 }
