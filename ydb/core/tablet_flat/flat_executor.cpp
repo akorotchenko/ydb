@@ -705,12 +705,10 @@ void TExecutor::TryActivateWaitingTransaction(TIntrusivePtr<NPageCollection::TPa
         return; // The abandoned attempt's result may already have been in transit.
     }
 
-    bool hasPinnedPages = false;
     for (auto& loaded : loadedPages) {
-        hasPinnedPages = hasPinnedPages || !loaded.Page.IsSticky();
         transaction.Seat->Pinned.emplace(std::move(loaded.Page));
     }
-    if (hasPinnedPages) {
+    if (!transaction.Seat->Pinned.empty()) {
         waitPad->HasPinnedPages.store(true, std::memory_order_release);
     }
 
@@ -2387,14 +2385,12 @@ void TExecutor::PostponeTransaction(TSeat* seat, TPageCollectionTxEnv &env,
     auto waitPad = MakeIntrusive<TTransactionWaitPad>(seat);
     TransactionWaitPads[waitPad.Get()] = waitPad;
 
-    bool hasPinnedPages = false;
     for (const auto& page : seat->Pinned) {
         if (!page.IsSticky()) {
-            hasPinnedPages = true;
             waitPad->WorkingSetBytes += page.size() + NActors::TSharedData::OverheadSize;
         }
     }
-    waitPad->HasPinnedPages.store(hasPinnedPages, std::memory_order_release);
+    waitPad->HasPinnedPages.store(!seat->Pinned.empty(), std::memory_order_release);
     auto toLoad = env.ObtainToLoad();
     for (const auto& [collectionId, locations] : toLoad) {
         const auto collection = FindPageCollection(collectionId);

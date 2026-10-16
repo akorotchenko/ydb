@@ -2047,12 +2047,12 @@ void BasicSetup(TMyEnvBase& env) {
     env.WaitFor<NFake::TEvCompacted>();
 }
 
-void ManyPartsSetup(TMyEnvBase& env) {
+void ManyPartsSetup(TMyEnvBase & env, bool enableBTreeIndex = false) {
     env->SetLogPriority(NKikimrServices::TABLET_SAUSAGECACHE, NActors::NLog::PRI_TRACE);
     env->SetLogPriority(NKikimrServices::TABLET_EXECUTOR, NActors::NLog::PRI_TRACE);
     env->SetLogPriority(NKikimrServices::TX_DATASHARD, NActors::NLog::PRI_TRACE);
 
-    env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndex(false);
+    env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndex(enableBTreeIndex);
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
     TAutoPtr<TTxInitSchema> initSchema = new TTxInitSchema();
     initSchema->CompactionPolicy = NLocalDb::CreateDefaultUserTablePolicy();
@@ -2140,6 +2140,88 @@ Y_UNIT_TEST(ResourcePressurePostponesTransactionAndRetriesReads) {
     }, TDuration::Seconds(10));
     UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 1);
     UNIT_ASSERT(retried.size() > 2);
+}
+
+Y_UNIT_TEST(ReviewR14ExecutorPublishesStickyPinsOnNextAttempt) {
+    TMyEnvBase env;
+    BasicSetup(env);
+    TBlockEvents<NSharedCache::TEvRequest> block(env.Env);
+    TRetriedCounters retried;
+    bool completed = false;
+    env.SendAsync(new NFake::TEvExecute{ new TTxReadRows({ 33 }, retried, completed) });
+    env.Env.WaitFor("transaction's first page request", [&] {
+        return block.size() == 1;
+    }, TDuration::Seconds(10));
+    auto firstPad = block.front()->Get()->WaitPad;
+    UNIT_ASSERT(firstPad);
+    UNIT_ASSERT(!firstPad->HasPinnedPages.load());
+    block.front()->Get()->Sticky.assign(block.front()->Get()->Pages.size(), true);
+    block.Unblock();
+
+    env.Env.WaitFor("transaction request while retaining a Sticky index page", [&] {
+        return block.size() == 1;
+    }, TDuration::Seconds(10));
+    const auto& nextPad = block.front()->Get()->WaitPad;
+    UNIT_ASSERT(nextPad);
+    UNIT_ASSERT(nextPad != firstPad);
+    UNIT_ASSERT(nextPad->HasPinnedPages.load());
+    UNIT_ASSERT(!completed);
+
+    block.Stop().Unblock();
+    env.Env.WaitFor("transaction completes with Sticky pins", [&] {
+        return completed;
+    }, TDuration::Seconds(10));
+}
+
+Y_UNIT_TEST(ReviewR14ExecutorPublishesPartialStickyResult) {
+    TMyEnvBase env;
+    ManyPartsSetup(env, true);
+    TBlockEvents<NSharedCache::TEvRequest> block(env.Env, [](const auto& ev) {
+        return bool(ev->Get()->WaitPad);
+    });
+    TRetriedCounters retried;
+    bool completed = false;
+    env.SendAsync(new NFake::TEvExecute{ new TTxReadRows({ 33, 66 }, retried, completed) });
+    env.Env.WaitFor("two collections requested by one transaction", [&] {
+        return block.size() == 2;
+    }, TDuration::Seconds(10));
+    auto request = block.front();
+    block.pop_front();
+    auto pad = request->Get()->WaitPad;
+    UNIT_ASSERT(pad && pad == block.front()->Get()->WaitPad);
+    UNIT_ASSERT_VALUES_EQUAL(pad->PendingRequests, 2);
+    UNIT_ASSERT(!pad->HasPinnedPages.load());
+
+    // Fetch real Sticky references without the transaction pad, so completion cannot publish its flag.
+    const auto edge = env->AllocateEdgeActor();
+    auto fetch = MakeHolder<NSharedCache::TEvRequest>(
+        NBlockIO::EPriority::Fast, request->Get()->PageCollection, request->Get()->Pages, request->Get()->Cookie);
+    fetch->Sticky.assign(fetch->Pages.size(), true);
+    env->Send(MakeSharedPageCacheId(), edge, fetch.Release(), 0, request->Cookie);
+    auto loaded = env.Env.GrabEdgeEventRethrow<NSharedCache::TEvResult>(edge, TDuration::Seconds(10));
+    UNIT_ASSERT_VALUES_EQUAL(loaded->Get()->Status, NKikimrProto::OK);
+    UNIT_ASSERT(!loaded->Get()->Pages.empty());
+    for (const auto& page : loaded->Get()->Pages) {
+        UNIT_ASSERT(page.Page.IsSticky());
+    }
+    UNIT_ASSERT(!pad->HasPinnedPages.load());
+
+    auto result = MakeHolder<NSharedCache::TEvResult>(
+        request->Get()->PageCollection, NKikimrProto::OK, request->Get()->Cookie, 0, 0, true);
+    result->WaitPad = pad;
+    result->Pages = std::move(loaded->Get()->Pages);
+    env->Send(request->Sender, MakeSharedPageCacheId(), result.Release(), 0, request->Cookie);
+    env.Env.WaitFor("executor retains the first collection's Sticky pages", [&] {
+        return pad->PendingRequests == 1;
+    }, TDuration::Seconds(10));
+    UNIT_ASSERT(pad->HasPinnedPages.load());
+    UNIT_ASSERT(!completed);
+
+    block.Stop().Unblock();
+    env.Env.WaitFor("transaction completes after the other collection arrives", [&] {
+        return completed;
+    }, TDuration::Seconds(10));
+    env->Send(MakeSharedPageCacheId(), edge, new NSharedCache::TEvUnregister);
 }
 
 Y_UNIT_TEST(One_Transaction_Two_Keys_Many_Parts) {
