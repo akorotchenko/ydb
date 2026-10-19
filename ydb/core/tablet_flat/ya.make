@@ -97,6 +97,7 @@ SRCS(
     shared_cache_hot_resize.cpp
     shared_cache_resize.cpp
     shared_cache_space.cpp
+    shared_cache_space_resize.cpp
     shared_cache_table.cpp
     shared_cache_table_resize.cpp
     shared_sausagecache.cpp
