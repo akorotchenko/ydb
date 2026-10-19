@@ -124,12 +124,16 @@ void TRequestCompletion::Complete(ui32 index, TSharedPageRef page, EPageFetchCom
         }
     } else {
         TEvResult::EStatus expected = NKikimrProto::OK;
-        Status_.compare_exchange_strong(expected, NKikimrProto::ERROR, std::memory_order_relaxed);
+        if (Status_.compare_exchange_strong(expected, NKikimrProto::ERROR, std::memory_order_relaxed)) {
+            for (auto& readyPage : ReadyPages_) {
+                readyPage.Drop();
+            }
+        }
     }
 
     const ui32 remaining = RemainingPages_.fetch_sub(1, std::memory_order_acq_rel);
     Y_DEBUG_ABORT_UNLESS(remaining != 0);
-    if (remaining == 1) {
+    if (remaining == 1 || HasFailed()) {
         SendResult();
     }
 }
@@ -194,7 +198,7 @@ TRequestPageWaiter::TRequestPageWaiter(TIntrusivePtr<TRequestCompletion> complet
 }
 
 bool TRequestPageWaiter::IsActive() const noexcept {
-    return !Completion_->IsCancelled();
+    return Completion_->IsActive();
 }
 
 void TRequestPageWaiter::Complete(TPageCacheItem page, EPageFetchCompletion completion) noexcept {
