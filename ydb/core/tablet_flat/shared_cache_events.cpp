@@ -168,6 +168,15 @@ void TRequestCompletion::NotifyResourcesReady() noexcept {
     ActorSystem_->Send(ReplyTo_, result, 0, EventCookie_);
 }
 
+void TRequestCompletion::NotifyWorkingSetTooLarge() noexcept {
+    TGuard<TMutex> guard(Mutex_);
+    auto* result =
+        new TEvResult(PageCollection_, NKikimrProto::ERROR, Cookie_, ExecutorGeneration_, RequestId_, CoreRoute_);
+    result->WaitPad = WaitPad_;
+    result->WorkingSetTooLarge = true;
+    ActorSystem_->Send(ReplyTo_, result, 0, EventCookie_);
+}
+
 void TRequestCompletion::SendResult() noexcept {
     if (ResultSent_.exchange(true, std::memory_order_acq_rel)) {
         return;

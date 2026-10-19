@@ -2215,6 +2215,82 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(bodies[0] && bodies[1]);
     }
 
+    TTestSharedCacheCollectionRef MakeReviewRetainedCollection(TFixture & fixture, const TLogoBlobID& id) {
+        TCollectionCacheItem item;
+        TTestSharedCacheCollectionRef ref;
+        UNIT_ASSERT(fixture.Cache->FindOrInsert(TCollectionLocation{ .Id = id }, item, ref) ==
+                    ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(fixture.Cache->MakeReady(item, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->Find(id, ref) == ESharedCacheResultStatus::Hit);
+        return ref;
+    }
+
+    void AddReviewRetainedPage(TFixture & fixture, TCollectionCacheItem collection, ui64 offset) {
+        TPageCacheItem item;
+        TTestSharedPageRef hit;
+        UNIT_ASSERT(FindOrInsertPage(*fixture.Cache, collection, MakePageLocation(offset, 16), EStickyState::Sticky,
+                        item, hit) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(fixture.Cache->MakeReady(item, MakePageData(item.Index(), 16)));
+    }
+
+    Y_UNIT_TEST(ReviewR20RetainedPseudoCollectionConsumesAHandle) {
+        TFixture fixture(5);
+        auto main = MakeReviewRetainedCollection(fixture, TLogoBlobID(120, 50020, 1));
+        auto pseudo = MakeReviewRetainedCollection(fixture, TLogoBlobID(120, 50020, 2));
+        TVector<NTable::NPage::TPageLocation> pages;
+        for (ui64 offset = 100; pages.size() < fixture.Cache->TargetHandleCount() - 3; ++offset) {
+            pages.push_back(MakePageLocation(offset, 16));
+        }
+        const TSharedCacheHandleRequirement requirement{ main->Id(), pages };
+        const std::array retained{ main.CacheItem(), pseudo.CacheItem(), main.CacheItem() };
+        UNIT_ASSERT_GT(fixture.Cache->CurrentLimit(), (pages.size() + 1) * (16 + NActors::TSharedData::OverheadSize));
+        UNIT_ASSERT(!fixture.Cache->WorkingSetExceedsCapacity({ &retained[0], 1 }, { &requirement, 1 }));
+        UNIT_ASSERT(fixture.Cache->WorkingSetExceedsCapacity(retained, { &requirement, 1 }));
+    }
+
+    Y_UNIT_TEST(ReviewR20IndependentStickyPagesRemainGlobalPressure) {
+        TFixture fixture(5);
+        auto main = MakeReviewRetainedCollection(fixture, TLogoBlobID(120, 50020, 3));
+        auto foreign = MakeReviewRetainedCollection(fixture, TLogoBlobID(120, 50020, 4));
+        AddReviewRetainedPage(fixture, main.CacheItem(), 1);
+        AddReviewRetainedPage(fixture, foreign.CacheItem(), 1);
+        const ui64 pageBytes = 16 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(2 * pageBytes));
+        const std::array pages{ MakePageLocation(1, 16), MakePageLocation(2, 16) };
+        const TSharedCacheHandleRequirement requirement{ main->Id(), pages };
+        const std::array retained{ main.CacheItem(), foreign.CacheItem() };
+        const ui64 before = fixture.Cache->PayloadUsage();
+        UNIT_ASSERT(!fixture.Cache->WorkingSetExceedsCapacity({ &retained[0], 1 }, { &requirement, 1 }));
+        UNIT_ASSERT(!fixture.Cache->CanAdmitWorkingSet(pageBytes));
+        UNIT_ASSERT(!fixture.Cache->WorkingSetExceedsCapacity(retained, { &requirement, 1 }));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), before);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR20RetiredAndCurrentCollectionGenerationsAreDistinct) {
+        TFixture fixture(5);
+        const TLogoBlobID id(120, 50020, 5);
+        auto retired = MakeReviewRetainedCollection(fixture, id);
+        UNIT_ASSERT(fixture.Cache->DetachCollection(retired.CacheItem()));
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, retired.CacheItem()));
+        UNIT_ASSERT(TSharedCacheTestAccess::EraseCold(
+            *fixture.Cache, MakeColdItem(*fixture.Cache, retired.CacheItem().Index())));
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, retired.CacheItem().Index()).IsTombstone());
+        auto current = MakeReviewRetainedCollection(fixture, id);
+        UNIT_ASSERT(retired.CacheItem() != current.CacheItem());
+        TVector<NTable::NPage::TPageLocation> pages;
+        for (ui64 offset = 100; pages.size() < fixture.Cache->TargetHandleCount() - 3; ++offset) {
+            pages.push_back(MakePageLocation(offset, 16));
+        }
+        const TSharedCacheHandleRequirement requirement{ id, pages };
+        const std::array retained{ retired.CacheItem(), current.CacheItem() };
+        UNIT_ASSERT(fixture.Cache->WorkingSetExceedsCapacity({ &retained[0], 1 }, { &requirement, 1 }));
+        UNIT_ASSERT(fixture.Cache->WorkingSetExceedsCapacity(retained, { &requirement, 1 }));
+        UNIT_ASSERT(!fixture.Cache->WorkingSetExceedsCapacity({ &retained[1], 1 }, { &requirement, 1 }));
+        retired.Drop();
+        UNIT_ASSERT(!fixture.Cache->WorkingSetExceedsCapacity(retained, { &requirement, 1 }));
+    }
+
     Y_UNIT_TEST(ReviewR15DuplicateBatchNeedsOneHandle) {
         TFixture fixture;
         const TLogoBlobID id(83, 84, 124);

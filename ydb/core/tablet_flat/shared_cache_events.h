@@ -222,6 +222,7 @@ namespace NKikimr::NSharedCache {
 
         bool ResourcePressure = false;
         bool ResourcesReady = false;
+        bool WorkingSetTooLarge = false;
 
         const EStatus Status;
         const TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
@@ -256,6 +257,7 @@ namespace NKikimr::NSharedCache {
         void Cancel(bool replyImmediately = false) noexcept;
         void PostponeForResources() noexcept;
         void NotifyResourcesReady() noexcept;
+        void NotifyWorkingSetTooLarge() noexcept;
 
         bool IsActive() const noexcept {
             return Status_.load(std::memory_order_acquire) == NKikimrProto::OK;

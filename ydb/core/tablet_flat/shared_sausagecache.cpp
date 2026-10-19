@@ -968,6 +968,18 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         return Cache->CanAdmitPageHandles(requirements);
     }
 
+    bool WorkingSetTooLarge(const TQueuedRequest& waiting) {
+        const auto& pad = waiting.Completion->WaitPad();
+        if (!pad || pad->RetainedCollections.empty()) {
+            return false;
+        }
+        TVector<TSharedCacheHandleRequirement> requirements;
+        for (const auto& [id, pages] : pad->WorkingSetPages) {
+            requirements.push_back({ id, pages });
+        }
+        return Cache->WorkingSetExceedsCapacity(pad->RetainedCollections, requirements);
+    }
+
     void RetryResourceWaits() {
         if (!Cache || ResourceWaits.empty()) {
             if (Cache) {
@@ -985,6 +997,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 if (CanAdmitPages(*waiting) &&
                     Cache->CanAdmitWorkingSet(waiting->Completion->WaitPad()->WorkingSetBytes)) {
                     waiting->Completion->NotifyResourcesReady();
+                } else if (WorkingSetTooLarge(*waiting)) {
+                    waiting->Completion->NotifyWorkingSetTooLarge();
                 } else {
                     ResourceWaits.push_back(std::move(waiting));
                 }
@@ -999,7 +1013,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                     continue;
                 }
                 const auto& pad = waiting->Completion->WaitPad();
-                if (pad && pad->HasPinnedPages.load(std::memory_order_acquire) && !pad->PostponedForResources) {
+                if (pad && (pad->HasPinnedPages.load(std::memory_order_acquire) || !pad->RetainedCollections.empty()) &&
+                    !pad->PostponedForResources) {
                     PostponeTransaction(pad, std::move(waiting));
                 } else {
                     ResourceWaits.push_back(std::move(waiting));
@@ -1030,7 +1045,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                             if (!pad || pad->PostponedForResources) {
                                 return;
                             }
-                            const bool held = pad->HasPinnedPages.load(std::memory_order_acquire);
+                            const bool held = pad->HasPinnedPages.load(std::memory_order_acquire) ||
+                                              !pad->RetainedCollections.empty();
                             if (held) {
                                 PostponeTransaction(pad);
                             }

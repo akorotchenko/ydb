@@ -108,6 +108,7 @@ public:
         CheckWorkingSet();
         RequestPad = MakeIntrusive<NPageCollection::TPagesWaitPad>();
         RequestPad->WorkingSetBytes = RequestWorkingSet.Bytes;
+        RequestPad->RetainedCollections = RetainedCollections;
         PageTracker.CollectPageLocations(RequestPad->WorkingSetPages);
         RequestPad->WorkingSetPages[info->Id()].push_back(location);
         // Sticky pages may be demoted while this request waits, so publish every retained pin.
@@ -127,6 +128,10 @@ public:
             return result->WaitPad == RequestPad && !result->ResourcesReady;
         }, &TTableStatsCoroBuilder::ProcessUnexpectedEvent);
         auto* result = ev->Get<NSharedCache::TEvResult>();
+        if (result->WorkingSetTooLarge) {
+            throw TExTableStatsError(
+                ECode::RESOURCE_ALLOCATION_FAILED, "Statistics page working set does not fit the shared cache");
+        }
         if (result->ResourcePressure) {
             throw TRetryStats{};
         }
@@ -149,7 +154,20 @@ private:
     void CheckWorkingSet() const {
         const auto& cache = TSharedCache::Get();
         if (RequestWorkingSet.TotalBytes > cache.CurrentLimit() ||
-            RequestWorkingSet.Pages + CollectionCount > cache.TargetHandleCount() - 2) {
+            RequestWorkingSet.Pages + RetainedCollections.size() > cache.TargetHandleCount() - 2) {
+            throw TExTableStatsError(
+                ECode::RESOURCE_ALLOCATION_FAILED, "Statistics page working set does not fit the shared cache");
+        }
+    }
+
+    void CheckRetainedWorkingSet() const {
+        TVector<TSharedCacheHandleRequirement> requirements;
+        for (const auto& [id, pages] : RequestPad->WorkingSetPages) {
+            requirements.push_back({ id, pages });
+        }
+        auto& cache = TSharedCache::Get();
+        auto binding = cache.BindCurrentThreadHazard();
+        if (cache.WorkingSetExceedsCapacity(RequestPad->RetainedCollections, requirements)) {
             throw TExTableStatsError(
                 ECode::RESOURCE_ALLOCATION_FAILED, "Statistics page working set does not fit the shared cache");
         }
@@ -174,13 +192,18 @@ private:
         CoroutineDeadline = GetCycleCountFast() + DurationToCycles(MaxCoroutineExecutionTime);
 
         THashSet<ui64> collections;
+        const auto retainCollection = [&](const TSharedCacheCollectionRef& collection) {
+            if (collection && collections.insert(collection.CacheItem().Raw()).second) {
+                RetainedCollections.push_back(collection.CacheItem());
+            }
+        };
         for (const auto& part : Subset->Flatten) {
             const auto* store = CheckedCast<const TPartStore*>(part.Part.Get());
             for (const auto& collection : store->PageCollections) {
-                collections.insert(collection.CacheItem().Raw());
+                retainCollection(collection);
             }
+            retainCollection(store->Pseudo);
         }
-        CollectionCount = collections.size();
 
         for (;;) {
             try {
@@ -205,16 +228,22 @@ private:
                 // BuildStats has unwound every page owner before we wait for the whole working set.
                 Y_DEBUG_ABORT_UNLESS(PageTracker.Empty());
                 ev->Stats.Clear();
+                CheckRetainedWorkingSet();
                 if (!ResourcesReady) {
-                    WaitForSpecificEvent([this](IEventHandle& event) {
+                    auto ready = WaitForSpecificEvent([this](IEventHandle& event) {
                         if (event.GetTypeRewrite() != NSharedCache::TEvResult::EventType) {
                             return false;
                         }
                         const auto* result = event.Get<NSharedCache::TEvResult>();
-                        return result->ResourcesReady && result->WaitPad == RequestPad;
+                        return (result->ResourcesReady || result->WorkingSetTooLarge) && result->WaitPad == RequestPad;
                     }, &TTableStatsCoroBuilder::ProcessUnexpectedEvent);
+                    if (ready->Get<NSharedCache::TEvResult>()->WorkingSetTooLarge) {
+                        throw TExTableStatsError(ECode::RESOURCE_ALLOCATION_FAILED,
+                            "Statistics page working set does not fit the shared cache");
+                    }
                 }
                 CheckWorkingSet();
+                CheckRetainedWorkingSet();
                 RequestPad.Drop();
                 Resume();
             }
@@ -239,6 +268,10 @@ private:
         switch (ev->GetTypeRewrite()) {
             case NSharedCache::TEvResult::EventType: {
                 const auto* result = ev->Get<NSharedCache::TEvResult>();
+                if (result->WorkingSetTooLarge && result->WaitPad == RequestPad) {
+                    throw TExTableStatsError(
+                        ECode::RESOURCE_ALLOCATION_FAILED, "Statistics page working set does not fit the shared cache");
+                }
                 // Readiness may arrive before pressure; replies for older pads cannot wake this attempt.
                 if (result->ResourcesReady && result->WaitPad == RequestPad) {
                     ResourcesReady = true;
@@ -299,7 +332,7 @@ private:
     NStats::TPageTracker::TWorkingSet RequestWorkingSet;
     TIntrusivePtr<NPageCollection::TPagesWaitPad> RequestPad;
     bool ResourcesReady = false;
-    ui64 CollectionCount = 0;
+    TVector<TCollectionCacheItem> RetainedCollections;
     ui64 PagesSize = 0;
     ui64 CoroutineDeadline;
     TAutoPtr<TSpent> Spent;
