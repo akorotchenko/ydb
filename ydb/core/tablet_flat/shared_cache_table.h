@@ -268,7 +268,7 @@ private:
 
     TSharedCacheItemRefImpl<TTraits> TryAcquireTombstone(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
-    void HelpTombstone(TCacheItem cacheItem, TSpaceOperation& spaceOp) noexcept;
+    void HelpTombstone(TCacheItem cacheItem, const TSharedCacheKey& routeKey, TSpaceOperation& spaceOp) noexcept;
 
     Y_FORCE_INLINE TBucketRoute SelectBucket(ui32 hash, TSpaceState spaceState) const noexcept {
         if (!spaceState.Resizing()) {

@@ -6776,6 +6776,109 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         CommitTransition(*fixture.Cache, growth);
     }
 
+    void ReviewMarkerRetirementWaitsForHelper(bool grow, bool helperFirst) {
+        TSharedCacheCapacity reserved;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 8, reserved));
+        TFixture fixture(6, 8, 7, reserved.Limit);
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(reserved.Limit));
+        const ui32 splitBit = static_cast<ui32>(SharedCacheBucketCount(grow ? 6 : 5));
+        const auto key = ReviewKeyForBucket(MakeCollectionCacheItem(119, 50019), (splitBit << 1) - 1, splitBit, 500000);
+        const auto survivingKey = ReviewKeyForBucket(PageCollection(key), (splitBit << 1) - 1, splitBit, 600000, &key);
+        const auto successor = InsertReadyPage(*fixture.Cache, key);
+        const auto survivor = InsertReadyPage(*fixture.Cache, survivingKey);
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, successor));
+
+        TTransition growth;
+        if (grow) {
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, grow ? 7 : 5));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishBucketSplit(*fixture.Cache));
+        if (!grow) {
+            UNIT_ASSERT(TSharedCacheTestAccess::CloseBucketSplit(*fixture.Cache));
+        }
+        const auto markerState = TSharedCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex);
+        const auto marker = TCacheItem::Make(markerState.Version(), ResizeMarkerIndex);
+
+        TSharedCacheGate gate;
+        gate.Slots[0].Arm(ESharedCacheHookPoint::AfterBucketSplitOwnerCheck, marker);
+        gate.Slots[1].Arm(ESharedCacheHookPoint::AfterTombstoneHelperClaim, marker);
+        TSharedCacheHookGuard hookGuard(*fixture.Cache, gate.Hooks);
+        auto cache = fixture.Cache;
+        bool removed = false;
+        TGateThread remover(gate, [&] {
+            auto binding = cache->BindThreadHazard(0);
+            removed = TSharedCacheTestAccess::RemoveBucketSplit(*cache);
+        });
+        gate.Slots[0].Wait();
+        bool erased = false;
+        TGateThread eraser(gate, [&] {
+            auto binding = cache->BindThreadHazard(1);
+            erased = TSharedCacheTestAccess::EraseCold(*cache, MakeColdItem(*cache, successor.Index()));
+        });
+        gate.Slots[1].Wait();
+        const auto heldMarker = TSharedCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex);
+        UNIT_ASSERT(heldMarker.IsTombstone());
+        UNIT_ASSERT_VALUES_EQUAL(heldMarker.Refs(), 2);
+        if (helperFirst) {
+            gate.Slots[1].Release();
+            eraser.Join();
+            UNIT_ASSERT(erased);
+            AssertResizeMarker(*fixture.Cache, EHandleState::Tombstone);
+            UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, successor.Index()).IsFree());
+            gate.Slots[0].Release();
+            remover.Join();
+            UNIT_ASSERT(removed);
+        } else {
+            gate.Slots[0].Release();
+            remover.Join();
+            UNIT_ASSERT(removed);
+            AssertResizeMarker(*fixture.Cache, EHandleState::Tombstone);
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::BucketResizeState(*fixture.Space).Phase() == EBucketResizePhase::Prepared);
+            UNIT_ASSERT(!TSharedCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+            AssertResizeMarker(*fixture.Cache, EHandleState::Tombstone);
+            gate.Slots[1].Release();
+            eraser.Join();
+            UNIT_ASSERT(erased);
+        }
+        if (grow) {
+            UNIT_ASSERT(TSharedCacheTestAccess::BucketHead(*fixture.Cache, 0).IsNull());
+            UNIT_ASSERT(TSharedCacheTestAccess::BucketHead(*fixture.Cache, splitBit) == survivor.CacheItem());
+        } else {
+            UNIT_ASSERT(TSharedCacheTestAccess::BucketHead(*fixture.Cache, 0) == survivor.CacheItem());
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex).IsFree());
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        UNIT_ASSERT(FindPage(*fixture.Cache, key).Status == ESharedCacheResultStatus::Miss);
+        AssertPageHit(*fixture.Cache, survivingKey, survivor);
+        if (grow) {
+            CommitTransition(*fixture.Cache, growth);
+        }
+    }
+
+    Y_UNIT_TEST(ReviewR18GrowthRetirementWaitsForLateMarkerHelper) {
+        ReviewMarkerRetirementWaitsForHelper(true, false);
+    }
+
+    Y_UNIT_TEST(ReviewR18ShrinkRetirementWaitsForLateMarkerHelper) {
+        ReviewMarkerRetirementWaitsForHelper(false, false);
+    }
+
+    Y_UNIT_TEST(ReviewR18GrowthRetirementFinishesAfterMarkerHelper) {
+        ReviewMarkerRetirementWaitsForHelper(true, true);
+    }
+
+    Y_UNIT_TEST(ReviewR18ShrinkRetirementFinishesAfterMarkerHelper) {
+        ReviewMarkerRetirementWaitsForHelper(false, true);
+    }
+
     Y_UNIT_TEST(ConcurrentGrowthPublicationPoints) {
         TFixture fixture(6, 8, 7);
         const auto keys = MakeResizeKeys(*fixture.Space, MakeCollectionCacheItem(8, 12), 600);

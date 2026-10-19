@@ -209,7 +209,7 @@ restart:
         const int comparison = CompareSharedCacheKeys(itemKey, itemKey.Hash(), key, hash);
         if (state.IsTombstone()) {
             if constexpr (Mode == ETombstoneMode::Help) {
-                HelpTombstone(result.Expected, spaceOp);
+                HelpTombstone(result.Expected, key, spaceOp);
                 goto restart;
             }
             if (comparison >= 0) {
@@ -476,7 +476,8 @@ bool TSharedCacheTable::PrepareSplitMarker(const TSpaceOperation& spaceOp, TCach
     THandle& marker = spaceOp.Handles()[ResizeMarkerIndex];
     ui64 expectedRaw = marker.State.load(std::memory_order_acquire);
     const THandleState expected = THandleState::FromRaw(expectedRaw);
-    if (expected.IsBucketSplit() && expected.Refs() > 0) {
+    // Helpers may still hold the retired marker from the previous pair.
+    if ((expected.IsBucketSplit() || expected.IsTombstone()) && expected.Refs() > 0) {
         return false;
     }
     Y_ABORT_UNLESS(expected.IsFree() && expected.Refs() == 0);
@@ -708,10 +709,6 @@ bool TSharedCacheTable::RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept {
         return false;
     }
     const TCacheItem markerIdentity = TCacheItem::Make(markerState.Version(), ResizeMarkerIndex);
-    if (!TransitionSplitMarkerToTombstone(spaceOp, markerIdentity) || !SplitMarkerIsSoleOwner(spaceOp, markerIdentity))
-    {
-        return false;
-    }
 
     const auto unlinkMarker = [&](const TOrderedLink& markerLink, TCacheItem successor,
                                   TOperationItemRef& ownerRef) noexcept {
@@ -737,8 +734,7 @@ bool TSharedCacheTable::RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept {
     // Releasing a Cold predecessor may reclaim another page; keep both refs until the marker is retired.
     TOperationItemRef oldOwnerRef(spaceOp);
     TOperationItemRef markerOwnerRef(spaceOp);
-    TOrderedLink markerLink;
-    if (resize.Direction() == EBucketResize::Growing) {
+    if (resize.Direction() == EBucketResize::Growing && markerState.IsBucketSplit()) {
         TOrderedLink oldLink;
         if (!FindLinkOnBucket(spaceOp, markerIdentity, bucket, oldLink)) {
             return false;
@@ -746,19 +742,22 @@ bool TSharedCacheTable::RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept {
         if (!unlinkMarker(oldLink, {}, oldOwnerRef)) {
             return false;
         }
-        if (!FindLinkOnBucket(spaceOp, markerIdentity, bucket | resize.SplitBit(), markerLink))
-        {
-            return false;
-        }
-    } else {
-        if (!FindLinkOnBucket(spaceOp, markerIdentity, bucket, markerLink)) {
-            return false;
-        }
     }
-    const TCacheItem successor =
-        TCacheItem::FromRaw(spaceOp.Handles()[ResizeMarkerIndex].Next.load(std::memory_order_acquire)).WithoutFrozen();
-    if (!unlinkMarker(markerLink, successor, markerOwnerRef)) {
+    // A Tombstone marker must have only one incoming link, so ordinary helpers can retire it safely.
+    if (!TransitionSplitMarkerToTombstone(spaceOp, markerIdentity) ||
+        !SplitMarkerIsSoleOwner(spaceOp, markerIdentity)) {
         return false;
+    }
+    Cache_.InvokeHook(ESharedCacheHookPoint::AfterBucketSplitOwnerCheck, markerIdentity);
+    const ui32 markerBucket = resize.Direction() == EBucketResize::Growing ? bucket | resize.SplitBit() : bucket;
+    TOrderedLink markerLink;
+    if (FindLinkOnBucket(spaceOp, markerIdentity, markerBucket, markerLink)) {
+        const TCacheItem successor =
+            TCacheItem::FromRaw(spaceOp.Handles()[ResizeMarkerIndex].Next.load(std::memory_order_acquire))
+                .WithoutFrozen();
+        if (!unlinkMarker(markerLink, successor, markerOwnerRef)) {
+            return false;
+        }
     }
     Cache_.InvokeHook(ESharedCacheHookPoint::AfterBucketSplitRemoved, markerIdentity);
     Cache_.Release(spaceOp, markerIdentity);
@@ -845,7 +844,7 @@ bool TSharedCacheTable::BridgeTombstone(
 
     for (;;) {
         TSharedCacheKey currentKey = key;
-        if (current != cacheItem) {
+        if (current != cacheItem && !current.IsResizeMarker()) {
             THandle& tombstone = spaceOp.Handles()[current.Index()];
             const THandleState state = THandleState::FromRaw(tombstone.State.load(std::memory_order_relaxed));
             Y_DEBUG_ABORT_UNLESS(current.Matches(state) && state.IsTombstone() && state.Refs() > 0);
@@ -957,7 +956,7 @@ void TSharedCacheTable::PublishPageReplacement(
                     continue;
                 }
                 if (ownerState.IsTombstone()) {
-                    HelpTombstone(orderedLink.Owner, spaceOp);
+                    HelpTombstone(orderedLink.Owner, key, spaceOp);
                     continue;
                 }
                 ownerRef.Get() = TryAcquire(spaceOp, orderedLink.Owner);
@@ -984,7 +983,8 @@ void TSharedCacheTable::PublishPageReplacement(
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCacheTable::HelpTombstone(TCacheItem cacheItem, TSpaceOperation& spaceOp) noexcept {
+void TSharedCacheTable::HelpTombstone(
+    TCacheItem cacheItem, const TSharedCacheKey& routeKey, TSpaceOperation& spaceOp) noexcept {
     TOperationItemRef hold(spaceOp, TryAcquireTombstone(spaceOp, cacheItem));
     if (!hold) {
         return;
@@ -993,7 +993,7 @@ void TSharedCacheTable::HelpTombstone(TCacheItem cacheItem, TSpaceOperation& spa
     THandle& handle = spaceOp.Handles()[tombstone.Index()];
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
     if (tombstone.Matches(state) && state.IsTombstone()) {
-        const TSharedCacheKey key = LoadSharedCacheKey(handle, state.Kind());
+        const TSharedCacheKey key = tombstone.IsResizeMarker() ? routeKey : LoadSharedCacheKey(handle, state.Kind());
         FreezeNext(spaceOp, tombstone);
         BridgeTombstone(tombstone, key, spaceOp);
     }
