@@ -93,6 +93,7 @@ SRCS(
     shared_cache_cold.cpp
     shared_cache_collection.cpp
     shared_cache_events.cpp
+    shared_cache_hot.cpp
     shared_cache_space.cpp
     shared_cache_table.cpp
     shared_cache_table_resize.cpp
