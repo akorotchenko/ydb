@@ -94,6 +94,7 @@ SRCS(
     shared_cache_events.cpp
     shared_cache_space.cpp
     shared_cache_table.cpp
+    shared_cache_table_resize.cpp
     shared_sausagecache.cpp
     shared_sausagecache.h
     tablet_flat_executor.h
