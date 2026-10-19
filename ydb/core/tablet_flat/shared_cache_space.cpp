@@ -40,57 +40,6 @@ bool TSharedCacheSpace::TryMappingSize(ui64 count, ui64 itemSize, size_t& result
     return true;
 }
 
-bool TSharedCacheSpace::PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept {
-    const TSpaceState spaceState = CurrentSpaceState();
-    const TSpaceView& current = SpaceView(spaceState);
-    if (transition.Phase_ != ETransitionPhase::Idle || target.AddressBits < MinSharedCacheAddressBits ||
-        target.AddressBits > MaxSharedCacheAddressBits || target.AddressBits > ReservedCapacity_.AddressBits ||
-        target.AddressBits == Capacity_.AddressBits || target.ExpectedPageSize != ReservedCapacity_.ExpectedPageSize ||
-        target.StaticBytes > ReservedCapacity_.StaticBytes || current.HandleCount != Capacity_.HandleCount() ||
-        current.AllocationLimit != Capacity_.HandleCount())
-    {
-        return false;
-    }
-
-    if (spaceState.Resizing() || spaceState.AddressBits() != Capacity_.AddressBits)
-    {
-        return false;
-    }
-
-    THolder<TSpaceView> view = MakeHolder<TSpaceView>();
-    if (!TryMappingSize(target.HandleCount(), sizeof(THandle), view->HandlesBytes) ||
-        !TryMappingSize(target.BucketCount(), sizeof(std::atomic<ui64>), view->BucketsBytes) ||
-        !TryMappingSize(target.HotSlotCount(), sizeof(std::atomic<ui64>), view->HotSlotBytes) ||
-        !TryMappingSize(target.ColdSlotCount(), sizeof(std::atomic<ui64>), view->ColdSlotBytes) ||
-        !TryMappingSize(target.KeepColdSlotCount(), sizeof(std::atomic<ui64>), view->KeepColdSlotBytes) ||
-        !TryMappingSize(target.HandleCount(), sizeof(std::atomic<ui64>), view->FreeSlotBytes) ||
-        !HandlesMapping_.Prepare(view->HandlesBytes, view->Handles) ||
-        !BucketsMapping_.Prepare(view->BucketsBytes, view->Buckets) ||
-        !HotMapping_.Prepare(view->HotSlotBytes, view->HotSlots) ||
-        !ColdMapping_.Prepare(view->ColdSlotBytes, view->ColdSlots) ||
-        !KeepColdMapping_.Prepare(view->KeepColdSlotBytes, view->KeepColdSlots) ||
-        !FreeMapping_.Prepare(view->FreeSlotBytes, view->FreeSlots))
-    {
-        CancelPreparedView(*view);
-        return false;
-    }
-
-    transition.Phase_ = ETransitionPhase::Prepare;
-    transition.Generation_ = spaceState.Generation();
-    transition.OldConfiguration_ = Capacity_;
-    transition.TargetConfiguration_ = target;
-    transition.ResizeDeltaBits_ = Capacity_.AddressBits < target.AddressBits
-                                      ? target.AddressBits - Capacity_.AddressBits
-                                      : Capacity_.AddressBits - target.AddressBits;
-    transition.ReleaseStage_ = ESpaceMap::Done;
-    transition.NextWorkIndex_ = 0;
-    transition.FinalDrainStage_ = ESpaceMap::Done;
-    transition.CutBlocked_ = false;
-    transition.PreparedView_ = std::move(view);
-    transition.OldView_.Reset();
-    return true;
-}
-
 void TSharedCacheSpace::PrepareView(ui32 generation, TSpaceView view) noexcept {
     Y_DEBUG_ABORT_UNLESS(S5FifoRings_ && FreeRingCursor_);
     view.Space = this;
