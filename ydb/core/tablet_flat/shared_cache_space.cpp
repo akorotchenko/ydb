@@ -27,18 +27,18 @@ namespace {
         return TryMultiply(count, size, product) && TryAdd(total, product, total);
     }
 
-    bool TryMappingSize(ui64 count, ui64 itemSize, size_t& result) noexcept {
-        ui64 bytes;
-        if (!TryMultiply(count, itemSize, bytes) || bytes > Max<size_t>()) {
-            return false;
-        }
-        result = static_cast<size_t>(bytes);
-        return true;
-    }
-
 } // anonymous namespace
 
 TSharedCacheSpace::~TSharedCacheSpace() = default;
+
+bool TSharedCacheSpace::TryMappingSize(ui64 count, ui64 itemSize, size_t& result) noexcept {
+    ui64 bytes;
+    if (!TryMultiply(count, itemSize, bytes) || bytes > Max<size_t>()) {
+        return false;
+    }
+    result = static_cast<size_t>(bytes);
+    return true;
+}
 
 bool TSharedCacheSpace::PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept {
     const TSpaceState spaceState = CurrentSpaceState();
