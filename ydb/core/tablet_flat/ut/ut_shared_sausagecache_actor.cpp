@@ -1807,6 +1807,79 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT(sharedCache.Results.front()->Get()->Pages.empty());
     }
 
+    Y_UNIT_TEST(ReviewR19CompletionReportsFailureBeforeRemainingPages) {
+        TSharedPageCacheMock sharedCache;
+        TIntrusivePtr<TRequestCompletion> completion = new TRequestCompletion(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .PageCollection = sharedCache.Collection1,
+            .Pages = { _P(1), _P(2), _P(3) },
+            .Cookie = 91,
+        });
+        TIntrusivePtr<TPageFetchWaiter> failed = new TRequestPageWaiter(completion, 0);
+        TIntrusivePtr<TPageFetchWaiter> firstPending = new TRequestPageWaiter(completion, 1);
+        TIntrusivePtr<TPageFetchWaiter> secondPending = new TRequestPageWaiter(completion, 2);
+        failed->Complete({}, EPageFetchCompletion::Failed);
+        sharedCache.CheckResults({ TFetch{ 91, sharedCache.Collection1, {} } }, NKikimrProto::ERROR);
+        UNIT_ASSERT(!firstPending->IsActive());
+        UNIT_ASSERT(!secondPending->IsActive());
+
+        std::thread first([&] {
+            firstPending->Complete({}, EPageFetchCompletion::Failed);
+        });
+        std::thread second([&] {
+            secondPending->Complete({}, EPageFetchCompletion::Failed);
+        });
+        first.join();
+        second.join();
+        sharedCache.CheckResults({});
+    }
+
+    void ReviewFailedRequestWithMemoryWait(bool sharedBlockedPage) {
+        TSharedPageCacheMock sharedCache;
+        sharedCache.SetLimit(3 * PAGE_TOTAL_SIZE, 0, 3 * PAGE_TOTAL_SIZE);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection2, { _P(0), _P(1) });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection2, { _P(0), _P(1) } } });
+        sharedCache.Provide(sharedCache.Collection2, { _P(0), _P(1) });
+        auto held = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection2, { _P(0), _P(1) } } });
+
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(0) });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(0) } } });
+        sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, { _P(0), _P(1), _P(2) });
+        sharedCache.CheckFetches({});
+        UNIT_ASSERT(sharedCache.Results.empty());
+        if (sharedBlockedPage) {
+            sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(1) });
+            sharedCache.CheckFetches({});
+            UNIT_ASSERT(sharedCache.Results.empty());
+        }
+
+        sharedCache.Fail(sharedCache.Collection1, { _P(0) });
+        sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, {} }, TFetch{ 3, sharedCache.Collection1, {} } },
+            NKikimrProto::ERROR);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(held.size(), 2);
+        if (sharedBlockedPage) {
+            sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(1) } } });
+            UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
+            sharedCache.Provide(sharedCache.Collection1, { _P(1) });
+            sharedCache.CheckResults({ TFetch{ 4, sharedCache.Collection1, { _P(1) } } });
+        } else {
+            sharedCache.CheckFetches({});
+        }
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCache::Get().ReservedBytes(), 0);
+        sharedCache.CheckResults({});
+    }
+
+    Y_UNIT_TEST(ReviewR19FailedRequestDoesNotWaitForPageMemory) {
+        ReviewFailedRequestWithMemoryWait(false);
+    }
+
+    Y_UNIT_TEST(ReviewR19FailurePreservesAnotherBlockedPageConsumer) {
+        ReviewFailedRequestWithMemoryWait(true);
+    }
+
     Y_UNIT_TEST(Request_Basics) {
         TSharedPageCacheMock sharedCache;
 
@@ -2419,12 +2492,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection2, {_P(4)}, EPriority::Bkgr);
         sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, {_P(1), _P(2) } } });
         sharedCache.Fail(sharedCache.Collection1, {_P(1), _P(2) });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, {} } }, NKikimrProto::ERROR);
         sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection1, {_P(3)}},
             TFetch{10, sharedCache.Collection2, { _P(4) } } });
-        sharedCache.Fail(sharedCache.Collection1, {_P(3) });
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {}} }, NKikimrProto::ERROR);
         sharedCache.Provide(sharedCache.Collection2, {_P(4)});
         sharedCache.CheckResults({
             TFetch{ 2, sharedCache.Collection2, {_P(4)}}

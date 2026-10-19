@@ -257,6 +257,10 @@ namespace NKikimr::NSharedCache {
         void PostponeForResources() noexcept;
         void NotifyResourcesReady() noexcept;
 
+        bool IsActive() const noexcept {
+            return Status_.load(std::memory_order_acquire) == NKikimrProto::OK;
+        }
+
         bool IsCancelled() const noexcept {
             return Status_.load(std::memory_order_acquire) == NKikimrProto::RACE;
         }

@@ -1175,6 +1175,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             TryDropExpiredCollection(*collection);
         }
         Counters.PendingRequests->Dec();
+        if (ev->Get()->Status == NKikimrProto::ERROR) {
+            PruneQueues();
+        }
         RetryResourceWaits();
         if (ev->Get()->Status == NKikimrProto::OK) {
             Counters.SucceedRequests->Inc();
@@ -1542,6 +1545,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
         const bool valid = data.Status == NKikimrProto::OK && data.PageCollection->Label() == fetch.CollectionId &&
                            data.Pages.size() == fetch.Pages.size();
+        bool failed = false;
         for (ui32 index = 0; index < fetch.Pages.size(); ++index) {
             TPageFetch& page = fetch.Pages[index];
             if (valid && data.Pages[index].Offset == page.Location().Offset &&
@@ -1549,10 +1553,14 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             {
                 page.MakeReady(std::move(data.Pages[index].Data));
             } else {
+                failed = true;
                 page.FailReady();
                 }
             }
 
+            if (failed) {
+                PruneQueues();
+            }
             if (fetch.QueueCookie == EBlockIOFetchTypeCookie::AsyncQueue) {
             Y_ENSURE(AsyncRequests.InFly >= fetch.Bytes);
             AsyncRequests.InFly -= fetch.Bytes;
