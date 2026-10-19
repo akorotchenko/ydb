@@ -1029,6 +1029,8 @@ private:
 
     void RouteFreeWord(const TSpaceView& view, ui64 raw) noexcept;
 
+    static bool TryMappingSize(ui64 count, ui64 itemSize, size_t& result) noexcept;
+
     void CancelPreparedView(TSpaceView& view) noexcept;
 
     void PublishPreparedView(THolder<TSpaceView> view, THolder<TSpaceView>& oldView) noexcept;
