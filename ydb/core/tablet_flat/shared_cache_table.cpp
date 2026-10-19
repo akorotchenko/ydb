@@ -713,19 +713,37 @@ bool TSharedCacheTable::RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept {
         return false;
     }
 
+    const auto unlinkMarker = [&](const TOrderedLink& markerLink, TCacheItem successor,
+                                  TOperationItemRef& ownerRef) noexcept {
+        Cache_.InvokeHook(ESharedCacheHookPoint::BeforeBucketSplitLinkClaim, markerLink.Owner);
+        if (!markerLink.Owner.IsNull()) {
+            ownerRef.Get() = TryAcquire(spaceOp, markerLink.Owner);
+            if (!ownerRef) {
+                return false;
+            }
+        }
+        const TCacheItem replacement = successor.IsNull() ? TCacheItem::Make(markerLink.Owner.Version(), 0) : successor;
+        ui64 expected = markerIdentity.Raw();
+        Cache_.InvokeHook(ESharedCacheHookPoint::BeforeTableLinkCas, markerLink.Owner);
+        const bool removed = markerLink.Link->compare_exchange_strong(
+            expected, replacement.Raw(), std::memory_order_release, std::memory_order_acquire);
+        if (removed) {
+            Cache_.InvokeHook(ESharedCacheHookPoint::AfterTableLinkCas, markerLink.Owner);
+        }
+        return removed;
+    };
+
     const ui32 bucket = resize.Cursor() - 1;
+    // Releasing a Cold predecessor may reclaim another page; keep both refs until the marker is retired.
+    TOperationItemRef oldOwnerRef(spaceOp);
+    TOperationItemRef markerOwnerRef(spaceOp);
     TOrderedLink markerLink;
     if (resize.Direction() == EBucketResize::Growing) {
         TOrderedLink oldLink;
         if (!FindLinkOnBucket(spaceOp, markerIdentity, bucket, oldLink)) {
             return false;
         }
-        const TCacheItem oldReplacement =
-            oldLink.Owner.IsNull() ? TCacheItem{} : TCacheItem::Make(oldLink.Owner.Version(), 0);
-        ui64 oldExpected = markerIdentity.Raw();
-        if (!oldLink.Link->compare_exchange_strong(
-                oldExpected, oldReplacement.Raw(), std::memory_order_release, std::memory_order_acquire))
-        {
+        if (!unlinkMarker(oldLink, {}, oldOwnerRef)) {
             return false;
         }
         if (!FindLinkOnBucket(spaceOp, markerIdentity, bucket | resize.SplitBit(), markerLink))
@@ -739,11 +757,7 @@ bool TSharedCacheTable::RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept {
     }
     const TCacheItem successor =
         TCacheItem::FromRaw(spaceOp.Handles()[ResizeMarkerIndex].Next.load(std::memory_order_acquire)).WithoutFrozen();
-    const TCacheItem replacement = successor.IsNull() ? TCacheItem::Make(markerLink.Owner.Version(), 0) : successor;
-    ui64 expected = markerIdentity.Raw();
-    if (!markerLink.Link->compare_exchange_strong(
-            expected, replacement.Raw(), std::memory_order_release, std::memory_order_acquire))
-    {
+    if (!unlinkMarker(markerLink, successor, markerOwnerRef)) {
         return false;
     }
     Cache_.InvokeHook(ESharedCacheHookPoint::AfterBucketSplitRemoved, markerIdentity);
