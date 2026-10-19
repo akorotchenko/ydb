@@ -338,4 +338,154 @@ bool TSharedCacheSpace::PublishFinalView(TTransition& transition) noexcept {
     return true;
 }
 
+template <bool WithHook>
+bool TSharedCacheSpace::TryReleaseOldMapping(ESpaceMap mapping, TTransition& transition, TReleaseHook hook) noexcept {
+    Y_DEBUG_ABORT_UNLESS(transition.OldView_);
+    TSpaceView& old = *transition.OldView_;
+    const TSpaceView& newest = *NewestViewOwner_;
+    TSharedCacheMapping* owner;
+    void* oldPointer;
+    size_t oldSize;
+    void* currentPointer;
+    size_t currentSize;
+    switch (mapping) {
+        case ESpaceMap::Handles:
+            owner = &HandlesMapping_;
+            oldPointer = old.Handles;
+            oldSize = old.HandlesBytes;
+            currentPointer = newest.Handles;
+            currentSize = newest.HandlesBytes;
+            break;
+        case ESpaceMap::Buckets:
+            owner = &BucketsMapping_;
+            oldPointer = old.Buckets;
+            oldSize = old.BucketsBytes;
+            currentPointer = newest.Buckets;
+            currentSize = newest.BucketsBytes;
+            break;
+        case ESpaceMap::Hot:
+            owner = &HotMapping_;
+            oldPointer = old.HotSlots;
+            oldSize = old.HotSlotBytes;
+            currentPointer = newest.HotSlots;
+            currentSize = newest.HotSlotBytes;
+            break;
+        case ESpaceMap::Cold:
+            owner = &ColdMapping_;
+            oldPointer = old.ColdSlots;
+            oldSize = old.ColdSlotBytes;
+            currentPointer = newest.ColdSlots;
+            currentSize = newest.ColdSlotBytes;
+            break;
+        case ESpaceMap::KeepCold:
+            owner = &KeepColdMapping_;
+            oldPointer = old.KeepColdSlots;
+            oldSize = old.KeepColdSlotBytes;
+            currentPointer = newest.KeepColdSlots;
+            currentSize = newest.KeepColdSlotBytes;
+            break;
+        case ESpaceMap::Free:
+            owner = &FreeMapping_;
+            oldPointer = old.FreeSlots;
+            oldSize = old.FreeSlotBytes;
+            currentPointer = newest.FreeSlots;
+            currentSize = newest.FreeSlotBytes;
+            break;
+        case ESpaceMap::Done:
+            Y_ABORT("Invalid shared-cache release stage");
+    }
+
+    if (!owner->NeedsRelease(oldPointer, oldSize, currentPointer, currentSize)) {
+        return true;
+    }
+    if constexpr (WithHook) {
+        const void* begin;
+        size_t size;
+        owner->ReleaseRange(oldPointer, oldSize, currentPointer, currentSize, begin, size);
+        if (!hook.Run(mapping, begin, size)) {
+            return false;
+        }
+    }
+    const bool released = owner->Release(oldPointer, oldSize, currentPointer, currentSize);
+
+    // Release may unmap the old view before failing to shrink its backing; preserve that progress for retry.
+    switch (mapping) {
+        case ESpaceMap::Handles:
+            old.Handles = static_cast<THandle*>(oldPointer);
+            break;
+        case ESpaceMap::Buckets:
+            old.Buckets = static_cast<std::atomic<ui64>*>(oldPointer);
+            break;
+        case ESpaceMap::Hot:
+            old.HotSlots = static_cast<std::atomic<ui64>*>(oldPointer);
+            break;
+        case ESpaceMap::Cold:
+            old.ColdSlots = static_cast<std::atomic<ui64>*>(oldPointer);
+            break;
+        case ESpaceMap::KeepCold:
+            old.KeepColdSlots = static_cast<std::atomic<ui64>*>(oldPointer);
+            break;
+        case ESpaceMap::Free:
+            old.FreeSlots = static_cast<std::atomic<ui64>*>(oldPointer);
+            break;
+        case ESpaceMap::Done:
+            Y_ABORT("Invalid shared-cache release stage");
+    }
+    return released;
+}
+
+bool TSharedCacheSpace::TryReleaseTransition(TTransition& transition) noexcept {
+    return TryReleaseTransitionImpl<false>(transition, {});
+}
+
+template <bool WithHook>
+bool TSharedCacheSpace::TryReleaseTransitionImpl(TTransition& transition, TReleaseHook hook) noexcept {
+    if ((transition.Phase_ != ETransitionPhase::Release && transition.Phase_ != ETransitionPhase::ReleaseRetry) ||
+        transition.NextHazardIndex_ != HazardSlotCount_)
+    {
+        return false;
+    }
+
+    while (transition.ReleaseStage_ != ESpaceMap::Done) {
+        if (!TryReleaseOldMapping<WithHook>(transition.ReleaseStage_, transition, hook)) {
+            transition.Phase_ = ETransitionPhase::ReleaseRetry;
+            return false;
+        }
+        transition.ReleaseStage_ = static_cast<ESpaceMap>(static_cast<ui8>(transition.ReleaseStage_) + 1);
+    }
+
+    transition.OldView_.Reset();
+    transition.Phase_ = ETransitionPhase::Commit;
+    return true;
+}
+
+bool TSharedCacheSpace::TryReleaseTransitionWithHook(TTransition& transition, TReleaseHook hook) noexcept {
+    return TryReleaseTransitionImpl<true>(transition, hook);
+}
+
+bool TSharedCacheSpace::CommitTransition(TTransition& transition) noexcept {
+    if (transition.Phase_ != ETransitionPhase::Commit || transition.ReleaseStage_ != ESpaceMap::Done)
+    {
+        return false;
+    }
+    Capacity_ = transition.TargetConfiguration_;
+    transition.Reset();
+    return true;
+}
+
+bool TSharedCacheSpace::AbandonTransition(TTransition& transition) noexcept {
+    if (transition.Phase_ == ETransitionPhase::Idle || transition.Phase_ == ETransitionPhase::AbandonedForShutdown)
+    {
+        return false;
+    }
+    if (transition.Phase_ == ETransitionPhase::Prepare || transition.Phase_ == ETransitionPhase::InitializeGrowth)
+    {
+        CancelPreparedView(*transition.PreparedView_);
+        transition.Reset();
+        return true;
+    }
+    transition.Phase_ = ETransitionPhase::AbandonedForShutdown;
+    return true;
+}
+
 } // namespace NKikimr::NSharedCache
