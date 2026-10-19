@@ -2197,7 +2197,7 @@ Y_UNIT_TEST(ReviewR14ExecutorPublishesPartialStickyResult) {
     auto fetch = MakeHolder<NSharedCache::TEvRequest>(
         NBlockIO::EPriority::Fast, request->Get()->PageCollection, request->Get()->Pages, request->Get()->Cookie);
     fetch->Sticky.assign(fetch->Pages.size(), true);
-    env->Send(MakeSharedPageCacheId(), edge, fetch.Release(), 0, request->Cookie);
+    env->Send(new IEventHandle(MakeSharedPageCacheId(), edge, fetch.Release(), 0, request->Cookie));
     auto loaded = env.Env.GrabEdgeEventRethrow<NSharedCache::TEvResult>(edge, TDuration::Seconds(10));
     UNIT_ASSERT_VALUES_EQUAL(loaded->Get()->Status, NKikimrProto::OK);
     UNIT_ASSERT(!loaded->Get()->Pages.empty());
@@ -2210,7 +2210,7 @@ Y_UNIT_TEST(ReviewR14ExecutorPublishesPartialStickyResult) {
         request->Get()->PageCollection, NKikimrProto::OK, request->Get()->Cookie, 0, 0, true);
     result->WaitPad = pad;
     result->Pages = std::move(loaded->Get()->Pages);
-    env->Send(request->Sender, MakeSharedPageCacheId(), result.Release(), 0, request->Cookie);
+    env->Send(new IEventHandle(request->Sender, MakeSharedPageCacheId(), result.Release(), 0, request->Cookie));
     env.Env.WaitFor("executor retains the first collection's Sticky pages", [&] {
         return pad->PendingRequests == 1;
     }, TDuration::Seconds(10));

@@ -2218,7 +2218,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
     Y_UNIT_TEST(ReviewR15DuplicateBatchNeedsOneHandle) {
         TFixture fixture;
         const TLogoBlobID id(83, 84, 124);
-        const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        TCollectionCacheItem collection;
+        TTestSharedCacheCollectionRef hit;
+        UNIT_ASSERT(fixture.Cache->FindOrInsert(TCollectionLocation{ .Id = id }, collection, hit) ==
+                    ESharedCacheResultStatus::Inserted);
         UNIT_ASSERT(fixture.Cache->MakeReady(collection, MakeCollection(id)));
         TVector<TTestSharedPageRef> held;
         for (ui64 offset = 100; AvailableFreeHandles(*fixture.Cache) > 1; ++offset) {
