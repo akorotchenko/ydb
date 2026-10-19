@@ -347,6 +347,9 @@ public:
     bool TryReserveFetchBatch(TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept;
     bool CanAdmitWorkingSet(ui64 bytes) noexcept;
     bool CanAdmitPageHandles(TArrayRef<const TSharedCacheHandleRequirement> requirements) noexcept;
+    // Pressure-only check of request-held collection handles and distinct requested pages.
+    bool WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheItem> retainedCollections,
+        TArrayRef<const TSharedCacheHandleRequirement> requirements) noexcept;
 
     void DisarmResourceWait() noexcept {
         ResourceWaitArmed_.store(false, std::memory_order_release);

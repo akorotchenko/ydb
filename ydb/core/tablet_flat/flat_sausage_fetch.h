@@ -17,6 +17,8 @@ namespace NPageCollection {
         ui64 PendingRequests = 0;
         ui64 WorkingSetBytes = 0; // Immutable page budget for retry after releasing this attempt's pins.
         THashMap<TLogoBlobID, TVector<TPageLocation>> WorkingSetPages; // Immutable identities, including Sticky pages.
+        // Non-owning identities of the requester's retained collections, including those without requested pages.
+        TVector<NSharedCache::TCollectionCacheItem> RetainedCollections;
         // Set by page clients or fetch completions when the attempt retains pins; stays set for this attempt.
         // Includes Sticky pins: their collection mode may change while the attempt waits.
         std::atomic<bool> HasPinnedPages{ false };

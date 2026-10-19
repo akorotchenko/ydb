@@ -1834,6 +1834,53 @@ bool TSharedCache::CanAdmitPageHandles(TArrayRef<const TSharedCacheHandleRequire
 }
 
 SHARED_CACHE_TEMPLATE
+bool TSharedCache::WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheItem> retainedCollections,
+    TArrayRef<const TSharedCacheHandleRequirement> requirements) noexcept {
+    auto spaceOp = BeginOperation();
+    const ui64 handleLimit = TargetHandleCount() - 2;
+    const ui64 byteLimit = CurrentLimit();
+    THashSet<ui64> collections;
+    for (const auto collection : retainedCollections) {
+        if (!spaceOp.Contains(collection.CacheItem())) {
+            continue;
+        }
+        const auto state =
+            THandleState::FromRaw(spaceOp.Handles()[collection.Index()].State.load(std::memory_order_acquire));
+        if (collection.Matches(state) && state.IsCollectionKind() && !state.IsFree() && state.Refs() > 0) {
+            collections.insert(collection.Raw());
+        }
+    }
+    ui64 handles = collections.size();
+    ui64 bytes = 0;
+    bool exceeds = handles > handleLimit;
+    THashMap<TLogoBlobID, THashSet<ui64>> pages;
+    for (const auto& requirement : requirements) {
+        auto [it, first] = pages.try_emplace(requirement.CollectionId);
+        if (first) {
+            TCacheItem current;
+            if (Table_.Find(spaceOp, TSharedCacheKey::Collection(requirement.CollectionId), current) ==
+                    ESharedCacheResultStatus::Miss ||
+                !collections.contains(current.Raw())) {
+                exceeds |= ++handles > handleLimit;
+            }
+        }
+        for (const auto& location : requirement.Pages) {
+            if (!it->second.insert(static_cast<ui64>(location.Offset)).second) {
+                continue;
+            }
+            exceeds |= ++handles > handleLimit;
+            const ui64 charge = AccountedPageBytes(location.Size);
+            if (charge > byteLimit - bytes) {
+                exceeds = true;
+            } else {
+                bytes += charge;
+            }
+        }
+    }
+    return exceeds && handleLimit == TargetHandleCount() - 2 && byteLimit == CurrentLimit();
+}
+
+SHARED_CACHE_TEMPLATE
 bool TSharedCache::DispatchFetch(TSpaceOperation& spaceOp, TCacheItem cacheItem, TPageFetchState& fetch) noexcept {
     Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];

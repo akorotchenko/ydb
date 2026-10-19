@@ -1925,6 +1925,80 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         return held;
     }
 
+    Y_UNIT_TEST(ReviewR20IndependentStickyPressureCanClearWithSubsetAlive) {
+        TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
+        auto& core = TSharedCache::Get();
+        auto pseudo = core.AdmitCollection(sharedCache.Collection2);
+        sharedCache.Collection1 = new TPageCollectionMock(1, 10000);
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true, false, false);
+        TSharedCacheCollectionRef main;
+        {
+            auto binding = core.BindCurrentThreadHazard();
+            UNIT_ASSERT(core.Find(sharedCache.Collection1->Label(), main) == ESharedCacheResultStatus::Hit);
+        }
+        for (ui32 index = 0; index < core.TargetHandleCount() - 4; ++index) {
+            auto page = core.AdmitPage(sharedCache.Collection1, _P(index), TSharedData::Copy(TString(10, 'x')), true);
+            UNIT_ASSERT(page && page.IsSticky());
+        }
+        UNIT_ASSERT_LT(core.PayloadUsage() + PAGE_TOTAL_SIZE, core.CurrentLimit());
+        auto pad = MakeIntrusive<TPagesWaitPad>();
+        pad->RetainedCollections = { main.CacheItem(), pseudo.CacheItem() };
+        pad->WorkingSetPages[main->Id()] = { _P(9000) };
+        pad->WorkingSetBytes = PAGE_TOTAL_SIZE;
+        UNIT_ASSERT(!pad->HasPinnedPages.load());
+        sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, { _P(9000) }, EPriority::Fast, 0, pad);
+        sharedCache.Runtime.WaitFor("independent Sticky pressure", [&] {
+            return sharedCache.Results.size() == 1;
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->ResourcePressure);
+        UNIT_ASSERT(!sharedCache.Results.front()->Get()->WorkingSetTooLarge);
+        sharedCache.Results.clear();
+        sharedCache.CheckFetches({});
+        UNIT_ASSERT(sharedCache.Results.empty());
+        main->DrainStickyPages();
+        sharedCache.Runtime.WaitFor("Sticky pressure clears without releasing retained collections", [&] {
+            return sharedCache.Results.size() == 1;
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT(main && pseudo);
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->ResourcesReady);
+        UNIT_ASSERT(!sharedCache.Results.front()->Get()->WorkingSetTooLarge);
+        sharedCache.Results.clear();
+        sharedCache.CheckFetches({});
+    }
+
+    Y_UNIT_TEST(ReviewR20ForeignHandlesRemainRetryableOnFirstPage) {
+        TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
+        auto held = HoldAllReviewPageHandles(sharedCache);
+        TSharedCacheCollectionRef main;
+        {
+            auto binding = TSharedCache::Get().BindCurrentThreadHazard();
+            UNIT_ASSERT(
+                TSharedCache::Get().Find(sharedCache.Collection1->Label(), main) == ESharedCacheResultStatus::Hit);
+        }
+        auto pad = MakeIntrusive<TPagesWaitPad>();
+        pad->RetainedCollections = { main.CacheItem() };
+        pad->WorkingSetPages[main->Id()] = { _P(9000) };
+        pad->WorkingSetBytes = PAGE_TOTAL_SIZE;
+        sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, { _P(9000) }, EPriority::Fast, 0, pad);
+        sharedCache.Runtime.WaitFor("first-page pressure releases the attempt", [&] {
+            return sharedCache.Results.size() == 1;
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->ResourcePressure);
+        UNIT_ASSERT(!sharedCache.Results.front()->Get()->WorkingSetTooLarge);
+        UNIT_ASSERT(!pad->HasPinnedPages.load());
+        sharedCache.Results.clear();
+        sharedCache.CheckFetches({});
+        UNIT_ASSERT(sharedCache.Results.empty());
+        held.pop_back();
+        sharedCache.Runtime.WaitFor("foreign handle release wakes statistics", [&] {
+            return sharedCache.Results.size() == 1;
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->ResourcesReady);
+        UNIT_ASSERT(!sharedCache.Results.front()->Get()->WorkingSetTooLarge);
+        sharedCache.Results.clear();
+        sharedCache.CheckFetches({});
+    }
+
     Y_UNIT_TEST(ReviewR15ReadWaitsForHandleWithoutStorageFailure) {
         TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
         auto held = HoldAllReviewPageHandles(sharedCache);
