@@ -3417,12 +3417,6 @@ bool TSharedCache::EraseCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) 
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::ReclaimCold() noexcept {
-    auto spaceOp = BeginOperation();
-    return ReclaimCold(spaceOp);
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept {
     const ui64 currentStaticBytes = Space_->CurrentConfiguration().StaticBytes;
     const ui64 staticDeltaBytes = target.StaticBytes > currentStaticBytes ? target.StaticBytes - currentStaticBytes : 0;
@@ -4388,74 +4382,6 @@ bool TSharedCache::AbandonTransition(TTransition& transition) noexcept {
         SubtractExactBytes(OverallUsage_, delta);
     }
     return true;
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::ReclaimCold(TSpaceOperation& spaceOp) noexcept {
-    const TRingView cold = spaceOp.Cold();
-    for (ui64 attempt = 0; attempt < cold.Capacity; ++attempt) {
-        if (ColdRingEntries_.load(std::memory_order_relaxed) == 0) {
-            return false;
-        }
-        InvokeHook(ESharedCacheHookPoint::BeforeColdRingPop, TCacheItem{});
-        const ui64 rawItem = cold.Pop();
-        if (rawItem != 0) {
-            const ui64 previous = ColdRingEntries_.fetch_sub(1, std::memory_order_relaxed);
-            Y_ABORT_UNLESS(previous != 0);
-            if (EraseCold(spaceOp, TColdCacheItem::FromRaw(rawItem))) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::DemoteKeepColdForSoftLimit(TSpaceOperation& spaceOp) noexcept {
-    const TRingView keep = spaceOp.KeepCold();
-    for (ui64 attempt = 0; attempt < keep.Capacity && KeepColdOwnedBytes() != 0; ++attempt) {
-        const ui64 raw = keep.Pop();
-        if (raw == 0) {
-            continue;
-        }
-        const TColdCacheItem item = TColdCacheItem::FromRaw(raw);
-        if (DemoteKeepCold(spaceOp, item)) {
-            return true;
-        }
-        // The FIFO entry is gone even when a structural ref delays demotion.
-        WithdrawKeepColdEntry(spaceOp, item);
-    }
-    return false;
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept {
-    const TRingView keep = spaceOp.KeepCold();
-    for (ui64 attempt = 0; attempt < keep.Capacity && KeepColdOwnedBytes() != 0; ++attempt) {
-        const ui64 raw = keep.Pop();
-        if (raw == 0) {
-            continue;
-        }
-        const TColdCacheItem item = TColdCacheItem::FromRaw(raw);
-        if (!MatchesKeepColdEntry(spaceOp, item)) {
-            continue;
-        }
-        InvokeHook(ESharedCacheHookPoint::AfterKeepColdEntryMatched, item);
-        if (EraseCold(spaceOp, item)) {
-            return true;
-        }
-        WithdrawKeepColdEntry(spaceOp, item);
-    }
-    return false;
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::Reclaim(TSpaceOperation& spaceOp, ui64 bytes) noexcept {
-    if (ReclaimCold(spaceOp) || ReclaimKeepCold(spaceOp)) {
-        return true;
-    }
-    // Cold is empty, so only moving the hot/cold boundary can make room, and that is EnforceCurrentLimit's job.
-    return EnforceCurrentLimit(spaceOp, bytes);
 }
 
 SHARED_CACHE_TEMPLATE
