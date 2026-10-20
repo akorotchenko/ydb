@@ -364,15 +364,15 @@ public:
     bool RunMaintenance() noexcept;
 
     ui64 CurrentLimit() const noexcept {
-        return CurrentLimit_.load(std::memory_order_relaxed);
+        return Memory_.CurrentLimit();
     }
 
     ui64 SoftLimit() const noexcept {
-        return SoftLimit_.load(std::memory_order_relaxed);
+        return Memory_.SoftLimit();
     }
 
     ui64 HardLimit() const noexcept {
-        return HardLimit_.load(std::memory_order_relaxed);
+        return Memory_.HardLimit();
     }
 
     // Serialized controller access, like UpdateHardLimit and RunMaintenance.
@@ -390,7 +390,7 @@ public:
     }
 
     ui64 ReservationLimit() const noexcept {
-        return ReservationLimit_;
+        return Memory_.ReservationLimit();
     }
 
     ui64 ResidentBytes() const noexcept {
@@ -933,7 +933,6 @@ private:
         const TSpaceOperation& spaceOp, ui32 effectiveHotSlots, ui32 step, bool underPressure) const noexcept;
     ui32 GrowHotTarget(const TSpaceOperation& spaceOp, ui32 effectiveHotSlots, ui32 step) const noexcept;
     ui32 HotResizeStep(ui32 effectiveHotSlots) const noexcept;
-    ui64 CalculateSoftLimit(ui64 currentLimit) const noexcept;
     void RefreshSoftLimit() noexcept;
     void RefreshEvictableByteBudget() noexcept;
     bool EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes = 0, bool forceShrinkHot = false) noexcept;
@@ -981,14 +980,10 @@ private:
     std::atomic<ui64> KeepColdOwnedBytes_{ 0 };
     std::atomic<ui64> KeepColdTrimScanRemaining_{ 0 };
     std::atomic<ui64> KeepModeSweepRemaining_{ 0 };
-    std::atomic<ui64> CurrentLimit_{ 0 };
     std::atomic<ui64> ResourceGeneration_{ 0 };
     std::atomic<ui64> ColdMinBytes_{ 0 };
     std::atomic<ui64> ColdTargetBytes_{ 0 };
     std::atomic<ui64> ColdGrowBytes_{ 0 };
-    std::atomic<ui64> SoftLimitOverride_{ Max<ui64>() };
-    std::atomic<ui64> SoftLimit_{ 0 };
-    std::atomic<ui64> HardLimit_{ 0 };
     std::atomic<ui64> TargetHandleCount_{ 0 };
     std::atomic<ui64> RequestedPages_{ 0 };
     std::atomic<ui64> RequestedBytes_{ 0 };
@@ -1000,7 +995,6 @@ private:
     std::atomic<bool> KeepColdTrimActive_{ false };
     std::atomic<bool> ResourceWaitArmed_{ false };
     std::atomic<bool> SoftLimitPressure_{ false };
-    ui64 ReservationLimit_ = 0;
     THotResize HotResize_;
     TSharedCacheCapacity HardTarget_;
     TTransition HardTransition_;
