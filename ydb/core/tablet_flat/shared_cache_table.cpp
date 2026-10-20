@@ -210,7 +210,7 @@ restart:
         const int comparison = CompareSharedCacheKeys(itemKey, itemKey.Hash(), key, hash);
         if (state.IsTombstone()) {
             if constexpr (Mode == ETombstoneMode::Help) {
-                HelpTombstone(result.Expected, key, spaceOp);
+                TryFinishErase(result.Expected, key, spaceOp);
                 goto restart;
             }
             if (comparison >= 0) {
@@ -537,7 +537,7 @@ bool TSharedCacheTable::FindLink(
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCacheTable::BridgeTombstone(
+bool TSharedCacheTable::UnlinkTombstone(
     TCacheItem cacheItem, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept {
     auto cacheOp = Cache_.BindOperation(spaceOp);
     const TCacheItem successor = FreezeNext(spaceOp, cacheItem).WithoutFrozen();
@@ -659,7 +659,7 @@ void TSharedCacheTable::PublishPageReplacement(
                     continue;
                 }
                 if (ownerState.IsTombstone()) {
-                    HelpTombstone(orderedLink.Owner, key, spaceOp);
+                    TryFinishErase(orderedLink.Owner, key, spaceOp);
                     continue;
                 }
                 ownerRef.Get() = TryAcquire(spaceOp, orderedLink.Owner);
@@ -686,7 +686,7 @@ void TSharedCacheTable::PublishPageReplacement(
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCacheTable::HelpTombstone(
+void TSharedCacheTable::TryFinishErase(
     TCacheItem cacheItem, const TSharedCacheKey& routeKey, TSpaceOperation& spaceOp) noexcept {
     TOperationItemRef hold(spaceOp, TryAcquireTombstone(spaceOp, cacheItem));
     if (!hold) {
@@ -698,7 +698,7 @@ void TSharedCacheTable::HelpTombstone(
     if (tombstone.Matches(state) && state.IsTombstone()) {
         const TSharedCacheKey key = tombstone.IsResizeMarker() ? routeKey : LoadSharedCacheKey(handle, state.Kind());
         FreezeNext(spaceOp, tombstone);
-        BridgeTombstone(tombstone, key, spaceOp);
+        UnlinkTombstone(tombstone, key, spaceOp);
     }
 }
 
@@ -753,7 +753,7 @@ void TSharedCacheTable::FinishErase(
         THandleState::FromRaw(spaceOp.Handles()[cacheItem.Index()].State.load(std::memory_order_acquire));
     Y_ABORT_UNLESS(cacheItem.Matches(state) && state.IsTombstone() && state.Refs() > 0);
     FreezeNext(spaceOp, cacheItem);
-    BridgeTombstone(cacheItem, key, spaceOp);
+    UnlinkTombstone(cacheItem, key, spaceOp);
 }
 
 #undef TSharedCacheTable
