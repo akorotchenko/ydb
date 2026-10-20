@@ -208,6 +208,10 @@ public:
         return std::forward<TCallback>(callback)(spaceOp);
     }
 
+    static auto BindOperation(TTestSharedCache& cache, TSpaceOperation& spaceOp) noexcept {
+        return cache.BindOperation(spaceOp);
+    }
+
     template <class TCallback>
     static decltype(auto) WithHandle(TTestSharedCache& cache, ui32 index, TCallback&& callback) {
         return WithSpace(cache, [&](TSpaceOperation& spaceOp) -> decltype(auto) {
@@ -2009,6 +2013,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 0);
             {
                 auto movedOp = std::move(cacheOp);
+                UNIT_ASSERT(&movedOp.SpaceOperation() == static_cast<TSpaceOperation*>(&movedOp));
                 UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
                 TOperationItemRef<TTestTraits> acquired(movedOp);
                 UNIT_ASSERT(movedOp.TryAcquire(item, false, acquired.Get()) ==
@@ -2018,6 +2023,36 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 1);
             }
             UNIT_ASSERT_VALUES_EQUAL(hazard->State.load(std::memory_order_acquire), 0);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(hazard->State.load(std::memory_order_acquire), 0);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 0);
+    }
+
+    Y_UNIT_TEST(BorrowedCacheOperationPreservesExistingGuard) {
+        TFixture fixture;
+        const auto key = TSharedCacheKey::Page(MakeCollectionCacheItem(1, 2), 100);
+        const auto page = InsertReadyPage(*fixture.Cache, key);
+        TSpaceHazard* hazard = nullptr;
+        {
+            auto spaceOp = fixture.Space->BeginOperation();
+            hazard = &spaceOp.Hazard();
+            {
+                auto cacheOp = TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp);
+                UNIT_ASSERT(&cacheOp.SpaceOperation() == &spaceOp);
+                UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
+                TCacheItem item;
+                UNIT_ASSERT(cacheOp.Find(key, item) == ESharedCacheResultStatus::Hit);
+                UNIT_ASSERT(item == page.CacheItem());
+                {
+                    TOperationItemRef<TTestTraits> acquired(cacheOp.SpaceOperation());
+                    UNIT_ASSERT(cacheOp.TryAcquire(item, false, acquired.Get()) ==
+                                TTestSharedCache::TOperation::EAcquireStatus::Ready);
+                    UNIT_ASSERT(acquired.CacheItem() == item);
+                    UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
+                }
+                UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
         }
         UNIT_ASSERT_VALUES_EQUAL(hazard->State.load(std::memory_order_acquire), 0);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 0);
@@ -5824,7 +5859,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::TryReserve(*fixture.Cache, reservation));
         TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
             for (ui32 pass = 0; pass < 200; ++pass) {
-                fixture.Cache->EnforceCurrentLimit(spaceOp, bytes + 1);
+                TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp).EnforceCurrentLimit(bytes + 1);
             }
         });
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), 25);
@@ -6558,7 +6593,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             const ui64 incomingBytes = exceedsFree ? Max<ui64>() : freeBytes - limit / 10;
             const ui64 hotSlots = TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache);
             TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
-                fixture.Cache->EnforceCurrentLimit(spaceOp, incomingBytes);
+                TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp).EnforceCurrentLimit(incomingBytes);
             });
             UNIT_ASSERT(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache) < hotSlots);
         }
@@ -6569,13 +6604,13 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(limit));
         const ui64 freeBytes = limit - fixture.Cache->PayloadUsage();
         TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
-            fixture.Cache->EnforceCurrentLimit(spaceOp, freeBytes);
+            TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp).EnforceCurrentLimit(freeBytes);
         });
         const ui64 hotSlots = TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache);
         UNIT_ASSERT(hotSlots < fixture.Capacity.HotSlotCount());
         const ui64 incomingBytes = freeBytes - limit / 4;
         TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
-            fixture.Cache->EnforceCurrentLimit(spaceOp, incomingBytes);
+            TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp).EnforceCurrentLimit(incomingBytes);
         });
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), hotSlots);
         fixture.Cache->EnforceCurrentLimit();
@@ -6598,13 +6633,13 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
             UNIT_ASSERT(
                 fixture.Cache->ColdReclaimableItems() + spaceOp.View().Free().Count() > spaceOp.View().ColdGrowHandles);
-            fixture.Cache->EnforceCurrentLimit(spaceOp, 0, true);
+            TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp).EnforceCurrentLimit(0, true);
         });
         const ui64 hotSlots = TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache);
         UNIT_ASSERT(hotSlots < fixture.Capacity.HotSlotCount());
         const ui64 incomingBytes = limit - fixture.Cache->PayloadUsage() + 1;
         TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
-            fixture.Cache->EnforceCurrentLimit(spaceOp, incomingBytes);
+            TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp).EnforceCurrentLimit(incomingBytes);
         });
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), hotSlots);
         fixture.Cache->EnforceCurrentLimit();
