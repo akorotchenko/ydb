@@ -2,6 +2,7 @@
 
 #include "shared_cache_item.h"
 
+#include <util/generic/algorithm.h>
 #include <util/generic/ylimits.h>
 #include <util/system/yassert.h>
 
@@ -11,7 +12,97 @@ namespace NKikimr::NSharedCache {
 
 class TCacheMemory {
 public:
+    // State transitions can overtake category accounting, temporarily making these estimates negative.
+    class TCategoryUsage {
+    public:
+        i64 BytesEstimate() const noexcept {
+            return Bytes_.load(std::memory_order_relaxed);
+        }
+
+        i64 PagesEstimate() const noexcept {
+            return Pages_.load(std::memory_order_relaxed);
+        }
+
+        ui64 Bytes() const noexcept {
+            return static_cast<ui64>(Max<i64>(BytesEstimate(), 0));
+        }
+
+        ui64 Pages() const noexcept {
+            return static_cast<ui64>(Max<i64>(PagesEstimate(), 0));
+        }
+
+        void AddBytes(i64 bytes) noexcept {
+            Bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        }
+
+        void RemoveBytes(i64 bytes) noexcept {
+            Bytes_.fetch_sub(bytes, std::memory_order_relaxed);
+        }
+
+        void AddPage(EItemKind kind) noexcept {
+            if (kind == EItemKind::Page) {
+                Pages_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        void RemovePage(EItemKind kind) noexcept {
+            if (kind == EItemKind::Page) {
+                Pages_.fetch_sub(1, std::memory_order_relaxed);
+            }
+        }
+
+        void TransferBytesTo(TCategoryUsage& destination, ui64 bytes) noexcept {
+            const i64 estimatedBytes = static_cast<i64>(bytes);
+            destination.Bytes_.fetch_add(estimatedBytes, std::memory_order_relaxed);
+            Bytes_.fetch_sub(estimatedBytes, std::memory_order_relaxed);
+        }
+
+        void TransferPageTo(TCategoryUsage& destination, EItemKind kind) noexcept {
+            if (kind != EItemKind::Page) {
+                return;
+            }
+            destination.Pages_.fetch_add(1, std::memory_order_relaxed);
+            Pages_.fetch_sub(1, std::memory_order_relaxed);
+        }
+
+    private:
+        std::atomic<i64> Bytes_{ 0 };
+        std::atomic<i64> Pages_{ 0 };
+    };
+
     TCacheMemory(ui64 staticBytes, ui64 initialLimit, ui64 reservationLimit) noexcept;
+
+    TCategoryUsage& Hot() noexcept {
+        return Hot_;
+    }
+
+    const TCategoryUsage& Hot() const noexcept {
+        return Hot_;
+    }
+
+    TCategoryUsage& Cold() noexcept {
+        return Cold_;
+    }
+
+    const TCategoryUsage& Cold() const noexcept {
+        return Cold_;
+    }
+
+    TCategoryUsage& KeepCold() noexcept {
+        return KeepCold_;
+    }
+
+    const TCategoryUsage& KeepCold() const noexcept {
+        return KeepCold_;
+    }
+
+    TCategoryUsage& Sticky() noexcept {
+        return Sticky_;
+    }
+
+    const TCategoryUsage& Sticky() const noexcept {
+        return Sticky_;
+    }
 
     ui64 CurrentLimit() const noexcept {
         return CurrentLimit_.load(std::memory_order_relaxed);
@@ -199,6 +290,10 @@ private: // Data members
     std::atomic<ui64> RetainedBytes_{ 0 };
     std::atomic<ui64> StickyOwnedBytes_{ 0 };
     std::atomic<ui64> KeepColdOwnedBytes_{ 0 };
+    TCategoryUsage Hot_;
+    TCategoryUsage Cold_; // All Cold storage, including held and retiring payloads
+    TCategoryUsage KeepCold_;
+    TCategoryUsage Sticky_;
     std::atomic<ui64> CurrentLimit_{ 0 };
     std::atomic<ui64> SoftLimitOverride_{ Max<ui64>() };
     std::atomic<ui64> SoftLimit_{ 0 };

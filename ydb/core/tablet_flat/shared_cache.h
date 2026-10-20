@@ -398,15 +398,15 @@ public:
     }
 
     ui64 HotBytes() const noexcept {
-        return LoadEstimatedBytes(HotBytes_);
+        return Memory_.Hot().Bytes();
     }
 
     ui64 HotPages() const noexcept {
-        return static_cast<ui64>(Max<i64>(0, HotPages_.load(std::memory_order_relaxed)));
+        return Memory_.Hot().Pages();
     }
 
     ui64 ColdPages() const noexcept {
-        return static_cast<ui64>(Max<i64>(0, ColdPages_.load(std::memory_order_relaxed)));
+        return Memory_.Cold().Pages();
     }
 
     ui64 ColdRingEntries() const noexcept {
@@ -414,11 +414,11 @@ public:
     }
 
     ui64 StickyPages() const noexcept {
-        return static_cast<ui64>(Max<i64>(0, StickyPages_.load(std::memory_order_relaxed)));
+        return Memory_.Sticky().Pages();
     }
 
     ui64 KeepColdPages() const noexcept {
-        return static_cast<ui64>(Max<i64>(0, KeepColdPages_.load(std::memory_order_relaxed)));
+        return Memory_.KeepCold().Pages();
     }
 
     ui64 Collections() const noexcept {
@@ -426,7 +426,7 @@ public:
     }
 
     ui64 ColdBytes() const noexcept {
-        return LoadEstimatedBytes(ColdBytes_);
+        return Memory_.Cold().Bytes();
     }
 
     ui64 ColdReclaimableBytes() const noexcept {
@@ -438,11 +438,11 @@ public:
     }
 
     ui64 StickyBytes() const noexcept {
-        return LoadEstimatedBytes(StickyBytes_);
+        return Memory_.Sticky().Bytes();
     }
 
     ui64 KeepColdBytes() const noexcept {
-        return LoadEstimatedBytes(KeepColdBytes_);
+        return Memory_.KeepCold().Bytes();
     }
 
     ui64 KeepResidentPageBytes() const noexcept {
@@ -856,11 +856,6 @@ private:
     static ui64 PageBytes(const THandle& handle) noexcept;
     static ui64 LoadEstimatedBytes(const std::atomic<i64>& counter) noexcept;
     static ui64 FractionCeil(ui64 value, double fraction) noexcept;
-    static void TransferEstimatedBytes(std::atomic<i64>& source, std::atomic<i64>& destination, ui64 bytes) noexcept;
-    static void TransferEstimatedPages(
-        std::atomic<i64>& source, std::atomic<i64>& destination, EItemKind kind) noexcept;
-    static void AddEstimatedPages(std::atomic<i64>& counter, EItemKind kind) noexcept;
-    static void SubtractEstimatedPages(std::atomic<i64>& counter, EItemKind kind) noexcept;
     static void SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept;
 
     bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool force = false) noexcept;
@@ -944,22 +939,13 @@ private:
     TSharedCacheTableImpl<TTraits> Table_;
     TIntrusivePtr<TCollectionRegistry> CollectionRegistry_ = new TCollectionRegistry;
     TCacheMemory Memory_;
-    std::atomic<i64> HotBytes_{ 0 };
-    std::atomic<i64> ColdBytes_{ 0 }; // All Cold storage, including held and retiring payloads
     std::atomic<i64> ColdReclaimableBytes_{ 0 }; // Unreferenced ordinary Cold payloads
     std::atomic<i64> ColdReclaimableItems_{ 0 }; // Unreferenced ordinary Cold items
     std::atomic<i64> ColdItems_{ 0 }; // All Cold-state items, including held items
     std::atomic<ui64> ColdRingEntries_{ 0 }; // Occupied ring slots, including stale entries until popped
-    std::atomic<i64> KeepColdBytes_{ 0 };
     std::atomic<ui64> KeepResidentPageBytes_{ 0 };
     std::atomic<ui64> KeepActivePageBytes_{ 0 };
     ui64 ColdByteBudget_ = Max<ui64>(); // Protected by HotResize_; watermark calculation input.
-    std::atomic<i64> StickyBytes_{ 0 };
-    // State transitions can overtake category accounting, temporarily making these estimates negative.
-    std::atomic<i64> HotPages_{ 0 };
-    std::atomic<i64> ColdPages_{ 0 };
-    std::atomic<i64> KeepColdPages_{ 0 };
-    std::atomic<i64> StickyPages_{ 0 };
     std::atomic<ui64> Collections_{ 0 };
     std::atomic<ui64> CollectionBytes_{ 0 };
     std::atomic<ui64> KeepColdMaxBytes_{ 0 }; // Configured ceiling; repeated updates preserve pressure shrinkage.

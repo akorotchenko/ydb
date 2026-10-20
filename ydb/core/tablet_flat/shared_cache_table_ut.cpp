@@ -263,10 +263,10 @@ public:
             const ui64 bytes = cache.PageBytes(handle);
             handle.State.store(state.WithState(EHandleState::KeepCold).Raw(), std::memory_order_relaxed);
             handle.ColdVersion.store(coldVersion, std::memory_order_relaxed);
-            cache.HotBytes_.fetch_sub(bytes, std::memory_order_relaxed);
-            cache.KeepColdBytes_.fetch_add(bytes, std::memory_order_relaxed);
-            cache.HotPages_.fetch_sub(1, std::memory_order_relaxed);
-            cache.KeepColdPages_.fetch_add(1, std::memory_order_relaxed);
+            cache.Memory_.Hot().RemoveBytes(bytes);
+            cache.Memory_.KeepCold().AddBytes(bytes);
+            cache.Memory_.Hot().RemovePage(EItemKind::Page);
+            cache.Memory_.KeepCold().AddPage(EItemKind::Page);
             cache.Memory_.AddKeepColdOwnedBytes(bytes);
         });
     }
@@ -407,23 +407,23 @@ public:
     }
 
     static void TransferColdToHot(TTestSharedCache& cache, ui64 bytes) {
-        cache.TransferEstimatedBytes(cache.ColdBytes_, cache.HotBytes_, bytes);
+        cache.Memory_.Cold().TransferBytesTo(cache.Memory_.Hot(), bytes);
     }
 
     static void TransferHotToCold(TTestSharedCache& cache, ui64 bytes) {
-        cache.TransferEstimatedBytes(cache.HotBytes_, cache.ColdBytes_, bytes);
+        cache.Memory_.Hot().TransferBytesTo(cache.Memory_.Cold(), bytes);
     }
 
     static i64 ColdBytesEstimate(const TTestSharedCache& cache) {
-        return cache.ColdBytes_.load(std::memory_order_relaxed);
+        return cache.Memory_.Cold().BytesEstimate();
     }
 
     static i64 ColdPagesEstimate(const TTestSharedCache& cache) {
-        return cache.ColdPages_.load(std::memory_order_relaxed);
+        return cache.Memory_.Cold().PagesEstimate();
     }
 
     static i64 KeepColdPagesEstimate(const TTestSharedCache& cache) {
-        return cache.KeepColdPages_.load(std::memory_order_relaxed);
+        return cache.Memory_.KeepCold().PagesEstimate();
     }
 
     static ETransitionPhase HardTransitionPhase(const TTestSharedCache& cache) noexcept {
