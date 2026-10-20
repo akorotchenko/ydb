@@ -70,13 +70,6 @@ inline int CompareSharedCacheKeys(const TSharedCacheKey& left, const TSharedCach
 void StoreSharedCacheKey(THandle& handle, const TSharedCacheKey& key) noexcept;
 TSharedCacheKey LoadSharedCacheKey(const THandle& handle, EItemKind kind) noexcept;
 
-enum class ESharedCacheResultStatus {
-    Miss,
-    Inserted,
-    Pending,
-    Hit,
-};
-
 template <class TTraits>
 class TSharedCacheTableImpl;
 template <class TTraits>
