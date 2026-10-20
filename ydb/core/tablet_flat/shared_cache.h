@@ -345,7 +345,7 @@ public:
     bool UpdateHardLimit(ui64 limit) noexcept;
 
     ui64 ResourceGeneration() const noexcept {
-        return ResourceGeneration_.load(std::memory_order_acquire);
+        return Memory_.ResourceGeneration();
     }
 
     void ArmResourceWait(ui64 generation) noexcept;
@@ -357,7 +357,7 @@ public:
         TArrayRef<const TSharedCacheHandleRequirement> requirements) noexcept;
 
     void DisarmResourceWait() noexcept {
-        ResourceWaitArmed_.store(false, std::memory_order_release);
+        Memory_.DisarmResourceWait();
     }
 
     bool EnforceCurrentLimit() noexcept;
@@ -915,14 +915,12 @@ private:
     std::atomic<ui64> KeepColdLimit_{ 0 }; // Effective budget, resized according to Cold+Free headroom.
     std::atomic<ui64> KeepColdTrimScanRemaining_{ 0 };
     std::atomic<ui64> KeepModeSweepRemaining_{ 0 };
-    std::atomic<ui64> ResourceGeneration_{ 0 };
     std::atomic<ui64> ColdMinBytes_{ 0 };
     std::atomic<ui64> ColdTargetBytes_{ 0 };
     std::atomic<ui64> ColdGrowBytes_{ 0 };
     std::atomic<ui64> TargetHandleCount_{ 0 };
     std::atomic<bool> KeepColdPressure_{ false };
     std::atomic<bool> KeepColdTrimActive_{ false };
-    std::atomic<bool> ResourceWaitArmed_{ false };
     std::atomic<bool> SoftLimitPressure_{ false };
     THotResize HotResize_;
     TSharedCacheCapacity HardTarget_;
