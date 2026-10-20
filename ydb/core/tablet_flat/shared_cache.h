@@ -422,7 +422,7 @@ public:
     }
 
     ui64 Collections() const noexcept {
-        return Collections_.load(std::memory_order_relaxed);
+        return Memory_.Collections();
     }
 
     ui64 ColdBytes() const noexcept {
@@ -446,15 +446,15 @@ public:
     }
 
     ui64 KeepResidentPageBytes() const noexcept {
-        return KeepResidentPageBytes_.load(std::memory_order_relaxed);
+        return Memory_.KeepResidentPageBytes();
     }
 
     ui64 KeepActivePageBytes() const noexcept {
-        return KeepActivePageBytes_.load(std::memory_order_relaxed);
+        return Memory_.KeepActivePageBytes();
     }
 
     ui64 CollectionBytes() const noexcept {
-        return CollectionBytes_.load(std::memory_order_relaxed);
+        return Memory_.CollectionBytes();
     }
 
     ui64 OverallUsage() const noexcept {
@@ -938,11 +938,7 @@ private:
     TSharedCacheTableImpl<TTraits> Table_;
     TIntrusivePtr<TCollectionRegistry> CollectionRegistry_ = new TCollectionRegistry;
     TCacheMemory Memory_;
-    std::atomic<ui64> KeepResidentPageBytes_{ 0 };
-    std::atomic<ui64> KeepActivePageBytes_{ 0 };
     ui64 ColdByteBudget_ = Max<ui64>(); // Protected by HotResize_; watermark calculation input.
-    std::atomic<ui64> Collections_{ 0 };
-    std::atomic<ui64> CollectionBytes_{ 0 };
     std::atomic<ui64> KeepColdMaxBytes_{ 0 }; // Configured ceiling; repeated updates preserve pressure shrinkage.
     std::atomic<ui64> KeepColdLimit_{ 0 }; // Effective budget, resized according to Cold+Free headroom.
     std::atomic<ui64> KeepColdTrimScanRemaining_{ 0 };
