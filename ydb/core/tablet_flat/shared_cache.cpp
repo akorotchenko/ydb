@@ -545,9 +545,7 @@ void TSharedCache::DeletePayload(THandle& handle, EItemKind kind, EHandleState s
     } else {
         Y_DEBUG_ABORT_UNLESS(hasPayload);
         delete std::exchange(handle.Body.Collection, nullptr);
-        const ui64 previous = Collections_.fetch_sub(1, std::memory_order_relaxed);
-        Y_ABORT_UNLESS(previous != 0);
-        SubtractExactBytes(CollectionBytes_, bytes);
+        Memory_.RemoveCollection(bytes);
     }
     if (hasPayload) {
         const i64 estimatedBytes = static_cast<i64>(bytes);
@@ -701,15 +699,8 @@ void TSharedCache::PublishKeepPageBytes(TCollection& owner) noexcept {
         const bool keep = owner.GetCacheMode() == ECacheMode::TryKeepInMemory;
         const ui64 resident = keep ? owner.KeepResidentPageBytes() : 0;
         const ui64 active = keep ? owner.KeepActivePageBytes() : 0;
-        const auto update = [&](std::atomic<ui64>& total, ui64 previous, ui64 current) {
-            if (current > previous) {
-                total.fetch_add(current - previous, std::memory_order_relaxed);
-            } else if (current < previous) {
-                SubtractExactBytes(total, previous - current);
-            }
-        };
-        update(KeepResidentPageBytes_, owner.ReportedKeepResidentBytes_, resident);
-        update(KeepActivePageBytes_, owner.ReportedKeepActiveBytes_, active);
+        Memory_.UpdateKeepResidentPageBytes(owner.ReportedKeepResidentBytes_, resident);
+        Memory_.UpdateKeepActivePageBytes(owner.ReportedKeepActiveBytes_, active);
         owner.ReportedKeepResidentBytes_ = resident;
         owner.ReportedKeepActiveBytes_ = active;
         ui32 expected = Publishing;
@@ -1544,8 +1535,7 @@ bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* regi
     Y_DEBUG_ABORT_UNLESS(handle.Metadata.PayloadBytes == value->AccountedBytes());
 
     const ui64 bytes = handle.Metadata.PayloadBytes;
-    CollectionBytes_.fetch_add(bytes, std::memory_order_relaxed);
-    Collections_.fetch_add(1, std::memory_order_relaxed);
+    Memory_.AddCollection(bytes);
     handle.Body.Collection = value.Get();
     value->CacheItem = TCollectionCacheItem::FromValidated(cacheItem);
     AddReference(*value);

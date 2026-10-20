@@ -259,6 +259,41 @@ public:
         Y_ABORT_UNLESS(previous != 0);
     }
 
+    ui64 Collections() const noexcept {
+        return Collections_.load(std::memory_order_relaxed);
+    }
+
+    ui64 CollectionBytes() const noexcept {
+        return CollectionBytes_.load(std::memory_order_relaxed);
+    }
+
+    void AddCollection(ui64 bytes) noexcept {
+        CollectionBytes_.fetch_add(bytes, std::memory_order_relaxed);
+        Collections_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void RemoveCollection(ui64 bytes) noexcept {
+        const ui64 previous = Collections_.fetch_sub(1, std::memory_order_relaxed);
+        Y_ABORT_UNLESS(previous != 0);
+        SubtractExactBytes(CollectionBytes_, bytes);
+    }
+
+    ui64 KeepResidentPageBytes() const noexcept {
+        return KeepResidentPageBytes_.load(std::memory_order_relaxed);
+    }
+
+    ui64 KeepActivePageBytes() const noexcept {
+        return KeepActivePageBytes_.load(std::memory_order_relaxed);
+    }
+
+    void UpdateKeepResidentPageBytes(ui64 previous, ui64 current) noexcept {
+        UpdateAggregate(KeepResidentPageBytes_, previous, current);
+    }
+
+    void UpdateKeepActivePageBytes(ui64 previous, ui64 current) noexcept {
+        UpdateAggregate(KeepActivePageBytes_, previous, current);
+    }
+
     // The caller checks its current limit against usage before each attempt.
     bool TryReserve(ui64& usage, ui64 bytes, ui64 pages) noexcept {
         if (PageUsage_.compare_exchange_weak(
@@ -319,6 +354,14 @@ public:
 private:
     static ui64 CalculateSoftLimit(ui64 currentLimit, double gapFraction, ui64 minimumGap) noexcept;
 
+    static void UpdateAggregate(std::atomic<ui64>& total, ui64 previous, ui64 current) noexcept {
+        if (current > previous) {
+            total.fetch_add(current - previous, std::memory_order_relaxed);
+        } else if (current < previous) {
+            SubtractExactBytes(total, previous - current);
+        }
+    }
+
     static void SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept {
         const ui64 previous = counter.fetch_sub(bytes, std::memory_order_relaxed);
         Y_ABORT_UNLESS(previous >= bytes);
@@ -343,6 +386,10 @@ private: // Data members
     std::atomic<i64> ColdReclaimableItems_{ 0 }; // Unreferenced ordinary Cold items
     std::atomic<i64> ColdItems_{ 0 }; // All Cold-state items, including held items
     std::atomic<ui64> ColdRingEntries_{ 0 }; // Occupied ring slots, including stale entries until popped
+    std::atomic<ui64> Collections_{ 0 };
+    std::atomic<ui64> CollectionBytes_{ 0 };
+    std::atomic<ui64> KeepResidentPageBytes_{ 0 };
+    std::atomic<ui64> KeepActivePageBytes_{ 0 };
     std::atomic<ui64> CurrentLimit_{ 0 };
     std::atomic<ui64> SoftLimitOverride_{ Max<ui64>() };
     std::atomic<ui64> SoftLimit_{ 0 };
