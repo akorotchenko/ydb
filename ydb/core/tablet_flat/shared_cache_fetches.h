@@ -16,6 +16,8 @@ template <class TTraits>
 class TOperationItemRef;
 template <class TTraits>
 class TSharedCacheTableImpl;
+template <class TTraits>
+class TCacheCollections;
 class TCacheMemory;
 class TCollection;
 
@@ -32,9 +34,7 @@ public:
     static ui64 PageBytes(const THandle& handle) noexcept;
     // A false result may leave a Ready reference in owner for the caller to release.
     bool TryAcquirePending(TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept;
-    static TCollection* PageCollection(TSpaceOperation& spaceOp, const THandle& page) noexcept;
     void UnlinkPendingStickyPage(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
-    void AddResidentPageBytes(TCollection& owner, NTable::NPage::EPage type, i64 bytes) noexcept;
     void MakeReadyState(TSpaceOperation& spaceOp, TCacheItem item, EHandleState state, TCollection* owner) noexcept;
 
 private:
@@ -88,10 +88,11 @@ public:
     };
 
     TCacheFetches(TCacheFetchServices<TTraits> services, TCacheMemory& memory, TSharedCacheTableImpl<TTraits>& table,
-        const TTraits& traits) noexcept
+        TCacheCollections<TTraits>& collections, const TTraits& traits) noexcept
         : Services_(services)
         , Memory_(memory)
         , Table_(table)
+        , Collections_(collections)
         , Traits_(traits)
     {}
 
@@ -124,6 +125,7 @@ private:
     TCacheFetchServices<TTraits> Services_;
     TCacheMemory& Memory_;
     TSharedCacheTableImpl<TTraits>& Table_;
+    TCacheCollections<TTraits>& Collections_;
     const TTraits& Traits_;
 };
 

@@ -94,8 +94,8 @@ Y_FORCE_INLINE void TSharedCache::CompleteHotEviction(TSpaceOperation& spaceOp, 
         Memory_.Hot().TransferPageTo(Memory_.Cold(), coldState.Kind());
         Memory_.AddColdItem();
         if (coldState.IsPageKind()) {
-            if (TCollection* owner = cacheOp.PageCollection(handle)) {
-                AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
+            if (TCollection* owner = cacheOp.Collections().PageCollection(handle)) {
+                Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
             }
         }
     }
@@ -250,7 +250,7 @@ bool TSharedCache::PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, b
         }
         Y_DEBUG_ABORT_UNLESS(expected.IsPageKind() && expected.Refs() != 0);
         const ui64 bytes = PageBytes(handle);
-        TCollection* owner = cacheOp.PageCollection(handle);
+        TCollection* owner = cacheOp.Collections().PageCollection(handle);
         const bool protectedPage =
             force || !owner || owner->CacheMode_.load(std::memory_order_acquire) != ECacheMode::Regular;
         if (protectedPage) {
@@ -268,7 +268,7 @@ bool TSharedCache::PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, b
             Memory_.Cold().RemovePage(EItemKind::Page);
             Memory_.RemoveColdItem();
             if (owner) {
-                AddActivePageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
+                Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
             }
             return true;
         }

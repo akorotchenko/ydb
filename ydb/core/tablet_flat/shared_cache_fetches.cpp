@@ -1,5 +1,6 @@
 #include "shared_cache_fetches.h"
 #include "shared_cache.h"
+#include "shared_cache_collections.h"
 
 #include <util/generic/vector.h>
 
@@ -30,19 +31,8 @@ bool TCacheFetchServices<TTraits>::TryAcquirePending(
 }
 
 template <class TTraits>
-TCollection* TCacheFetchServices<TTraits>::PageCollection(TSpaceOperation& spaceOp, const THandle& page) noexcept {
-    return TSharedCacheImpl<TTraits>::PageCollection(spaceOp, page);
-}
-
-template <class TTraits>
 void TCacheFetchServices<TTraits>::UnlinkPendingStickyPage(TSpaceOperation& spaceOp, TCacheItem page) noexcept {
     Cache_.UnlinkPendingStickyPage(spaceOp, page);
-}
-
-template <class TTraits>
-void TCacheFetchServices<TTraits>::AddResidentPageBytes(
-    TCollection& owner, NTable::NPage::EPage type, i64 bytes) noexcept {
-    Cache_.AddResidentPageBytes(owner, type, bytes);
 }
 
 template <class TTraits>
@@ -196,7 +186,7 @@ void TCacheFetches<TTraits>::Finish(
         new (&handle.Body.PageBuffer) NActors::TSharedData::TBuffer(std::move(data).Extract());
         const ui64 bytes = Services_.PageBytes(handle);
         EHandleState readyState = EHandleState::Hot;
-        TCollection* owner = Services_.PageCollection(spaceOp, handle);
+        TCollection* owner = Collections_.BindOperation(spaceOp).PageCollection(handle);
         const bool regular = owner && owner->GetCacheMode() == ECacheMode::Regular &&
                              !THandleState::FromRaw(handle.State.load(std::memory_order_acquire)).IsStickyField();
         if (regular) {
@@ -207,7 +197,7 @@ void TCacheFetches<TTraits>::Finish(
             Memory_.AddRetainedBytes(bytes);
         }
         if (owner) {
-            Services_.AddResidentPageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
+            Collections_.AddResidentPageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
         }
         Memory_.CompleteReservedPage();
         Services_.MakeReadyState(spaceOp, page, readyState, owner);
