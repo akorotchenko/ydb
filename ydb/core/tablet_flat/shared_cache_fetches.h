@@ -12,6 +12,10 @@ namespace NKikimr::NSharedCache {
 
 template <class TTraits>
 class TOperationItemRef;
+template <class TTraits>
+class TSharedCacheTableImpl;
+class TCacheMemory;
+class TCollection;
 
 // Coordinator services until the remaining component owners are extracted
 template <class TTraits>
@@ -26,7 +30,10 @@ public:
     static ui64 PageBytes(const THandle& handle) noexcept;
     // A false result may leave a Ready reference in owner for the caller to release.
     bool TryAcquirePending(TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept;
-    void FinalizeFetch(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch, bool reserved) noexcept;
+    static TCollection* PageCollection(TSpaceOperation& spaceOp, const THandle& page) noexcept;
+    void UnlinkPendingStickyPage(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
+    void AddResidentPageBytes(TCollection& owner, NTable::NPage::EPage type, i64 bytes) noexcept;
+    void MakeReadyState(TSpaceOperation& spaceOp, TCacheItem item, EHandleState state, TCollection* owner) noexcept;
 
 private:
     TSharedCacheImpl<TTraits>& Cache_;
@@ -78,13 +85,19 @@ public:
         TSpaceOperation& SpaceOp_;
     };
 
-    explicit TCacheFetches(TCacheFetchServices<TTraits> services) noexcept
+    TCacheFetches(TCacheFetchServices<TTraits> services, TCacheMemory& memory, TSharedCacheTableImpl<TTraits>& table,
+        const TTraits& traits) noexcept
         : Services_(services)
+        , Memory_(memory)
+        , Table_(table)
+        , Traits_(traits)
     {}
 
     TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
         return { *this, spaceOp };
     }
+
+    static void DeletePendingFetch(THandle& handle) noexcept;
 
 private:
     static bool MatchesPendingFetch(
@@ -97,12 +110,19 @@ private:
     bool Fail(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept;
     void Release(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept;
 
+    void Finish(TOperationItemRef<TTraits>& finalizerRef, TPageFetchState& fetch, bool reserved) noexcept;
+    void FinishFailed(TOperationItemRef<TTraits>& finalizerRef, TPageFetchState& fetch, TPageFetchWaiter* waiters,
+        bool reserved) noexcept;
+
     bool ReserveMemory(TSpaceOperation& spaceOp, TCacheItem item, TPageFetchState& fetch) noexcept;
     bool TryReserveBatch(TSpaceOperation& spaceOp, TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept;
     bool Dispatch(TSpaceOperation& spaceOp, TCacheItem cacheItem, TPageFetchState& fetch) noexcept;
 
 private:
     TCacheFetchServices<TTraits> Services_;
+    TCacheMemory& Memory_;
+    TSharedCacheTableImpl<TTraits>& Table_;
+    const TTraits& Traits_;
 };
 
 } // namespace NKikimr::NSharedCache

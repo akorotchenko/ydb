@@ -624,11 +624,6 @@ private:
     void MakeReadyState(TSpaceOperation& spaceOp, TCacheItem cacheItem, EHandleState readyState = EHandleState::Hot,
         TCollection* pageOwner = nullptr) noexcept;
 
-    void FinishFetch(TOperationItemRef<TTraits>& finalizerRef, TPageFetchState& fetch, bool reserved) noexcept;
-    void FinishFailedFetch(TOperationItemRef<TTraits>& finalizerRef, TPageFetchState& fetch, TPageFetchWaiter* waiters,
-        bool reserved) noexcept;
-    static void DeletePendingFetch(THandle& handle) noexcept;
-
     ESharedCacheResultStatus Find(
         TOperationView& cacheOp, const TSharedCacheKey& key, TSharedCacheItemRefImpl<TTraits>& ref) noexcept;
 
