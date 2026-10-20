@@ -34,7 +34,7 @@ void TSharedCache::RouteCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::WantsKeepCold(TSpaceOperation& spaceOp, const THandle& page) noexcept {
     auto cacheOp = BindOperation(spaceOp);
-    if (TCollection* collection = cacheOp.PageCollection(page)) {
+    if (TCollection* collection = cacheOp.Collections().PageCollection(page)) {
         return collection->CacheMode_.load(std::memory_order_acquire) == ECacheMode::TryKeepInMemory &&
                collection->IsKeepAllowedPage(page.Metadata.Page.Type);
     }
@@ -74,8 +74,8 @@ bool TSharedCache::DemoteKeepCold(
             Memory_.KeepCold().TransferPageTo(Memory_.Cold(), EItemKind::Page);
             Memory_.AddColdItem();
             Memory_.ReleaseKeepColdOwnedBytes(bytes);
-            if (TCollection* owner = cacheOp.PageCollection(handle)) {
-                AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
+            if (TCollection* owner = cacheOp.Collections().PageCollection(handle)) {
+                Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
             }
             cacheOp.ReleaseColdDemotionPin(pin);
             return true;

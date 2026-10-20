@@ -19,7 +19,7 @@ TCollection::~TCollection() {
 void TCollection::SetSkipBTreeIndexV1Shadow(bool skip) {
     auto& cache = TSharedCache::Get();
     auto binding = cache.BindCurrentThreadHazard();
-    cache.SetCollectionSkipBTreeIndexV1Shadow(*this, skip);
+    cache.Collections_.SetSkipBTreeIndexV1Shadow(*this, skip);
 }
 
 void TCollection::DrainStickyPages() {

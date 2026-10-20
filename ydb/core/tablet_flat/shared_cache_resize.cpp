@@ -342,7 +342,7 @@ bool TSharedCache::DemoteUnlinkedStickyPage(TSpaceOperation& spaceOp, ui32 index
         }
         Y_ABORT_UNLESS(page.NextInOwner.load(std::memory_order_acquire) == 0);
 
-        if (TCollection* owner = cacheOp.PageCollection(page)) {
+        if (TCollection* owner = cacheOp.Collections().PageCollection(page)) {
             const THandleState ownerState = THandleState::FromRaw(
                 spaceOp.Handles()[owner->CacheItem.Index()].State.load(std::memory_order_acquire));
             if (ownerState.IsTransitionField()) {

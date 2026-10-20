@@ -1,6 +1,7 @@
 #pragma once
 
 #include "shared_cache_collection.h"
+#include "shared_cache_collections.h"
 #include "shared_cache_fetches.h"
 #include "shared_cache_memory.h"
 #include "shared_cache_table.h"
@@ -766,21 +767,14 @@ private:
         return MatchesCandidateMetadata(spaceOp, candidate.CacheItem, existing);
     }
 
-    static TCollection* PageCollection(TSpaceOperation& spaceOp, const THandle& page) noexcept;
-    static TCollection* PageCollection(TSpaceOperation& spaceOp, TCollectionCacheItem collection) noexcept;
     static void AddReference(TCollection& owner) noexcept;
     void DropPageItemRef(TSpaceOperation& spaceOp, THandle& page) noexcept;
     static bool DropReference(TCollection& owner) noexcept;
-    void AddResidentPageBytes(TCollection& owner, NTable::NPage::EPage type, i64 bytes) noexcept;
-    void AddActivePageBytes(TCollection& owner, NTable::NPage::EPage type, i64 bytes) noexcept;
-    void PublishKeepPageBytes(TCollection& owner) noexcept;
-    void SetCollectionSkipBTreeIndexV1Shadow(TCollection& owner, bool skip) noexcept;
     void DropOwnerReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept;
     static ui64 PayloadBytes(const THandle& handle, EItemKind kind) noexcept;
     static ui64 AccountedPageBytes(ui64 size) noexcept;
     static ui64 PageBytes(const THandle& handle) noexcept;
     static ui64 FractionCeil(ui64 value, double fraction) noexcept;
-    static void SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept;
 
     bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool force = false) noexcept;
     bool ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept;
@@ -861,6 +855,7 @@ private:
     TSharedCacheTableImpl<TTraits> Table_;
     TIntrusivePtr<TCollectionRegistry> CollectionRegistry_ = new TCollectionRegistry;
     TCacheMemory Memory_;
+    TCacheCollections<TTraits> Collections_;
     TCacheFetches<TTraits> Fetches_;
     ui64 ColdByteBudget_ = Max<ui64>(); // Protected by HotResize_; watermark calculation input.
     std::atomic<ui64> KeepColdMaxBytes_{ 0 }; // Configured ceiling; repeated updates preserve pressure shrinkage.
@@ -1200,12 +1195,8 @@ public: // Cache helpers
         return Cache_.MatchesCandidateMetadata(SpaceOp_, candidate, existing);
     }
 
-    Y_FORCE_INLINE TCollection* PageCollection(const THandle& page) noexcept {
-        return Cache_.PageCollection(SpaceOp_, page);
-    }
-
-    Y_FORCE_INLINE TCollection* PageCollection(TCollectionCacheItem collection) noexcept {
-        return Cache_.PageCollection(SpaceOp_, collection);
+    Y_FORCE_INLINE typename TCacheCollections<TTraits>::TOperation Collections() noexcept {
+        return Cache_.Collections_.BindOperation(SpaceOp_);
     }
 
     Y_FORCE_INLINE void DropPageItemRef(THandle& page) noexcept {
