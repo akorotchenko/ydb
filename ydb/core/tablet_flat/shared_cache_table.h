@@ -278,11 +278,11 @@ private: // Table helpers
 
     TSharedCacheItemRefImpl<TTraits> TryAcquireTombstone(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
-    void HelpTombstone(TCacheItem cacheItem, const TSharedCacheKey& routeKey, TSpaceOperation& spaceOp) noexcept;
+    void TryFinishErase(TCacheItem cacheItem, const TSharedCacheKey& routeKey, TSpaceOperation& spaceOp) noexcept;
 
     TCacheItem FreezeNext(const TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
-    bool BridgeTombstone(TCacheItem cacheItem, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept;
+    bool UnlinkTombstone(TCacheItem cacheItem, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept;
 
     template <ETombstoneMode Mode>
     bool FindLinkOnBucket(TSpaceOperation& spaceOp, const TSharedCacheKey& key, ui32 hash, ui32 bucket,
