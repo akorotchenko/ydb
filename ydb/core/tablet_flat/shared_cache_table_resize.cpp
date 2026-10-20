@@ -295,6 +295,7 @@ bool TSharedCacheTable::CloseBucketSplit(TSpaceOperation& spaceOp) noexcept {
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCacheTable::RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept {
+    auto cacheOp = Cache_.BindOperation(spaceOp);
     const TBucketResizeState resize = Space_.BucketResizeState();
     if (!resize || (resize.Direction() == EBucketResize::Shrinking && resize.Phase() != EBucketResizePhase::Closed) ||
         (resize.Direction() == EBucketResize::Growing && resize.Phase() != EBucketResizePhase::CursorPublished) ||
@@ -360,7 +361,7 @@ bool TSharedCacheTable::RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept {
         }
     }
     Cache_.InvokeHook(ESharedCacheHookPoint::AfterBucketSplitRemoved, markerIdentity);
-    Cache_.Release(spaceOp, markerIdentity);
+    cacheOp.Release(markerIdentity);
     const ui32 pairCount = resize.PairCount();
     if (resize.Cursor() < pairCount) {
         return Space_.PrepareNextBucketResizePair();
