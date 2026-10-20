@@ -188,7 +188,7 @@ TCacheItem TSharedCache::PreparePageReplacement(TSpaceOperation& spaceOp, TCache
     // Relocation transfers the source's sticky charge; claiming a second budget slot would double count it.
     cacheOp.InitializePage(replacementItem, collection, offset, size, type, crc32, EStickyState::None, true, true);
     THandle& replacement = spaceOp.Handles()[replacementItem.Index()];
-    DeletePendingFetch(replacement);
+    TCacheFetches<TTraits>::DeletePendingFetch(replacement);
     new (&replacement.Body.PageBuffer) NActors::TSharedData::TBuffer(std::move(data).Extract());
     const THandleState initialized = THandleState::FromRaw(replacement.State.load(std::memory_order_relaxed));
     Y_DEBUG_ABORT_UNLESS(replacementItem.Matches(initialized) && initialized.IsBegin() && initialized.Refs() == 0);
