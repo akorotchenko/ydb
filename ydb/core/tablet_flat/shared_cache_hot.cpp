@@ -89,7 +89,7 @@ Y_FORCE_INLINE void TSharedCache::CompleteHotEviction(TSpaceOperation& spaceOp, 
         TransferEstimatedBytes(HotBytes_, KeepColdBytes_, bytes);
         TransferEstimatedPages(HotPages_, KeepColdPages_, coldState.Kind());
     } else {
-        SubtractExactBytes(RetainedBytes_, bytes);
+        Memory_.ReleaseRetainedBytes(bytes);
         TransferEstimatedBytes(HotBytes_, ColdBytes_, bytes);
         TransferEstimatedPages(HotPages_, ColdPages_, coldState.Kind());
         ColdItems_.fetch_add(1, std::memory_order_relaxed);
@@ -159,7 +159,7 @@ void TSharedCache::ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheI
                 const ui64 bytes = PayloadBytes(handle, state.Kind());
                 const bool keep = state.IsPageKind() && state.Refs() == 1 && cacheOp.WantsKeepCold(handle);
                 if (keep) {
-                    AddKeepColdOwnedBytes(bytes);
+                    Memory_.AddKeepColdOwnedBytes(bytes);
                 }
                 const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
                 const THandleState cold = state.WithState(keep ? EHandleState::KeepCold : EHandleState::Cold);
@@ -171,7 +171,7 @@ void TSharedCache::ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheI
                 }
 
                 if (keep) {
-                    SubtractExactBytes(KeepColdOwnedBytes_, bytes);
+                    Memory_.ReleaseKeepColdOwnedBytes(bytes);
                 }
 
                 level = EHotLevel::L0;
@@ -221,7 +221,7 @@ bool TSharedCache::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) 
         const ui64 bytes = PayloadBytes(handle, expected.Kind());
         const bool keep = expected.IsPageKind() && expected.Refs() == 1 && cacheOp.WantsKeepCold(handle);
         if (keep) {
-            AddKeepColdOwnedBytes(bytes);
+            Memory_.AddKeepColdOwnedBytes(bytes);
         }
         const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
         const THandleState desired =
@@ -233,7 +233,7 @@ bool TSharedCache::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) 
             return true;
         }
         if (keep) {
-            SubtractExactBytes(KeepColdOwnedBytes_, bytes);
+            Memory_.ReleaseKeepColdOwnedBytes(bytes);
         }
     }
 }
@@ -254,8 +254,8 @@ bool TSharedCache::PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, b
         const bool protectedPage =
             force || !owner || owner->CacheMode_.load(std::memory_order_acquire) != ECacheMode::Regular;
         if (protectedPage) {
-            RetainedBytes_.fetch_add(bytes, std::memory_order_relaxed);
-        } else if (!TryAddRetainedBytes(bytes)) {
+            Memory_.AddRetainedBytes(bytes);
+        } else if (!Memory_.TryAddRetainedBytes(bytes)) {
             return false;
         }
         HotBytes_.fetch_add(bytes, std::memory_order_relaxed);
@@ -274,7 +274,7 @@ bool TSharedCache::PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, b
         }
         HotBytes_.fetch_sub(bytes, std::memory_order_relaxed);
         SubtractEstimatedPages(HotPages_, EItemKind::Page);
-        SubtractExactBytes(RetainedBytes_, bytes);
+        Memory_.ReleaseRetainedBytes(bytes);
     }
 }
 

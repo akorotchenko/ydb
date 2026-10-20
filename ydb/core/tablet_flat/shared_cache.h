@@ -466,7 +466,7 @@ public:
     }
 
     ui64 RetainedBytes() const noexcept {
-        return RetainedBytes_.load(std::memory_order_relaxed);
+        return Memory_.RetainedBytes();
     }
 
     ui64 ReservedBytes() const noexcept {
@@ -495,11 +495,11 @@ public:
     }
 
     ui64 KeepColdOwnedBytes() const noexcept {
-        return KeepColdOwnedBytes_.load(std::memory_order_relaxed);
+        return Memory_.KeepColdOwnedBytes();
     }
 
     ui64 StickyOwnedBytes() const noexcept {
-        return StickyOwnedBytes_.load(std::memory_order_relaxed);
+        return Memory_.StickyOwnedBytes();
     }
 
     ui64 StaticBytes() const noexcept {
@@ -863,19 +863,8 @@ private:
     static void SubtractEstimatedPages(std::atomic<i64>& counter, EItemKind kind) noexcept;
     static void SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept;
 
-    // Sticky ownership counts page payloads; collection records contribute only to the resident-state estimates.
-    void SubStickyOwnedBytes(EItemKind kind, ui64 bytes) noexcept {
-        if (kind == EItemKind::Page) {
-            SubtractExactBytes(StickyOwnedBytes_, bytes);
-        }
-    }
-
-    void AddStickyOwnedBytes(ui64 bytes) noexcept;
-    bool TryAddRetainedBytes(ui64 bytes) noexcept;
     bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool force = false) noexcept;
     bool ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept;
-
-    void AddKeepColdOwnedBytes(ui64 bytes) noexcept;
 
     bool TrimKeepCold(TSpaceOperation& spaceOp) noexcept;
     bool ShrinkKeepCold(TSpaceOperation& spaceOp) noexcept;
@@ -973,11 +962,8 @@ private:
     std::atomic<i64> StickyPages_{ 0 };
     std::atomic<ui64> Collections_{ 0 };
     std::atomic<ui64> CollectionBytes_{ 0 };
-    std::atomic<ui64> RetainedBytes_{ 0 };
-    std::atomic<ui64> StickyOwnedBytes_{ 0 };
     std::atomic<ui64> KeepColdMaxBytes_{ 0 }; // Configured ceiling; repeated updates preserve pressure shrinkage.
     std::atomic<ui64> KeepColdLimit_{ 0 }; // Effective budget, resized according to Cold+Free headroom.
-    std::atomic<ui64> KeepColdOwnedBytes_{ 0 };
     std::atomic<ui64> KeepColdTrimScanRemaining_{ 0 };
     std::atomic<ui64> KeepModeSweepRemaining_{ 0 };
     std::atomic<ui64> ResourceGeneration_{ 0 };

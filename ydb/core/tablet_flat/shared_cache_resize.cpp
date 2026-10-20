@@ -362,7 +362,7 @@ bool TSharedCache::DemoteUnlinkedStickyPage(TSpaceOperation& spaceOp, ui32 index
             const ui64 bytes = PageBytes(page);
             TransferEstimatedBytes(StickyBytes_, HotBytes_, bytes);
             TransferEstimatedPages(StickyPages_, HotPages_, EItemKind::Page);
-            SubStickyOwnedBytes(EItemKind::Page, bytes);
+            Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, bytes);
             cacheOp.RouteHot(EHotLevel::L1, pageItem);
             return true;
         }
