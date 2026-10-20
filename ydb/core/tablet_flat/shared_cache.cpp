@@ -267,7 +267,7 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     , Space_(std::move(space))
     , Table_(*Space_, *this)
     , Memory_(Space_->CurrentConfiguration().StaticBytes, hardLimit, Space_->ReservedConfiguration().Limit)
-    , Fetches_(TCacheFetchServices<TTraits>(*this))
+    , Fetches_(TCacheFetchServices<TTraits>(*this), Memory_, Table_, static_cast<const TTraits&>(*this))
     , TargetHandleCount_(Space_->CurrentConfiguration().HandleCount())
     , HardTarget_(Space_->CurrentConfiguration())
 {
@@ -501,7 +501,7 @@ TSharedCache::~TSharedCacheImpl() {
             if (TPageFetchState* fetch = handle.Body.Fetch) {
                 fetch->AbandonWaiters();
             }
-            DeletePendingFetch(handle);
+            TCacheFetches<TTraits>::DeletePendingFetch(handle);
         } else if (state.IsReady() || state.IsTombstone()) {
             DeletePayload(handle, state.Kind(), state.State());
         }
@@ -519,13 +519,6 @@ SHARED_CACHE_TEMPLATE
 void TSharedCache::DeleteReplacedPage(THandle& handle) noexcept {
     Y_DEBUG_ABORT_UNLESS(handle.Body.PageBuffer);
     handle.Body.PageBuffer.~TBuffer();
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::DeletePendingFetch(THandle& handle) noexcept {
-    if (TPageFetchState* fetch = std::exchange(handle.Body.Fetch, nullptr)) {
-        fetch->UnRef();
-    }
 }
 
 SHARED_CACHE_TEMPLATE
@@ -903,7 +896,7 @@ void TSharedCache::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem cacheIt
             if (state.IsStickyField()) {
                 Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, PageBytes(handle));
             }
-            DeletePendingFetch(handle);
+            TCacheFetches<TTraits>::DeletePendingFetch(handle);
         }
         if (reserved) {
             ReleaseReservation(reservedBytes, page ? 1 : 0);
@@ -1267,80 +1260,6 @@ bool TSharedCache::WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheIte
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCache::FinishFailedFetch(
-    TOperationItemRef& finalizerRef, TPageFetchState& fetch, TPageFetchWaiter* waiters, bool reserved) noexcept {
-    TSpaceOperation& spaceOp = finalizerRef.SpaceOperation();
-    auto cacheOp = BindOperation(spaceOp);
-    const TCacheItem cacheItem = finalizerRef.CacheItem();
-    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    THandleState completing = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
-    Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(completing) && completing.IsCompleting() && completing.Refs() == 1 &&
-                         handle.Body.Fetch == &fetch);
-    if (completing.IsStickyField()) {
-        cacheOp.UnlinkPendingStickyPage(cacheItem);
-        completing = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    }
-    DeletePendingFetch(handle);
-    new (&handle.Body.PageBuffer) NActors::TSharedData::TBuffer();
-    if (reserved) {
-        ReleaseReservation(PageBytes(handle), 1);
-    }
-    const bool begun = cacheOp.TryBeginErase(finalizerRef.Get(), completing);
-    Y_DEBUG_ABORT_UNLESS(begun);
-    InvokeHook(ESharedCacheHookPoint::AfterTombstoneOwnerClaim, cacheItem);
-    const TSharedCacheKey key = LoadSharedCacheKey(handle, EItemKind::Page);
-    cacheOp.FinishErase(cacheItem, key);
-    TPageFetchState::DrainWaiters(waiters, [cacheItem](TIntrusivePtr<TPageFetchWaiter> waiter) {
-        waiter->Complete(TPageCacheItem::FromValidated(cacheItem), EPageFetchCompletion::Failed);
-    });
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::FinishFetch(TOperationItemRef& finalizerRef, TPageFetchState& fetch, bool reserved) noexcept {
-    TSpaceOperation& spaceOp = finalizerRef.SpaceOperation();
-    auto cacheOp = BindOperation(spaceOp);
-    const TCacheItem page = finalizerRef.CacheItem();
-    THandle& handle = spaceOp.Handles()[page.Index()];
-    const THandleState completing = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
-    Y_DEBUG_ABORT_UNLESS(
-        page.Matches(completing) && completing.IsCompleting() && completing.Refs() == 1 && handle.Body.Fetch == &fetch);
-    TPageFetchWaiter* waiters = fetch.DetachWaiters();
-    Y_DEBUG_ABORT_UNLESS(waiters != TPageFetchState::Sealed);
-    if (fetch.Completion() == EPageFetchCompletion::Failed) {
-        FinishFailedFetch(finalizerRef, fetch, waiters, reserved);
-        return;
-    }
-
-    Y_DEBUG_ABORT_UNLESS(reserved && fetch.Completion() == EPageFetchCompletion::Ready);
-    {
-        InvokeHook(ESharedCacheHookPoint::BeforePageReadyState, page);
-        NActors::TSharedData data = fetch.TakeData();
-        DeletePendingFetch(handle);
-        new (&handle.Body.PageBuffer) NActors::TSharedData::TBuffer(std::move(data).Extract());
-        const ui64 bytes = PageBytes(handle);
-        EHandleState readyState = EHandleState::Hot;
-        TCollection* owner = cacheOp.PageCollection(handle);
-        const bool regular = owner && owner->CacheMode_.load(std::memory_order_acquire) == ECacheMode::Regular &&
-                             !THandleState::FromRaw(handle.State.load(std::memory_order_acquire)).IsStickyField();
-        if (regular) {
-            if (!Memory_.TryAddRetainedBytes(bytes)) {
-                readyState = EHandleState::Cold;
-            }
-        } else {
-            Memory_.AddRetainedBytes(bytes);
-        }
-        if (owner) {
-            AddResidentPageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
-        }
-        Memory_.CompleteReservedPage();
-        cacheOp.MakeReadyState(page, readyState, owner);
-    }
-    TPageFetchState::DrainWaiters(waiters, [page](TIntrusivePtr<TPageFetchWaiter> waiter) {
-        waiter->Complete(TPageCacheItem::FromValidated(page), EPageFetchCompletion::Ready);
-    });
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* registry, TCacheItem cacheItem,
     THolder<TCollection>&& value) noexcept {
     auto cacheOp = BindOperation(spaceOp);
@@ -1588,7 +1507,7 @@ void TSharedCache::DiscardCandidate(
     if (expected.IsReady()) {
         DeletePayload(handle, expected.Kind(), expected.State(), owner);
     } else if (expected.IsPageKind() && expected.IsPending()) {
-        DeletePendingFetch(handle);
+        TCacheFetches<TTraits>::DeletePendingFetch(handle);
     }
     if (owner) {
         cacheOp.DropOwnerReference(*owner);
