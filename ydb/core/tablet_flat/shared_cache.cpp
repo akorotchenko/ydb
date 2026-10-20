@@ -206,7 +206,7 @@ bool TPageFetch::TryReserveMemory() noexcept {
     TSharedCache& cache = TSharedCache::Get();
     auto binding = cache.BindCurrentThreadHazard();
     auto cacheOp = cache.BeginOperation();
-    return cacheOp.ReserveFetchMemory(FetchState_->Page().CacheItem(), *FetchState_);
+    return cacheOp.Fetches().ReserveMemory(FetchState_->Page().CacheItem(), *FetchState_);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -217,7 +217,7 @@ bool TPageFetch::Dispatch() noexcept {
     TSharedCache& cache = TSharedCache::Get();
     auto binding = cache.BindCurrentThreadHazard();
     auto cacheOp = cache.BeginOperation();
-    return cacheOp.DispatchFetch(FetchState_->Page().CacheItem(), *FetchState_);
+    return cacheOp.Fetches().Dispatch(FetchState_->Page().CacheItem(), *FetchState_);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -267,6 +267,7 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     , Space_(std::move(space))
     , Table_(*Space_, *this)
     , Memory_(Space_->CurrentConfiguration().StaticBytes, hardLimit, Space_->ReservedConfiguration().Limit)
+    , Fetches_(TCacheFetchServices<TTraits>(*this))
     , TargetHandleCount_(Space_->CurrentConfiguration().HandleCount())
     , HardTarget_(Space_->CurrentConfiguration())
 {
@@ -1154,13 +1155,6 @@ bool TSharedCache::AcknowledgeCollectionBytes(TCollectionCacheItem collection) n
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::MatchesPendingFetch(
-    const THandle& handle, THandleState state, TCacheItem cacheItem, const TPageFetchState& fetch) noexcept {
-    return cacheItem.Matches(state) && state.IsPageKind() && state.IsPending() && handle.Body.Fetch == &fetch &&
-           fetch.Page().CacheItem() == cacheItem;
-}
-
-SHARED_CACHE_TEMPLATE
 THandle* TSharedCache::TryGetPendingFetchHandle(TOperationItemRef& owner, TPageFetchState& fetch) noexcept {
     Y_DEBUG_ABORT_UNLESS(owner);
     TSpaceOperation& spaceOp = owner.SpaceOperation();
@@ -1168,7 +1162,8 @@ THandle* TSharedCache::TryGetPendingFetchHandle(TOperationItemRef& owner, TPageF
     Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AccessibleHandleCount());
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    if (!MatchesPendingFetch(handle, state, cacheItem, fetch) || fetch.Completion() != EPageFetchCompletion::Pending)
+    if (!TCacheFetches<TTraits>::MatchesPendingFetch(handle, state, cacheItem, fetch) ||
+        fetch.Completion() != EPageFetchCompletion::Pending)
     {
         return nullptr;
     }
@@ -1191,70 +1186,9 @@ bool TSharedCache::CompleteFetch(
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::ReserveFetchMemory(TSpaceOperation& spaceOp, TCacheItem item, TPageFetchState& fetch) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    THandle& handle = spaceOp.Handles()[item.Index()];
-    ui64 raw = handle.State.load(std::memory_order_acquire);
-    THandleState state = THandleState::FromRaw(raw);
-    if (!MatchesPendingFetch(handle, state, item, fetch)) {
-        return false;
-    }
-    if (!state.IsWaitingForMemory()) {
-        return true;
-    }
-    const ui64 bytes = PageBytes(handle);
-    if (!cacheOp.TryReserve(bytes, 1)) {
-        return false;
-    }
-    // Only the move-only fetch owner reserves memory. Subscribers may change refs/Sticky concurrently.
-    for (;;) {
-        state = THandleState::FromRaw(raw);
-        if (!MatchesPendingFetch(handle, state, item, fetch) || !state.IsWaitingForMemory()) {
-            ReleaseReservation(bytes, 1);
-            return false;
-        }
-        if (handle.State.compare_exchange_weak(raw, state.WithState(EHandleState::Begin).Raw(),
-                std::memory_order_release, std::memory_order_relaxed)) {
-            return true;
-        }
-    }
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::TryReserveFetchBatch(TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept {
     auto cacheOp = BeginOperation();
-    TVector<TPageFetchState*> waiting;
-    ui64 bytes = 0;
-    for (auto& page : pages) {
-        TPageFetchState& fetch = *page.FetchState_;
-        const TCacheItem item = fetch.Page().CacheItem();
-        THandle& handle = cacheOp.Handles()[item.Index()];
-        const auto state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-        Y_ABORT_UNLESS(MatchesPendingFetch(handle, state, item, fetch));
-        if (state.IsWaitingForMemory()) {
-            bytes += PageBytes(handle);
-            waiting.push_back(&fetch);
-        }
-    }
-    // Reserve the missing batch as a whole; two non-transactional requests must not each
-    // hold a partial batch while waiting for the other one's bytes.
-    if (!cacheOp.TryReserve(bytes, waiting.size())) {
-        return false;
-    }
-    for (auto* fetch : waiting) {
-        const TCacheItem item = fetch->Page().CacheItem();
-        THandle& handle = cacheOp.Handles()[item.Index()];
-        ui64 raw = handle.State.load(std::memory_order_relaxed);
-        for (;;) {
-            const auto state = THandleState::FromRaw(raw);
-            Y_ABORT_UNLESS(MatchesPendingFetch(handle, state, item, *fetch) && state.IsWaitingForMemory());
-            if (handle.State.compare_exchange_weak(raw, state.WithState(EHandleState::Begin).Raw(),
-                    std::memory_order_release, std::memory_order_relaxed)) {
-                break;
-            }
-        }
-    }
-    return true;
+    return cacheOp.Fetches().TryReserveBatch(pages);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -1376,32 +1310,6 @@ bool TSharedCache::WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheIte
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::DispatchFetch(TSpaceOperation& spaceOp, TCacheItem cacheItem, TPageFetchState& fetch) noexcept {
-    Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
-    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        if (!MatchesPendingFetch(handle, expected, cacheItem, fetch)) {
-            return false;
-        }
-        if (expected.IsRequested() || expected.IsQueuedRequested()) {
-            return true;
-        }
-        if (!expected.IsBegin() && !expected.IsQueued()) {
-            return false;
-        }
-        const EHandleState requested = expected.IsQueued() ? EHandleState::QueuedRequested : EHandleState::Requested;
-        const THandleState desired = expected.WithState(requested);
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
-        {
-            return true;
-        }
-    }
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::FailFetch(TOperationItemRef& owner, TPageFetchState& fetch) noexcept {
     if (!TryGetPendingFetchHandle(owner, fetch)) {
         return false;
@@ -1494,7 +1402,8 @@ void TSharedCache::ReleaseFetchRef(TOperationItemRef& owner, TPageFetchState& fe
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
     for (;;) {
         const THandleState expected = THandleState::FromRaw(expectedRaw);
-        Y_DEBUG_ABORT_UNLESS(MatchesPendingFetch(handle, expected, cacheItem, fetch) && expected.Refs() > 0);
+        Y_DEBUG_ABORT_UNLESS(
+            TCacheFetches<TTraits>::MatchesPendingFetch(handle, expected, cacheItem, fetch) && expected.Refs() > 0);
         const bool finish = expected.Refs() == 1 && fetch.Completion() != EPageFetchCompletion::Pending;
         const THandleState desired =
             finish ? expected.WithState(EHandleState::Completing).WithFrequency(0) : expected.DecrementRefs();

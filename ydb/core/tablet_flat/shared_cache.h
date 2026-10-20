@@ -1,6 +1,7 @@
 #pragma once
 
 #include "shared_cache_collection.h"
+#include "shared_cache_fetches.h"
 #include "shared_cache_memory.h"
 #include "shared_cache_table.h"
 
@@ -139,6 +140,7 @@ public:
 
 private:
     friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheFetches<TTraits>;
 
     explicit TPageFetchImpl(TPageFetchState* fetch) noexcept;
 
@@ -528,6 +530,7 @@ private:
     friend class TSharedPageRefImpl<TTraits>;
     friend class TSharedCacheCollectionRefImpl<TTraits>;
     friend class TPageFetchImpl<TTraits>;
+    friend class TCacheFetchServices<TTraits>;
     friend class TRequestPageWaiter;
     friend class TCompactedPageWaiter;
     friend struct TEvSaveCompactedPages;
@@ -611,13 +614,9 @@ private:
 
     TIntrusivePtr<TPageFetchState> TryAcquirePageFetch(
         TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept;
-    static bool MatchesPendingFetch(
-        const THandle& handle, THandleState state, TCacheItem cacheItem, const TPageFetchState& fetch) noexcept;
     THandle* TryGetPendingFetchHandle(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept;
 
     bool CompleteFetch(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch, NActors::TSharedData&& data) noexcept;
-
-    bool DispatchFetch(TSpaceOperation& spaceOp, TCacheItem cacheItem, TPageFetchState& fetch) noexcept;
 
     bool FailFetch(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept;
 
@@ -696,7 +695,6 @@ private:
     bool AdvanceBucketResize() noexcept;
 
     bool TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages = 0) noexcept;
-    bool ReserveFetchMemory(TSpaceOperation& spaceOp, TCacheItem item, TPageFetchState& fetch) noexcept;
     void NotifyResourcesAvailable() noexcept;
     void ReleaseReservation(ui64 bytes, ui64 pages = 0) noexcept;
 
@@ -910,6 +908,7 @@ private:
     TSharedCacheTableImpl<TTraits> Table_;
     TIntrusivePtr<TCollectionRegistry> CollectionRegistry_ = new TCollectionRegistry;
     TCacheMemory Memory_;
+    TCacheFetches<TTraits> Fetches_;
     ui64 ColdByteBudget_ = Max<ui64>(); // Protected by HotResize_; watermark calculation input.
     std::atomic<ui64> KeepColdMaxBytes_{ 0 }; // Configured ceiling; repeated updates preserve pressure shrinkage.
     std::atomic<ui64> KeepColdLimit_{ 0 }; // Effective budget, resized according to Cold+Free headroom.
@@ -988,12 +987,8 @@ public: // Cache helpers
         Cache_.Release(SpaceOp_, item);
     }
 
-    Y_FORCE_INLINE bool ReserveFetchMemory(TCacheItem item, TPageFetchState& fetch) noexcept {
-        return Cache_.ReserveFetchMemory(SpaceOp_, item, fetch);
-    }
-
-    Y_FORCE_INLINE bool DispatchFetch(TCacheItem item, TPageFetchState& fetch) noexcept {
-        return Cache_.DispatchFetch(SpaceOp_, item, fetch);
+    Y_FORCE_INLINE typename TCacheFetches<TTraits>::TOperation Fetches() noexcept {
+        return Cache_.Fetches_.BindOperation(SpaceOp_);
     }
 
     Y_FORCE_INLINE void DrainStickyPages(TCollection& collection) noexcept {
