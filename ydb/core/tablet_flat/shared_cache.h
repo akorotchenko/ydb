@@ -1,6 +1,7 @@
 #pragma once
 
 #include "shared_cache_collection.h"
+#include "shared_cache_memory.h"
 #include "shared_cache_table.h"
 
 #include <util/generic/function_ref.h>
@@ -393,7 +394,7 @@ public:
     }
 
     ui64 ResidentBytes() const noexcept {
-        return ResidentBytes_.load(std::memory_order_relaxed);
+        return Memory_.ResidentBytes();
     }
 
     ui64 HotBytes() const noexcept {
@@ -457,11 +458,11 @@ public:
     }
 
     ui64 OverallUsage() const noexcept {
-        return OverallUsage_.load(std::memory_order_relaxed);
+        return Memory_.OverallUsage();
     }
 
     ui64 PayloadUsage() const noexcept {
-        return PageUsage_.load(std::memory_order_relaxed);
+        return Memory_.PayloadUsage();
     }
 
     ui64 RetainedBytes() const noexcept {
@@ -469,13 +470,13 @@ public:
     }
 
     ui64 ReservedBytes() const noexcept {
-        return ReservedBytes_.load(std::memory_order_relaxed);
+        return Memory_.ReservedBytes();
     }
 
     // Admitted pages whose payload has not arrived yet, i.e. the pages currently being loaded. The actor publishes
     // them as the LoadInFlyPages/LoadInFlyBytes counters.
     ui64 ReservedPages() const noexcept {
-        return ReservedPages_.load(std::memory_order_relaxed);
+        return Memory_.ReservedPages();
     }
 
     bool UpdateKeepColdLimit(ui64 limit) noexcept;
@@ -502,11 +503,11 @@ public:
     }
 
     ui64 StaticBytes() const noexcept {
-        return StaticBytes_.load(std::memory_order_relaxed);
+        return Memory_.StaticBytes();
     }
 
     ui64 StaticDeltaBytes() const noexcept {
-        return StaticDeltaBytes_.load(std::memory_order_relaxed);
+        return Memory_.StaticDeltaBytes();
     }
 
     struct TStats {
@@ -721,7 +722,6 @@ private:
     bool AdvanceBucketResize() noexcept;
 
     bool TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages = 0) noexcept;
-    void AccountWrittenMemory(ui64 bytes, ui64 pages) noexcept;
     bool ReserveFetchMemory(TSpaceOperation& spaceOp, TCacheItem item, TPageFetchState& fetch) noexcept;
     void NotifyResourcesAvailable() noexcept;
     void ReleaseReservation(ui64 bytes, ui64 pages = 0) noexcept;
@@ -955,7 +955,7 @@ private:
     THolder<TSharedCacheSpace> Space_;
     TSharedCacheTableImpl<TTraits> Table_;
     TIntrusivePtr<TCollectionRegistry> CollectionRegistry_ = new TCollectionRegistry;
-    std::atomic<ui64> ResidentBytes_{ 0 };
+    TCacheMemory Memory_;
     std::atomic<i64> HotBytes_{ 0 };
     std::atomic<i64> ColdBytes_{ 0 }; // All Cold storage, including held and retiring payloads
     std::atomic<i64> ColdReclaimableBytes_{ 0 }; // Unreferenced ordinary Cold payloads
@@ -974,13 +974,7 @@ private:
     std::atomic<i64> StickyPages_{ 0 };
     std::atomic<ui64> Collections_{ 0 };
     std::atomic<ui64> CollectionBytes_{ 0 };
-    std::atomic<ui64> StaticBytes_{ 0 };
-    std::atomic<ui64> StaticDeltaBytes_{ 0 };
-    std::atomic<ui64> OverallUsage_{ 0 };
-    std::atomic<ui64> PageUsage_{ 0 };
     std::atomic<ui64> RetainedBytes_{ 0 };
-    std::atomic<ui64> ReservedBytes_{ 0 };
-    std::atomic<ui64> ReservedPages_{ 0 };
     std::atomic<ui64> StickyOwnedBytes_{ 0 };
     std::atomic<ui64> KeepColdMaxBytes_{ 0 }; // Configured ceiling; repeated updates preserve pressure shrinkage.
     std::atomic<ui64> KeepColdLimit_{ 0 }; // Effective budget, resized according to Cold+Free headroom.

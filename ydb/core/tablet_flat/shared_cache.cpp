@@ -266,8 +266,7 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     : TTraits(std::move(traits))
     , Space_(std::move(space))
     , Table_(*Space_, *this)
-    , StaticBytes_(Space_->CurrentConfiguration().StaticBytes)
-    , OverallUsage_(Space_->CurrentConfiguration().StaticBytes)
+    , Memory_(Space_->CurrentConfiguration().StaticBytes)
     , CurrentLimit_(hardLimit)
     , HardLimit_(hardLimit)
     , TargetHandleCount_(Space_->CurrentConfiguration().HandleCount())
@@ -571,13 +570,12 @@ void TSharedCache::DeletePayload(THandle& handle, EItemKind kind, EHandleState s
             SubtractEstimatedPages(ColdPages_, kind);
             ColdItems_.fetch_sub(1, std::memory_order_relaxed);
         }
-        SubtractExactBytes(ResidentBytes_, bytes);
+        Memory_.RemoveResident(bytes);
         if (state == EHandleState::Hot || state == EHandleState::Sticky || state == EHandleState::KeepCold) {
             SubtractExactBytes(RetainedBytes_, bytes);
         }
-        SubtractExactBytes(OverallUsage_, bytes);
+        Memory_.ReleasePayloadCharge(bytes, kind);
         if (kind == EItemKind::Page) {
-            SubtractExactBytes(PageUsage_, bytes);
             NotifyResourcesAvailable();
         }
     }
@@ -1549,7 +1547,7 @@ void TSharedCache::FinishFetch(TOperationItemRef& finalizerRef, TPageFetchState&
         if (owner) {
             AddResidentPageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
         }
-        SubtractExactBytes(ReservedPages_, 1);
+        Memory_.CompleteReservedPage();
         cacheOp.MakeReadyState(page, readyState, owner);
     }
     TPageFetchState::DrainWaiters(waiters, [page](TIntrusivePtr<TPageFetchWaiter> waiter) {
@@ -1639,7 +1637,7 @@ void TSharedCache::MakeReadyState(
         SubtractExactBytes(RetainedBytes_, bytes);
         readyState = EHandleState::Cold;
     }
-    ResidentBytes_.fetch_add(bytes, std::memory_order_relaxed);
+    Memory_.AddResident(bytes);
     if (readyState == EHandleState::Cold) {
         ColdBytes_.fetch_add(estimatedBytes, std::memory_order_relaxed);
         AddEstimatedPages(ColdPages_, initial.Kind());
@@ -1654,7 +1652,7 @@ void TSharedCache::MakeReadyState(
     if (pageOwner && readyState != EHandleState::Cold) {
         AddActivePageBytes(*pageOwner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
     }
-    SubtractExactBytes(ReservedBytes_, bytes);
+    Memory_.CompleteReservedBytes(bytes);
     InvokeHook(ESharedCacheHookPoint::BeforeReadyStatePublication, cacheItem);
 
     for (;;) {
@@ -2941,7 +2939,7 @@ bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandida
     bool reserved = true;
     TCacheItem cacheItem;
     if (candidate.Admission == EPageAdmission::Written) {
-        AccountWrittenMemory(reservedBytes, 1);
+        Memory_.AccountWritten(reservedBytes, 1);
         cacheItem = cacheOp.Allocate();
         if (cacheItem.IsNull()) {
             ReleaseReservation(reservedBytes, 1);
@@ -3129,7 +3127,7 @@ bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& coll
     }
     bool reserved = true;
     if (admission == EPageAdmission::Written) {
-        AccountWrittenMemory(reservedBytes, preparedPages);
+        Memory_.AccountWritten(reservedBytes, preparedPages);
     } else {
         reserved = cacheOp.TryReserve(reservedBytes, preparedPages);
     }
@@ -3593,7 +3591,7 @@ bool TSharedCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) 
         return true;
     }
 
-    ui64 usage = PageUsage_.load(std::memory_order_relaxed);
+    ui64 usage = Memory_.PayloadUsage();
     ui32 reclamationAttempts = 0;
     for (;;) {
         const ui64 currentLimit = CurrentLimit_.load(std::memory_order_relaxed);
@@ -3602,40 +3600,20 @@ bool TSharedCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) 
             // Aging/resizing can make progress without freeing bytes. Bound cooperative work so
             // concurrent activity cannot keep a requester here instead of putting it on the wait path.
             if (reclamationAttempts++ < SharedCacheTransitionWorkBatch && cacheOp.Reclaim(bytes)) {
-                usage = PageUsage_.load(std::memory_order_relaxed);
+                usage = Memory_.PayloadUsage();
                 continue;
             }
             return false;
         }
-        if (PageUsage_.compare_exchange_weak(
-                usage, usage + bytes, std::memory_order_relaxed, std::memory_order_relaxed))
-        {
-            OverallUsage_.fetch_add(bytes, std::memory_order_relaxed);
-            ReservedBytes_.fetch_add(bytes, std::memory_order_relaxed);
-            ReservedPages_.fetch_add(pages, std::memory_order_relaxed);
+        if (Memory_.TryReserve(usage, bytes, pages)) {
             return true;
         }
     }
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCache::AccountWrittenMemory(ui64 bytes, ui64 pages) noexcept {
-    if (bytes == 0 && pages == 0) {
-        return;
-    }
-    // The writer already owns these buffers; transfer their charge before publishing native page items.
-    PageUsage_.fetch_add(bytes, std::memory_order_relaxed);
-    OverallUsage_.fetch_add(bytes, std::memory_order_relaxed);
-    ReservedBytes_.fetch_add(bytes, std::memory_order_relaxed);
-    ReservedPages_.fetch_add(pages, std::memory_order_relaxed);
-}
-
-SHARED_CACHE_TEMPLATE
 void TSharedCache::ReleaseReservation(ui64 bytes, ui64 pages) noexcept {
-    SubtractExactBytes(ReservedBytes_, bytes);
-    SubtractExactBytes(ReservedPages_, pages);
-    SubtractExactBytes(OverallUsage_, bytes);
-    SubtractExactBytes(PageUsage_, bytes);
+    Memory_.ReleaseReservation(bytes, pages);
     NotifyResourcesAvailable();
 }
 
