@@ -510,36 +510,10 @@ public:
         return Memory_.StaticDeltaBytes();
     }
 
-    struct TStats {
-        ui64 RequestedPages = 0;
-        ui64 RequestedBytes = 0;
-        ui64 HitPages = 0;
-        ui64 HitBytes = 0;
-        ui64 MissPages = 0;
-        ui64 MissBytes = 0;
-
-        void AddAdmission(ESharedCacheResultStatus status, ui64 bytes) noexcept {
-            ++RequestedPages;
-            RequestedBytes += bytes;
-            if (status == ESharedCacheResultStatus::Hit) {
-                ++HitPages;
-                HitBytes += bytes;
-                return;
-            }
-            ++MissPages;
-            MissBytes += bytes;
-        }
-    };
+    using TStats = TCacheMemory::TStats;
 
     TStats Stats() const noexcept {
-        return {
-            .RequestedPages = RequestedPages_.load(std::memory_order_relaxed),
-            .RequestedBytes = RequestedBytes_.load(std::memory_order_relaxed),
-            .HitPages = HitPages_.load(std::memory_order_relaxed),
-            .HitBytes = HitBytes_.load(std::memory_order_relaxed),
-            .MissPages = MissPages_.load(std::memory_order_relaxed),
-            .MissBytes = MissBytes_.load(std::memory_order_relaxed),
-        };
+        return Memory_.Stats();
     }
 
 private:
@@ -880,8 +854,6 @@ private:
 
     bool MatchesKeepColdEntry(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
 
-    void AddStats(const TStats& stats) noexcept;
-
     bool EvictFromHot(TSpaceOperation& spaceOp, ui32 index) noexcept;
 
     bool EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
@@ -948,12 +920,6 @@ private:
     std::atomic<ui64> ColdTargetBytes_{ 0 };
     std::atomic<ui64> ColdGrowBytes_{ 0 };
     std::atomic<ui64> TargetHandleCount_{ 0 };
-    std::atomic<ui64> RequestedPages_{ 0 };
-    std::atomic<ui64> RequestedBytes_{ 0 };
-    std::atomic<ui64> HitPages_{ 0 };
-    std::atomic<ui64> HitBytes_{ 0 };
-    std::atomic<ui64> MissPages_{ 0 };
-    std::atomic<ui64> MissBytes_{ 0 };
     std::atomic<bool> KeepColdPressure_{ false };
     std::atomic<bool> KeepColdTrimActive_{ false };
     std::atomic<bool> ResourceWaitArmed_{ false };

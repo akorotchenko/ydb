@@ -765,16 +765,6 @@ void TSharedCache::SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) no
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCache::AddStats(const TStats& stats) noexcept {
-    RequestedPages_.fetch_add(stats.RequestedPages, std::memory_order_relaxed);
-    RequestedBytes_.fetch_add(stats.RequestedBytes, std::memory_order_relaxed);
-    HitPages_.fetch_add(stats.HitPages, std::memory_order_relaxed);
-    HitBytes_.fetch_add(stats.HitBytes, std::memory_order_relaxed);
-    MissPages_.fetch_add(stats.MissPages, std::memory_order_relaxed);
-    MissBytes_.fetch_add(stats.MissBytes, std::memory_order_relaxed);
-}
-
-SHARED_CACHE_TEMPLATE
 void TSharedCache::UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept {
     if (Memory_.UpdateColdReclaimable(payloadBytes, before, after)) {
         NotifyResourcesAvailable();
@@ -2973,7 +2963,7 @@ ESharedCacheResultStatus TSharedCache::FindOrInsert(TCollectionCacheItem collect
     const ESharedCacheResultStatus status = cacheOp.FindOrInsertPage(candidate, std::move(waiter), hit, fetch);
     TStats stats;
     stats.AddAdmission(status, page.Size);
-    AddStats(stats);
+    Memory_.AddStats(stats);
     return status;
 }
 
@@ -3194,7 +3184,7 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
         }
     }
     if (recordStats) {
-        AddStats(stats);
+        Memory_.AddStats(stats);
     }
     return true;
 }

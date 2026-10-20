@@ -1,5 +1,6 @@
 #pragma once
 
+#include "shared_cache_fwd.h"
 #include "shared_cache_item.h"
 
 #include <util/generic/algorithm.h>
@@ -12,6 +13,47 @@ namespace NKikimr::NSharedCache {
 
 class TCacheMemory {
 public:
+    struct TStats {
+        ui64 RequestedPages = 0;
+        ui64 RequestedBytes = 0;
+        ui64 HitPages = 0;
+        ui64 HitBytes = 0;
+        ui64 MissPages = 0;
+        ui64 MissBytes = 0;
+
+        void AddAdmission(ESharedCacheResultStatus status, ui64 bytes) noexcept {
+            ++RequestedPages;
+            RequestedBytes += bytes;
+            if (status == ESharedCacheResultStatus::Hit) {
+                ++HitPages;
+                HitBytes += bytes;
+                return;
+            }
+            ++MissPages;
+            MissBytes += bytes;
+        }
+    };
+
+    TStats Stats() const noexcept {
+        return {
+            .RequestedPages = RequestedPages_.load(std::memory_order_relaxed),
+            .RequestedBytes = RequestedBytes_.load(std::memory_order_relaxed),
+            .HitPages = HitPages_.load(std::memory_order_relaxed),
+            .HitBytes = HitBytes_.load(std::memory_order_relaxed),
+            .MissPages = MissPages_.load(std::memory_order_relaxed),
+            .MissBytes = MissBytes_.load(std::memory_order_relaxed),
+        };
+    }
+
+    void AddStats(const TStats& stats) noexcept {
+        RequestedPages_.fetch_add(stats.RequestedPages, std::memory_order_relaxed);
+        RequestedBytes_.fetch_add(stats.RequestedBytes, std::memory_order_relaxed);
+        HitPages_.fetch_add(stats.HitPages, std::memory_order_relaxed);
+        HitBytes_.fetch_add(stats.HitBytes, std::memory_order_relaxed);
+        MissPages_.fetch_add(stats.MissPages, std::memory_order_relaxed);
+        MissBytes_.fetch_add(stats.MissBytes, std::memory_order_relaxed);
+    }
+
     // State transitions can overtake category accounting, temporarily making these estimates negative.
     class TCategoryUsage {
     public:
@@ -390,6 +432,12 @@ private: // Data members
     std::atomic<ui64> CollectionBytes_{ 0 };
     std::atomic<ui64> KeepResidentPageBytes_{ 0 };
     std::atomic<ui64> KeepActivePageBytes_{ 0 };
+    std::atomic<ui64> RequestedPages_{ 0 };
+    std::atomic<ui64> RequestedBytes_{ 0 };
+    std::atomic<ui64> HitPages_{ 0 };
+    std::atomic<ui64> HitBytes_{ 0 };
+    std::atomic<ui64> MissPages_{ 0 };
+    std::atomic<ui64> MissBytes_{ 0 };
     std::atomic<ui64> CurrentLimit_{ 0 };
     std::atomic<ui64> SoftLimitOverride_{ Max<ui64>() };
     std::atomic<ui64> SoftLimit_{ 0 };

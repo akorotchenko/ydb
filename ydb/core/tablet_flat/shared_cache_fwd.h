@@ -2,6 +2,13 @@
 
 namespace NKikimr::NSharedCache {
 
+enum class ESharedCacheResultStatus {
+    Miss,
+    Inserted,
+    Pending,
+    Hit,
+};
+
 struct TProdTraits;
 template <class TTraits>
 class TSharedCacheImpl;
