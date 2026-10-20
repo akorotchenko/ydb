@@ -410,7 +410,7 @@ public:
     }
 
     ui64 ColdRingEntries() const noexcept {
-        return ColdRingEntries_.load(std::memory_order_relaxed);
+        return Memory_.ColdRingEntries();
     }
 
     ui64 StickyPages() const noexcept {
@@ -430,11 +430,11 @@ public:
     }
 
     ui64 ColdReclaimableBytes() const noexcept {
-        return LoadEstimatedBytes(ColdReclaimableBytes_);
+        return Memory_.ColdReclaimableBytes();
     }
 
     ui64 ColdReclaimableItems() const noexcept {
-        return static_cast<ui64>(Max<i64>(0, ColdReclaimableItems_.load(std::memory_order_relaxed)));
+        return Memory_.ColdReclaimableItems();
     }
 
     ui64 StickyBytes() const noexcept {
@@ -854,7 +854,6 @@ private:
     static ui64 PayloadBytes(const THandle& handle, EItemKind kind) noexcept;
     static ui64 AccountedPageBytes(ui64 size) noexcept;
     static ui64 PageBytes(const THandle& handle) noexcept;
-    static ui64 LoadEstimatedBytes(const std::atomic<i64>& counter) noexcept;
     static ui64 FractionCeil(ui64 value, double fraction) noexcept;
     static void SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept;
 
@@ -939,10 +938,6 @@ private:
     TSharedCacheTableImpl<TTraits> Table_;
     TIntrusivePtr<TCollectionRegistry> CollectionRegistry_ = new TCollectionRegistry;
     TCacheMemory Memory_;
-    std::atomic<i64> ColdReclaimableBytes_{ 0 }; // Unreferenced ordinary Cold payloads
-    std::atomic<i64> ColdReclaimableItems_{ 0 }; // Unreferenced ordinary Cold items
-    std::atomic<i64> ColdItems_{ 0 }; // All Cold-state items, including held items
-    std::atomic<ui64> ColdRingEntries_{ 0 }; // Occupied ring slots, including stale entries until popped
     std::atomic<ui64> KeepResidentPageBytes_{ 0 };
     std::atomic<ui64> KeepActivePageBytes_{ 0 };
     ui64 ColdByteBudget_ = Max<ui64>(); // Protected by HotResize_; watermark calculation input.

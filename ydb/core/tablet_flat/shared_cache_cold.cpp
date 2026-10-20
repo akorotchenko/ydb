@@ -22,12 +22,11 @@ void TSharedCache::RouteCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) 
         return;
     }
 
-    ColdRingEntries_.fetch_add(1, std::memory_order_relaxed);
+    Memory_.AddColdRingEntry();
     InvokeHook(ESharedCacheHookPoint::BeforeColdExchange, coldItem);
     const TColdCacheItem displaced = spaceOp.PutCold(coldItem);
     if (!displaced.IsNull()) {
-        const ui64 previous = ColdRingEntries_.fetch_sub(1, std::memory_order_relaxed);
-        Y_ABORT_UNLESS(previous != 0);
+        Memory_.RemoveColdRingEntry();
         cacheOp.EraseCold(displaced);
     }
 }
@@ -73,7 +72,7 @@ bool TSharedCache::DemoteKeepCold(
             Memory_.ReleaseRetainedBytes(bytes);
             Memory_.KeepCold().TransferBytesTo(Memory_.Cold(), bytes);
             Memory_.KeepCold().TransferPageTo(Memory_.Cold(), EItemKind::Page);
-            ColdItems_.fetch_add(1, std::memory_order_relaxed);
+            Memory_.AddColdItem();
             Memory_.ReleaseKeepColdOwnedBytes(bytes);
             if (TCollection* owner = cacheOp.PageCollection(handle)) {
                 AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
@@ -293,14 +292,13 @@ bool TSharedCache::ReclaimCold(TSpaceOperation& spaceOp) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     const TRingView cold = spaceOp.Cold();
     for (ui64 attempt = 0; attempt < cold.Capacity; ++attempt) {
-        if (ColdRingEntries_.load(std::memory_order_relaxed) == 0) {
+        if (ColdRingEntries() == 0) {
             return false;
         }
         InvokeHook(ESharedCacheHookPoint::BeforeColdRingPop, TCacheItem{});
         const ui64 rawItem = cold.Pop();
         if (rawItem != 0) {
-            const ui64 previous = ColdRingEntries_.fetch_sub(1, std::memory_order_relaxed);
-            Y_ABORT_UNLESS(previous != 0);
+            Memory_.RemoveColdRingEntry();
             if (cacheOp.EraseCold(TColdCacheItem::FromRaw(rawItem))) {
                 return true;
             }

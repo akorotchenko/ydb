@@ -92,7 +92,7 @@ Y_FORCE_INLINE void TSharedCache::CompleteHotEviction(TSpaceOperation& spaceOp, 
         Memory_.ReleaseRetainedBytes(bytes);
         Memory_.Hot().TransferBytesTo(Memory_.Cold(), bytes);
         Memory_.Hot().TransferPageTo(Memory_.Cold(), coldState.Kind());
-        ColdItems_.fetch_add(1, std::memory_order_relaxed);
+        Memory_.AddColdItem();
         if (coldState.IsPageKind()) {
             if (TCollection* owner = cacheOp.PageCollection(handle)) {
                 AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
@@ -266,7 +266,7 @@ bool TSharedCache::PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, b
             AdvanceColdMembership(handle);
             Memory_.Cold().RemoveBytes(bytes);
             Memory_.Cold().RemovePage(EItemKind::Page);
-            ColdItems_.fetch_sub(1, std::memory_order_relaxed);
+            Memory_.RemoveColdItem();
             if (owner) {
                 AddActivePageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
             }

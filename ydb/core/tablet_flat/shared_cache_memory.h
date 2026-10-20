@@ -214,6 +214,51 @@ public:
         SubtractExactBytes(KeepColdOwnedBytes_, bytes);
     }
 
+    ui64 ColdReclaimableBytes() const noexcept {
+        return static_cast<ui64>(Max<i64>(ColdReclaimableBytes_.load(std::memory_order_relaxed), 0));
+    }
+
+    ui64 ColdReclaimableItems() const noexcept {
+        return static_cast<ui64>(Max<i64>(0, ColdReclaimableItems_.load(std::memory_order_relaxed)));
+    }
+
+    // Returns true when the transition makes the item reclaimable.
+    bool UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept {
+        const auto reclaimable = [](THandleState state) {
+            return state.IsCold() && state.IsStickyNoneField() && state.Refs() == 0;
+        };
+        const bool wasReclaimable = reclaimable(before);
+        const bool isReclaimable = reclaimable(after);
+        if (wasReclaimable == isReclaimable) {
+            return false;
+        }
+        const i64 bytes = static_cast<i64>(payloadBytes);
+        ColdReclaimableBytes_.fetch_add(isReclaimable ? bytes : -bytes, std::memory_order_relaxed);
+        ColdReclaimableItems_.fetch_add(isReclaimable ? 1 : -1, std::memory_order_relaxed);
+        return isReclaimable;
+    }
+
+    void AddColdItem() noexcept {
+        ColdItems_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void RemoveColdItem() noexcept {
+        ColdItems_.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    ui64 ColdRingEntries() const noexcept {
+        return ColdRingEntries_.load(std::memory_order_relaxed);
+    }
+
+    void AddColdRingEntry() noexcept {
+        ColdRingEntries_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void RemoveColdRingEntry() noexcept {
+        const ui64 previous = ColdRingEntries_.fetch_sub(1, std::memory_order_relaxed);
+        Y_ABORT_UNLESS(previous != 0);
+    }
+
     // The caller checks its current limit against usage before each attempt.
     bool TryReserve(ui64& usage, ui64 bytes, ui64 pages) noexcept {
         if (PageUsage_.compare_exchange_weak(
@@ -294,6 +339,10 @@ private: // Data members
     TCategoryUsage Cold_; // All Cold storage, including held and retiring payloads
     TCategoryUsage KeepCold_;
     TCategoryUsage Sticky_;
+    std::atomic<i64> ColdReclaimableBytes_{ 0 }; // Unreferenced ordinary Cold payloads
+    std::atomic<i64> ColdReclaimableItems_{ 0 }; // Unreferenced ordinary Cold items
+    std::atomic<i64> ColdItems_{ 0 }; // All Cold-state items, including held items
+    std::atomic<ui64> ColdRingEntries_{ 0 }; // Occupied ring slots, including stale entries until popped
     std::atomic<ui64> CurrentLimit_{ 0 };
     std::atomic<ui64> SoftLimitOverride_{ Max<ui64>() };
     std::atomic<ui64> SoftLimit_{ 0 };
