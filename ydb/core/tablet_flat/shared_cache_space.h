@@ -513,6 +513,7 @@ static_assert(alignof(TSpaceHazard) == 64);
 inline constexpr ui64 SpaceHazardGeneration(ui64 state) noexcept;
 inline constexpr ui32 SpaceHazardActiveCount(ui64 state) noexcept;
 
+// Keeps handle, bucket and ring mappings alive; page data needs its own owner.
 class TSpaceOperation {
 public:
     TSpaceOperation(const TSpaceOperation&) = delete;

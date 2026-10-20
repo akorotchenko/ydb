@@ -15,6 +15,7 @@ TCacheItem TSharedCache::PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCach
         spaceOp.Hot(ToUnderlying(level)).PutAndPopWithHook(cacheItem.Raw(), [&]() noexcept {
             InvokeHook(ESharedCacheHookPoint::BeforeHotExchange, cacheItem);
         });
+    // The operation protects the mapping; a concurrent cut may still exclude this slot.
     if (!spaceOp.IsAllowedHotSlot(exchange.Slot)) {
         ui64 expected = cacheItem.Raw();
         if (exchange.Slot->compare_exchange_strong(expected, 0, std::memory_order_relaxed, std::memory_order_relaxed))
@@ -286,7 +287,7 @@ bool TSharedCache::ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept {
 #undef TSharedCache
 #undef SHARED_CACHE_TEMPLATE
 
-// Hot members are instantiated here; remaining cache members are instantiated in shared_cache.cpp.
+// Explicit instantiations of this file's Hot definitions for both trait variants.
 template TCacheItem TSharedCacheImpl<TProdTraits>::PutHot(
     TSpaceOperation&, TSharedCacheImpl<TProdTraits>::EHotLevel, TCacheItem) noexcept;
 template void TSharedCacheImpl<TProdTraits>::RouteHot(

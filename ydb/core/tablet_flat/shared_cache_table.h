@@ -188,34 +188,15 @@ private:
 
 template <class TTraits = TProdTraits>
 class TSharedCacheTableImpl {
-public:
-    TSharedCacheTableImpl(TSharedCacheSpace& space, TSharedCacheImpl<TTraits>& cache) noexcept
-        : Space_(space)
-        , Cache_(cache)
-    {}
-
-    ESharedCacheResultStatus Find(TSpaceOperation& spaceOp, const TSharedCacheKey& key, TCacheItem& cacheItem) noexcept;
-
-    void CompleteTombstone(TCacheItem cacheItem, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept;
-
-    bool PrepareBucketSplit(TSpaceOperation& spaceOp) noexcept;
-    bool ActivateBucketSplitOrMerge(TSpaceOperation& spaceOp) noexcept;
-    bool PublishBucketSplit(TSpaceOperation& spaceOp) noexcept;
-    bool CloseBucketSplit(TSpaceOperation& spaceOp) noexcept;
-    bool RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept;
-
-    TCacheItem FreezeNext(const TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
-
-    bool BridgeTombstone(TCacheItem cacheItem, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept;
-
-    void PublishPageReplacement(
-        TCacheItem source, TCacheItem replacement, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept;
-
-private:
-    friend class TSharedCacheTestAccess;
-    friend class TSharedCacheImpl<TTraits>;
-
+public: // Cache table operations
     struct TInsertPosition {
+        void DropOwner(TSpaceOperation& spaceOp) noexcept {
+            OwnerRef.Drop(spaceOp);
+        }
+
+    private:
+        friend class TSharedCacheTableImpl<TTraits>;
+
         std::atomic<ui64>* Link = nullptr;
         TCacheItem Expected;
         TCacheItem Owner;
@@ -223,6 +204,40 @@ private:
         TSpaceState SpaceState;
         TBucketResizeState ResizeState;
     };
+
+    TSharedCacheTableImpl(TSharedCacheSpace& space, TSharedCacheImpl<TTraits>& cache) noexcept
+        : Space_(space)
+        , Cache_(cache)
+    {}
+
+    ESharedCacheResultStatus Find(TSpaceOperation& spaceOp, const TSharedCacheKey& key, TCacheItem& cacheItem) noexcept;
+
+    ESharedCacheResultStatus FindForInsert(TSpaceOperation& spaceOp, const TSharedCacheKey& key, TCacheItem& cacheItem,
+        TInsertPosition& insertPosition) noexcept;
+
+    bool InsertAt(TSpaceOperation& spaceOp, TInsertPosition& insertPosition, TCacheItem candidate) noexcept;
+
+    bool TryBeginErase(TSpaceOperation& spaceOp, TCacheItem cacheItem, THandleState& expected,
+        TSharedCacheItemRefImpl<TTraits>& owner) noexcept;
+
+    bool TryBeginErase(
+        TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>& owner, THandleState& expected) noexcept;
+
+    void FinishErase(TSpaceOperation& spaceOp, TCacheItem cacheItem, const TSharedCacheKey& key) noexcept;
+
+public: // Resizing
+    // Resize steps may return false after partial progress; recheck the phase and cursor before retrying.
+    bool PrepareBucketSplit(TSpaceOperation& spaceOp) noexcept;
+    bool ActivateBucketSplitOrMerge(TSpaceOperation& spaceOp) noexcept;
+    bool PublishBucketSplit(TSpaceOperation& spaceOp) noexcept;
+    bool CloseBucketSplit(TSpaceOperation& spaceOp) noexcept;
+    bool RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept;
+
+    void PublishPageReplacement(
+        TCacheItem source, TCacheItem replacement, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept;
+
+private: // Table helpers
+    friend class TSharedCacheTestAccess;
 
     struct TOrderedLink {
         std::atomic<ui64>* Link = nullptr;
@@ -254,11 +269,6 @@ private:
     Y_FORCE_INLINE ESharedCacheResultStatus FindOrInsert(TSpaceOperation& spaceOp, const TSharedCacheKey& key,
         TCacheItem& cacheItem, TInsertPosition* insertPosition = nullptr) noexcept;
 
-    ESharedCacheResultStatus FindForInsert(TSpaceOperation& spaceOp, const TSharedCacheKey& key, TCacheItem& cacheItem,
-        TInsertPosition& insertPosition) noexcept;
-
-    bool InsertAt(TSpaceOperation& spaceOp, TInsertPosition& insertPosition, TCacheItem candidate) noexcept;
-
     bool ValidateTerminalOwner(const TSpaceOperation& spaceOp, const TOrderedLink& orderedLink) const noexcept;
 
     bool FindLink(
@@ -270,63 +280,9 @@ private:
 
     void HelpTombstone(TCacheItem cacheItem, const TSharedCacheKey& routeKey, TSpaceOperation& spaceOp) noexcept;
 
-    Y_FORCE_INLINE TBucketRoute SelectBucket(ui32 hash, TSpaceState spaceState) const noexcept {
-        if (!spaceState.Resizing()) {
-            const ui32 bucket = hash & spaceState.BucketMask();
-            return { .Bucket = bucket, .BaseBucket = bucket };
-        }
+    TCacheItem FreezeNext(const TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
-        const TBucketResizeState resize = Space_.BucketResizeState();
-        const ui32 splitBit = resize.SplitBit();
-        const ui32 base = hash & (splitBit - 1);
-        const bool suffix = (hash & splitBit) != 0;
-        if (resize.Direction() == EBucketResize::Growing) {
-            if (suffix && base < resize.Cursor()) {
-                return { .Resize = resize, .Bucket = base | splitBit, .BaseBucket = base, .FollowsSplitSuffix = true };
-            }
-            return { .Resize = resize, .Bucket = base, .BaseBucket = base, .FollowsSplitSuffix = suffix };
-        }
-
-        if (suffix && base >= resize.Cursor()) {
-            return { .Resize = resize, .Bucket = base | splitBit, .BaseBucket = base, .FollowsSplitSuffix = true };
-        }
-        return { .Resize = resize, .Bucket = base, .BaseBucket = base, .FollowsSplitSuffix = suffix };
-    }
-
-    template <ETombstoneMode Mode>
-    static Y_FORCE_INLINE bool SelectGrowthBucket(TBucketRoute& route, const TOrderedLink& link) noexcept {
-        const TBucketResizeState& resize = route.Resize;
-        if (!resize || resize.Direction() != EBucketResize::Growing) {
-            return false;
-        }
-        if constexpr (Mode == ETombstoneMode::Help) {
-            if (resize.Phase() != EBucketResizePhase::Activated) {
-                return false;
-            }
-        } else if (resize.Phase() != EBucketResizePhase::Prepared && resize.Phase() != EBucketResizePhase::Activated)
-        {
-            return false;
-        }
-        if (route.FollowsSplitSuffix && route.Bucket == route.BaseBucket && !link.SawSplit &&
-            route.BaseBucket == resize.Cursor())
-        {
-            route.Bucket = route.BaseBucket | resize.SplitBit();
-            return true;
-        }
-        return false;
-    }
-
-    template <ETombstoneMode Mode>
-    Y_FORCE_INLINE EBucketRouteResult ResolveBucketMiss(
-        TSpaceState& spaceState, TBucketRoute& route, const TOrderedLink& link) const noexcept {
-        if (!Space_.RefreshBucketRoute(spaceState, route.Resize)) {
-            return EBucketRouteResult::Retry;
-        }
-        if (SelectGrowthBucket<Mode>(route, link)) {
-            return EBucketRouteResult::Next;
-        }
-        return EBucketRouteResult::Done;
-    }
+    bool BridgeTombstone(TCacheItem cacheItem, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept;
 
     template <ETombstoneMode Mode>
     bool FindLinkOnBucket(TSpaceOperation& spaceOp, const TSharedCacheKey& key, ui32 hash, ui32 bucket,
@@ -335,6 +291,16 @@ private:
     bool FindLinkOnBucket(
         const TSpaceOperation& spaceOp, TCacheItem target, ui32 bucket, TOrderedLink& result) noexcept;
 
+    Y_FORCE_INLINE TBucketRoute SelectBucket(ui32 hash, TSpaceState spaceState) const noexcept;
+
+    template <ETombstoneMode Mode>
+    static Y_FORCE_INLINE bool SelectGrowthBucket(TBucketRoute& route, const TOrderedLink& link) noexcept;
+
+    template <ETombstoneMode Mode>
+    Y_FORCE_INLINE EBucketRouteResult ResolveBucketMiss(
+        TSpaceState& spaceState, TBucketRoute& route, const TOrderedLink& link) const noexcept;
+
+private: // Resize helpers
     bool FindSplitBoundary(
         const TSpaceOperation& spaceOp, ui32 bucket, ui32 splitBit, bool suffix, TOrderedLink& result) noexcept;
 
@@ -345,7 +311,7 @@ private:
     bool TransitionSplitMarkerToTombstone(const TSpaceOperation& spaceOp, TCacheItem marker) noexcept;
     bool SplitMarkerIsSoleOwner(const TSpaceOperation& spaceOp, TCacheItem marker) const noexcept;
 
-private:
+private: // Data members
     TSharedCacheSpace& Space_;
     TSharedCacheImpl<TTraits>& Cache_;
 };
