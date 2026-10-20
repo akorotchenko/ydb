@@ -71,6 +71,58 @@ public:
         return ReservedPages_.load(std::memory_order_relaxed);
     }
 
+    ui64 RetainedBytes() const noexcept {
+        return RetainedBytes_.load(std::memory_order_relaxed);
+    }
+
+    ui64 StickyOwnedBytes() const noexcept {
+        return StickyOwnedBytes_.load(std::memory_order_relaxed);
+    }
+
+    ui64 KeepColdOwnedBytes() const noexcept {
+        return KeepColdOwnedBytes_.load(std::memory_order_relaxed);
+    }
+
+    bool TryAddRetainedBytes(ui64 bytes) noexcept {
+        ui64 retained = RetainedBytes_.load(std::memory_order_relaxed);
+        for (;;) {
+            if (retained + bytes > SoftLimit()) {
+                return false;
+            }
+            if (RetainedBytes_.compare_exchange_weak(
+                    retained, retained + bytes, std::memory_order_relaxed, std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+    }
+
+    void AddRetainedBytes(ui64 bytes) noexcept {
+        RetainedBytes_.fetch_add(bytes, std::memory_order_relaxed);
+    }
+
+    void ReleaseRetainedBytes(ui64 bytes) noexcept {
+        SubtractExactBytes(RetainedBytes_, bytes);
+    }
+
+    void AddStickyOwnedBytes(ui64 bytes) noexcept {
+        StickyOwnedBytes_.fetch_add(bytes, std::memory_order_relaxed);
+    }
+
+    // Sticky ownership counts page payloads; collection records contribute only to the resident-state estimates.
+    void ReleaseStickyOwnedBytes(EItemKind kind, ui64 bytes) noexcept {
+        if (kind == EItemKind::Page) {
+            SubtractExactBytes(StickyOwnedBytes_, bytes);
+        }
+    }
+
+    void AddKeepColdOwnedBytes(ui64 bytes) noexcept {
+        KeepColdOwnedBytes_.fetch_add(bytes, std::memory_order_relaxed);
+    }
+
+    void ReleaseKeepColdOwnedBytes(ui64 bytes) noexcept {
+        SubtractExactBytes(KeepColdOwnedBytes_, bytes);
+    }
+
     // The caller checks its current limit against usage before each attempt.
     bool TryReserve(ui64& usage, ui64 bytes, ui64 pages) noexcept {
         if (PageUsage_.compare_exchange_weak(
@@ -144,6 +196,9 @@ private: // Data members
     std::atomic<ui64> PageUsage_{ 0 };
     std::atomic<ui64> ReservedBytes_{ 0 };
     std::atomic<ui64> ReservedPages_{ 0 };
+    std::atomic<ui64> RetainedBytes_{ 0 };
+    std::atomic<ui64> StickyOwnedBytes_{ 0 };
+    std::atomic<ui64> KeepColdOwnedBytes_{ 0 };
     std::atomic<ui64> CurrentLimit_{ 0 };
     std::atomic<ui64> SoftLimitOverride_{ Max<ui64>() };
     std::atomic<ui64> SoftLimit_{ 0 };

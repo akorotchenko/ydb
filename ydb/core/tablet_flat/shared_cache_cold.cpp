@@ -70,11 +70,11 @@ bool TSharedCache::DemoteKeepCold(
             InvokeHook(ESharedCacheHookPoint::AfterKeepColdDemoted, coldItem);
             const ui64 bytes = PageBytes(handle);
             AdvanceColdMembership(handle);
-            SubtractExactBytes(RetainedBytes_, bytes);
+            Memory_.ReleaseRetainedBytes(bytes);
             TransferEstimatedBytes(KeepColdBytes_, ColdBytes_, bytes);
             TransferEstimatedPages(KeepColdPages_, ColdPages_, EItemKind::Page);
             ColdItems_.fetch_add(1, std::memory_order_relaxed);
-            SubtractExactBytes(KeepColdOwnedBytes_, bytes);
+            Memory_.ReleaseKeepColdOwnedBytes(bytes);
             if (TCollection* owner = cacheOp.PageCollection(handle)) {
                 AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
             }
@@ -187,16 +187,10 @@ void TSharedCache::RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldIt
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCache::AddKeepColdOwnedBytes(ui64 bytes) noexcept {
-    KeepColdOwnedBytes_.fetch_add(bytes, std::memory_order_relaxed);
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::TrimKeepCold(TSpaceOperation& spaceOp) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     const ui64 limit = KeepColdLimit();
-    if (KeepColdOwnedBytes_.load(std::memory_order_relaxed) <= limit &&
-        !KeepColdTrimActive_.load(std::memory_order_relaxed))
+    if (KeepColdOwnedBytes() <= limit && !KeepColdTrimActive_.load(std::memory_order_relaxed))
     {
         return false;
     }
@@ -219,8 +213,7 @@ bool TSharedCache::TrimKeepCold(TSpaceOperation& spaceOp) noexcept {
         }
     }
     bool progress = false;
-    for (ui64 index = 0; index < attempts && KeepColdOwnedBytes_.load(std::memory_order_relaxed) > lowWatermark;
-         ++index)
+    for (ui64 index = 0; index < attempts && KeepColdOwnedBytes() > lowWatermark; ++index)
     {
         const ui64 raw = spaceOp.KeepCold().Pop();
         if (raw == 0) {
@@ -230,15 +223,15 @@ bool TSharedCache::TrimKeepCold(TSpaceOperation& spaceOp) noexcept {
         if (cacheOp.DemoteKeepCold(coldItem)) {
             progress = true;
         } else {
-            const ui64 keepColdBytes = KeepColdOwnedBytes_.load(std::memory_order_relaxed);
+            const ui64 keepColdBytes = KeepColdOwnedBytes();
             cacheOp.WithdrawKeepColdEntry(coldItem);
             // A referenced page cannot be demoted yet, but its entry is gone now: advance the membership so
             // that the page leaves KeepCold on its last release. The withdrawal helper also demotes it if the
             // last release raced with the membership advance.
-            progress = progress || KeepColdOwnedBytes_.load(std::memory_order_relaxed) < keepColdBytes;
+            progress = progress || KeepColdOwnedBytes() < keepColdBytes;
         }
     }
-    if (KeepColdOwnedBytes_.load(std::memory_order_relaxed) <= lowWatermark) {
+    if (KeepColdOwnedBytes() <= lowWatermark) {
         KeepColdTrimActive_.store(false, std::memory_order_relaxed);
         KeepColdTrimScanRemaining_.store(0, std::memory_order_relaxed);
     } else if (progress) {
@@ -381,7 +374,6 @@ template void TSharedCacheImpl<TProdTraits>::WithdrawKeepColdEntry(TSpaceOperati
 template bool TSharedCacheImpl<TProdTraits>::MatchesKeepColdEntry(TSpaceOperation&, TColdCacheItem) noexcept;
 template bool TSharedCacheImpl<TProdTraits>::IsKeepColdQueued(const THandle&) noexcept;
 template void TSharedCacheImpl<TProdTraits>::RouteKeepCold(TSpaceOperation&, TColdCacheItem) noexcept;
-template void TSharedCacheImpl<TProdTraits>::AddKeepColdOwnedBytes(ui64) noexcept;
 template bool TSharedCacheImpl<TProdTraits>::TrimKeepCold(TSpaceOperation&) noexcept;
 template bool TSharedCacheImpl<TProdTraits>::ShrinkKeepCold(TSpaceOperation&) noexcept;
 template bool TSharedCacheImpl<TProdTraits>::GrowKeepCold() noexcept;
@@ -400,7 +392,6 @@ template void TSharedCacheImpl<TTestTraits>::WithdrawKeepColdEntry(TSpaceOperati
 template bool TSharedCacheImpl<TTestTraits>::MatchesKeepColdEntry(TSpaceOperation&, TColdCacheItem) noexcept;
 template bool TSharedCacheImpl<TTestTraits>::IsKeepColdQueued(const THandle&) noexcept;
 template void TSharedCacheImpl<TTestTraits>::RouteKeepCold(TSpaceOperation&, TColdCacheItem) noexcept;
-template void TSharedCacheImpl<TTestTraits>::AddKeepColdOwnedBytes(ui64) noexcept;
 template bool TSharedCacheImpl<TTestTraits>::TrimKeepCold(TSpaceOperation&) noexcept;
 template bool TSharedCacheImpl<TTestTraits>::ShrinkKeepCold(TSpaceOperation&) noexcept;
 template bool TSharedCacheImpl<TTestTraits>::GrowKeepCold() noexcept;

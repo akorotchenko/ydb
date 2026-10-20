@@ -267,7 +267,7 @@ public:
             cache.KeepColdBytes_.fetch_add(bytes, std::memory_order_relaxed);
             cache.HotPages_.fetch_sub(1, std::memory_order_relaxed);
             cache.KeepColdPages_.fetch_add(1, std::memory_order_relaxed);
-            cache.AddKeepColdOwnedBytes(bytes);
+            cache.Memory_.AddKeepColdOwnedBytes(bytes);
         });
     }
 
