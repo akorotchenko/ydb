@@ -12,16 +12,13 @@ bool TSharedCache::PrepareTransition(const TSharedCacheCapacity& target, TTransi
     const ui64 currentStaticBytes = Space_->CurrentConfiguration().StaticBytes;
     const ui64 staticDeltaBytes = target.StaticBytes > currentStaticBytes ? target.StaticBytes - currentStaticBytes : 0;
     if (staticDeltaBytes != 0) {
-        Y_DEBUG_ABORT_UNLESS(StaticDeltaBytes_.load(std::memory_order_relaxed) == 0);
-        StaticDeltaBytes_.fetch_add(staticDeltaBytes, std::memory_order_relaxed);
-        OverallUsage_.fetch_add(staticDeltaBytes, std::memory_order_relaxed);
+        Memory_.PrepareStaticResize(staticDeltaBytes);
     }
     if (Space_->PrepareTransition(target, transition)) {
         return true;
     }
     if (staticDeltaBytes != 0) {
-        SubtractExactBytes(StaticDeltaBytes_, staticDeltaBytes);
-        SubtractExactBytes(OverallUsage_, staticDeltaBytes);
+        Memory_.CancelStaticResize(staticDeltaBytes);
     }
     return false;
 }
@@ -116,15 +113,7 @@ bool TSharedCache::CommitTransition(TTransition& transition) noexcept {
         return false;
     }
 
-    if (targetStaticBytes > oldStaticBytes) {
-        const ui64 delta = targetStaticBytes - oldStaticBytes;
-        StaticBytes_.fetch_add(delta, std::memory_order_relaxed);
-        SubtractExactBytes(StaticDeltaBytes_, delta);
-    } else {
-        const ui64 delta = oldStaticBytes - targetStaticBytes;
-        SubtractExactBytes(StaticBytes_, delta);
-        SubtractExactBytes(OverallUsage_, delta);
-    }
+    Memory_.CommitStaticResize(oldStaticBytes, targetStaticBytes);
     if (commitTargetLimit) {
         TargetHandleCount_.store(targetHandleCount, std::memory_order_relaxed);
         HardLimit_.store(targetLimit, std::memory_order_relaxed);
@@ -145,8 +134,7 @@ bool TSharedCache::AbandonTransition(TTransition& transition) noexcept {
         targetStaticBytes > oldStaticBytes)
     {
         const ui64 delta = targetStaticBytes - oldStaticBytes;
-        SubtractExactBytes(StaticDeltaBytes_, delta);
-        SubtractExactBytes(OverallUsage_, delta);
+        Memory_.CancelStaticResize(delta);
     }
     return true;
 }
