@@ -66,7 +66,8 @@ public:
 
     static bool UnlinkCollectionRegistry(
         TTestSharedCache& cache, TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept {
-        return cache.UnlinkCollectionRegistry(registry, collection);
+        auto cacheOp = cache.BeginOperation();
+        return cacheOp.Collections().Unlink(registry, collection.CacheItem());
     }
 
     static bool DeleteCollection(

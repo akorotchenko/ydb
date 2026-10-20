@@ -134,7 +134,7 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     , Space_(std::move(space))
     , Table_(*Space_, *this)
     , Memory_(Space_->CurrentConfiguration().StaticBytes, hardLimit, Space_->ReservedConfiguration().Limit)
-    , Collections_(Memory_, static_cast<const TTraits&>(*this))
+    , Collections_(TCacheCollectionServices<TTraits>(*this), Memory_, static_cast<const TTraits&>(*this))
     , Fetches_(TCacheFetchServices<TTraits>(*this), Memory_, Table_, Collections_, static_cast<const TTraits&>(*this))
     , TargetHandleCount_(Space_->CurrentConfiguration().HandleCount())
     , HardTarget_(Space_->CurrentConfiguration())
@@ -762,7 +762,7 @@ bool TSharedCache::FailReady(TPageCacheItem page) noexcept {
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::MakeReady(TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept {
-    return MakeReady(*CollectionRegistry_, collection, std::move(value));
+    return MakeReady(Collections_.Registry(), collection, std::move(value));
 }
 
 SHARED_CACHE_TEMPLATE
@@ -827,7 +827,7 @@ void TSharedCache::FinishCollectionRetain(TSpaceOperation& spaceOp, TCacheItem c
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::DetachCollection(TCollectionCacheItem collection) noexcept {
-    return DetachCollection(*CollectionRegistry_, collection);
+    return DetachCollection(Collections_.Registry(), collection);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -838,12 +838,6 @@ bool TSharedCache::DetachCollection(TCollectionRegistry& registry, TCollectionCa
         return false;
     }
     return cacheOp.DetachCollection(registry, collection.CacheItem());
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::UnlinkCollectionRegistry(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept {
-    auto cacheOp = BeginOperation();
-    return cacheOp.UnlinkCollectionRegistry(registry, collection.CacheItem());
 }
 
 SHARED_CACHE_TEMPLATE
@@ -1053,7 +1047,7 @@ bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* regi
     value->CacheItem = TCollectionCacheItem::FromValidated(cacheItem);
     AddReference(*value);
     if (registry) {
-        Y_ABORT_UNLESS(cacheOp.LinkCollection(*registry, cacheItem));
+        Y_ABORT_UNLESS(cacheOp.Collections().Link(*registry, cacheItem));
     } else {
         Y_DEBUG_ABORT_UNLESS(handle.NextInOwner.load(std::memory_order_relaxed) == 0 &&
                              !handle.Body.Collection->Registry_.load(std::memory_order_relaxed));
@@ -1828,36 +1822,6 @@ bool TSharedCache::UnstickyCutPages(TSpaceOperation& spaceOp, TCacheItem pageIte
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::LinkCollection(
-    TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collectionItem) noexcept {
-    THandle& handle = spaceOp.Handles()[collectionItem.Index()];
-    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    Y_DEBUG_ABORT_UNLESS(collectionItem.Matches(state) && state.IsCollectionKind());
-    Y_DEBUG_ABORT_UNLESS((state.IsBegin() && state.IsStickyField()) ||
-                         ((state.IsHot() || state.IsCold()) && state.IsTransitionField()) ||
-                         (state.IsSticky() && (state.IsStickyField() || state.IsTransitionField())));
-    Y_DEBUG_ABORT_UNLESS(handle.NextInOwner.load(std::memory_order_relaxed) == 0);
-    Y_DEBUG_ABORT_UNLESS(handle.Body.Collection);
-
-    TCollectionRegistry* expectedRegistry = nullptr;
-    if (!handle.Body.Collection->Registry_.compare_exchange_strong(
-            expectedRegistry, &registry, std::memory_order_acq_rel, std::memory_order_acquire))
-    {
-        return false;
-    }
-
-    ui32 head = registry.CollectionListHead.load(std::memory_order_relaxed);
-    for (;;) {
-        handle.NextInOwner.store(head, std::memory_order_release);
-        if (registry.CollectionListHead.compare_exchange_weak(
-                head, collectionItem.Index(), std::memory_order_release, std::memory_order_relaxed))
-        {
-            return true;
-        }
-    }
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::TryBeginCollectionAttach(TSpaceOperation& spaceOp, TCollectionRegistry& registry,
     TCacheItem collectionItem, THandleState& attachState) noexcept {
     auto cacheOp = BindOperation(spaceOp);
@@ -1874,7 +1838,7 @@ bool TSharedCache::TryBeginCollectionAttach(TSpaceOperation& spaceOp, TCollectio
                 attachState = expected;
                 return true;
             }
-            if (!owner && cacheOp.LinkCollection(registry, collectionItem)) {
+            if (!owner && cacheOp.Collections().Link(registry, collectionItem)) {
                 attachState = expected;
                 return true;
             }
@@ -1939,75 +1903,10 @@ bool TSharedCache::AttachCollection(
     }
 
     const EHandleState detachedState = attachState.State();
-    Y_ABORT_UNLESS(cacheOp.LinkCollection(registry, collectionItem));
+    Y_ABORT_UNLESS(cacheOp.Collections().Link(registry, collectionItem));
     AddReference(*spaceOp.Handles()[collectionItem.Index()].Body.Collection);
     cacheOp.FinishCollectionAttach(collectionItem, detachedState);
     return true;
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::UnlinkCollectionRegistry(TSpaceOperation& spaceOp, TCollectionRegistry& registry,
-    TCacheItem collectionItem, EHandleState expectedState) noexcept {
-    for (;;) {
-        std::atomic<ui32>* link = &registry.CollectionListHead;
-        ui32 current = link->load(std::memory_order_acquire);
-        while (current != 0) {
-            Y_DEBUG_ABORT_UNLESS(current < spaceOp.AccessibleHandleCount());
-            THandle& handle = spaceOp.Handles()[current];
-            const ui32 next = handle.NextInOwner.load(std::memory_order_acquire);
-            const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-            Y_DEBUG_ABORT_UNLESS(state.IsCollectionKind() && handle.Body.Collection &&
-                                 handle.Body.Collection->Registry_.load(std::memory_order_acquire) == &registry);
-
-            if (current == collectionItem.Index()) {
-                if (!collectionItem.Matches(state) || state.State() != expectedState) {
-                    return false;
-                }
-                if (!link->compare_exchange_weak(current, next, std::memory_order_acq_rel, std::memory_order_acquire))
-                {
-                    break;
-                }
-                handle.NextInOwner.store(0, std::memory_order_release);
-                TCollectionRegistry* expectedRegistry = &registry;
-                Y_ABORT_UNLESS(handle.Body.Collection->Registry_.compare_exchange_strong(
-                    expectedRegistry, nullptr, std::memory_order_release, std::memory_order_relaxed));
-                return true;
-            }
-
-            link = &handle.NextInOwner;
-            current = next;
-        }
-        if (current == 0) {
-            return false;
-        }
-    }
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::UnlinkCollectionRegistry(TCollectionRegistry& registry, TOperationItemRef& collectionRef) noexcept {
-    const bool unlinked = UnlinkCollectionRegistry(
-        collectionRef.SpaceOperation(), registry, collectionRef.CacheItem(), EHandleState::Tombstone);
-    Y_DEBUG_ABORT_UNLESS(unlinked);
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::UnlinkCollectionRegistry(
-    TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collectionItem) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    TOperationItemRef collectionRef(spaceOp, cacheOp.TryAcquireStructural(collectionItem));
-    if (!collectionRef) {
-        return false;
-    }
-
-    THandle& handle = spaceOp.Handles()[collectionItem.Index()];
-    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    if (!collectionItem.Matches(state) || !state.IsCollectionKind() || !state.IsSticky() || !state.IsStickyField() ||
-        !handle.Body.Collection || handle.Body.Collection->Registry_.load(std::memory_order_acquire) != &registry)
-    {
-        return false;
-    }
-
-    return cacheOp.UnlinkCollectionRegistry(registry, collectionItem, EHandleState::Sticky);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -2051,7 +1950,7 @@ bool TSharedCache::DetachCollection(
         KeepModeSweepRemaining_.store(spaceOp.KeepCold().Capacity, std::memory_order_release);
     }
     cacheOp.DrainStickyPages(value);
-    Y_ABORT_UNLESS(cacheOp.UnlinkCollectionRegistry(registry, collectionItem, EHandleState::Sticky));
+    Y_ABORT_UNLESS(cacheOp.Collections().Unlink(registry, collectionItem, EHandleState::Sticky));
 
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
     for (;;) {
@@ -2127,7 +2026,7 @@ bool TSharedCache::DeleteCollection(
 
     TCollectionRegistry* registryOwner = handle.Body.Collection->Registry_.load(std::memory_order_acquire);
     if (registryOwner) {
-        UnlinkCollectionRegistry(*registryOwner, deletionOwner);
+        cacheOp.Collections().Unlink(*registryOwner, deletionOwner);
     } else {
         Y_DEBUG_ABORT_UNLESS(handle.NextInOwner.load(std::memory_order_relaxed) == 0);
     }
@@ -2168,10 +2067,10 @@ bool TSharedCache::MoveCollectionRegistry(TSpaceOperation& spaceOp, TCollectionR
         return true;
     }
 
-    if (!cacheOp.UnlinkCollectionRegistry(source, collectionItem, EHandleState::Sticky)) {
+    if (!cacheOp.Collections().Unlink(source, collectionItem, EHandleState::Sticky)) {
         return false;
     }
-    Y_ABORT_UNLESS(cacheOp.LinkCollection(destination, collectionItem));
+    Y_ABORT_UNLESS(cacheOp.Collections().Link(destination, collectionItem));
     return true;
 }
 
@@ -2339,25 +2238,8 @@ ESharedCacheResultStatus TSharedCache::Find(const TLogoBlobID& id, TSharedCacheC
 
 SHARED_CACHE_TEMPLATE
 void TSharedCache::ForEachCollection(TFunctionRef<void(TCollection&)> callback) noexcept {
-    ForEachCollection(*CollectionRegistry_, callback);
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::ForEachCollection(
-    TCollectionRegistry& registry, TFunctionRef<void(TCollection&)> callback) noexcept {
     auto cacheOp = BeginOperation();
-    ui32 current = registry.CollectionListHead.load(std::memory_order_acquire);
-    while (current) {
-        THandle& handle = cacheOp.Handles()[current];
-        const ui32 next = handle.NextInOwner.load(std::memory_order_acquire);
-        const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-        Y_DEBUG_ABORT_UNLESS(state.IsCollectionKind() && handle.Body.Collection &&
-                             handle.Body.Collection->Registry_.load(std::memory_order_acquire) == &registry);
-        TOperationItemRef ref(cacheOp, cacheOp.TryAcquireStructural(TCacheItem::Make(state.Version(), current)));
-        Y_ABORT_UNLESS(ref);
-        callback(*handle.Body.Collection);
-        current = next;
-    }
+    cacheOp.Collections().ForEach(callback);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -2724,7 +2606,7 @@ ESharedCacheResultStatus TSharedCache::FindOrInsertUnregistered(
 SHARED_CACHE_TEMPLATE
 ESharedCacheResultStatus TSharedCache::FindOrInsert(
     const TCollectionLocation& collection, TCollectionCacheItem& inserted, TSharedCacheCollectionRef& hit) noexcept {
-    return FindOrInsert(*CollectionRegistry_, collection, inserted, hit);
+    return FindOrInsert(Collections_.Registry(), collection, inserted, hit);
 }
 
 SHARED_CACHE_TEMPLATE

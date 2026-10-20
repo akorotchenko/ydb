@@ -499,6 +499,7 @@ private:
     friend class TSharedPageRefImpl<TTraits>;
     friend class TSharedCacheCollectionRefImpl<TTraits>;
     friend class TCacheFetchServices<TTraits>;
+    friend class TCacheCollectionServices<TTraits>;
     friend class TRequestPageWaiter;
     friend class TCompactedPageWaiter;
     friend struct TEvSaveCompactedPages;
@@ -700,7 +701,6 @@ private:
     bool MakePageSticky(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
     bool UnstickyCutPages(TSpaceOperation& spaceOp, TCacheItem page, ui64 allocationLimit) noexcept;
 
-    bool LinkCollection(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
     bool TryBeginCollectionAttach(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection,
         THandleState& attachState) noexcept;
     void FinishCollectionAttach(TSpaceOperation& spaceOp, TCacheItem collection, EHandleState detachedState) noexcept;
@@ -711,11 +711,7 @@ private:
     void FinishCollectionRetain(TSpaceOperation& spaceOp, TCacheItem collection) noexcept;
     bool DetachCollection(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
     bool DetachCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
-    bool UnlinkCollectionRegistry(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
     bool DeleteCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
-    void ForEachCollection(TCollectionRegistry& registry, TFunctionRef<void(TCollection&)> callback) noexcept;
-    bool UnlinkCollectionRegistry(
-        TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
     bool TryClaimCollectionDeletion(TSpaceOperation& spaceOp, TCollectionRegistry* expectedRegistry,
         TCacheItem collection, THandleState& sourceState, TSharedCacheItemRefImpl<TTraits>& owner) noexcept;
     bool DeleteCollection(TCollectionRegistry* registry, TCollectionCacheItem collection) noexcept;
@@ -723,9 +719,6 @@ private:
         TSpaceOperation& spaceOp, TCollectionRegistry* expectedRegistry, TCacheItem collection) noexcept;
     bool MoveCollectionRegistry(TSpaceOperation& spaceOp, TCollectionRegistry& source, TCollectionRegistry& destination,
         TCacheItem collection) noexcept;
-    bool UnlinkCollectionRegistry(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection,
-        EHandleState expectedState) noexcept;
-    void UnlinkCollectionRegistry(TCollectionRegistry& registry, TOperationItemRef<TTraits>& collection) noexcept;
 
     bool IsPageSticky(TPageCacheItem page) const noexcept;
     TSharedPageRefImpl<TTraits> BuildPageRef(
@@ -853,7 +846,6 @@ private:
 private:
     THolder<TSharedCacheSpace> Space_;
     TSharedCacheTableImpl<TTraits> Table_;
-    TIntrusivePtr<TCollectionRegistry> CollectionRegistry_ = new TCollectionRegistry;
     TCacheMemory Memory_;
     TCacheCollections<TTraits> Collections_;
     TCacheFetches<TTraits> Fetches_;
@@ -1092,10 +1084,6 @@ public: // Cache helpers
         return Cache_.UnstickyCutPages(SpaceOp_, page, allocationLimit);
     }
 
-    Y_FORCE_INLINE bool LinkCollection(TCollectionRegistry& registry, TCacheItem collection) noexcept {
-        return Cache_.LinkCollection(SpaceOp_, registry, collection);
-    }
-
     Y_FORCE_INLINE bool TryBeginCollectionAttach(
         TCollectionRegistry& registry, TCacheItem collection, THandleState& attachState) noexcept {
         return Cache_.TryBeginCollectionAttach(SpaceOp_, registry, collection, attachState);
@@ -1121,10 +1109,6 @@ public: // Cache helpers
         return Cache_.DetachCollection(SpaceOp_, registry, collection);
     }
 
-    Y_FORCE_INLINE bool UnlinkCollectionRegistry(TCollectionRegistry& registry, TCacheItem collection) noexcept {
-        return Cache_.UnlinkCollectionRegistry(SpaceOp_, registry, collection);
-    }
-
     Y_FORCE_INLINE bool TryClaimCollectionDeletion(TCollectionRegistry* expectedRegistry, TCacheItem collection,
         THandleState& sourceState, TSharedCacheItemRefImpl<TTraits>& owner) noexcept {
         return Cache_.TryClaimCollectionDeletion(SpaceOp_, expectedRegistry, collection, sourceState, owner);
@@ -1137,11 +1121,6 @@ public: // Cache helpers
     Y_FORCE_INLINE bool MoveCollectionRegistry(
         TCollectionRegistry& source, TCollectionRegistry& destination, TCacheItem collection) noexcept {
         return Cache_.MoveCollectionRegistry(SpaceOp_, source, destination, collection);
-    }
-
-    Y_FORCE_INLINE bool UnlinkCollectionRegistry(
-        TCollectionRegistry& registry, TCacheItem collection, EHandleState expectedState) noexcept {
-        return Cache_.UnlinkCollectionRegistry(SpaceOp_, registry, collection, expectedState);
     }
 
     Y_FORCE_INLINE TSharedPageRefImpl<TTraits> BuildPageRef(TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {
