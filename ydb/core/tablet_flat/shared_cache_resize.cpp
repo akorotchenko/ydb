@@ -75,7 +75,7 @@ bool TSharedCache::StartHardTransition() noexcept {
     {
         return false;
     }
-    next.Limit = HardLimit_.load(std::memory_order_relaxed);
+    next.Limit = HardLimit();
     return PrepareTransition(next, HardTransition_);
 }
 
@@ -116,7 +116,7 @@ bool TSharedCache::CommitTransition(TTransition& transition) noexcept {
     Memory_.CommitStaticResize(oldStaticBytes, targetStaticBytes);
     if (commitTargetLimit) {
         TargetHandleCount_.store(targetHandleCount, std::memory_order_relaxed);
-        HardLimit_.store(targetLimit, std::memory_order_relaxed);
+        Memory_.SetHardLimit(targetLimit);
     }
     RefreshSoftLimit();
     return true;

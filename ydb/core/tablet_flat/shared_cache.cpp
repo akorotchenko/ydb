@@ -266,11 +266,8 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     : TTraits(std::move(traits))
     , Space_(std::move(space))
     , Table_(*Space_, *this)
-    , Memory_(Space_->CurrentConfiguration().StaticBytes)
-    , CurrentLimit_(hardLimit)
-    , HardLimit_(hardLimit)
+    , Memory_(Space_->CurrentConfiguration().StaticBytes, hardLimit, Space_->ReservedConfiguration().Limit)
     , TargetHandleCount_(Space_->CurrentConfiguration().HandleCount())
-    , ReservationLimit_(Space_->ReservedConfiguration().Limit)
     , HardTarget_(Space_->CurrentConfiguration())
 {
     RefreshSoftLimit();
@@ -3483,11 +3480,11 @@ bool TSharedCache::AdvanceBucketResize() noexcept {
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::UpdateCurrentLimit(ui64 limit) noexcept {
-    if (limit == 0 || limit > HardLimit_.load(std::memory_order_relaxed)) {
+    if (limit == 0 || limit > HardLimit()) {
         return false;
     }
 
-    CurrentLimit_.store(limit, std::memory_order_relaxed);
+    Memory_.SetCurrentLimit(limit);
     RefreshSoftLimit();
     NotifyResourcesAvailable();
     return true;
@@ -3495,18 +3492,14 @@ bool TSharedCache::UpdateCurrentLimit(ui64 limit) noexcept {
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::UpdateSoftLimit(ui64 limit) noexcept {
-    SoftLimitOverride_.store(limit, std::memory_order_release);
+    Memory_.SetSoftLimitOverride(limit);
     RefreshSoftLimit();
     return true;
 }
 
 SHARED_CACHE_TEMPLATE
 void TSharedCache::RefreshSoftLimit() noexcept {
-    const ui64 currentLimit = CurrentLimit_.load(std::memory_order_relaxed);
-    const ui64 configured = SoftLimitOverride_.load(std::memory_order_acquire);
-    const bool hasOverride = configured != Max<ui64>();
-    const ui64 softLimit = hasOverride ? Min(configured, currentLimit) : CalculateSoftLimit(currentLimit);
-    SoftLimit_.store(softLimit, std::memory_order_relaxed);
+    const ui64 softLimit = Memory_.RefreshSoftLimit(Policy_.CurrentLimitGap, Policy_.MinCurrentLimitGap);
     if (auto hotResize = HotResize_.TryLock()) {
         RefreshEvictableByteBudget();
     }
@@ -3529,7 +3522,7 @@ void TSharedCache::RefreshEvictableByteBudget() noexcept {
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::UpdateKeepColdLimit(ui64 limit) noexcept {
-    if (limit > HardLimit_.load(std::memory_order_relaxed)) {
+    if (limit > HardLimit()) {
         return false;
     }
     const ui64 previousMaximum = KeepColdMaxBytes_.exchange(limit, std::memory_order_relaxed);
@@ -3594,7 +3587,7 @@ bool TSharedCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) 
     ui64 usage = Memory_.PayloadUsage();
     ui32 reclamationAttempts = 0;
     for (;;) {
-        const ui64 currentLimit = CurrentLimit_.load(std::memory_order_relaxed);
+        const ui64 currentLimit = CurrentLimit();
         if (ExceedsLimit(usage, currentLimit, bytes)) {
             SoftLimitPressure_.store(true, std::memory_order_relaxed);
             // Aging/resizing can make progress without freeing bytes. Bound cooperative work so
@@ -3619,7 +3612,7 @@ void TSharedCache::ReleaseReservation(ui64 bytes, ui64 pages) noexcept {
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::UpdateHardLimit(ui64 limit) noexcept {
-    if (limit == 0 || limit < CurrentLimit_.load(std::memory_order_relaxed) || limit > ReservationLimit_) {
+    if (limit == 0 || limit < CurrentLimit() || limit > ReservationLimit()) {
         return false;
     }
 
@@ -3645,7 +3638,7 @@ bool TSharedCache::UpdateHardLimit(ui64 limit) noexcept {
 
     HardTarget_ = target;
     TargetHandleCount_.store(target.HandleCount(), std::memory_order_relaxed);
-    HardLimit_.store(limit, std::memory_order_relaxed);
+    Memory_.SetHardLimit(limit);
     StartHardTransition();
     return true;
 }
@@ -3659,7 +3652,7 @@ bool TSharedCache::EnforceCurrentLimit() noexcept {
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes, bool forceShrinkHot) noexcept {
     auto cacheOp = BindOperation(spaceOp);
-    const ui64 softLimit = SoftLimit_.load(std::memory_order_relaxed);
+    const ui64 softLimit = SoftLimit();
     const bool hadCurrentPressure = ExceedsLimit(PayloadUsage(), CurrentLimit(), bytes);
     const ui32 resizeStep = HotResizeStep(static_cast<ui32>(spaceOp.EffectiveHotSlots()));
     // Retained cache bytes drive soft pressure; total page commitment independently drives current pressure.
@@ -3758,13 +3751,6 @@ bool TSharedCache::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes, boo
         }
     }
     return progress;
-}
-
-SHARED_CACHE_TEMPLATE
-ui64 TSharedCache::CalculateSoftLimit(ui64 currentLimit) const noexcept {
-    const ui64 gap =
-        Min(currentLimit, Max(Policy_.MinCurrentLimitGap, FractionCeil(currentLimit, Policy_.CurrentLimitGap)));
-    return currentLimit - gap;
 }
 
 SHARED_CACHE_TEMPLATE

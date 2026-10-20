@@ -2,6 +2,7 @@
 
 #include "shared_cache_item.h"
 
+#include <util/generic/ylimits.h>
 #include <util/system/yassert.h>
 
 #include <atomic>
@@ -10,7 +11,37 @@ namespace NKikimr::NSharedCache {
 
 class TCacheMemory {
 public:
-    explicit TCacheMemory(ui64 staticBytes) noexcept;
+    TCacheMemory(ui64 staticBytes, ui64 initialLimit, ui64 reservationLimit) noexcept;
+
+    ui64 CurrentLimit() const noexcept {
+        return CurrentLimit_.load(std::memory_order_relaxed);
+    }
+
+    ui64 SoftLimit() const noexcept {
+        return SoftLimit_.load(std::memory_order_relaxed);
+    }
+
+    ui64 HardLimit() const noexcept {
+        return HardLimit_.load(std::memory_order_relaxed);
+    }
+
+    ui64 ReservationLimit() const noexcept {
+        return ReservationLimit_;
+    }
+
+    void SetCurrentLimit(ui64 limit) noexcept {
+        CurrentLimit_.store(limit, std::memory_order_relaxed);
+    }
+
+    void SetHardLimit(ui64 limit) noexcept {
+        HardLimit_.store(limit, std::memory_order_relaxed);
+    }
+
+    void SetSoftLimitOverride(ui64 limit) noexcept {
+        SoftLimitOverride_.store(limit, std::memory_order_release);
+    }
+
+    ui64 RefreshSoftLimit(double gapFraction, ui64 minimumGap) noexcept;
 
     ui64 ResidentBytes() const noexcept {
         return ResidentBytes_.load(std::memory_order_relaxed);
@@ -98,6 +129,8 @@ public:
     void CommitStaticResize(ui64 oldStaticBytes, ui64 targetStaticBytes) noexcept;
 
 private:
+    static ui64 CalculateSoftLimit(ui64 currentLimit, double gapFraction, ui64 minimumGap) noexcept;
+
     static void SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept {
         const ui64 previous = counter.fetch_sub(bytes, std::memory_order_relaxed);
         Y_ABORT_UNLESS(previous >= bytes);
@@ -111,6 +144,11 @@ private: // Data members
     std::atomic<ui64> PageUsage_{ 0 };
     std::atomic<ui64> ReservedBytes_{ 0 };
     std::atomic<ui64> ReservedPages_{ 0 };
+    std::atomic<ui64> CurrentLimit_{ 0 };
+    std::atomic<ui64> SoftLimitOverride_{ Max<ui64>() };
+    std::atomic<ui64> SoftLimit_{ 0 };
+    std::atomic<ui64> HardLimit_{ 0 };
+    ui64 ReservationLimit_ = 0;
 };
 
 } // namespace NKikimr::NSharedCache
