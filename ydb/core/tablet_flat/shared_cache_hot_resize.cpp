@@ -10,14 +10,15 @@ namespace NKikimr::NSharedCache {
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::DrainHotResize() noexcept {
     if (auto hotResize = HotResize_.TryLock()) {
-        auto spaceOp = BeginOperation();
-        return DrainHotResize(spaceOp);
+        auto cacheOp = BeginOperation();
+        return cacheOp.DrainHotResize();
     }
     return false;
 }
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::DrainHotResize(TSpaceOperation& spaceOp) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
     bool progress = false;
     while (HotResize_.Phase() == EHotResizePhase::Cut) {
         ui32 level;
@@ -27,7 +28,7 @@ bool TSharedCache::DrainHotResize(TSpaceOperation& spaceOp) noexcept {
         }
         progress = true;
         if (raw != 0) {
-            ProcessHot(spaceOp, static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
+            cacheOp.ProcessHot(static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
         }
     }
     return progress;

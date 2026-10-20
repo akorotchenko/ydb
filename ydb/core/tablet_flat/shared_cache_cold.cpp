@@ -8,6 +8,7 @@ namespace NKikimr::NSharedCache {
 
 SHARED_CACHE_TEMPLATE
 void TSharedCache::RouteCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
     if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen()) {
         return;
     }
@@ -27,13 +28,14 @@ void TSharedCache::RouteCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) 
     if (!displaced.IsNull()) {
         const ui64 previous = ColdRingEntries_.fetch_sub(1, std::memory_order_relaxed);
         Y_ABORT_UNLESS(previous != 0);
-        EraseCold(spaceOp, displaced);
+        cacheOp.EraseCold(displaced);
     }
 }
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::WantsKeepCold(TSpaceOperation& spaceOp, const THandle& page) noexcept {
-    if (TCollection* collection = PageCollection(spaceOp, page)) {
+    auto cacheOp = BindOperation(spaceOp);
+    if (TCollection* collection = cacheOp.PageCollection(page)) {
         return collection->CacheMode_.load(std::memory_order_acquire) == ECacheMode::TryKeepInMemory &&
                collection->IsKeepAllowedPage(page.Metadata.Page.Type);
     }
@@ -43,6 +45,7 @@ bool TSharedCache::WantsKeepCold(TSpaceOperation& spaceOp, const THandle& page) 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::DemoteKeepCold(
     TSpaceOperation& spaceOp, TColdCacheItem coldItem, TPageCacheItem expectedPage) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
     if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen()) {
         return false;
     }
@@ -72,10 +75,10 @@ bool TSharedCache::DemoteKeepCold(
             TransferEstimatedPages(KeepColdPages_, ColdPages_, EItemKind::Page);
             ColdItems_.fetch_add(1, std::memory_order_relaxed);
             SubtractExactBytes(KeepColdOwnedBytes_, bytes);
-            if (TCollection* owner = PageCollection(spaceOp, handle)) {
+            if (TCollection* owner = cacheOp.PageCollection(handle)) {
                 AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
             }
-            ReleaseColdDemotionPin(spaceOp, pin);
+            cacheOp.ReleaseColdDemotionPin(pin);
             return true;
         }
     }
@@ -83,20 +86,22 @@ bool TSharedCache::DemoteKeepCold(
 
 SHARED_CACHE_TEMPLATE
 void TSharedCache::ReleaseColdDemotionPin(TSpaceOperation& spaceOp, TOperationItemRef& pin) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
     const TCacheItem cacheItem = pin.CacheItem();
     pin.Disarm();
     // A policy demotion must not readmit the page to KeepCold when releasing its temporary ref.
-    if (TCollection* owner = ReleaseItem(spaceOp, cacheItem, false)) {
-        DropOwnerReference(spaceOp, *owner);
+    if (TCollection* owner = cacheOp.ReleaseItem(cacheItem, false)) {
+        cacheOp.DropOwnerReference(*owner);
     }
 }
 
 SHARED_CACHE_TEMPLATE
 void TSharedCache::WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
-    if (DemoteKeepCold(spaceOp, coldItem)) {
+    auto cacheOp = BindOperation(spaceOp);
+    if (cacheOp.DemoteKeepCold(coldItem)) {
         return;
     }
-    if (!MatchesKeepColdEntry(spaceOp, coldItem)) {
+    if (!cacheOp.MatchesKeepColdEntry(coldItem)) {
         return;
     }
     THandle& handle = spaceOp.Handles()[coldItem.Index()];
@@ -104,7 +109,7 @@ void TSharedCache::WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TColdCacheIte
     if (!AdvanceColdMembership(handle, coldItem.ColdVersion(), false, coldVersion)) {
         return;
     }
-    DemoteKeepCold(spaceOp, TColdCacheItem::Make(coldVersion, coldItem.Index()));
+    cacheOp.DemoteKeepCold(TColdCacheItem::Make(coldVersion, coldItem.Index()));
 }
 
 SHARED_CACHE_TEMPLATE
@@ -127,6 +132,7 @@ bool TSharedCache::IsKeepColdQueued(const THandle& handle) noexcept {
 
 SHARED_CACHE_TEMPLATE
 void TSharedCache::RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
     if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen()) {
         return;
     }
@@ -143,7 +149,7 @@ void TSharedCache::RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldIt
         }
         if (expected.Refs() != 0) {
             // The caller took this page's ring entry; its last reference will process the withdrawal.
-            WithdrawKeepColdEntry(spaceOp, coldItem);
+            cacheOp.WithdrawKeepColdEntry(coldItem);
             return;
         }
         if (handle.State.compare_exchange_weak(
@@ -155,8 +161,8 @@ void TSharedCache::RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldIt
     if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
         return;
     }
-    if (!WantsKeepCold(spaceOp, handle)) {
-        WithdrawKeepColdEntry(spaceOp, coldItem);
+    if (!cacheOp.WantsKeepCold(handle)) {
+        cacheOp.WithdrawKeepColdEntry(coldItem);
         return;
     }
     ui32 queuedVersion;
@@ -168,16 +174,16 @@ void TSharedCache::RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldIt
     InvokeHook(ESharedCacheHookPoint::AfterKeepColdQueued, queuedItem);
     if (displaced != 0) {
         const TColdCacheItem displacedItem = TColdCacheItem::FromRaw(displaced);
-        if (!DemoteKeepCold(spaceOp, displacedItem)) {
+        if (!cacheOp.DemoteKeepCold(displacedItem)) {
             // The displaced page stays KeepCold without a ring entry: demote it on its last release.
-            WithdrawKeepColdEntry(spaceOp, displacedItem);
+            cacheOp.WithdrawKeepColdEntry(displacedItem);
         }
     }
-    if (!WantsKeepCold(spaceOp, handle)) {
-        WithdrawKeepColdEntry(spaceOp, queuedItem);
+    if (!cacheOp.WantsKeepCold(handle)) {
+        cacheOp.WithdrawKeepColdEntry(queuedItem);
     }
     pin.Get().Drop(spaceOp);
-    TrimKeepCold(spaceOp);
+    cacheOp.TrimKeepCold();
 }
 
 SHARED_CACHE_TEMPLATE
@@ -187,6 +193,7 @@ void TSharedCache::AddKeepColdOwnedBytes(ui64 bytes) noexcept {
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::TrimKeepCold(TSpaceOperation& spaceOp) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
     const ui64 limit = KeepColdLimit();
     if (KeepColdOwnedBytes_.load(std::memory_order_relaxed) <= limit &&
         !KeepColdTrimActive_.load(std::memory_order_relaxed))
@@ -220,11 +227,11 @@ bool TSharedCache::TrimKeepCold(TSpaceOperation& spaceOp) noexcept {
             continue;
         }
         const TColdCacheItem coldItem = TColdCacheItem::FromRaw(raw);
-        if (DemoteKeepCold(spaceOp, coldItem)) {
+        if (cacheOp.DemoteKeepCold(coldItem)) {
             progress = true;
         } else {
             const ui64 keepColdBytes = KeepColdOwnedBytes_.load(std::memory_order_relaxed);
-            WithdrawKeepColdEntry(spaceOp, coldItem);
+            cacheOp.WithdrawKeepColdEntry(coldItem);
             // A referenced page cannot be demoted yet, but its entry is gone now: advance the membership so
             // that the page leaves KeepCold on its last release. The withdrawal helper also demotes it if the
             // last release raced with the membership advance.
@@ -242,9 +249,10 @@ bool TSharedCache::TrimKeepCold(TSpaceOperation& spaceOp) noexcept {
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::ShrinkKeepCold(TSpaceOperation& spaceOp) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
     // Finish the previous FIFO trim before reducing the target again: sparse slots or held pages may delay it.
     if (KeepColdTrimActive_.load(std::memory_order_relaxed)) {
-        return TrimKeepCold(spaceOp);
+        return cacheOp.TrimKeepCold();
     }
     ui64 limit = KeepColdLimit_.load(std::memory_order_relaxed);
     for (;;) {
@@ -252,11 +260,11 @@ bool TSharedCache::ShrinkKeepCold(TSpaceOperation& spaceOp) noexcept {
         const ui64 step = Max<ui64>(1, FractionCeil(occupied, Policy_.ResizeStep));
         const ui64 target = occupied - Min(occupied, step);
         if (limit == target) {
-            return TrimKeepCold(spaceOp);
+            return cacheOp.TrimKeepCold();
         }
         if (KeepColdLimit_.compare_exchange_weak(limit, target, std::memory_order_relaxed, std::memory_order_relaxed))
         {
-            TrimKeepCold(spaceOp);
+            cacheOp.TrimKeepCold();
             return true;
         }
     }
@@ -283,12 +291,13 @@ bool TSharedCache::GrowKeepCold() noexcept {
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::ReclaimCold() noexcept {
-    auto spaceOp = BeginOperation();
-    return ReclaimCold(spaceOp);
+    auto cacheOp = BeginOperation();
+    return cacheOp.ReclaimCold();
 }
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::ReclaimCold(TSpaceOperation& spaceOp) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
     const TRingView cold = spaceOp.Cold();
     for (ui64 attempt = 0; attempt < cold.Capacity; ++attempt) {
         if (ColdRingEntries_.load(std::memory_order_relaxed) == 0) {
@@ -299,7 +308,7 @@ bool TSharedCache::ReclaimCold(TSpaceOperation& spaceOp) noexcept {
         if (rawItem != 0) {
             const ui64 previous = ColdRingEntries_.fetch_sub(1, std::memory_order_relaxed);
             Y_ABORT_UNLESS(previous != 0);
-            if (EraseCold(spaceOp, TColdCacheItem::FromRaw(rawItem))) {
+            if (cacheOp.EraseCold(TColdCacheItem::FromRaw(rawItem))) {
                 return true;
             }
         }
@@ -309,6 +318,7 @@ bool TSharedCache::ReclaimCold(TSpaceOperation& spaceOp) noexcept {
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::DemoteKeepColdForSoftLimit(TSpaceOperation& spaceOp) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
     const TRingView keep = spaceOp.KeepCold();
     for (ui64 attempt = 0; attempt < keep.Capacity && KeepColdOwnedBytes() != 0; ++attempt) {
         const ui64 raw = keep.Pop();
@@ -316,17 +326,18 @@ bool TSharedCache::DemoteKeepColdForSoftLimit(TSpaceOperation& spaceOp) noexcept
             continue;
         }
         const TColdCacheItem item = TColdCacheItem::FromRaw(raw);
-        if (DemoteKeepCold(spaceOp, item)) {
+        if (cacheOp.DemoteKeepCold(item)) {
             return true;
         }
         // The FIFO entry is gone even when a structural ref delays demotion.
-        WithdrawKeepColdEntry(spaceOp, item);
+        cacheOp.WithdrawKeepColdEntry(item);
     }
     return false;
 }
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
     const TRingView keep = spaceOp.KeepCold();
     for (ui64 attempt = 0; attempt < keep.Capacity && KeepColdOwnedBytes() != 0; ++attempt) {
         const ui64 raw = keep.Pop();
@@ -334,25 +345,26 @@ bool TSharedCache::ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept {
             continue;
         }
         const TColdCacheItem item = TColdCacheItem::FromRaw(raw);
-        if (!MatchesKeepColdEntry(spaceOp, item)) {
+        if (!cacheOp.MatchesKeepColdEntry(item)) {
             continue;
         }
         InvokeHook(ESharedCacheHookPoint::AfterKeepColdEntryMatched, item);
-        if (EraseCold(spaceOp, item)) {
+        if (cacheOp.EraseCold(item)) {
             return true;
         }
-        WithdrawKeepColdEntry(spaceOp, item);
+        cacheOp.WithdrawKeepColdEntry(item);
     }
     return false;
 }
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::Reclaim(TSpaceOperation& spaceOp, ui64 bytes) noexcept {
-    if (ReclaimCold(spaceOp) || ReclaimKeepCold(spaceOp)) {
+    auto cacheOp = BindOperation(spaceOp);
+    if (cacheOp.ReclaimCold() || cacheOp.ReclaimKeepCold()) {
         return true;
     }
     // Cold is empty, so only moving the hot/cold boundary can make room, and that is EnforceCurrentLimit's job.
-    return EnforceCurrentLimit(spaceOp, bytes);
+    return cacheOp.EnforceCurrentLimit(bytes);
 }
 
 #undef TOperationItemRef

@@ -133,7 +133,8 @@ SHARED_CACHE_TEMPLATE
 void TSharedCacheItemRef::Drop(TSpaceOperation& spaceOp) noexcept {
     const TCacheItem cacheItem = Take();
     if (!cacheItem.IsNull()) {
-        TSharedCache::Get().Release(spaceOp, cacheItem);
+        auto cacheOp = TSharedCache::Get().BindOperation(spaceOp);
+        cacheOp.Release(cacheItem);
     }
 }
 
@@ -255,7 +256,8 @@ bool TSharedCacheTable::ValidateTerminalOwner(
 
 SHARED_CACHE_TEMPLATE
 TSharedCacheItemRef TSharedCacheTable::TryAcquire(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
-    return Cache_.TryAcquireStructural(spaceOp, cacheItem);
+    auto cacheOp = Cache_.BindOperation(spaceOp);
+    return cacheOp.TryAcquireStructural(cacheItem);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -537,6 +539,7 @@ bool TSharedCacheTable::FindLink(
 SHARED_CACHE_TEMPLATE
 bool TSharedCacheTable::BridgeTombstone(
     TCacheItem cacheItem, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept {
+    auto cacheOp = Cache_.BindOperation(spaceOp);
     const TCacheItem successor = FreezeNext(spaceOp, cacheItem).WithoutFrozen();
     TCacheItem leftmostTombstone;
     TCacheItem rightmostTombstone;
@@ -560,7 +563,7 @@ bool TSharedCacheTable::BridgeTombstone(
             THandle& tombstone = spaceOp.Handles()[current.Index()];
             const TCacheItem next = TCacheItem::FromRaw(tombstone.Next.load(std::memory_order_acquire)).WithoutFrozen();
             const bool wasRightmost = current == rightmostTombstone;
-            Cache_.Release(spaceOp, current);
+            cacheOp.Release(current);
             if (wasRightmost) {
                 leftmostTombstone = {};
                 rightmostTombstone = {};
@@ -624,7 +627,7 @@ bool TSharedCacheTable::BridgeTombstone(
                 const TCacheItem next =
                     TCacheItem::FromRaw(tombstone.Next.load(std::memory_order_acquire)).WithoutFrozen();
                 const bool wasRightmost = current == rightmostTombstone;
-                Cache_.Release(spaceOp, current);
+                cacheOp.Release(current);
                 if (wasRightmost) {
                     break;
                 }
