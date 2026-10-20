@@ -519,10 +519,10 @@ public:
         return cache.Space_->FinishBucketResize();
     }
 
-    static void CompleteTombstone(TTestSharedCache& cache, TCacheItem cacheItem, const TSharedCacheKey& key) {
+    static void FinishErase(TTestSharedCache& cache, TCacheItem cacheItem, const TSharedCacheKey& key) {
         auto operation = cache.BeginOperation();
         TOperationItemRef<TTestTraits> ownerRef(operation, cacheItem);
-        cache.Table_.CompleteTombstone(ownerRef.CacheItem(), key, operation);
+        cache.Table_.FinishErase(operation, ownerRef.CacheItem(), key);
     }
 
     static void InstallHooks(TTestSharedCache& cache, TTestTraits* hooks) noexcept {
@@ -1992,6 +1992,109 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         fixture.Cache->ForEachCollection([](TCollection&) {
             UNIT_FAIL("Detached collection remained registered");
         });
+    }
+
+    Y_UNIT_TEST(CacheOperationMovesGuardAndSharesHelperScope) {
+        TFixture fixture;
+        const auto key = TSharedCacheKey::Page(MakeCollectionCacheItem(1, 2), 100);
+        const auto page = InsertReadyPage(*fixture.Cache, key);
+        TSpaceHazard* hazard = nullptr;
+        {
+            auto cacheOp = fixture.Cache->BeginOperation();
+            hazard = &cacheOp.Hazard();
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
+            TCacheItem item;
+            UNIT_ASSERT(cacheOp.Find(key, item) == ESharedCacheResultStatus::Hit);
+            UNIT_ASSERT(item == page.CacheItem());
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 0);
+            {
+                auto movedOp = std::move(cacheOp);
+                UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
+                TOperationItemRef<TTestTraits> acquired(movedOp);
+                UNIT_ASSERT(movedOp.TryAcquire(item, false, acquired.Get()) ==
+                            TTestSharedCache::TOperation::EAcquireStatus::Ready);
+                UNIT_ASSERT(acquired.CacheItem() == item);
+                UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
+                UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 1);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(hazard->State.load(std::memory_order_acquire), 0);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(hazard->State.load(std::memory_order_acquire), 0);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 0);
+    }
+
+    Y_UNIT_TEST(BeginEraseAcquiresOwnerAndFinishErasePreservesHeldItem) {
+        TFixture fixture;
+        const auto key = TSharedCacheKey::Page(MakeCollectionCacheItem(1, 2), 100);
+        const auto page = InsertReadyPage(*fixture.Cache, key);
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+
+        TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& cacheOp) {
+            TOperationItemRef<TTestTraits> held(cacheOp, cacheOp.TryAcquireStructural(page.CacheItem()));
+            UNIT_ASSERT(held);
+            THandle& handle = cacheOp.Handles()[page.Index()];
+            const THandleState before = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+            UNIT_ASSERT(before.IsCold());
+            UNIT_ASSERT_VALUES_EQUAL(before.Refs(), 1);
+            {
+                TOperationItemRef<TTestTraits> owner(cacheOp);
+                THandleState expected = before.IncrementRefs();
+                UNIT_ASSERT(!cacheOp.TryBeginErase(page.CacheItem(), expected, owner.Get()));
+                UNIT_ASSERT(!owner);
+                UNIT_ASSERT_VALUES_EQUAL(expected.Raw(), before.Raw());
+                UNIT_ASSERT_VALUES_EQUAL(handle.State.load(std::memory_order_acquire), before.Raw());
+
+                UNIT_ASSERT(cacheOp.TryBeginErase(page.CacheItem(), expected, owner.Get()));
+                UNIT_ASSERT(owner.CacheItem() == page.CacheItem());
+                const THandleState deleted = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+                UNIT_ASSERT(deleted.IsTombstone());
+                UNIT_ASSERT_VALUES_EQUAL(deleted.Refs(), 2);
+                TCacheItem found;
+                UNIT_ASSERT(cacheOp.Find(key, found) == ESharedCacheResultStatus::Miss);
+
+                cacheOp.FinishErase(owner.CacheItem(), key);
+                cacheOp.FinishErase(owner.CacheItem(), key);
+                UNIT_ASSERT_VALUES_EQUAL(handle.State.load(std::memory_order_acquire), deleted.Raw());
+            }
+            const THandleState retained = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+            UNIT_ASSERT(retained.IsTombstone());
+            UNIT_ASSERT_VALUES_EQUAL(retained.Refs(), 1);
+        });
+        const THandleState released = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+        UNIT_ASSERT(released.IsFree());
+        UNIT_ASSERT_VALUES_EQUAL(released.Version(), AdvanceItemVersion(page.Version()));
+    }
+
+    Y_UNIT_TEST(BeginEraseReusesOwnerWithoutReferenceIncrement) {
+        TFixture fixture;
+        const auto key = TSharedCacheKey::Page(MakeCollectionCacheItem(1, 2), 100);
+        const auto page = InsertReadyPage(*fixture.Cache, key);
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+
+        TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& cacheOp) {
+            TOperationItemRef<TTestTraits> owner(cacheOp, cacheOp.TryAcquireStructural(page.CacheItem()));
+            UNIT_ASSERT(owner);
+            THandle& handle = cacheOp.Handles()[page.Index()];
+            const THandleState before = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+            UNIT_ASSERT(before.IsCold());
+            UNIT_ASSERT_VALUES_EQUAL(before.Refs(), 1);
+
+            THandleState expected = before.IncrementRefs();
+            UNIT_ASSERT(!cacheOp.TryBeginErase(owner.Get(), expected));
+            UNIT_ASSERT(owner.CacheItem() == page.CacheItem());
+            UNIT_ASSERT_VALUES_EQUAL(expected.Raw(), before.Raw());
+            UNIT_ASSERT_VALUES_EQUAL(handle.State.load(std::memory_order_acquire), before.Raw());
+
+            UNIT_ASSERT(cacheOp.TryBeginErase(owner.Get(), expected));
+            const THandleState deleted = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+            UNIT_ASSERT(deleted.IsTombstone());
+            UNIT_ASSERT_VALUES_EQUAL(deleted.Refs(), 1);
+            cacheOp.FinishErase(owner.CacheItem(), key);
+            cacheOp.FinishErase(owner.CacheItem(), key);
+            UNIT_ASSERT(owner.CacheItem() == page.CacheItem());
+            UNIT_ASSERT_VALUES_EQUAL(handle.State.load(std::memory_order_acquire), deleted.Raw());
+        });
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsFree());
     }
 
     Y_UNIT_TEST(InsertFindAndRollback) {
@@ -8213,7 +8316,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                     state.IncrementRefs().WithState(EHandleState::Tombstone).Raw(), std::memory_order_release);
                 return state.Version();
             });
-            TSharedCacheTestAccess::CompleteTombstone(*fixture.Cache, TCacheItem::Make(pageVersion, page.Index()), key);
+            TSharedCacheTestAccess::FinishErase(*fixture.Cache, TCacheItem::Make(pageVersion, page.Index()), key);
             UNIT_ASSERT_VALUES_EQUAL(
                 TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index(), std::memory_order_relaxed).Refs(), 1);
         }
@@ -8900,8 +9003,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 });
         }
 
-        TSharedCacheTestAccess::CompleteTombstone(
-            *fixture.Cache, tombstones[TombstoneCount - 1], keys[TombstoneCount - 1]);
+        TSharedCacheTestAccess::FinishErase(*fixture.Cache, tombstones[TombstoneCount - 1], keys[TombstoneCount - 1]);
 
         for (ui32 index = 0; index + 1 < TombstoneCount; ++index) {
             const THandleState state = TSharedCacheTestAccess::HandleState(*fixture.Cache, indices[index]);
@@ -8918,7 +9020,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         successor.Ref.Drop();
 
         for (ui32 index = 0; index + 1 < TombstoneCount; ++index) {
-            TSharedCacheTestAccess::CompleteTombstone(*fixture.Cache, tombstones[index], keys[index]);
+            TSharedCacheTestAccess::FinishErase(*fixture.Cache, tombstones[index], keys[index]);
         }
         UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), fixture.Capacity.HandleCount() - 3);
     }
@@ -8978,7 +9080,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 1); // only the paused deletion owner remains
         UNIT_ASSERT(TCacheItem::FromRaw(TSharedCacheTestAccess::HandleNext(*fixture.Cache, indices[1])).IsFrozen());
 
-        TSharedCacheTestAccess::CompleteTombstone(*fixture.Cache, tombstoneItem, keys[1]);
+        TSharedCacheTestAccess::FinishErase(*fixture.Cache, tombstoneItem, keys[1]);
         state = TSharedCacheTestAccess::HandleState(*fixture.Cache, indices[1], std::memory_order_relaxed);
         UNIT_ASSERT(state.IsFree());
         UNIT_ASSERT_VALUES_EQUAL(state.Version(), AdvanceItemVersion(tombstoneItem.Version()));

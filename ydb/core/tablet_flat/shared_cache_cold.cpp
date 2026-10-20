@@ -359,7 +359,7 @@ bool TSharedCache::Reclaim(TSpaceOperation& spaceOp, ui64 bytes) noexcept {
 #undef TSharedCache
 #undef SHARED_CACHE_TEMPLATE
 
-// Cold and KeepCold members are instantiated here; other cache members are instantiated in shared_cache.cpp.
+// Explicit instantiations of this file's Cold/KeepCold definitions for both trait variants.
 template void TSharedCacheImpl<TProdTraits>::RouteCold(TSpaceOperation&, TColdCacheItem) noexcept;
 template bool TSharedCacheImpl<TProdTraits>::WantsKeepCold(TSpaceOperation&, const THandle&) noexcept;
 template bool TSharedCacheImpl<TProdTraits>::DemoteKeepCold(TSpaceOperation&, TColdCacheItem, TPageCacheItem) noexcept;

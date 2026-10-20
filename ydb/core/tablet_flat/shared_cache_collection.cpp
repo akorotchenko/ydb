@@ -25,8 +25,8 @@ void TCollection::SetSkipBTreeIndexV1Shadow(bool skip) {
 void TCollection::DrainStickyPages() {
     auto& cache = TSharedCache::Get();
     auto binding = cache.BindCurrentThreadHazard();
-    auto spaceOp = cache.BeginOperation();
-    cache.DrainStickyPages(spaceOp, *this);
+    auto cacheOp = cache.BeginOperation();
+    cacheOp.DrainStickyPages(*this);
 }
 
 TCollectionActorState& TCollection::EnsureActorState() {

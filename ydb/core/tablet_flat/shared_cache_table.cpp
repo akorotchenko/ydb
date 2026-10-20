@@ -123,8 +123,8 @@ void TSharedCacheItemRef::Drop() noexcept {
         // A missing resolver is the explicit terminal-shutdown abandonment path.
         if (TSharedCache* cache = TSharedCache::TryGet()) {
             auto binding = cache->BindCurrentThreadHazard();
-            auto spaceOp = cache->BeginOperation();
-            cache->Release(spaceOp, cacheItem);
+            auto cacheOp = cache->BeginOperation();
+            cacheOp.Release(cacheItem);
         }
     }
 }
@@ -268,6 +268,68 @@ SHARED_CACHE_TEMPLATE
 ESharedCacheResultStatus TSharedCacheTable::FindForInsert(TSpaceOperation& spaceOp, const TSharedCacheKey& key,
     TCacheItem& cacheItem, TInsertPosition& insertPosition) noexcept {
     return FindOrInsert<true>(spaceOp, key, cacheItem, &insertPosition);
+}
+
+SHARED_CACHE_TEMPLATE
+Y_FORCE_INLINE typename TSharedCacheTable::TBucketRoute TSharedCacheTable::SelectBucket(
+    ui32 hash, TSpaceState spaceState) const noexcept {
+    if (!spaceState.Resizing()) {
+        const ui32 bucket = hash & spaceState.BucketMask();
+        return { .Bucket = bucket, .BaseBucket = bucket };
+    }
+
+    const TBucketResizeState resize = Space_.BucketResizeState();
+    const ui32 splitBit = resize.SplitBit();
+    const ui32 base = hash & (splitBit - 1);
+    const bool suffix = (hash & splitBit) != 0;
+    if (resize.Direction() == EBucketResize::Growing) {
+        if (suffix && base < resize.Cursor()) {
+            return { .Resize = resize, .Bucket = base | splitBit, .BaseBucket = base, .FollowsSplitSuffix = true };
+        }
+        return { .Resize = resize, .Bucket = base, .BaseBucket = base, .FollowsSplitSuffix = suffix };
+    }
+
+    if (suffix && base >= resize.Cursor()) {
+        return { .Resize = resize, .Bucket = base | splitBit, .BaseBucket = base, .FollowsSplitSuffix = true };
+    }
+    return { .Resize = resize, .Bucket = base, .BaseBucket = base, .FollowsSplitSuffix = suffix };
+}
+
+SHARED_CACHE_TEMPLATE
+template <typename TSharedCacheTable::ETombstoneMode Mode>
+Y_FORCE_INLINE bool TSharedCacheTable::SelectGrowthBucket(TBucketRoute& route, const TOrderedLink& link) noexcept {
+    const TBucketResizeState& resize = route.Resize;
+    if (!resize || resize.Direction() != EBucketResize::Growing) {
+        return false;
+    }
+    if constexpr (Mode == ETombstoneMode::Help) {
+        if (resize.Phase() != EBucketResizePhase::Activated) {
+            return false;
+        }
+    } else if (resize.Phase() != EBucketResizePhase::Prepared && resize.Phase() != EBucketResizePhase::Activated)
+    {
+        return false;
+    }
+    if (route.FollowsSplitSuffix && route.Bucket == route.BaseBucket && !link.SawSplit &&
+        route.BaseBucket == resize.Cursor())
+    {
+        route.Bucket = route.BaseBucket | resize.SplitBit();
+        return true;
+    }
+    return false;
+}
+
+SHARED_CACHE_TEMPLATE
+template <typename TSharedCacheTable::ETombstoneMode Mode>
+Y_FORCE_INLINE typename TSharedCacheTable::EBucketRouteResult TSharedCacheTable::ResolveBucketMiss(
+    TSpaceState& spaceState, TBucketRoute& route, const TOrderedLink& link) const noexcept {
+    if (!Space_.RefreshBucketRoute(spaceState, route.Resize)) {
+        return EBucketRouteResult::Retry;
+    }
+    if (SelectGrowthBucket<Mode>(route, link)) {
+        return EBucketRouteResult::Next;
+    }
+    return EBucketRouteResult::Done;
 }
 
 SHARED_CACHE_TEMPLATE
@@ -638,8 +700,52 @@ void TSharedCacheTable::HelpTombstone(
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCacheTable::CompleteTombstone(
-    TCacheItem cacheItem, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept {
+bool TSharedCacheTable::TryBeginErase(
+    TSpaceOperation& spaceOp, TCacheItem cacheItem, THandleState& expected, TSharedCacheItemRef& owner) noexcept {
+    Y_DEBUG_ABORT_UNLESS(!owner && !expected.IsCompleting());
+    if (!spaceOp.Contains(cacheItem) || cacheItem.IsFrozen() || !cacheItem.Matches(expected)) {
+        return false;
+    }
+    Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
+    const THandleState desired = expected.IncrementRefs().WithState(EHandleState::Tombstone).WithFrequency(0);
+    ui64 expectedRaw = expected.Raw();
+    if (!spaceOp.Handles()[cacheItem.Index()].State.compare_exchange_strong(
+            expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed)) {
+        expected = THandleState::FromRaw(expectedRaw);
+        return false;
+    }
+    owner = TSharedCacheItemRef(cacheItem);
+    return true;
+}
+
+SHARED_CACHE_TEMPLATE
+bool TSharedCacheTable::TryBeginErase(
+    TSpaceOperation& spaceOp, TSharedCacheItemRef& owner, THandleState& expected) noexcept {
+    Y_DEBUG_ABORT_UNLESS(owner && expected.Refs() > 0);
+    const TCacheItem cacheItem = owner.CacheItem();
+    if (!cacheItem.Matches(expected)) {
+        return false;
+    }
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    if (expected.IsCompleting()) {
+        Y_DEBUG_ABORT_UNLESS(expected.IsPageKind() && expected.Refs() == 1);
+        handle.State.store(expected.WithState(EHandleState::Tombstone).WithSticky(EStickyState::None).Raw(),
+            std::memory_order_release);
+        return true;
+    }
+    const THandleState desired = expected.WithState(EHandleState::Tombstone).WithFrequency(0);
+    ui64 expectedRaw = expected.Raw();
+    if (!handle.State.compare_exchange_strong(
+            expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        expected = THandleState::FromRaw(expectedRaw);
+        return false;
+    }
+    return true;
+}
+
+SHARED_CACHE_TEMPLATE
+void TSharedCacheTable::FinishErase(
+    TSpaceOperation& spaceOp, TCacheItem cacheItem, const TSharedCacheKey& key) noexcept {
     const THandleState state =
         THandleState::FromRaw(spaceOp.Handles()[cacheItem.Index()].State.load(std::memory_order_acquire));
     Y_ABORT_UNLESS(cacheItem.Matches(state) && state.IsTombstone() && state.Refs() > 0);
