@@ -555,6 +555,9 @@ public:
 
 private:
     template <class>
+    friend class TCacheFetches;
+
+    template <class>
     friend class TSharedCacheImpl;
 
     template <class>

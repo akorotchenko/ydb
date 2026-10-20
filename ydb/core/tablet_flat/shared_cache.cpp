@@ -229,10 +229,10 @@ bool TPageFetch::MakeReady(NActors::TSharedData&& data) noexcept {
     bool ready;
     {
         auto binding = cache.BindCurrentThreadHazard();
-        auto spaceOp = cache.BeginOperation();
+        auto cacheOp = cache.BeginOperation();
         // The fetch owns the insertion ref represented by FetchState_, without storing a second item identity.
-        TOperationItemRef owner(spaceOp, FetchState_->Page().CacheItem());
-        ready = cache.CompleteFetch(owner, *FetchState_, std::move(data));
+        TOperationItemRef owner(cacheOp, FetchState_->Page().CacheItem());
+        ready = cacheOp.Fetches().Complete(owner, *FetchState_, std::move(data));
     }
     FetchState_.Drop();
     return ready;
@@ -253,9 +253,9 @@ bool TPageFetch::FailReady() noexcept {
     bool failed;
     {
         auto binding = cache->BindCurrentThreadHazard();
-        auto spaceOp = cache->BeginOperation();
-        TOperationItemRef owner(spaceOp, FetchState_->Page().CacheItem());
-        failed = cache->FailFetch(owner, *FetchState_);
+        auto cacheOp = cache->BeginOperation();
+        TOperationItemRef owner(cacheOp, FetchState_->Page().CacheItem());
+        failed = cacheOp.Fetches().Fail(owner, *FetchState_);
     }
     FetchState_.Drop();
     return failed;
@@ -963,37 +963,25 @@ TPageCacheItem TSharedCache::AllocatePage(TCollectionCacheItem collection, ui64 
 }
 
 SHARED_CACHE_TEMPLATE
-TIntrusivePtr<TPageFetchState> TSharedCache::TryAcquirePageFetch(
-    TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef& owner) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    if (cacheOp.TryAcquire(page.CacheItem(), true, owner.Get()) != EAcquireStatus::Pending) {
-        return {};
-    }
-    TIntrusivePtr<TPageFetchState> fetch = spaceOp.Handles()[page.Index()].Body.Fetch;
-    Y_DEBUG_ABORT_UNLESS(fetch);
-    return fetch;
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::MakeReady(TPageCacheItem page, NActors::TSharedData&& data) noexcept {
     auto cacheOp = BeginOperation();
     TOperationItemRef owner(cacheOp);
-    TIntrusivePtr<TPageFetchState> fetch = cacheOp.TryAcquirePageFetch(page, owner);
+    TIntrusivePtr<TPageFetchState> fetch = cacheOp.Fetches().TryAcquire(page, owner);
     if (!fetch) {
         return false;
     }
-    return CompleteFetch(owner, *fetch, std::move(data));
+    return cacheOp.Fetches().Complete(owner, *fetch, std::move(data));
 }
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::FailReady(TPageCacheItem page) noexcept {
     auto cacheOp = BeginOperation();
     TOperationItemRef owner(cacheOp);
-    TIntrusivePtr<TPageFetchState> fetch = cacheOp.TryAcquirePageFetch(page, owner);
+    TIntrusivePtr<TPageFetchState> fetch = cacheOp.Fetches().TryAcquire(page, owner);
     if (!fetch) {
         return false;
     }
-    return FailFetch(owner, *fetch);
+    return cacheOp.Fetches().Fail(owner, *fetch);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -1155,37 +1143,6 @@ bool TSharedCache::AcknowledgeCollectionBytes(TCollectionCacheItem collection) n
 }
 
 SHARED_CACHE_TEMPLATE
-THandle* TSharedCache::TryGetPendingFetchHandle(TOperationItemRef& owner, TPageFetchState& fetch) noexcept {
-    Y_DEBUG_ABORT_UNLESS(owner);
-    TSpaceOperation& spaceOp = owner.SpaceOperation();
-    const TCacheItem cacheItem = owner.CacheItem();
-    Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AccessibleHandleCount());
-    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    if (!TCacheFetches<TTraits>::MatchesPendingFetch(handle, state, cacheItem, fetch) ||
-        fetch.Completion() != EPageFetchCompletion::Pending)
-    {
-        return nullptr;
-    }
-    return &handle;
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::CompleteFetch(
-    TOperationItemRef& owner, TPageFetchState& fetch, NActors::TSharedData&& data) noexcept {
-    Y_DEBUG_ABORT_UNLESS(data);
-    THandle* handle = TryGetPendingFetchHandle(owner, fetch);
-    if (!handle || THandleState::FromRaw(handle->State.load(std::memory_order_acquire)).IsWaitingForMemory()) {
-        return false;
-    }
-    Y_DEBUG_ABORT_UNLESS(handle->Key2OrSize.load(std::memory_order_relaxed) == data.size());
-    fetch.SetReady(std::move(data));
-    // Drop the I/O-owner ref; the last pending releaser performs MakeReadyState.
-    ReleaseFetchRef(owner, fetch);
-    return true;
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::TryReserveFetchBatch(TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept {
     auto cacheOp = BeginOperation();
     return cacheOp.Fetches().TryReserveBatch(pages);
@@ -1310,16 +1267,6 @@ bool TSharedCache::WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheIte
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::FailFetch(TOperationItemRef& owner, TPageFetchState& fetch) noexcept {
-    if (!TryGetPendingFetchHandle(owner, fetch)) {
-        return false;
-    }
-    fetch.SetFailed();
-    ReleaseFetchRef(owner, fetch);
-    return true;
-}
-
-SHARED_CACHE_TEMPLATE
 void TSharedCache::FinishFailedFetch(
     TOperationItemRef& finalizerRef, TPageFetchState& fetch, TPageFetchWaiter* waiters, bool reserved) noexcept {
     TSpaceOperation& spaceOp = finalizerRef.SpaceOperation();
@@ -1391,34 +1338,6 @@ void TSharedCache::FinishFetch(TOperationItemRef& finalizerRef, TPageFetchState&
     TPageFetchState::DrainWaiters(waiters, [page](TIntrusivePtr<TPageFetchWaiter> waiter) {
         waiter->Complete(TPageCacheItem::FromValidated(page), EPageFetchCompletion::Ready);
     });
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::ReleaseFetchRef(TOperationItemRef& owner, TPageFetchState& fetch) noexcept {
-    Y_DEBUG_ABORT_UNLESS(owner);
-    TSpaceOperation& spaceOp = owner.SpaceOperation();
-    const TCacheItem cacheItem = owner.CacheItem();
-    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        Y_DEBUG_ABORT_UNLESS(
-            TCacheFetches<TTraits>::MatchesPendingFetch(handle, expected, cacheItem, fetch) && expected.Refs() > 0);
-        const bool finish = expected.Refs() == 1 && fetch.Completion() != EPageFetchCompletion::Pending;
-        const THandleState desired =
-            finish ? expected.WithState(EHandleState::Completing).WithFrequency(0) : expected.DecrementRefs();
-        const std::memory_order successOrder = finish ? std::memory_order_acq_rel : std::memory_order_release;
-        if (!handle.State.compare_exchange_weak(expectedRaw, desired.Raw(), successOrder, std::memory_order_relaxed)) {
-            continue;
-        }
-        if (finish) {
-            FinishFetch(owner, fetch, !expected.IsWaitingForMemory());
-        } else {
-            // The CAS above already decremented this ref.
-            owner.Disarm();
-        }
-        return;
-    }
 }
 
 SHARED_CACHE_TEMPLATE
@@ -3837,7 +3756,7 @@ TCollection* TSharedCache::ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cach
             TPageFetchState* fetch = handle.Body.Fetch;
             Y_DEBUG_ABORT_UNLESS(fetch && fetch->Page().CacheItem() == cacheItem);
             TOperationItemRef ownerRef(spaceOp, cacheItem);
-            ReleaseFetchRef(ownerRef, *fetch);
+            cacheOp.Fetches().Release(ownerRef, *fetch);
             return nullptr;
         }
         if (cacheItem.Matches(expected) && expected.IsCold() && expected.IsPageKind() && expected.Refs() == 1 &&

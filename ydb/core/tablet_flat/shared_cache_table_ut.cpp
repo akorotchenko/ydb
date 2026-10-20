@@ -5681,6 +5681,22 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ResidentBytes(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
     }
+    Y_UNIT_TEST(ReadyPageRejectsCompletionWithoutLeakingReference) {
+        TFixture fixture;
+        const auto collection = MakeCollectionCacheItem(36, 37);
+        const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 0));
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsReady());
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 0);
+
+        UNIT_ASSERT(!fixture.Cache->MakeReady(page, MakePageData(page.Index())));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 0);
+        UNIT_ASSERT(!fixture.Cache->FailReady(page));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 0);
+
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        UNIT_ASSERT(fixture.Cache->ReclaimCold());
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsFree());
+    }
     Y_UNIT_TEST(ReservationReclaimsCold) {
         TFixture fixture;
         const TCollectionCacheItem collection = MakeCollectionCacheItem(47, 48);

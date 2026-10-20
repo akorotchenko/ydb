@@ -21,10 +21,102 @@ ui64 TCacheFetchServices<TTraits>::PageBytes(const THandle& handle) noexcept {
 }
 
 template <class TTraits>
+bool TCacheFetchServices<TTraits>::TryAcquirePending(
+    TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept {
+    return Cache_.TryAcquire(spaceOp, page.CacheItem(), true, owner.Get()) ==
+           TSharedCacheImpl<TTraits>::EAcquireStatus::Pending;
+}
+
+template <class TTraits>
+void TCacheFetchServices<TTraits>::FinalizeFetch(
+    TOperationItemRef<TTraits>& owner, TPageFetchState& fetch, bool reserved) noexcept {
+    Cache_.FinishFetch(owner, fetch, reserved);
+}
+
+template <class TTraits>
 bool TCacheFetches<TTraits>::MatchesPendingFetch(
     const THandle& handle, THandleState state, TCacheItem cacheItem, const TPageFetchState& fetch) noexcept {
     return cacheItem.Matches(state) && state.IsPageKind() && state.IsPending() && handle.Body.Fetch == &fetch &&
            fetch.Page().CacheItem() == cacheItem;
+}
+
+template <class TTraits>
+TIntrusivePtr<TPageFetchState> TCacheFetches<TTraits>::TryAcquire(
+    TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept {
+    if (!Services_.TryAcquirePending(spaceOp, page, owner)) {
+        return {};
+    }
+    TIntrusivePtr<TPageFetchState> fetch = spaceOp.Handles()[page.Index()].Body.Fetch;
+    Y_DEBUG_ABORT_UNLESS(fetch);
+    return fetch;
+}
+
+template <class TTraits>
+THandle* TCacheFetches<TTraits>::TryGetPendingHandle(
+    TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept {
+    Y_DEBUG_ABORT_UNLESS(owner);
+    TSpaceOperation& spaceOp = owner.SpaceOperation();
+    const TCacheItem cacheItem = owner.CacheItem();
+    Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AccessibleHandleCount());
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+    if (!MatchesPendingFetch(handle, state, cacheItem, fetch) || fetch.Completion() != EPageFetchCompletion::Pending)
+    {
+        return nullptr;
+    }
+    return &handle;
+}
+
+template <class TTraits>
+bool TCacheFetches<TTraits>::Complete(
+    TOperationItemRef<TTraits>& owner, TPageFetchState& fetch, NActors::TSharedData&& data) noexcept {
+    Y_DEBUG_ABORT_UNLESS(data);
+    THandle* handle = TryGetPendingHandle(owner, fetch);
+    if (!handle || THandleState::FromRaw(handle->State.load(std::memory_order_acquire)).IsWaitingForMemory()) {
+        return false;
+    }
+    Y_DEBUG_ABORT_UNLESS(handle->Key2OrSize.load(std::memory_order_relaxed) == data.size());
+    fetch.SetReady(std::move(data));
+    // Drop the I/O-owner ref; the last pending releaser performs MakeReadyState.
+    Release(owner, fetch);
+    return true;
+}
+
+template <class TTraits>
+bool TCacheFetches<TTraits>::Fail(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept {
+    if (!TryGetPendingHandle(owner, fetch)) {
+        return false;
+    }
+    fetch.SetFailed();
+    Release(owner, fetch);
+    return true;
+}
+
+template <class TTraits>
+void TCacheFetches<TTraits>::Release(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept {
+    Y_DEBUG_ABORT_UNLESS(owner);
+    TSpaceOperation& spaceOp = owner.SpaceOperation();
+    const TCacheItem cacheItem = owner.CacheItem();
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        Y_DEBUG_ABORT_UNLESS(MatchesPendingFetch(handle, expected, cacheItem, fetch) && expected.Refs() > 0);
+        const bool finish = expected.Refs() == 1 && fetch.Completion() != EPageFetchCompletion::Pending;
+        const THandleState desired =
+            finish ? expected.WithState(EHandleState::Completing).WithFrequency(0) : expected.DecrementRefs();
+        const std::memory_order successOrder = finish ? std::memory_order_acq_rel : std::memory_order_release;
+        if (!handle.State.compare_exchange_weak(expectedRaw, desired.Raw(), successOrder, std::memory_order_relaxed)) {
+            continue;
+        }
+        if (finish) {
+            Services_.FinalizeFetch(owner, fetch, !expected.IsWaitingForMemory());
+        } else {
+            // The CAS above already decremented this ref.
+            owner.Disarm();
+        }
+        return;
+    }
 }
 
 template <class TTraits>

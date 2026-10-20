@@ -612,14 +612,6 @@ private:
 
     void RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
-    TIntrusivePtr<TPageFetchState> TryAcquirePageFetch(
-        TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept;
-    THandle* TryGetPendingFetchHandle(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept;
-
-    bool CompleteFetch(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch, NActors::TSharedData&& data) noexcept;
-
-    bool FailFetch(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept;
-
     bool MakeReady(
         TCollectionRegistry& registry, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept;
 
@@ -635,7 +627,6 @@ private:
     void FinishFetch(TOperationItemRef<TTraits>& finalizerRef, TPageFetchState& fetch, bool reserved) noexcept;
     void FinishFailedFetch(TOperationItemRef<TTraits>& finalizerRef, TPageFetchState& fetch, TPageFetchWaiter* waiters,
         bool reserved) noexcept;
-    void ReleaseFetchRef(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept;
     static void DeletePendingFetch(THandle& handle) noexcept;
 
     ESharedCacheResultStatus Find(
@@ -1017,11 +1008,6 @@ public: // Cache helpers
 
     Y_FORCE_INLINE void RecycleCandidate(TCacheItem cacheItem) noexcept {
         Cache_.RecycleCandidate(SpaceOp_, cacheItem);
-    }
-
-    Y_FORCE_INLINE TIntrusivePtr<TPageFetchState> TryAcquirePageFetch(
-        TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept {
-        return Cache_.TryAcquirePageFetch(SpaceOp_, page, owner);
     }
 
     Y_FORCE_INLINE bool MakeReady(
