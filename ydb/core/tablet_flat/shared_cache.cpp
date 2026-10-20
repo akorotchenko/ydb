@@ -565,7 +565,7 @@ void TSharedCache::DeletePayload(THandle& handle, EItemKind kind, EHandleState s
         } else {
             Memory_.Cold().RemoveBytes(estimatedBytes);
             Memory_.Cold().RemovePage(kind);
-            ColdItems_.fetch_sub(1, std::memory_order_relaxed);
+            Memory_.RemoveColdItem();
         }
         Memory_.RemoveResident(bytes);
         if (state == EHandleState::Hot || state == EHandleState::Sticky || state == EHandleState::KeepCold) {
@@ -629,11 +629,6 @@ SHARED_CACHE_TEMPLATE
 ui64 TSharedCache::AccountedPageBytes(ui64 size) noexcept {
     Y_ABORT_UNLESS(size <= Max<ui64>() - NActors::TSharedData::OverheadSize);
     return size + NActors::TSharedData::OverheadSize;
-}
-
-SHARED_CACHE_TEMPLATE
-ui64 TSharedCache::LoadEstimatedBytes(const std::atomic<i64>& counter) noexcept {
-    return static_cast<ui64>(Max<i64>(counter.load(std::memory_order_relaxed), 0));
 }
 
 SHARED_CACHE_TEMPLATE
@@ -790,18 +785,7 @@ void TSharedCache::AddStats(const TStats& stats) noexcept {
 
 SHARED_CACHE_TEMPLATE
 void TSharedCache::UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept {
-    const auto reclaimable = [](THandleState state) {
-        return state.IsCold() && state.IsStickyNoneField() && state.Refs() == 0;
-    };
-    const bool wasReclaimable = reclaimable(before);
-    const bool isReclaimable = reclaimable(after);
-    if (wasReclaimable == isReclaimable) {
-        return;
-    }
-    const i64 bytes = static_cast<i64>(payloadBytes);
-    ColdReclaimableBytes_.fetch_add(isReclaimable ? bytes : -bytes, std::memory_order_relaxed);
-    ColdReclaimableItems_.fetch_add(isReclaimable ? 1 : -1, std::memory_order_relaxed);
-    if (isReclaimable) {
+    if (Memory_.UpdateColdReclaimable(payloadBytes, before, after)) {
         NotifyResourcesAvailable();
     }
 }
@@ -1606,7 +1590,7 @@ void TSharedCache::MakeReadyState(
     if (readyState == EHandleState::Cold) {
         Memory_.Cold().AddBytes(estimatedBytes);
         Memory_.Cold().AddPage(initial.Kind());
-        ColdItems_.fetch_add(1, std::memory_order_relaxed);
+        Memory_.AddColdItem();
     } else if (accountedSticky == EStickyState::Sticky) {
         Memory_.Sticky().AddBytes(estimatedBytes);
         Memory_.Sticky().AddPage(initial.Kind());
@@ -1630,7 +1614,7 @@ void TSharedCache::MakeReadyState(
                     Memory_.AddRetainedBytes(bytes);
                     Memory_.Cold().TransferBytesTo(Memory_.Hot(), bytes);
                     Memory_.Cold().TransferPageTo(Memory_.Hot(), initial.Kind());
-                    ColdItems_.fetch_sub(1, std::memory_order_relaxed);
+                    Memory_.RemoveColdItem();
                     if (pageOwner) {
                         AddActivePageBytes(*pageOwner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
                     }
@@ -1643,7 +1627,7 @@ void TSharedCache::MakeReadyState(
                 Memory_.ReleaseRetainedBytes(bytes);
                 Memory_.Sticky().TransferBytesTo(Memory_.Cold(), bytes);
                 Memory_.Sticky().TransferPageTo(Memory_.Cold(), expected.Kind());
-                ColdItems_.fetch_add(1, std::memory_order_relaxed);
+                Memory_.AddColdItem();
                 if (pageOwner) {
                     AddActivePageBytes(*pageOwner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
                 }
@@ -2419,7 +2403,7 @@ void TSharedCache::FinishCollectionAttach(
         AdvanceColdMembership(handle);
         Memory_.AddRetainedBytes(bytes);
         Memory_.Cold().TransferBytesTo(Memory_.Sticky(), bytes);
-        ColdItems_.fetch_sub(1, std::memory_order_relaxed);
+        Memory_.RemoveColdItem();
     } else if (detachedState == EHandleState::Hot) {
         Memory_.Hot().TransferBytesTo(Memory_.Sticky(), bytes);
     }
@@ -2649,11 +2633,11 @@ bool TSharedCache::DeleteCollection(
     if (sourceState.IsSticky()) {
         Memory_.ReleaseRetainedBytes(bytes);
         Memory_.Sticky().TransferBytesTo(Memory_.Cold(), bytes);
-        ColdItems_.fetch_add(1, std::memory_order_relaxed);
+        Memory_.AddColdItem();
     } else if (sourceState.IsHot()) {
         Memory_.ReleaseRetainedBytes(bytes);
         Memory_.Hot().TransferBytesTo(Memory_.Cold(), bytes);
-        ColdItems_.fetch_add(1, std::memory_order_relaxed);
+        Memory_.AddColdItem();
     }
 
     const TSharedCacheKey key = LoadSharedCacheKey(handle, EItemKind::Collection);
@@ -3377,7 +3361,7 @@ bool TSharedCache::EraseCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) 
                 Memory_.ReleaseRetainedBytes(bytes);
                 Memory_.KeepCold().TransferBytesTo(Memory_.Cold(), bytes);
                 Memory_.KeepCold().TransferPageTo(Memory_.Cold(), expected.Kind());
-                ColdItems_.fetch_add(1, std::memory_order_relaxed);
+                Memory_.AddColdItem();
                 Memory_.ReleaseKeepColdOwnedBytes(bytes);
                 if (pageCollection) {
                     AddActivePageBytes(*pageCollection, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
@@ -3631,7 +3615,7 @@ bool TSharedCache::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes, boo
             const ui64 physicalUsage = PayloadUsage();
             const ui64 currentLimit = CurrentLimit();
             const ui64 freeBytes = currentLimit - Min(currentLimit, physicalUsage);
-            const ui64 coldBytes = LoadEstimatedBytes(ColdReclaimableBytes_);
+            const ui64 coldBytes = ColdReclaimableBytes();
             // Forecast the room remaining after admitting the caller's payload.
             const ui64 freeAfterAdmission = freeBytes - Min(freeBytes, bytes);
             const ui64 coldFreeBytes = coldBytes + freeAfterAdmission;
@@ -4041,7 +4025,7 @@ bool TSharedCache::TryReleaseColdPageToKeepCold(
         const ui32 coldVersion = AdvanceColdMembership(handle);
         Memory_.Cold().TransferBytesTo(Memory_.KeepCold(), bytes);
         Memory_.Cold().TransferPageTo(Memory_.KeepCold(), EItemKind::Page);
-        ColdItems_.fetch_sub(1, std::memory_order_relaxed);
+        Memory_.RemoveColdItem();
         cacheOp.ReleaseKeepColdPin(pin, coldVersion);
         return true;
     }

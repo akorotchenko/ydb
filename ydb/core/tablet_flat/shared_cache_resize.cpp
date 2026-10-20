@@ -88,8 +88,7 @@ bool TSharedCache::FinalDrain(TTransition& transition) noexcept {
             cacheOp.RouteHot(static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
         },
         [&](ui64 raw) noexcept {
-            const ui64 previous = ColdRingEntries_.fetch_sub(1, std::memory_order_relaxed);
-            Y_ABORT_UNLESS(previous != 0);
+            Memory_.RemoveColdRingEntry();
             cacheOp.RouteCold(TColdCacheItem::FromRaw(raw));
         },
         [&](ui64 raw) noexcept {
