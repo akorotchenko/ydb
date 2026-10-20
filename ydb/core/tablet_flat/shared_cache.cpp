@@ -83,7 +83,6 @@ void TProdTraits::NotifyResourcesAvailable() const noexcept {
 #define TSharedCache TSharedCacheImpl<TTraits>
 #define TSharedCacheItemRef TSharedCacheItemRefImpl<TTraits>
 #define TSharedCacheCollectionRef TSharedCacheCollectionRefImpl<TTraits>
-#define TPageFetch TPageFetchImpl<TTraits>
 #define TOperationItemRef TOperationItemRef<TTraits>
 
 SHARED_CACHE_TEMPLATE
@@ -127,138 +126,6 @@ void TSharedCacheThreadBinding<TTraits>::Reset() noexcept {
         Cache_ = nullptr;
         Hazard_ = {};
     }
-}
-
-SHARED_CACHE_TEMPLATE
-TPageFetch::TPageFetchImpl(TPageFetchState* fetch) noexcept
-    : FetchState_(fetch)
-{
-    Y_DEBUG_ABORT_UNLESS(FetchState_ && FetchState_->Page());
-}
-
-SHARED_CACHE_TEMPLATE
-TPageFetch::TPageFetchImpl(TPageFetch&& other) noexcept
-    : FetchState_(std::move(other.FetchState_))
-{}
-
-SHARED_CACHE_TEMPLATE
-TPageFetch& TPageFetch::operator=(TPageFetch&& other) noexcept {
-    if (this != &other) {
-        FailReady();
-        FetchState_ = std::move(other.FetchState_);
-    }
-    return *this;
-}
-
-SHARED_CACHE_TEMPLATE
-TPageFetch::~TPageFetchImpl() {
-    FailReady();
-}
-
-SHARED_CACHE_TEMPLATE
-TPageCacheItem TPageFetch::CacheItem() const noexcept {
-    Y_DEBUG_ABORT_UNLESS(FetchState_);
-    return FetchState_->Page();
-}
-
-SHARED_CACHE_TEMPLATE
-NTable::NPage::TPageLocation TPageFetch::Location() const noexcept {
-    Y_DEBUG_ABORT_UNLESS(FetchState_);
-    TSharedCache& cache = TSharedCache::Get();
-    auto binding = cache.BindCurrentThreadHazard();
-    auto spaceOp = cache.BeginOperation();
-    const TCacheItem cacheItem = FetchState_->Page().CacheItem();
-    Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
-    const THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    Y_DEBUG_ABORT_UNLESS(
-        cacheItem.Matches(state) && state.IsPageKind() && state.IsPending() && handle.Body.Fetch == FetchState_.Get());
-    return {
-        NTable::NPage::TPageOffset::FromRaw(handle.Key1.load(std::memory_order_relaxed)),
-        handle.Key2OrSize.load(std::memory_order_relaxed),
-        handle.Metadata.Page.Type,
-        handle.Metadata.Page.Crc32,
-    };
-}
-
-SHARED_CACHE_TEMPLATE
-ui64 TPageFetch::Size() const noexcept {
-    return Location().Size;
-}
-
-SHARED_CACHE_TEMPLATE
-bool TPageFetch::HasActiveWaiters() const noexcept {
-    return FetchState_ && FetchState_->HasActiveWaiters();
-}
-
-SHARED_CACHE_TEMPLATE
-void TPageFetch::ForEachActiveWaiter(TFunctionRef<void(const TPageFetchWaiter&)> visitor) const noexcept {
-    if (FetchState_) {
-        FetchState_->ForEachActiveWaiter(visitor);
-    }
-}
-
-SHARED_CACHE_TEMPLATE
-bool TPageFetch::TryReserveMemory() noexcept {
-    if (!FetchState_) {
-        return false;
-    }
-    TSharedCache& cache = TSharedCache::Get();
-    auto binding = cache.BindCurrentThreadHazard();
-    auto cacheOp = cache.BeginOperation();
-    return cacheOp.Fetches().ReserveMemory(FetchState_->Page().CacheItem(), *FetchState_);
-}
-
-SHARED_CACHE_TEMPLATE
-bool TPageFetch::Dispatch() noexcept {
-    if (!FetchState_) {
-        return false;
-    }
-    TSharedCache& cache = TSharedCache::Get();
-    auto binding = cache.BindCurrentThreadHazard();
-    auto cacheOp = cache.BeginOperation();
-    return cacheOp.Fetches().Dispatch(FetchState_->Page().CacheItem(), *FetchState_);
-}
-
-SHARED_CACHE_TEMPLATE
-bool TPageFetch::MakeReady(NActors::TSharedData&& data) noexcept {
-    if (!FetchState_) {
-        return false;
-    }
-    TSharedCache& cache = TSharedCache::Get();
-    bool ready;
-    {
-        auto binding = cache.BindCurrentThreadHazard();
-        auto cacheOp = cache.BeginOperation();
-        // The fetch owns the insertion ref represented by FetchState_, without storing a second item identity.
-        TOperationItemRef owner(cacheOp, FetchState_->Page().CacheItem());
-        ready = cacheOp.Fetches().Complete(owner, *FetchState_, std::move(data));
-    }
-    FetchState_.Drop();
-    return ready;
-}
-
-SHARED_CACHE_TEMPLATE
-bool TPageFetch::FailReady() noexcept {
-    if (!FetchState_) {
-        return false;
-    }
-    TSharedCache* cache = TSharedCache::TryGet();
-    if (!cache) {
-        // Missing actor context is terminal shutdown, as for native item references.
-        FetchState_->AbandonWaiters();
-        FetchState_.Drop();
-        return false;
-    }
-    bool failed;
-    {
-        auto binding = cache->BindCurrentThreadHazard();
-        auto cacheOp = cache->BeginOperation();
-        TOperationItemRef owner(cacheOp, FetchState_->Page().CacheItem());
-        failed = cacheOp.Fetches().Fail(owner, *FetchState_);
-    }
-    FetchState_.Drop();
-    return failed;
 }
 
 SHARED_CACHE_TEMPLATE
@@ -3807,7 +3674,6 @@ bool TSharedCache::TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheI
 
 #undef TSharedCacheCollectionRef
 #undef TSharedCacheItemRef
-#undef TPageFetch
 #undef TOperationItemRef
 #undef TSharedCache
 #undef SHARED_CACHE_TEMPLATE
@@ -3815,12 +3681,10 @@ bool TSharedCache::TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheI
 template class TSharedCacheThreadBinding<TProdTraits>;
 template class TSharedPageRefImpl<TProdTraits>;
 template class TSharedCacheCollectionRefImpl<TProdTraits>;
-template class TPageFetchImpl<TProdTraits>;
 template class TSharedCacheImpl<TProdTraits>;
 template class TSharedCacheThreadBinding<TTestTraits>;
 template class TSharedPageRefImpl<TTestTraits>;
 template class TSharedCacheCollectionRefImpl<TTestTraits>;
-template class TPageFetchImpl<TTestTraits>;
 template class TSharedCacheImpl<TTestTraits>;
 
 } // namespace NKikimr::NSharedCache

@@ -117,38 +117,6 @@ private:
 };
 
 template <class TTraits = TProdTraits>
-class TPageFetchImpl : private TMoveOnly {
-public:
-    TPageFetchImpl() noexcept = default;
-    TPageFetchImpl(TPageFetchImpl&& other) noexcept;
-    TPageFetchImpl& operator=(TPageFetchImpl&& other) noexcept;
-    ~TPageFetchImpl();
-
-    explicit operator bool() const noexcept {
-        return bool(FetchState_);
-    }
-
-    TPageCacheItem CacheItem() const noexcept;
-    NTable::NPage::TPageLocation Location() const noexcept;
-    ui64 Size() const noexcept;
-    bool HasActiveWaiters() const noexcept;
-    void ForEachActiveWaiter(TFunctionRef<void(const TPageFetchWaiter&)> visitor) const noexcept;
-    bool TryReserveMemory() noexcept;
-    bool Dispatch() noexcept;
-    bool MakeReady(NActors::TSharedData&& data) noexcept;
-    bool FailReady() noexcept;
-
-private:
-    friend class TSharedCacheImpl<TTraits>;
-    friend class TCacheFetches<TTraits>;
-
-    explicit TPageFetchImpl(TPageFetchState* fetch) noexcept;
-
-private:
-    TIntrusivePtr<TPageFetchState> FetchState_;
-};
-
-template <class TTraits = TProdTraits>
 struct TSharedCachePageRequestImpl {
     NTable::NPage::TPageLocation Location;
     TIntrusivePtr<TPageFetchWaiter> Waiter;
@@ -529,7 +497,6 @@ private:
     friend class TSharedCacheTableImpl<TTraits>;
     friend class TSharedPageRefImpl<TTraits>;
     friend class TSharedCacheCollectionRefImpl<TTraits>;
-    friend class TPageFetchImpl<TTraits>;
     friend class TCacheFetchServices<TTraits>;
     friend class TRequestPageWaiter;
     friend class TCompactedPageWaiter;
