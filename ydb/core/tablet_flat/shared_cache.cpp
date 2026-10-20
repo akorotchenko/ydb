@@ -3474,18 +3474,14 @@ bool TSharedCache::UpdateKeepColdLimit(ui64 limit) noexcept {
 
 SHARED_CACHE_TEMPLATE
 void TSharedCache::NotifyResourcesAvailable() noexcept {
-    ResourceGeneration_.fetch_add(1, std::memory_order_release);
-    if (ResourceWaitArmed_.exchange(false, std::memory_order_acq_rel)) {
+    if (Memory_.NotifyResourcesAvailable()) {
         TTraits::NotifyResourcesAvailable();
     }
 }
 
 SHARED_CACHE_TEMPLATE
 void TSharedCache::ArmResourceWait(ui64 generation) noexcept {
-    // Acquire the notifier's last exchange even when it has already cleared the flag.
-    // This makes its preceding generation update visible and closes the store/load lost-wake race.
-    ResourceWaitArmed_.exchange(true, std::memory_order_acq_rel);
-    if (ResourceGeneration() != generation && ResourceWaitArmed_.exchange(false, std::memory_order_acq_rel)) {
+    if (Memory_.ArmResourceWait(generation)) {
         TTraits::NotifyResourcesAvailable();
     }
 }
