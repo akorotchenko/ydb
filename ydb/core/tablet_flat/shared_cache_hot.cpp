@@ -100,6 +100,12 @@ Y_FORCE_INLINE void TSharedCache::CompleteHotEviction(TSpaceOperation& spaceOp, 
 }
 
 SHARED_CACHE_TEMPLATE
+Y_FORCE_INLINE void TSharedCache::TOperationView::CompleteHotEviction(
+    THandle& handle, THandleState coldState, ui64 bytes, TOperationItemRef& pin, ui32 initialColdVersion) noexcept {
+    Cache_.CompleteHotEviction(SpaceOp_, handle, coldState, bytes, pin, initialColdVersion);
+}
+
+SHARED_CACHE_TEMPLATE
 void TSharedCache::ReleaseKeepColdPin(
     TSpaceOperation& spaceOp, TOperationItemRef& pin, ui32 initialColdVersion) noexcept {
     const TCacheItem cacheItem = pin.CacheItem();
@@ -297,6 +303,8 @@ template TSharedCacheItemRefImpl<TProdTraits> TSharedCacheImpl<TProdTraits>::Try
     TSpaceOperation&, TCacheItem) noexcept;
 template void TSharedCacheImpl<TProdTraits>::CompleteHotEviction(
     TSpaceOperation&, THandle&, THandleState, ui64, TOperationItemRef<TProdTraits>&, ui32) noexcept;
+template void TSharedCacheImpl<TProdTraits>::TOperationView::CompleteHotEviction(
+    THandle&, THandleState, ui64, TOperationItemRef<TProdTraits>&, ui32) noexcept;
 template void TSharedCacheImpl<TProdTraits>::ReleaseKeepColdPin(
     TSpaceOperation&, TOperationItemRef<TProdTraits>&, ui32) noexcept;
 template void TSharedCacheImpl<TProdTraits>::ProcessHot(
@@ -315,6 +323,8 @@ template TSharedCacheItemRefImpl<TTestTraits> TSharedCacheImpl<TTestTraits>::Try
     TSpaceOperation&, TCacheItem) noexcept;
 template void TSharedCacheImpl<TTestTraits>::CompleteHotEviction(
     TSpaceOperation&, THandle&, THandleState, ui64, TOperationItemRef<TTestTraits>&, ui32) noexcept;
+template void TSharedCacheImpl<TTestTraits>::TOperationView::CompleteHotEviction(
+    THandle&, THandleState, ui64, TOperationItemRef<TTestTraits>&, ui32) noexcept;
 template void TSharedCacheImpl<TTestTraits>::ReleaseKeepColdPin(
     TSpaceOperation&, TOperationItemRef<TTestTraits>&, ui32) noexcept;
 template void TSharedCacheImpl<TTestTraits>::ProcessHot(

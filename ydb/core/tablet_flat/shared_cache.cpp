@@ -2881,7 +2881,7 @@ void TSharedCache::ForEachCollection(
 
 SHARED_CACHE_TEMPLATE
 ESharedCacheResultStatus TSharedCache::Find(
-    TOperation& cacheOp, const TSharedCacheKey& key, TSharedCacheItemRef& ref) noexcept {
+    TOperationView& cacheOp, const TSharedCacheKey& key, TSharedCacheItemRef& ref) noexcept {
     for (;;) {
         TCacheItem cacheItem;
         const ESharedCacheResultStatus status = cacheOp.Find(key, cacheItem);
@@ -2889,7 +2889,7 @@ ESharedCacheResultStatus TSharedCache::Find(
             return ESharedCacheResultStatus::Miss;
         }
         Y_DEBUG_ABORT_UNLESS(status == ESharedCacheResultStatus::Hit);
-        TOperationItemRef acquired(cacheOp);
+        TOperationItemRef acquired(cacheOp.SpaceOperation());
         switch (cacheOp.TryAcquire(cacheItem, false, acquired.Get())) {
             case EAcquireStatus::Stale:
                 continue;
