@@ -71,8 +71,8 @@ bool TSharedCache::DemoteKeepCold(
             const ui64 bytes = PageBytes(handle);
             AdvanceColdMembership(handle);
             Memory_.ReleaseRetainedBytes(bytes);
-            TransferEstimatedBytes(KeepColdBytes_, ColdBytes_, bytes);
-            TransferEstimatedPages(KeepColdPages_, ColdPages_, EItemKind::Page);
+            Memory_.KeepCold().TransferBytesTo(Memory_.Cold(), bytes);
+            Memory_.KeepCold().TransferPageTo(Memory_.Cold(), EItemKind::Page);
             ColdItems_.fetch_add(1, std::memory_order_relaxed);
             Memory_.ReleaseKeepColdOwnedBytes(bytes);
             if (TCollection* owner = cacheOp.PageCollection(handle)) {

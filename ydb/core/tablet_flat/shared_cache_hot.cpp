@@ -86,12 +86,12 @@ Y_FORCE_INLINE void TSharedCache::CompleteHotEviction(TSpaceOperation& spaceOp, 
     InvokeHook(ESharedCacheHookPoint::AfterHotEvictionPublished, pin.CacheItem());
     UpdateColdReclaimable(bytes, coldState.WithState(EHandleState::Hot), coldState);
     if (coldState.IsKeepCold()) {
-        TransferEstimatedBytes(HotBytes_, KeepColdBytes_, bytes);
-        TransferEstimatedPages(HotPages_, KeepColdPages_, coldState.Kind());
+        Memory_.Hot().TransferBytesTo(Memory_.KeepCold(), bytes);
+        Memory_.Hot().TransferPageTo(Memory_.KeepCold(), coldState.Kind());
     } else {
         Memory_.ReleaseRetainedBytes(bytes);
-        TransferEstimatedBytes(HotBytes_, ColdBytes_, bytes);
-        TransferEstimatedPages(HotPages_, ColdPages_, coldState.Kind());
+        Memory_.Hot().TransferBytesTo(Memory_.Cold(), bytes);
+        Memory_.Hot().TransferPageTo(Memory_.Cold(), coldState.Kind());
         ColdItems_.fetch_add(1, std::memory_order_relaxed);
         if (coldState.IsPageKind()) {
             if (TCollection* owner = cacheOp.PageCollection(handle)) {
@@ -258,22 +258,22 @@ bool TSharedCache::PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, b
         } else if (!Memory_.TryAddRetainedBytes(bytes)) {
             return false;
         }
-        HotBytes_.fetch_add(bytes, std::memory_order_relaxed);
-        HotPages_.fetch_add(1, std::memory_order_relaxed);
+        Memory_.Hot().AddBytes(bytes);
+        Memory_.Hot().AddPage(EItemKind::Page);
         const THandleState desired = expected.WithState(EHandleState::Hot).WithFrequency(0);
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed)) {
             AdvanceColdMembership(handle);
-            ColdBytes_.fetch_sub(bytes, std::memory_order_relaxed);
-            SubtractEstimatedPages(ColdPages_, EItemKind::Page);
+            Memory_.Cold().RemoveBytes(bytes);
+            Memory_.Cold().RemovePage(EItemKind::Page);
             ColdItems_.fetch_sub(1, std::memory_order_relaxed);
             if (owner) {
                 AddActivePageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
             }
             return true;
         }
-        HotBytes_.fetch_sub(bytes, std::memory_order_relaxed);
-        SubtractEstimatedPages(HotPages_, EItemKind::Page);
+        Memory_.Hot().RemoveBytes(bytes);
+        Memory_.Hot().RemovePage(EItemKind::Page);
         Memory_.ReleaseRetainedBytes(bytes);
     }
 }

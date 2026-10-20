@@ -37,7 +37,7 @@ bool TSharedCache::DrainHotResize(TSpaceOperation& spaceOp) noexcept {
 SHARED_CACHE_TEMPLATE
 ui32 TSharedCache::MinimumHotSlots(const TSpaceOperation& spaceOp, bool underPressure) const noexcept {
     const ui64 hotPages = HotPages();
-    const ui64 hotBytes = LoadEstimatedBytes(HotBytes_);
+    const ui64 hotBytes = Memory_.Hot().Bytes();
     const ui64 meanPageBytes = hotPages ? Max<ui64>(1, hotBytes / hotPages)
                                         : AccountedPageBytes(Space_->ReservedConfiguration().ExpectedPageSize);
     const ui64 hotMinBytes =

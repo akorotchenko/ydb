@@ -360,8 +360,8 @@ bool TSharedCache::DemoteUnlinkedStickyPage(TSpaceOperation& spaceOp, ui32 index
         if (page.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed)) {
             const ui64 bytes = PageBytes(page);
-            TransferEstimatedBytes(StickyBytes_, HotBytes_, bytes);
-            TransferEstimatedPages(StickyPages_, HotPages_, EItemKind::Page);
+            Memory_.Sticky().TransferBytesTo(Memory_.Hot(), bytes);
+            Memory_.Sticky().TransferPageTo(Memory_.Hot(), EItemKind::Page);
             Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, bytes);
             cacheOp.RouteHot(EHotLevel::L1, pageItem);
             return true;
