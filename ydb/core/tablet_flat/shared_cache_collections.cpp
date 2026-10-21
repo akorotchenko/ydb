@@ -12,6 +12,11 @@ TSharedCacheItemRefImpl<TTraits> TCacheCollectionServices<TTraits>::TryAcquireSt
 }
 
 template <class TTraits>
+void TCacheCollectionServices<TTraits>::RouteHotL1(TSpaceOperation& spaceOp, TCacheItem item) noexcept {
+    Cache_.RouteHot(spaceOp, TSharedCacheImpl<TTraits>::EHotLevel::L1, item);
+}
+
+template <class TTraits>
 TCollection* TCacheCollections<TTraits>::PageCollection(TSpaceOperation& spaceOp, const THandle& page) noexcept {
     return PageCollection(
         spaceOp, TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(page.Key0.load(std::memory_order_relaxed))));
@@ -219,6 +224,96 @@ void TCacheCollections<TTraits>::ForEach(
         Y_ABORT_UNLESS(ref);
         callback(*handle.Body.Collection);
         current = next;
+    }
+}
+
+template <class TTraits>
+void TCacheCollections<TTraits>::AddReference(TCollection& owner) noexcept {
+    owner.References.fetch_add(1, std::memory_order_relaxed);
+}
+
+template <class TTraits>
+bool TCacheCollections<TTraits>::DropReference(TCollection& owner) noexcept {
+    const ui64 previous = owner.References.fetch_sub(1, std::memory_order_relaxed);
+    Y_ABORT_UNLESS(previous != 0);
+    return previous == 1;
+}
+
+template <class TTraits>
+void TCacheCollections<TTraits>::DropOwnerReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept {
+    // Keep the payload alive after dropping the page's collection ownership.
+    TOperationItemRef<TTraits> collectionRef(
+        spaceOp, Services_.TryAcquireStructural(spaceOp, owner.CacheItem.CacheItem()));
+    Y_ABORT_UNLESS(collectionRef);
+    const bool lastOwner = DropReference(owner);
+    Traits_.Invoke(ESharedCacheHookPoint::AfterCollectionOwnerReferenceDropped, collectionRef.CacheItem());
+    if (lastOwner) {
+        const TLogoBlobID id = owner.Id();
+        const TCollectionCacheItem item = owner.CacheItem;
+        PublishCollectionForReclaim(spaceOp, item.CacheItem());
+        Traits_.NotifyCollectionReleased(id, item);
+    } else if (owner.Registry_.load(std::memory_order_acquire) &&
+               owner.References.load(std::memory_order_acquire) == 1) {
+        // The registry is the only remaining structural owner; actor work may now be cleaned up.
+        Traits_.NotifyCollectionReleased(owner.Id(), owner.CacheItem);
+    }
+}
+
+template <class TTraits>
+void TCacheCollections<TTraits>::DropPageItemRef(TSpaceOperation& spaceOp, THandle& page) noexcept {
+    const THandleState state = THandleState::FromRaw(page.State.load(std::memory_order_relaxed));
+    if (state.Kind() != EItemKind::Page) {
+        return;
+    }
+    if (TCollection* owner = PageCollection(spaceOp, page)) {
+        DropOwnerReference(spaceOp, *owner);
+    }
+}
+
+template <class TTraits>
+void TCacheCollections<TTraits>::PublishCollectionForReclaim(
+    TSpaceOperation& spaceOp, TCacheItem collectionItem) noexcept {
+    THandle& handle = spaceOp.Handles()[collectionItem.Index()];
+    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        if (!collectionItem.Matches(expected) || !expected.IsCollectionKind() || !expected.IsSticky() ||
+            !expected.IsStickyNoneField() || handle.Body.Collection->Registry_.load(std::memory_order_acquire) ||
+            handle.Body.Collection->References.load(std::memory_order_acquire) != 0)
+        {
+            return;
+        }
+        const THandleState desired = expected.WithState(EHandleState::Hot).WithFrequency(0);
+        if (handle.State.compare_exchange_weak(
+                expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
+        {
+            Memory_.Sticky().TransferBytesTo(Memory_.Hot(), handle.Metadata.PayloadBytes);
+            Traits_.Invoke(ESharedCacheHookPoint::BeforeCollectionHotPublished, collectionItem);
+            Services_.RouteHotL1(spaceOp, collectionItem);
+            return;
+        }
+    }
+}
+
+template <class TTraits>
+void TCacheCollections<TTraits>::FinishCollectionRetain(TSpaceOperation& spaceOp, TCacheItem collectionItem) noexcept {
+    THandle& handle = spaceOp.Handles()[collectionItem.Index()];
+    if (handle.Body.Collection->Registry_.load(std::memory_order_acquire)) {
+        return;
+    }
+    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        Y_ABORT_UNLESS(collectionItem.Matches(expected) && expected.IsCollectionKind() && expected.IsSticky());
+        if (expected.IsStickyField()) {
+            return;
+        }
+        const THandleState desired = expected.WithSticky(EStickyState::Sticky).WithFrequency(0);
+        if (handle.State.compare_exchange_weak(
+                expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
+        {
+            return;
+        }
     }
 }
 

@@ -498,50 +498,6 @@ ui64 TSharedCache::FractionCeil(ui64 value, double fraction) noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
-void TSharedCache::AddReference(TCollection& owner) noexcept {
-    owner.References.fetch_add(1, std::memory_order_relaxed);
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::DropReference(TCollection& owner) noexcept {
-    const ui64 previous = owner.References.fetch_sub(1, std::memory_order_relaxed);
-    Y_ABORT_UNLESS(previous != 0);
-    return previous == 1;
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::DropOwnerReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    // Keep the payload alive after dropping the page's collection ownership.
-    TOperationItemRef collectionRef(spaceOp, cacheOp.TryAcquireStructural(owner.CacheItem.CacheItem()));
-    Y_ABORT_UNLESS(collectionRef);
-    const bool lastOwner = DropReference(owner);
-    InvokeHook(ESharedCacheHookPoint::AfterCollectionOwnerReferenceDropped, collectionRef.CacheItem());
-    if (lastOwner) {
-        const TLogoBlobID id = owner.Id();
-        const TCollectionCacheItem item = owner.CacheItem;
-        cacheOp.PublishCollectionForReclaim(item.CacheItem());
-        this->NotifyCollectionReleased(id, item);
-    } else if (owner.Registry_.load(std::memory_order_acquire) &&
-               owner.References.load(std::memory_order_acquire) == 1) {
-        // The registry is the only remaining structural owner; actor work may now be cleaned up.
-        this->NotifyCollectionReleased(owner.Id(), owner.CacheItem);
-    }
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::DropPageItemRef(TSpaceOperation& spaceOp, THandle& page) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    const THandleState state = THandleState::FromRaw(page.State.load(std::memory_order_relaxed));
-    if (state.Kind() != EItemKind::Page) {
-        return;
-    }
-    if (TCollection* owner = cacheOp.Collections().PageCollection(page)) {
-        cacheOp.DropOwnerReference(*owner);
-    }
-}
-
-SHARED_CACHE_TEMPLATE
 void TSharedCache::UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept {
     if (Memory_.UpdateColdReclaimable(payloadBytes, before, after)) {
         NotifyResourcesAvailable();
@@ -663,7 +619,7 @@ void TSharedCache::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem cacheIt
             !state.IsCollectionKind() || handle.Body.Collection->Registry_.load(std::memory_order_acquire) == nullptr);
         DeletePayload(handle, state.Kind(), state.State(),
             state.IsPageKind() ? cacheOp.Collections().PageCollection(handle) : nullptr);
-        cacheOp.DropPageItemRef(handle);
+        cacheOp.Collections().DropPageItemRef(handle);
         if (state.IsPageKind()) {
             handle.Key0.store(0, std::memory_order_relaxed);
             handle.Body.Fetch = nullptr;
@@ -674,7 +630,7 @@ void TSharedCache::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem cacheIt
     if (pending) {
         const bool page = state.IsPageKind();
         if (page) {
-            cacheOp.DropPageItemRef(handle);
+            cacheOp.Collections().DropPageItemRef(handle);
             handle.Key0.store(0, std::memory_order_relaxed);
             if (state.IsStickyField()) {
                 Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, PageBytes(handle));
@@ -776,53 +732,6 @@ bool TSharedCache::MakeReady(
     TCollectionRegistry* registry, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept {
     auto cacheOp = BeginOperation();
     return cacheOp.MakeReady(registry, collection.CacheItem(), std::move(value));
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::PublishCollectionForReclaim(TSpaceOperation& spaceOp, TCacheItem collectionItem) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    THandle& handle = spaceOp.Handles()[collectionItem.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        if (!collectionItem.Matches(expected) || !expected.IsCollectionKind() || !expected.IsSticky() ||
-            !expected.IsStickyNoneField() || handle.Body.Collection->Registry_.load(std::memory_order_acquire) ||
-            handle.Body.Collection->References.load(std::memory_order_acquire) != 0)
-        {
-            return;
-        }
-        const THandleState desired = expected.WithState(EHandleState::Hot).WithFrequency(0);
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
-        {
-            Memory_.Sticky().TransferBytesTo(Memory_.Hot(), PayloadBytes(handle, EItemKind::Collection));
-            InvokeHook(ESharedCacheHookPoint::BeforeCollectionHotPublished, collectionItem);
-            cacheOp.RouteHot(EHotLevel::L1, collectionItem);
-            return;
-        }
-    }
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::FinishCollectionRetain(TSpaceOperation& spaceOp, TCacheItem collectionItem) noexcept {
-    THandle& handle = spaceOp.Handles()[collectionItem.Index()];
-    if (handle.Body.Collection->Registry_.load(std::memory_order_acquire)) {
-        return;
-    }
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        Y_ABORT_UNLESS(collectionItem.Matches(expected) && expected.IsCollectionKind() && expected.IsSticky());
-        if (expected.IsStickyField()) {
-            return;
-        }
-        const THandleState desired = expected.WithSticky(EStickyState::Sticky).WithFrequency(0);
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
-        {
-            return;
-        }
-    }
 }
 
 SHARED_CACHE_TEMPLATE
@@ -1045,7 +954,7 @@ bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* regi
     Memory_.AddCollection(bytes);
     handle.Body.Collection = value.Get();
     value->CacheItem = TCollectionCacheItem::FromValidated(cacheItem);
-    AddReference(*value);
+    Collections_.AddReference(*value);
     if (registry) {
         Y_ABORT_UNLESS(cacheOp.Collections().Link(*registry, cacheItem));
     } else {
@@ -1280,7 +1189,7 @@ void TSharedCache::DiscardCandidate(
         TCacheFetches<TTraits>::DeletePendingFetch(handle);
     }
     if (owner) {
-        cacheOp.DropOwnerReference(*owner);
+        cacheOp.Collections().DropOwnerReference(*owner);
     }
     if (reservedBytes != 0) {
         ReleaseReservation(reservedBytes, expected.IsPageKind() ? 1 : 0);
@@ -1904,7 +1813,7 @@ bool TSharedCache::AttachCollection(
 
     const EHandleState detachedState = attachState.State();
     Y_ABORT_UNLESS(cacheOp.Collections().Link(registry, collectionItem));
-    AddReference(*spaceOp.Handles()[collectionItem.Index()].Body.Collection);
+    Collections_.AddReference(*spaceOp.Handles()[collectionItem.Index()].Body.Collection);
     cacheOp.FinishCollectionAttach(collectionItem, detachedState);
     return true;
 }
@@ -1964,8 +1873,8 @@ bool TSharedCache::DetachCollection(
             break;
         }
     }
-    if (DropReference(*handle.Body.Collection)) {
-        cacheOp.PublishCollectionForReclaim(collectionItem);
+    if (Collections_.DropReference(*handle.Body.Collection)) {
+        cacheOp.Collections().PublishCollectionForReclaim(collectionItem);
     }
     return true;
 }
@@ -2548,7 +2457,7 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
     } while (!owner.References.compare_exchange_weak(
         owners, owners + 1, std::memory_order_acquire, std::memory_order_relaxed));
     Y_DEFER {
-        cacheOp.DropOwnerReference(owner);
+        cacheOp.Collections().DropOwnerReference(owner);
     };
     const THandleState admittedState = THandleState::FromRaw(collectionHandle.State.load(std::memory_order_acquire));
     if (!collection.Matches(admittedState) || !admittedState.IsSticky() || !admittedState.IsStickyField()) {
@@ -3292,7 +3201,7 @@ void TSharedCache::ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheIte
             Y_ABORT_UNLESS(handle.NextInOwner.load(std::memory_order_acquire) == 0);
             DeleteReplacedPage(handle);
             if (owner) {
-                cacheOp.DropOwnerReference(*owner);
+                cacheOp.Collections().DropOwnerReference(*owner);
             }
             Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(cacheItem.Index(), nextVersion));
             NotifyResourcesAvailable();
@@ -3306,7 +3215,7 @@ void TSharedCache::Release(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexc
     auto cacheOp = BindOperation(spaceOp);
     TCollection* owner = cacheOp.ReleaseItem(cacheItem);
     if (owner) {
-        cacheOp.DropOwnerReference(*owner);
+        cacheOp.Collections().DropOwnerReference(*owner);
     }
 }
 
