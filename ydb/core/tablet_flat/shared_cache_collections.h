@@ -25,6 +25,8 @@ public:
 
     TSharedCacheItemRefImpl<TTraits> TryAcquireStructural(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     void RouteHotL1(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+    void UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept;
+    static ui32 AdvanceColdMembership(THandle& handle) noexcept;
 
 private:
     TSharedCacheImpl<TTraits>& Cache_;
@@ -53,6 +55,10 @@ public:
 
         void PublishCollectionForReclaim(TCacheItem item) noexcept {
             Collections_.PublishCollectionForReclaim(SpaceOp_, item);
+        }
+
+        bool Attach(TCollectionRegistry& registry, TCacheItem item) noexcept {
+            return Collections_.Attach(SpaceOp_, registry, item);
         }
 
         bool Link(TCollectionRegistry& registry, TCacheItem item) noexcept {
@@ -121,6 +127,11 @@ private:
     void DropPageItemRef(TSpaceOperation& spaceOp, THandle& page) noexcept;
     void PublishCollectionForReclaim(TSpaceOperation& spaceOp, TCacheItem collection) noexcept;
     void FinishCollectionRetain(TSpaceOperation& spaceOp, TCacheItem collection) noexcept;
+
+    bool TryBeginAttach(
+        TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item, THandleState& attachState) noexcept;
+    void FinishAttach(TSpaceOperation& spaceOp, TCacheItem item, EHandleState detachedState) noexcept;
+    bool Attach(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item) noexcept;
 
     bool Link(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item) noexcept;
     bool Unlink(

@@ -701,10 +701,6 @@ private:
     bool MakePageSticky(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
     bool UnstickyCutPages(TSpaceOperation& spaceOp, TCacheItem page, ui64 allocationLimit) noexcept;
 
-    bool TryBeginCollectionAttach(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection,
-        THandleState& attachState) noexcept;
-    void FinishCollectionAttach(TSpaceOperation& spaceOp, TCacheItem collection, EHandleState detachedState) noexcept;
-    bool AttachCollection(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
     bool TryBeginCollectionDetach(
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
     bool DetachCollection(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
@@ -1076,19 +1072,6 @@ public: // Cache helpers
 
     Y_FORCE_INLINE bool UnstickyCutPages(TCacheItem page, ui64 allocationLimit) noexcept {
         return Cache_.UnstickyCutPages(SpaceOp_, page, allocationLimit);
-    }
-
-    Y_FORCE_INLINE bool TryBeginCollectionAttach(
-        TCollectionRegistry& registry, TCacheItem collection, THandleState& attachState) noexcept {
-        return Cache_.TryBeginCollectionAttach(SpaceOp_, registry, collection, attachState);
-    }
-
-    Y_FORCE_INLINE void FinishCollectionAttach(TCacheItem collection, EHandleState detachedState) noexcept {
-        Cache_.FinishCollectionAttach(SpaceOp_, collection, detachedState);
-    }
-
-    Y_FORCE_INLINE bool AttachCollection(TCollectionRegistry& registry, TCacheItem collection) noexcept {
-        return Cache_.AttachCollection(SpaceOp_, registry, collection);
     }
 
     Y_FORCE_INLINE bool TryBeginCollectionDetach(TCollectionRegistry& registry, TCacheItem collection) noexcept {
