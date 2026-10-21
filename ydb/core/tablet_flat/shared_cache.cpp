@@ -135,7 +135,8 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     , Table_(*Space_, *this)
     , Memory_(Space_->CurrentConfiguration().StaticBytes, hardLimit, Space_->ReservedConfiguration().Limit)
     , Collections_(TCacheCollectionServices<TTraits>(*this), Memory_, Table_, static_cast<const TTraits&>(*this))
-    , Eviction_(TCacheEvictionServices<TTraits>(*this), Memory_, Policy_)
+    , Eviction_(
+          TCacheEvictionServices<TTraits>(*this), Memory_, Collections_, Policy_, static_cast<const TTraits&>(*this))
     , Fetches_(TCacheFetchServices<TTraits>(*this), Memory_, Table_, Collections_, static_cast<const TTraits&>(*this))
     , TargetHandleCount_(Space_->CurrentConfiguration().HandleCount())
     , HardTarget_(Space_->CurrentConfiguration())
@@ -2329,7 +2330,7 @@ bool TSharedCache::RunMaintenance() noexcept {
             for (ui64 index = 0; index < batch; ++index) {
                 const ui64 raw = cacheOp.KeepCold().Pop();
                 if (raw != 0) {
-                    cacheOp.RouteKeepCold(TColdCacheItem::FromRaw(raw));
+                    cacheOp.Eviction().RouteKeepCold(TColdCacheItem::FromRaw(raw));
                 }
             }
             return true;
@@ -2567,7 +2568,7 @@ TCollection* TSharedCache::ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cach
         }
         Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(expected) && expected.Refs() > 0);
         if (allowKeepCold && expected.IsCold() && expected.IsPageKind() && expected.Refs() == 1 &&
-            cacheOp.WantsKeepCold(handle) && Memory_.TryAddRetainedBytes(PageBytes(handle)))
+            cacheOp.Eviction().WantsKeepCold(handle) && Memory_.TryAddRetainedBytes(PageBytes(handle)))
         {
             if (cacheOp.TryReleaseColdPageToKeepCold(cacheItem, expectedRaw)) {
                 return nullptr;
@@ -2624,7 +2625,7 @@ bool TSharedCache::TryReleaseColdPageToKeepCold(
         Memory_.Cold().TransferBytesTo(Memory_.KeepCold(), bytes);
         Memory_.Cold().TransferPageTo(Memory_.KeepCold(), EItemKind::Page);
         Memory_.RemoveColdItem();
-        cacheOp.ReleaseKeepColdPin(pin, coldVersion);
+        cacheOp.Eviction().ReleaseKeepColdPin(pin, coldVersion);
         return true;
     }
     Memory_.ReleaseKeepColdOwnedBytes(bytes);
@@ -2642,7 +2643,7 @@ bool TSharedCache::TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheI
     const THandleState expected = THandleState::FromRaw(expectedRaw);
     const bool publishCold = expected.IsCold() && expected.Refs() == 1;
     const bool lastKeepColdRef = expected.IsKeepCold() && expected.Refs() == 1;
-    const bool wantsKeepCold = lastKeepColdRef && cacheOp.WantsKeepCold(handle);
+    const bool wantsKeepCold = lastKeepColdRef && cacheOp.Eviction().WantsKeepCold(handle);
     const ui64 coldBytes = publishCold ? PayloadBytes(handle, expected.Kind()) : 0;
     // Capture while the native ref protects the payload; detach/reclaim may follow the final CAS.
     const bool notifyCollectionRelease =
@@ -2666,9 +2667,9 @@ bool TSharedCache::TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheI
             InvokeHook(ESharedCacheHookPoint::AfterKeepColdRefReleased, cacheItem);
             // Check after releasing the final ref: a concurrent trim may have withdrawn this page's ring entry
             // while the ref was being dropped. Policy was read while the original page was still pinned.
-            if (!IsKeepColdQueued(handle) || !wantsKeepCold) {
+            if (!Eviction_.IsKeepColdQueued(handle) || !wantsKeepCold) {
                 const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire);
-                cacheOp.DemoteKeepCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, cacheItem.Index()),
+                cacheOp.Eviction().DemoteKeepCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, cacheItem.Index()),
                     TPageCacheItem::FromValidated(cacheItem));
             }
         }

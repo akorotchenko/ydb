@@ -735,21 +735,6 @@ private:
     bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool force = false) noexcept;
     bool ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept;
 
-    bool WantsKeepCold(TSpaceOperation& spaceOp, const THandle& page) noexcept;
-
-    void RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
-
-    bool DemoteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem, TPageCacheItem expectedPage = {}) noexcept;
-    void ReleaseColdDemotionPin(TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin) noexcept;
-    void ReleaseKeepColdPin(
-        TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept;
-
-    void WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
-
-    static bool IsKeepColdQueued(const THandle& handle) noexcept;
-
-    bool MatchesKeepColdEntry(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
-
     bool EvictFromHot(TSpaceOperation& spaceOp, ui32 index) noexcept;
 
     bool EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
@@ -1066,34 +1051,6 @@ public: // Cache helpers
 
     Y_FORCE_INLINE bool ReclaimKeepCold() noexcept {
         return Cache_.ReclaimKeepCold(SpaceOp_);
-    }
-
-    Y_FORCE_INLINE bool WantsKeepCold(const THandle& page) noexcept {
-        return Cache_.WantsKeepCold(SpaceOp_, page);
-    }
-
-    Y_FORCE_INLINE void RouteKeepCold(TColdCacheItem coldItem) noexcept {
-        Cache_.RouteKeepCold(SpaceOp_, coldItem);
-    }
-
-    Y_FORCE_INLINE bool DemoteKeepCold(TColdCacheItem coldItem, TPageCacheItem expectedPage = {}) noexcept {
-        return Cache_.DemoteKeepCold(SpaceOp_, coldItem, expectedPage);
-    }
-
-    Y_FORCE_INLINE void ReleaseColdDemotionPin(TOperationItemRef<TTraits>& pin) noexcept {
-        Cache_.ReleaseColdDemotionPin(SpaceOp_, pin);
-    }
-
-    Y_FORCE_INLINE void ReleaseKeepColdPin(TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept {
-        Cache_.ReleaseKeepColdPin(SpaceOp_, pin, initialColdVersion);
-    }
-
-    Y_FORCE_INLINE void WithdrawKeepColdEntry(TColdCacheItem coldItem) noexcept {
-        Cache_.WithdrawKeepColdEntry(SpaceOp_, coldItem);
-    }
-
-    Y_FORCE_INLINE bool MatchesKeepColdEntry(TColdCacheItem coldItem) noexcept {
-        return Cache_.MatchesKeepColdEntry(SpaceOp_, coldItem);
     }
 
     Y_FORCE_INLINE bool EvictFromHot(ui32 index) noexcept {
