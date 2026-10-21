@@ -474,7 +474,7 @@ public:
 
     static bool DemoteKeepCold(TTestSharedCache& cache, TColdCacheItem item) noexcept {
         auto operation = cache.BeginOperation();
-        return cache.DemoteKeepCold(operation, item);
+        return operation.Eviction().DemoteKeepCold(item);
     }
 
     static bool TrimKeepCold(TTestSharedCache& cache, TSpaceOperation& operation) noexcept {

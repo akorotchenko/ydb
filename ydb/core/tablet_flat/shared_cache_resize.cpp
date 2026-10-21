@@ -92,7 +92,7 @@ bool TSharedCache::FinalDrain(TTransition& transition) noexcept {
             cacheOp.RouteCold(TColdCacheItem::FromRaw(raw));
         },
         [&](ui64 raw) noexcept {
-            cacheOp.RouteKeepCold(TColdCacheItem::FromRaw(raw));
+            cacheOp.Eviction().RouteKeepCold(TColdCacheItem::FromRaw(raw));
         });
 }
 
@@ -398,7 +398,7 @@ typename TSharedCache::EShrinkCutStatus TSharedCache::ReclaimShrinkHandle(
     }
     if (state.IsKeepCold()) {
         const ui32 coldVersion = spaceOp.Handles()[index].ColdVersion.load(std::memory_order_acquire);
-        if (cacheOp.DemoteKeepCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, index))) {
+        if (cacheOp.Eviction().DemoteKeepCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, index))) {
             return EShrinkCutStatus::Progress;
         }
     }

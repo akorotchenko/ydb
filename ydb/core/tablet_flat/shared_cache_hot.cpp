@@ -99,41 +99,13 @@ Y_FORCE_INLINE void TSharedCache::CompleteHotEviction(TSpaceOperation& spaceOp, 
             }
         }
     }
-    cacheOp.ReleaseKeepColdPin(pin, initialColdVersion);
+    cacheOp.Eviction().ReleaseKeepColdPin(pin, initialColdVersion);
 }
 
 SHARED_CACHE_TEMPLATE
 Y_FORCE_INLINE void TSharedCache::TOperationView::CompleteHotEviction(
     THandle& handle, THandleState coldState, ui64 bytes, TOperationItemRef& pin, ui32 initialColdVersion) noexcept {
     Cache_.CompleteHotEviction(SpaceOp_, handle, coldState, bytes, pin, initialColdVersion);
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::ReleaseKeepColdPin(
-    TSpaceOperation& spaceOp, TOperationItemRef& pin, ui32 initialColdVersion) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    const TCacheItem cacheItem = pin.CacheItem();
-    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        if (!cacheItem.Matches(expected) || !expected.IsKeepCold() || expected.Refs() != 1 ||
-            (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != initialColdVersion ||
-            IsKeepColdQueued(handle) || !cacheOp.WantsKeepCold(handle))
-        {
-            pin.Drop();
-            return;
-        }
-        const THandleState desired = expected.DecrementRefs();
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
-        {
-            pin.Disarm();
-            cacheOp.RouteKeepCold(TColdCacheItem::Make(initialColdVersion, cacheItem.Index()));
-            NotifyResourcesAvailable();
-            return;
-        }
-    }
 }
 
 SHARED_CACHE_TEMPLATE
@@ -157,7 +129,7 @@ void TSharedCache::ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheI
             } else {
                 ui64 hotRaw = state.Raw();
                 const ui64 bytes = PayloadBytes(handle, state.Kind());
-                const bool keep = state.IsPageKind() && state.Refs() == 1 && cacheOp.WantsKeepCold(handle);
+                const bool keep = state.IsPageKind() && state.Refs() == 1 && cacheOp.Eviction().WantsKeepCold(handle);
                 if (keep) {
                     Memory_.AddKeepColdOwnedBytes(bytes);
                 }
@@ -219,7 +191,7 @@ bool TSharedCache::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) 
             return false;
         }
         const ui64 bytes = PayloadBytes(handle, expected.Kind());
-        const bool keep = expected.IsPageKind() && expected.Refs() == 1 && cacheOp.WantsKeepCold(handle);
+        const bool keep = expected.IsPageKind() && expected.Refs() == 1 && cacheOp.Eviction().WantsKeepCold(handle);
         if (keep) {
             Memory_.AddKeepColdOwnedBytes(bytes);
         }
@@ -314,8 +286,6 @@ template void TSharedCacheImpl<TProdTraits>::CompleteHotEviction(
     TSpaceOperation&, THandle&, THandleState, ui64, TOperationItemRef<TProdTraits>&, ui32) noexcept;
 template void TSharedCacheImpl<TProdTraits>::TOperationView::CompleteHotEviction(
     THandle&, THandleState, ui64, TOperationItemRef<TProdTraits>&, ui32) noexcept;
-template void TSharedCacheImpl<TProdTraits>::ReleaseKeepColdPin(
-    TSpaceOperation&, TOperationItemRef<TProdTraits>&, ui32) noexcept;
 template void TSharedCacheImpl<TProdTraits>::ProcessHot(
     TSpaceOperation&, TSharedCacheImpl<TProdTraits>::EHotLevel, TCacheItem) noexcept;
 template bool TSharedCacheImpl<TProdTraits>::EvictFromHot(TSpaceOperation&, ui32) noexcept;
@@ -334,8 +304,6 @@ template void TSharedCacheImpl<TTestTraits>::CompleteHotEviction(
     TSpaceOperation&, THandle&, THandleState, ui64, TOperationItemRef<TTestTraits>&, ui32) noexcept;
 template void TSharedCacheImpl<TTestTraits>::TOperationView::CompleteHotEviction(
     THandle&, THandleState, ui64, TOperationItemRef<TTestTraits>&, ui32) noexcept;
-template void TSharedCacheImpl<TTestTraits>::ReleaseKeepColdPin(
-    TSpaceOperation&, TOperationItemRef<TTestTraits>&, ui32) noexcept;
 template void TSharedCacheImpl<TTestTraits>::ProcessHot(
     TSpaceOperation&, TSharedCacheImpl<TTestTraits>::EHotLevel, TCacheItem) noexcept;
 template bool TSharedCacheImpl<TTestTraits>::EvictFromHot(TSpaceOperation&, ui32) noexcept;
