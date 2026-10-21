@@ -1731,94 +1731,6 @@ bool TSharedCache::UnstickyCutPages(TSpaceOperation& spaceOp, TCacheItem pageIte
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::TryBeginCollectionAttach(TSpaceOperation& spaceOp, TCollectionRegistry& registry,
-    TCacheItem collectionItem, THandleState& attachState) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    THandle& handle = spaceOp.Handles()[collectionItem.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_acquire);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        if (!collectionItem.Matches(expected) || !expected.IsCollectionKind()) {
-            return false;
-        }
-        if (expected.IsSticky() && expected.IsStickyField()) {
-            TCollectionRegistry* owner = handle.Body.Collection->Registry_.load(std::memory_order_acquire);
-            if (owner == &registry) {
-                attachState = expected;
-                return true;
-            }
-            if (!owner && cacheOp.Collections().Link(registry, collectionItem)) {
-                attachState = expected;
-                return true;
-            }
-            return false;
-        }
-        if ((!expected.IsSticky() && !expected.IsHot() && !expected.IsCold()) || !expected.IsStickyNoneField() ||
-            handle.Body.Collection->Registry_.load(std::memory_order_acquire)) {
-            return false;
-        }
-
-        const THandleState claimed = expected.WithSticky(EStickyState::Transition);
-        InvokeHook(ESharedCacheHookPoint::BeforeCollectionAttachClaim, collectionItem);
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, claimed.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
-        {
-            UpdateColdReclaimable(PayloadBytes(handle, expected.Kind()), expected, claimed);
-            attachState = claimed;
-            return true;
-        }
-    }
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::FinishCollectionAttach(
-    TSpaceOperation& spaceOp, TCacheItem collectionItem, EHandleState detachedState) noexcept {
-    THandle& handle = spaceOp.Handles()[collectionItem.Index()];
-    const ui64 bytes = PayloadBytes(handle, EItemKind::Collection);
-    if (detachedState == EHandleState::Cold) {
-        AdvanceColdMembership(handle);
-        Memory_.AddRetainedBytes(bytes);
-        Memory_.Cold().TransferBytesTo(Memory_.Sticky(), bytes);
-        Memory_.RemoveColdItem();
-    } else if (detachedState == EHandleState::Hot) {
-        Memory_.Hot().TransferBytesTo(Memory_.Sticky(), bytes);
-    }
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        Y_ABORT_UNLESS(collectionItem.Matches(expected) && expected.IsCollectionKind() &&
-                       expected.State() == detachedState && expected.IsTransitionField());
-        const THandleState desired =
-            expected.WithState(EHandleState::Sticky).WithSticky(EStickyState::Sticky).WithFrequency(0);
-        InvokeHook(ESharedCacheHookPoint::BeforeCollectionAttachPublished, collectionItem);
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
-        {
-            return;
-        }
-    }
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::AttachCollection(
-    TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collectionItem) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    THandleState attachState;
-    if (!cacheOp.TryBeginCollectionAttach(registry, collectionItem, attachState)) {
-        return false;
-    }
-    if (attachState.IsStickyField()) {
-        return true;
-    }
-
-    const EHandleState detachedState = attachState.State();
-    Y_ABORT_UNLESS(cacheOp.Collections().Link(registry, collectionItem));
-    Collections_.AddReference(*spaceOp.Handles()[collectionItem.Index()].Body.Collection);
-    cacheOp.FinishCollectionAttach(collectionItem, detachedState);
-    return true;
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::TryBeginCollectionDetach(
     TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collectionItem) noexcept {
     if (!spaceOp.Contains(collectionItem) || collectionItem.IsFrozen()) {
@@ -2547,7 +2459,7 @@ ESharedCacheResultStatus TSharedCache::FindOrInsertCollection(TSpaceOperation& s
             {
                 return ESharedCacheResultStatus::Pending;
             }
-            if (!cacheOp.AttachCollection(*registry, ref.CacheItem())) {
+            if (!cacheOp.Collections().Attach(*registry, ref.CacheItem())) {
                 return ESharedCacheResultStatus::Pending;
             }
         }
