@@ -12,7 +12,6 @@
 #include <util/generic/scope.h>
 #include <util/system/spinlock.h>
 
-#include <cmath>
 #include <type_traits>
 #include <utility>
 
@@ -494,12 +493,6 @@ ui64 TSharedCache::AccountedPageBytes(ui64 size) noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
-ui64 TSharedCache::FractionCeil(ui64 value, double fraction) noexcept {
-    Y_DEBUG_ABORT_UNLESS(fraction >= 0.0 && fraction <= 1.0);
-    return fraction == 1.0 ? value : static_cast<ui64>(std::ceil(static_cast<double>(value) * fraction));
-}
-
-SHARED_CACHE_TEMPLATE
 void TSharedCache::UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept {
     if (Memory_.UpdateColdReclaimable(payloadBytes, before, after)) {
         NotifyResourcesAvailable();
@@ -551,7 +544,7 @@ ui32 TSharedCache::TryAllocateHandle(TSpaceOperation& spaceOp) noexcept {
         for (ui32 attempt = 0; attempt < spaceOp.HandleCount(); ++attempt) {
             if (!cacheOp.Eviction().ReclaimCold()) {
                 const ui32 hotSlots = static_cast<ui32>(Space_->EffectiveHotSlots());
-                cacheOp.EnforceCurrentLimit(0, true);
+                cacheOp.Eviction().EnforceCurrentLimit(*Space_, HotResize_, 0, true);
                 // The caller's view may predate growth; drain with a fresh operation under the resize lock.
                 DrainHotResize();
                 if (hotSlots == Space_->EffectiveHotSlots() && !cacheOp.Eviction().ReclaimCold()) {
@@ -2003,23 +1996,11 @@ SHARED_CACHE_TEMPLATE
 void TSharedCache::RefreshSoftLimit() noexcept {
     const ui64 softLimit = Memory_.RefreshSoftLimit(Policy_.CurrentLimitGap, Policy_.MinCurrentLimitGap);
     if (auto hotResize = HotResize_.TryLock()) {
-        RefreshEvictableByteBudget();
+        Eviction_.RefreshEvictableByteBudget();
     }
     if (RetainedBytes() >= softLimit) {
-        SoftLimitPressure_.store(true, std::memory_order_relaxed);
+        Eviction_.MarkSoftLimitPressure();
     }
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::RefreshEvictableByteBudget() noexcept {
-    const ui64 budget = EvictableByteBudget();
-    if (ColdByteBudget_ == budget) {
-        return;
-    }
-    ColdByteBudget_ = budget;
-    ColdMinBytes_.store(FractionCeil(budget, Policy_.ColdMin), std::memory_order_relaxed);
-    ColdTargetBytes_.store(FractionCeil(budget, (Policy_.ColdMin + Policy_.Grow) / 2), std::memory_order_relaxed);
-    ColdGrowBytes_.store(FractionCeil(budget, Policy_.Grow), std::memory_order_relaxed);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -2053,10 +2034,11 @@ bool TSharedCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) 
     for (;;) {
         const ui64 currentLimit = CurrentLimit();
         if (ExceedsLimit(usage, currentLimit, bytes)) {
-            SoftLimitPressure_.store(true, std::memory_order_relaxed);
+            Eviction_.MarkSoftLimitPressure();
             // Aging/resizing can make progress without freeing bytes. Bound cooperative work so
             // concurrent activity cannot keep a requester here instead of putting it on the wait path.
-            if (reclamationAttempts++ < SharedCacheTransitionWorkBatch && cacheOp.Eviction().Reclaim(bytes)) {
+            if (reclamationAttempts++ < SharedCacheTransitionWorkBatch &&
+                cacheOp.Eviction().Reclaim(*Space_, HotResize_, bytes)) {
                 usage = Memory_.PayloadUsage();
                 continue;
             }
@@ -2108,6 +2090,15 @@ bool TSharedCache::UpdateHardLimit(ui64 limit) noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
+bool TSharedCache::DrainHotResize() noexcept {
+    if (auto hotResize = HotResize_.TryLock()) {
+        auto cacheOp = BeginOperation();
+        return cacheOp.Eviction().DrainHotResize(*Space_, HotResize_);
+    }
+    return false;
+}
+
+SHARED_CACHE_TEMPLATE
 bool TSharedCache::ReclaimCold() noexcept {
     auto cacheOp = BeginOperation();
     return cacheOp.Eviction().ReclaimCold();
@@ -2116,111 +2107,7 @@ bool TSharedCache::ReclaimCold() noexcept {
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::EnforceCurrentLimit() noexcept {
     auto cacheOp = BeginOperation();
-    return cacheOp.EnforceCurrentLimit(0);
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes, bool forceShrinkHot) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    const ui64 softLimit = SoftLimit();
-    const bool hadCurrentPressure = ExceedsLimit(PayloadUsage(), CurrentLimit(), bytes);
-    const ui32 resizeStep = HotResizeStep(static_cast<ui32>(spaceOp.EffectiveHotSlots()));
-    // Retained cache bytes drive soft pressure; total page commitment independently drives current pressure.
-    const bool enforceSoftLimit =
-        SoftLimitPressure_.exchange(false, std::memory_order_relaxed) || RetainedBytes() > softLimit;
-
-    bool progress = false;
-    if (hadCurrentPressure) {
-        for (ui32 attempt = 0; attempt < resizeStep && ExceedsLimit(PayloadUsage(), CurrentLimit(), bytes); ++attempt) {
-            if (!cacheOp.Eviction().ReclaimCold()) {
-                break;
-            }
-            progress = true;
-        }
-    }
-    const bool enforceCurrentLimit = ExceedsLimit(PayloadUsage(), CurrentLimit(), bytes);
-    if (auto hotResize = HotResize_.TryLock()) {
-        // Publication uses the same lock, so Hot maintenance can route newly added handles safely.
-        auto hotCacheOp = BeginOperation();
-        const ui32 effectiveHotSlots = static_cast<ui32>(hotCacheOp.EffectiveHotSlots());
-        const ui32 hotResizeStep = HotResizeStep(effectiveHotSlots);
-        RefreshEvictableByteBudget();
-        if (HotResize_.Phase() == EHotResizePhase::Cut) {
-            progress = hotCacheOp.DrainHotResize() || progress;
-        } else {
-            const ui64 pageUsage = RetainedBytes();
-            const ui64 physicalUsage = PayloadUsage();
-            const ui64 currentLimit = CurrentLimit();
-            const ui64 freeBytes = currentLimit - Min(currentLimit, physicalUsage);
-            const ui64 coldBytes = ColdReclaimableBytes();
-            // Forecast the room remaining after admitting the caller's payload.
-            const ui64 freeAfterAdmission = freeBytes - Min(freeBytes, bytes);
-            const ui64 coldFreeBytes = coldBytes + freeAfterAdmission;
-            const ui64 coldFreeHandles = ColdReclaimableItems() + hotCacheOp.View().Free().Count();
-            const ui64 payloadBudget = EvictableByteBudget();
-
-            const ui64 coldTargetBytes = ColdTargetBytes_.load(std::memory_order_relaxed);
-            const ui64 evictableHandles =
-                hotCacheOp.AllocationLimit() - 2 - Min(hotCacheOp.AllocationLimit() - 2, StickyPages());
-            const ui64 coldMinHandles = (evictableHandles + 4) / 5;
-            const ui64 coldGrowHandles = (evictableHandles * 3 + 9) / 10;
-            const ui64 coldTargetHandles = (coldMinHandles + coldGrowHandles) / 2;
-            const bool belowColdMinimum =
-                coldFreeBytes < ColdMinBytes_.load(std::memory_order_relaxed) || coldFreeHandles < coldMinHandles;
-            if (coldFreeBytes >= coldTargetBytes && coldFreeHandles >= coldTargetHandles) {
-                KeepColdPressure_.store(false, std::memory_order_relaxed);
-            }
-            const bool refillKeepCold =
-                belowColdMinimum || (KeepColdPressure_.load(std::memory_order_relaxed) &&
-                                        (coldFreeBytes < coldTargetBytes || coldFreeHandles < coldTargetHandles));
-            ui32 targetHotSlots = 0;
-            // The caller's own requirement counts as already resident, so it lowers the cold plus free room.
-            // Referenced Cold and in-flight loads cannot be reclaimed yet. Under current-limit
-            // pressure, let Hot shrink further to compensate for their physical commitment.
-            const bool hotUnderPressure =
-                enforceCurrentLimit && (ReservedBytes() != 0 || Memory_.Cold().Bytes() > coldBytes);
-            const ui32 minimumHotSlots = hotCacheOp.MinimumHotSlots(hotUnderPressure);
-            if (effectiveHotSlots < minimumHotSlots) {
-                targetHotSlots = minimumHotSlots;
-            } else if (enforceCurrentLimit || forceShrinkHot || refillKeepCold ||
-                       (pageUsage > softLimit && Memory_.Hot().Bytes() > payloadBudget))
-            {
-                targetHotSlots = hotCacheOp.ShrinkHotTarget(effectiveHotSlots, hotResizeStep, hotUnderPressure);
-                if (targetHotSlots == 0) {
-                    const bool needColdHandles =
-                        coldFreeHandles < coldMinHandles ||
-                        (KeepColdPressure_.load(std::memory_order_relaxed) && coldFreeHandles < coldTargetHandles);
-                    if (needColdHandles && KeepColdOwnedBytes() != 0) {
-                        KeepColdPressure_.store(true, std::memory_order_relaxed);
-                        progress = hotCacheOp.Eviction().ShrinkKeepCold() || progress;
-                    }
-                    if (enforceCurrentLimit || forceShrinkHot || pageUsage > softLimit) {
-                        progress = hotCacheOp.Eviction().ProcessHotAtMinimum() || progress;
-                    }
-                }
-            } else if (!hadCurrentPressure && pageUsage <= softLimit &&
-                       coldFreeBytes > ColdGrowBytes_.load(std::memory_order_relaxed) &&
-                       coldFreeHandles > coldGrowHandles)
-            {
-                targetHotSlots = hotCacheOp.GrowHotTarget(effectiveHotSlots, hotResizeStep);
-                progress = Eviction_.GrowKeepCold() || progress;
-            }
-
-            if (targetHotSlots != 0 && Space_->BeginHotResize(targetHotSlots, HotResize_)) {
-                if (HotResize_.Phase() == EHotResizePhase::Cut) {
-                    progress = hotCacheOp.DrainHotResize() || progress;
-                }
-            }
-        }
-    }
-
-    if (enforceCurrentLimit || enforceSoftLimit || (softLimit == 0 && ColdReclaimableItems() != 0)) {
-        progress = cacheOp.Eviction().ReclaimToLimits(softLimit, resizeStep, bytes) || progress;
-        if (RetainedBytes() > softLimit) {
-            SoftLimitPressure_.store(true, std::memory_order_relaxed);
-        }
-    }
-    return progress;
+    return cacheOp.Eviction().EnforceCurrentLimit(*Space_, HotResize_, 0);
 }
 
 SHARED_CACHE_TEMPLATE

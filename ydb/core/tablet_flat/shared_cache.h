@@ -715,7 +715,6 @@ private:
     static ui64 PayloadBytes(const THandle& handle, EItemKind kind) noexcept;
     static ui64 AccountedPageBytes(ui64 size) noexcept;
     static ui64 PageBytes(const THandle& handle) noexcept;
-    static ui64 FractionCeil(ui64 value, double fraction) noexcept;
 
     void UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept;
 
@@ -726,15 +725,7 @@ private:
 
     TSharedCacheItemRefImpl<TTraits> TryAcquireHotEvictionPin(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
     bool DrainHotResize() noexcept;
-    bool DrainHotResize(TSpaceOperation& spaceOp) noexcept;
-    ui32 MinimumHotSlots(const TSpaceOperation& spaceOp, bool underPressure = false) const noexcept;
-    ui32 ShrinkHotTarget(
-        const TSpaceOperation& spaceOp, ui32 effectiveHotSlots, ui32 step, bool underPressure) const noexcept;
-    ui32 GrowHotTarget(const TSpaceOperation& spaceOp, ui32 effectiveHotSlots, ui32 step) const noexcept;
-    ui32 HotResizeStep(ui32 effectiveHotSlots) const noexcept;
     void RefreshSoftLimit() noexcept;
-    void RefreshEvictableByteBudget() noexcept;
-    bool EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes = 0, bool forceShrinkHot = false) noexcept;
     bool StartHardTransition() noexcept;
     TSharedCacheItemRefImpl<TTraits> TryAcquirePageForRelocation(TSpaceOperation& spaceOp, ui32 index) noexcept;
     TCacheItem PreparePageReplacement(TSpaceOperation& spaceOp, TCacheItem source) noexcept;
@@ -754,13 +745,7 @@ private:
     TCacheCollections<TTraits> Collections_;
     TCacheEviction<TTraits> Eviction_;
     TCacheFetches<TTraits> Fetches_;
-    ui64 ColdByteBudget_ = Max<ui64>(); // Protected by HotResize_; watermark calculation input.
-    std::atomic<ui64> ColdMinBytes_{ 0 };
-    std::atomic<ui64> ColdTargetBytes_{ 0 };
-    std::atomic<ui64> ColdGrowBytes_{ 0 };
     std::atomic<ui64> TargetHandleCount_{ 0 };
-    std::atomic<bool> KeepColdPressure_{ false };
-    std::atomic<bool> SoftLimitPressure_{ false };
     THotResize HotResize_;
     TSharedCacheCapacity HardTarget_;
     TTransition HardTransition_;
@@ -829,10 +814,6 @@ public: // Cache helpers
 
     Y_FORCE_INLINE typename TCacheFetches<TTraits>::TOperation Fetches() noexcept {
         return Cache_.Fetches_.BindOperation(SpaceOp_);
-    }
-
-    Y_FORCE_INLINE bool EnforceCurrentLimit(ui64 bytes = 0, bool forceShrinkHot = false) noexcept {
-        return Cache_.EnforceCurrentLimit(SpaceOp_, bytes, forceShrinkHot);
     }
 
     Y_FORCE_INLINE TCacheItem Allocate() noexcept {
@@ -987,22 +968,6 @@ public: // Cache helpers
 
     Y_FORCE_INLINE typename TCacheEviction<TTraits>::TOperation Eviction() noexcept {
         return Cache_.Eviction_.BindOperation(SpaceOp_);
-    }
-
-    Y_FORCE_INLINE bool DrainHotResize() noexcept {
-        return Cache_.DrainHotResize(SpaceOp_);
-    }
-
-    Y_FORCE_INLINE ui32 MinimumHotSlots(bool underPressure = false) const noexcept {
-        return Cache_.MinimumHotSlots(SpaceOp_, underPressure);
-    }
-
-    Y_FORCE_INLINE ui32 ShrinkHotTarget(ui32 effectiveHotSlots, ui32 step, bool underPressure) const noexcept {
-        return Cache_.ShrinkHotTarget(SpaceOp_, effectiveHotSlots, step, underPressure);
-    }
-
-    Y_FORCE_INLINE ui32 GrowHotTarget(ui32 effectiveHotSlots, ui32 step) const noexcept {
-        return Cache_.GrowHotTarget(SpaceOp_, effectiveHotSlots, step);
     }
 
     Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> TryAcquirePageForRelocation(ui32 index) noexcept {
