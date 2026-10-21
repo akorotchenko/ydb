@@ -29,6 +29,7 @@ public:
     static ui32 AdvanceColdMembership(THandle& handle) noexcept;
     static ui64 PageBytes(const THandle& handle) noexcept;
     void PromoteColdForSticky(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+    void ScheduleKeepColdSweep(ui64 slots) noexcept;
 
 private:
     TSharedCacheImpl<TTraits>& Cache_;
@@ -87,6 +88,14 @@ public:
             return Collections_.UnstickyCutPages(SpaceOp_, item, allocationLimit);
         }
 
+        bool SetPagesCacheMode(TCollection& collection, ECacheMode mode) noexcept {
+            return Collections_.SetPagesCacheMode(SpaceOp_, collection, mode);
+        }
+
+        bool Detach(TCollectionRegistry& registry, TCacheItem item) noexcept {
+            return Collections_.Detach(SpaceOp_, registry, item);
+        }
+
         bool Attach(TCollectionRegistry& registry, TCacheItem item) noexcept {
             return Collections_.Attach(SpaceOp_, registry, item);
         }
@@ -141,6 +150,7 @@ public:
     void AcknowledgeBytes(TCollection& owner) noexcept;
     static void AddReference(TCollection& owner) noexcept;
     static bool DropReference(TCollection& owner) noexcept;
+    static bool WantsStickyPage(const TCollection& collection) noexcept;
 
 private:
     friend class TSharedCacheImpl<TTraits>;
@@ -174,6 +184,10 @@ private:
     bool FinishStickyPromotion(TSpaceOperation& spaceOp, TCacheItem item, ui64 bytes) noexcept;
     static void PublishPageUnsticky(THandle& page, THandleState state) noexcept;
     bool UnstickyCutPages(TSpaceOperation& spaceOp, TCacheItem item, ui64 allocationLimit) noexcept;
+
+    bool SetPagesCacheMode(TSpaceOperation& spaceOp, TCollection& collection, ECacheMode mode) noexcept;
+    bool TryBeginDetach(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item) noexcept;
+    bool Detach(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item) noexcept;
 
     bool TryBeginAttach(
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item, THandleState& attachState) noexcept;

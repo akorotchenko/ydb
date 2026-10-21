@@ -686,11 +686,6 @@ private:
 
     TSharedCacheItemRefImpl<TTraits> BuildExternalRef(EItemKind kind, TCacheItem cacheItem) noexcept;
 
-    bool SetCollectionPagesCacheMode(TSpaceOperation& spaceOp, TCollection& collection, ECacheMode mode) noexcept;
-
-    bool TryBeginCollectionDetach(
-        TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
-    bool DetachCollection(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
     bool DetachCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
     bool DeleteCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
     bool TryClaimCollectionDeletion(TSpaceOperation& spaceOp, TCollectionRegistry* expectedRegistry,
@@ -754,7 +749,6 @@ private:
     bool GrowKeepCold() noexcept;
 
     bool WantsKeepCold(TSpaceOperation& spaceOp, const THandle& page) noexcept;
-    static bool WantsStickyPage(const TCollection& collection) noexcept;
 
     void RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
 
@@ -830,7 +824,7 @@ private:
     std::atomic<ui64> KeepColdMaxBytes_{ 0 }; // Configured ceiling; repeated updates preserve pressure shrinkage.
     std::atomic<ui64> KeepColdLimit_{ 0 }; // Effective budget, resized according to Cold+Free headroom.
     std::atomic<ui64> KeepColdTrimScanRemaining_{ 0 };
-    std::atomic<ui64> KeepModeSweepRemaining_{ 0 };
+    std::atomic<ui64> KeepColdSweepRemaining_{ 0 };
     std::atomic<ui64> ColdMinBytes_{ 0 };
     std::atomic<ui64> ColdTargetBytes_{ 0 };
     std::atomic<ui64> ColdGrowBytes_{ 0 };
@@ -1021,18 +1015,6 @@ public: // Cache helpers
 
     Y_FORCE_INLINE void InitializeCollection(TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept {
         Cache_.InitializeCollection(SpaceOp_, cacheItem, id, bytes);
-    }
-
-    Y_FORCE_INLINE bool SetCollectionPagesCacheMode(TCollection& collection, ECacheMode mode) noexcept {
-        return Cache_.SetCollectionPagesCacheMode(SpaceOp_, collection, mode);
-    }
-
-    Y_FORCE_INLINE bool TryBeginCollectionDetach(TCollectionRegistry& registry, TCacheItem collection) noexcept {
-        return Cache_.TryBeginCollectionDetach(SpaceOp_, registry, collection);
-    }
-
-    Y_FORCE_INLINE bool DetachCollection(TCollectionRegistry& registry, TCacheItem collection) noexcept {
-        return Cache_.DetachCollection(SpaceOp_, registry, collection);
     }
 
     Y_FORCE_INLINE bool TryClaimCollectionDeletion(TCollectionRegistry* expectedRegistry, TCacheItem collection,
