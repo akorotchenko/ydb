@@ -4140,7 +4140,6 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_Follower) {
         // Force metadata loads: direct core lookup can otherwise boot the follower without requests.
         auto* core = &NSharedCache::TSharedCache::Get();
         {
-            auto binding = core->BindCurrentThreadHazard();
             TSharedCacheCollectionRef collection;
             UNIT_ASSERT(core->Find(collectionId, collection) == ESharedCacheResultStatus::Hit);
             UNIT_ASSERT(core->SetCollectionPagesCacheMode(collection.CacheItem(), ECacheMode::TryKeepInMemory));

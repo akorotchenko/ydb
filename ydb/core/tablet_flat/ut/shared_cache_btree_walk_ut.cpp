@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
 
 #include <library/cpp/testing/unittest/registar.h>
@@ -79,14 +80,12 @@ namespace {
                 TSharedCache::Get().AdmitCollection(MakeIntrusiveConst<TPageCollectionStub>(TLogoBlobID(1, 1, 1)));
             Collection->EnsureActorState();
             auto& cache = TSharedCache::Get();
-            auto binding = cache.BindCurrentThreadHazard();
             UNIT_ASSERT(cache.SetCollectionPagesCacheMode(Collection.CacheItem(), ECacheMode::Regular));
         }
 
         void KeepCollection(const TActorId& owner) {
             Collection->GetActorState()->InMemoryOwners.insert(owner);
             auto& cache = TSharedCache::Get();
-            auto binding = cache.BindCurrentThreadHazard();
             UNIT_ASSERT(cache.SetCollectionPagesCacheMode(Collection.CacheItem(), ECacheMode::TryKeepInMemory));
         }
 
@@ -160,7 +159,7 @@ namespace {
 
 } // namespace
 
-Y_UNIT_TEST_SUITE(TCacheBTreeWalkController) {
+Y_UNIT_TEST_SUITE_F(TCacheBTreeWalkController, ::NKikimr::NTable::NTest::TTableCacheTest) {
     Y_UNIT_TEST(CoreKeepIndexUsesPendingQueueAndParsesReadyPage) {
         TWalkHostMock host;
         TCacheBTreeWalkController walks(host);

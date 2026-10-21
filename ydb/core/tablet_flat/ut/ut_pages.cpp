@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
 #include <ydb/core/tablet_flat/test/libs/table/model/large.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_part.h>
@@ -22,7 +23,7 @@ namespace {
     const NTest::TMass MassZ(new NTest::TModelStd(false), 128);
 }
 
-Y_UNIT_TEST_SUITE(NPage) {
+Y_UNIT_TEST_SUITE_F(NPage, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(Encoded)
     {

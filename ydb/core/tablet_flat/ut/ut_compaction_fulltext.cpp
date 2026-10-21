@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_part.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_writer.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_envs.h>
@@ -292,7 +293,7 @@ namespace {
 
 } // anonymous namespace
 
-Y_UNIT_TEST_SUITE(TFulltextCompaction) {
+Y_UNIT_TEST_SUITE_F(TFulltextCompaction, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(NonFinalAddedOnly) {
         auto lay = MakeFulltextLayout();

@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/shared_cache_thread_test.h>
 #include "datashard_ut_common_kqp.h"
 #include <ydb/core/tablet_flat/shared_cache_counters.h>
 #include <ydb/core/base/memory_controller_iface.h>
@@ -7,7 +8,6 @@
 #include <ydb/core/tablet_flat/shared_sausagecache.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_make.h>
 #include <ydb/core/testlib/actors/block_events.h>
-#include <ydb/core/testlib/actor_helpers.h>
 
 namespace NKikimr {
 
@@ -576,8 +576,6 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
         constexpr ui32 rows = 32768;
         UpsertRows(server, sender, 0, rows);
         auto& cache = *runtime.GetAppData().SharedCache;
-        TActorSystemStub cacheContext;
-        cacheContext.AppData.SharedCache = runtime.GetAppData().SharedCache;
         const ui64 savedLimit = cache.CurrentLimit();
         Y_DEFER {
             cache.UpdateCurrentLimit(savedLimit);
@@ -618,7 +616,6 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
         pageBudget = Max(pageBudget, requests.front()->Get()->Pages.front().Size + NActors::TSharedData::OverheadSize);
         UNIT_ASSERT_GT(indexBytes, 4 * pageBudget);
         {
-            auto binding = cache.BindCurrentThreadHazard();
             while (cache.EnforceCurrentLimit()) {
             }
         }

@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include "flat_page_btree_index.h"
 #include "flat_page_btree_index_writer.h"
 #include "flat_part_walker.h"
@@ -271,7 +272,7 @@ namespace {
     }
 }
 
-Y_UNIT_TEST_SUITE(TBtreeIndexNode) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexNode, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
     using TChild = TBtreeIndexNode::TChild;
 
@@ -597,7 +598,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexNode) {
 
 }
 
-Y_UNIT_TEST_SUITE(TBtreeIndexBuilder) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexBuilder, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
     using TChild = TBtreeIndexNode::TChild;
 
@@ -771,7 +772,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexBuilder) {
 
 }
 
-Y_UNIT_TEST_SUITE(TBtreeIndexTPart) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexTPart, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(Conf) {
         NPage::TConf conf;
@@ -1057,7 +1058,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexTPart) {
     }
 }
 
-Y_UNIT_TEST_SUITE(TBtreeIndexNodeV2) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexNodeV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using TChildV2 = TBtreeIndexNode::TChildV2;
     using TShortChildV2 = TBtreeIndexNode::TShortChildV2;
 
@@ -1114,7 +1115,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexNodeV2) {
 // Section 3: Twin format tests — v1 and v2 produce identical results
 // ========================================================================
 
-Y_UNIT_TEST_SUITE(TBtreeIndexTPartV2) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexTPartV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     // Twin test: write same data in v1 and v2, compare row-level stats and iteration.
@@ -1362,7 +1363,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexTPartV2) {
 // Section 4: V2 format-specific tests
 // ========================================================================
 
-Y_UNIT_TEST_SUITE(TBtreeIndexV2Specific) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexV2Specific, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
     using TChildV2 = TBtreeIndexNode::TChildV2;
     using TShortChildV2 = TBtreeIndexNode::TShortChildV2;
@@ -2145,7 +2146,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexV2Specific) {
 // Section 5.2: Read format flag tests
 // ========================================================================
 
-Y_UNIT_TEST_SUITE(TBtreeIndexReadFlags) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexReadFlags, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     Y_UNIT_TEST(ReadFlag_Off_KeepsV2OnlyRoot) {
@@ -2184,7 +2185,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexReadFlags) {
 }
 
 // ========================================================================
-Y_UNIT_TEST_SUITE(TBTreePartWalker) {
+Y_UNIT_TEST_SUITE_F(TBTreePartWalker, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     Y_UNIT_TEST(WalkMultiLevelBTree) {

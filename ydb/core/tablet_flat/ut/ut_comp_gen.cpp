@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include "flat_comp_ut_common.h"
 
 #include <ydb/core/tablet_flat/flat_comp_gen.h>
@@ -10,7 +11,7 @@ namespace NCompGen {
 
 using namespace NTest;
 
-Y_UNIT_TEST_SUITE(TGenCompaction) {
+Y_UNIT_TEST_SUITE_F(TGenCompaction, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     constexpr ui32 Table = 1;
 

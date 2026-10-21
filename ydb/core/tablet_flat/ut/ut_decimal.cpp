@@ -1,10 +1,11 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <library/cpp/testing/unittest/registar.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_dbase.h>
 
 namespace NKikimr {
 namespace NTable {
 
-Y_UNIT_TEST_SUITE(TFlatDatabaseDecimal) {
+Y_UNIT_TEST_SUITE_F(TFlatDatabaseDecimal, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(UpdateRead) {
         constexpr ui32 tableId = 1;

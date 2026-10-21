@@ -16,6 +16,7 @@
 #include <ydb/core/tablet_flat/test/libs/table/test_envs.h>
 #include <ydb/core/tablet_flat/test/libs/table/wrap_part.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_steps.h>
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_context.h>
 
 // ya test -r -D BENCHMARK_MAKE_LARGE_PART
 #ifndef BENCHMARK_MAKE_LARGE_PART
@@ -46,6 +47,7 @@ namespace {
 
         void SetUp(::benchmark::State& state) 
         {
+            Cache = MakeHolder<TTableCacheContext>();
             const bool useBTree = state.range(0);
             const ui32 partsCount = state.range(1);
             const bool groups = state.range(2);
@@ -87,6 +89,15 @@ namespace {
             Part = Subset->Flatten[0].Part.Get();
         }
 
+        void TearDown(::benchmark::State&) override {
+            Checker.Reset();
+            CheckerReverse.Reset();
+            Subset.Reset();
+            Mass.Reset();
+            Cache.Reset();
+        }
+
+        THolder<TTableCacheContext> Cache;
         TMersenne<ui64> Rnd;
         TAutoPtr<NTest::TMass> Mass;
         TAutoPtr<TSubset> Subset;
