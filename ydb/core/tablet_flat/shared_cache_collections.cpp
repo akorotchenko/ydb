@@ -16,7 +16,7 @@ TSharedCacheItemRefImpl<TTraits> TCacheCollectionServices<TTraits>::TryAcquireSt
 
 template <class TTraits>
 void TCacheCollectionServices<TTraits>::RouteHotL1(TSpaceOperation& spaceOp, TCacheItem item) noexcept {
-    Cache_.RouteHot(spaceOp, TSharedCacheImpl<TTraits>::EHotLevel::L1, item);
+    Cache_.Eviction_.BindOperation(spaceOp).RouteHot(EHotLevel::L1, item);
 }
 
 template <class TTraits>
@@ -37,7 +37,7 @@ ui64 TCacheCollectionServices<TTraits>::PageBytes(const THandle& handle) noexcep
 
 template <class TTraits>
 void TCacheCollectionServices<TTraits>::PromoteColdForSticky(TSpaceOperation& spaceOp, TCacheItem item) noexcept {
-    Cache_.PromoteCold(spaceOp, item, true);
+    Cache_.Eviction_.BindOperation(spaceOp).PromoteCold(item, true);
 }
 
 template <class TTraits>

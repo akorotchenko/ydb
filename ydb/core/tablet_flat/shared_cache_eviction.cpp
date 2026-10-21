@@ -1,6 +1,8 @@
 #include "shared_cache_eviction.h"
 #include "shared_cache.h"
 
+#include <util/generic/cast.h>
+
 #include <cmath>
 
 namespace NKikimr::NSharedCache {
@@ -8,6 +10,17 @@ namespace NKikimr::NSharedCache {
 template <class TTraits>
 ui64 TCacheEvictionServices<TTraits>::PageBytes(const THandle& handle) noexcept {
     return TSharedCacheImpl<TTraits>::PageBytes(handle);
+}
+
+template <class TTraits>
+ui64 TCacheEvictionServices<TTraits>::PayloadBytes(const THandle& handle, EItemKind kind) noexcept {
+    return TSharedCacheImpl<TTraits>::PayloadBytes(handle, kind);
+}
+
+template <class TTraits>
+TSharedCacheItemRefImpl<TTraits> TCacheEvictionServices<TTraits>::TryAcquireHotEvictionPin(
+    TSpaceOperation& spaceOp, TCacheItem item) noexcept {
+    return Cache_.TryAcquireHotEvictionPin(spaceOp, item);
 }
 
 template <class TTraits>
@@ -354,6 +367,231 @@ void TCacheEviction<TTraits>::ReleaseKeepColdPin(
             return;
         }
     }
+}
+
+template <class TTraits>
+TCacheItem TCacheEviction<TTraits>::PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept {
+    const TRingExchangeResult exchange =
+        spaceOp.Hot(ToUnderlying(level)).PutAndPopWithHook(cacheItem.Raw(), [&]() noexcept {
+            Traits_.Invoke(ESharedCacheHookPoint::BeforeHotExchange, cacheItem);
+        });
+    // The operation protects the mapping; a concurrent cut may still exclude this slot.
+    if (!spaceOp.IsAllowedHotSlot(exchange.Slot)) {
+        ui64 expected = cacheItem.Raw();
+        if (exchange.Slot->compare_exchange_strong(expected, 0, std::memory_order_relaxed, std::memory_order_relaxed))
+        {
+            EvictFromHot(spaceOp, cacheItem);
+        }
+    }
+    return TCacheItem::FromRaw(exchange.Previous);
+}
+
+template <class TTraits>
+void TCacheEviction<TTraits>::RouteHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept {
+    const TCacheItem displaced = PutHot(spaceOp, level, cacheItem);
+    if (!displaced.IsNull()) {
+        ProcessHot(spaceOp, level, displaced);
+    }
+}
+
+template <class TTraits>
+Y_FORCE_INLINE bool TCacheEviction<TTraits>::TakeHotFrequency(
+    THandle& handle, TCacheItem cacheItem, THandleState& state, ui8& frequency) noexcept {
+    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        if (!cacheItem.Matches(expected) || !expected.IsHot() || !expected.IsStickyNoneField()) {
+            return false;
+        }
+        const THandleState desired = expected.WithFrequency(0);
+        if (handle.State.compare_exchange_weak(
+                expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed))
+        {
+            state = desired;
+            frequency = expected.Frequency();
+            return true;
+        }
+    }
+}
+
+template <class TTraits>
+Y_FORCE_INLINE void TCacheEviction<TTraits>::CompleteHotEviction(TSpaceOperation& spaceOp, THandle& handle,
+    THandleState coldState, ui64 bytes, TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept {
+    Y_DEBUG_ABORT_UNLESS(coldState.Refs() > 0);
+    Traits_.Invoke(ESharedCacheHookPoint::AfterHotEvictionPublished, pin.CacheItem());
+    if (Memory_.UpdateColdReclaimable(bytes, coldState.WithState(EHandleState::Hot), coldState)) {
+        Services_.NotifyResourcesAvailable();
+    }
+    if (coldState.IsKeepCold()) {
+        Memory_.Hot().TransferBytesTo(Memory_.KeepCold(), bytes);
+        Memory_.Hot().TransferPageTo(Memory_.KeepCold(), coldState.Kind());
+    } else {
+        Memory_.ReleaseRetainedBytes(bytes);
+        Memory_.Hot().TransferBytesTo(Memory_.Cold(), bytes);
+        Memory_.Hot().TransferPageTo(Memory_.Cold(), coldState.Kind());
+        Memory_.AddColdItem();
+        if (coldState.IsPageKind()) {
+            if (TCollection* owner = Collections_.BindOperation(spaceOp).PageCollection(handle)) {
+                Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
+            }
+        }
+    }
+    ReleaseKeepColdPin(spaceOp, pin, initialColdVersion);
+}
+
+template <class TTraits>
+void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept {
+    for (;;) {
+        TOperationItemRef<TTraits> evictionPin(spaceOp, Services_.TryAcquireHotEvictionPin(spaceOp, cacheItem));
+        if (!evictionPin) {
+            return;
+        }
+        THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+        THandleState state;
+        ui8 frequency;
+        if (!TakeHotFrequency(handle, cacheItem, state, frequency)) {
+            return;
+        }
+
+        if (frequency == 0) {
+            if (level != EHotLevel::L0) {
+                level = EHotLevel::L0;
+            } else {
+                ui64 hotRaw = state.Raw();
+                const ui64 bytes = Services_.PayloadBytes(handle, state.Kind());
+                const bool keep = state.IsPageKind() && state.Refs() == 1 && WantsKeepCold(spaceOp, handle);
+                if (keep) {
+                    Memory_.AddKeepColdOwnedBytes(bytes);
+                }
+                const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
+                const THandleState cold = state.WithState(keep ? EHandleState::KeepCold : EHandleState::Cold);
+                if (handle.State.compare_exchange_strong(
+                        hotRaw, cold.Raw(), std::memory_order_relaxed, std::memory_order_relaxed))
+                {
+                    CompleteHotEviction(spaceOp, handle, cold, bytes, evictionPin, coldVersion);
+                    return;
+                }
+
+                if (keep) {
+                    Memory_.ReleaseKeepColdOwnedBytes(bytes);
+                }
+
+                level = EHotLevel::L0;
+            }
+        } else {
+            level = level >= EHotLevel::L2 && frequency > 1 ? EHotLevel::L3 : EHotLevel::L2;
+        }
+
+        evictionPin.Drop();
+        const TCacheItem displaced = PutHot(spaceOp, level, cacheItem);
+        if (displaced.IsNull()) {
+            return;
+        }
+        cacheItem = displaced;
+    }
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::EvictFromHot(TSpaceOperation& spaceOp, ui32 index) noexcept {
+    Y_DEBUG_ABORT_UNLESS(index >= 2 && index < spaceOp.AccessibleHandleCount());
+
+    const THandleState state = THandleState::FromRaw(spaceOp.Handles()[index].State.load(std::memory_order_relaxed));
+    if (!state.IsHot()) {
+        return false;
+    }
+    return EvictFromHot(spaceOp, TCacheItem::Make(state.Version(), index));
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
+    Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem) && !cacheItem.IsFrozen() && cacheItem.Index() >= 2);
+
+    TOperationItemRef<TTraits> evictionPin(spaceOp, Services_.TryAcquireHotEvictionPin(spaceOp, cacheItem));
+    if (!evictionPin) {
+        return false;
+    }
+    const ui32 index = cacheItem.Index();
+    THandle& handle = spaceOp.Handles()[index];
+    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        if (!cacheItem.Matches(expected) || !expected.IsHot() || !expected.IsStickyNoneField()) {
+            return false;
+        }
+        const ui64 bytes = Services_.PayloadBytes(handle, expected.Kind());
+        const bool keep = expected.IsPageKind() && expected.Refs() == 1 && WantsKeepCold(spaceOp, handle);
+        if (keep) {
+            Memory_.AddKeepColdOwnedBytes(bytes);
+        }
+        const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
+        const THandleState desired =
+            expected.WithState(keep ? EHandleState::KeepCold : EHandleState::Cold).WithFrequency(0);
+        if (handle.State.compare_exchange_weak(
+                expectedRaw, desired.Raw(), std::memory_order_relaxed, std::memory_order_relaxed))
+        {
+            CompleteHotEviction(spaceOp, handle, desired, bytes, evictionPin, coldVersion);
+            return true;
+        }
+        if (keep) {
+            Memory_.ReleaseKeepColdOwnedBytes(bytes);
+        }
+    }
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool force) noexcept {
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        if (!cacheItem.Matches(expected) || !expected.IsCold()) {
+            return false;
+        }
+        Y_DEBUG_ABORT_UNLESS(expected.IsPageKind() && expected.Refs() != 0);
+        const ui64 bytes = Services_.PageBytes(handle);
+        TCollection* owner = Collections_.BindOperation(spaceOp).PageCollection(handle);
+        const bool protectedPage = force || !owner || owner->GetCacheMode() != ECacheMode::Regular;
+        if (protectedPage) {
+            Memory_.AddRetainedBytes(bytes);
+        } else if (!Memory_.TryAddRetainedBytes(bytes)) {
+            return false;
+        }
+        Memory_.Hot().AddBytes(bytes);
+        Memory_.Hot().AddPage(EItemKind::Page);
+        const THandleState desired = expected.WithState(EHandleState::Hot).WithFrequency(0);
+        if (handle.State.compare_exchange_weak(
+                expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            Services_.AdvanceColdMembership(handle);
+            Memory_.Cold().RemoveBytes(bytes);
+            Memory_.Cold().RemovePage(EItemKind::Page);
+            Memory_.RemoveColdItem();
+            if (owner) {
+                Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
+            }
+            return true;
+        }
+        Memory_.Hot().RemoveBytes(bytes);
+        Memory_.Hot().RemovePage(EItemKind::Page);
+        Memory_.ReleaseRetainedBytes(bytes);
+    }
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept {
+    bool progress = false;
+    // Give every level a share of the bounded work even when the lower rings are large or empty.
+    for (ui32 level = 0; level < 4; ++level) {
+        const TRingView hot = spaceOp.Hot(level);
+        const ui64 attempts = Min<ui64>(hot.Capacity, SharedCacheTransitionWorkBatch / 4);
+        for (ui64 attempt = 0; attempt < attempts; ++attempt) {
+            const ui64 raw = hot.Pop();
+            if (raw != 0) {
+                ProcessHot(spaceOp, static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
+                progress = true;
+            }
+        }
+    }
+    return progress;
 }
 
 template class TCacheEvictionServices<TProdTraits>;

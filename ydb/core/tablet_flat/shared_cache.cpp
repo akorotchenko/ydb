@@ -1048,7 +1048,7 @@ void TSharedCache::MakeReadyState(
                 expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
         {
             if (desired.IsHot()) {
-                cacheOp.RouteHot(EHotLevel::L1, TCacheItem::Make(expected.Version(), index));
+                cacheOp.Eviction().RouteHot(EHotLevel::L1, TCacheItem::Make(expected.Version(), index));
             }
             return;
         }
@@ -1241,10 +1241,10 @@ typename TSharedCache::EAcquireStatus TSharedCache::TryAcquire(
             Memory_.KeepCold().TransferBytesTo(Memory_.Hot(), bytes);
             Memory_.KeepCold().TransferPageTo(Memory_.Hot(), EItemKind::Page);
             Memory_.ReleaseKeepColdOwnedBytes(bytes);
-            cacheOp.RouteHot(EHotLevel::L1, cacheItem);
+            cacheOp.Eviction().RouteHot(EHotLevel::L1, cacheItem);
         } else if (expected.IsCold() && expected.IsPageKind()) {
-            if (cacheOp.PromoteCold(cacheItem)) {
-                cacheOp.RouteHot(EHotLevel::L1, cacheItem);
+            if (cacheOp.Eviction().PromoteCold(cacheItem)) {
+                cacheOp.Eviction().RouteHot(EHotLevel::L1, cacheItem);
             } else {
                 AdvanceColdMembership(handle);
             }
@@ -2257,7 +2257,7 @@ bool TSharedCache::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes, boo
                         progress = hotCacheOp.Eviction().ShrinkKeepCold() || progress;
                     }
                     if (enforceCurrentLimit || forceShrinkHot || pageUsage > softLimit) {
-                        progress = hotCacheOp.ProcessHotAtMinimum() || progress;
+                        progress = hotCacheOp.Eviction().ProcessHotAtMinimum() || progress;
                     }
                 }
             } else if (!hadCurrentPressure && pageUsage <= softLimit &&

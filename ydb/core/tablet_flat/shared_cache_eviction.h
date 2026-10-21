@@ -9,10 +9,19 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
+class TSharedCacheItemRefImpl;
+template <class TTraits>
 class TOperationItemRef;
 template <class TTraits>
 class TCacheCollections;
 class TCollection;
+
+enum class EHotLevel : ui32 {
+    L0,
+    L1,
+    L2,
+    L3,
+};
 
 template <class TTraits>
 class TCacheEvictionServices {
@@ -22,6 +31,8 @@ public:
     {}
 
     static ui64 PageBytes(const THandle& handle) noexcept;
+    static ui64 PayloadBytes(const THandle& handle, EItemKind kind) noexcept;
+    TSharedCacheItemRefImpl<TTraits> TryAcquireHotEvictionPin(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     static ui32 AdvanceColdMembership(THandle& handle) noexcept;
     static bool AdvanceColdMembership(
         THandle& handle, ui32 expectedVersion, bool keepColdQueued, ui32& newVersion) noexcept;
@@ -67,6 +78,30 @@ public:
 
         void ReleaseKeepColdPin(TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept {
             Eviction_.ReleaseKeepColdPin(SpaceOp_, pin, initialColdVersion);
+        }
+
+        void RouteHot(EHotLevel level, TCacheItem item) noexcept {
+            Eviction_.RouteHot(SpaceOp_, level, item);
+        }
+
+        void ProcessHot(EHotLevel level, TCacheItem item) noexcept {
+            Eviction_.ProcessHot(SpaceOp_, level, item);
+        }
+
+        bool EvictFromHot(ui32 index) noexcept {
+            return Eviction_.EvictFromHot(SpaceOp_, index);
+        }
+
+        bool EvictFromHot(TCacheItem item) noexcept {
+            return Eviction_.EvictFromHot(SpaceOp_, item);
+        }
+
+        bool PromoteCold(TCacheItem item, bool force = false) noexcept {
+            return Eviction_.PromoteCold(SpaceOp_, item, force);
+        }
+
+        bool ProcessHotAtMinimum() noexcept {
+            return Eviction_.ProcessHotAtMinimum(SpaceOp_);
         }
 
     private:
@@ -132,6 +167,18 @@ private:
     void RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
     void ReleaseKeepColdPin(
         TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept;
+
+    TCacheItem PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
+    void RouteHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
+    static Y_FORCE_INLINE bool TakeHotFrequency(
+        THandle& handle, TCacheItem item, THandleState& state, ui8& frequency) noexcept;
+    Y_FORCE_INLINE void CompleteHotEviction(TSpaceOperation& spaceOp, THandle& handle, THandleState coldState,
+        ui64 bytes, TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept;
+    void ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
+    bool EvictFromHot(TSpaceOperation& spaceOp, ui32 index) noexcept;
+    bool EvictFromHot(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+    bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem item, bool force = false) noexcept;
+    bool ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept;
 
 private:
     TCacheEvictionServices<TTraits> Services_;

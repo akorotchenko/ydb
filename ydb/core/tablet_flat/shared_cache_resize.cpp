@@ -85,7 +85,7 @@ bool TSharedCache::FinalDrain(TTransition& transition) noexcept {
     return Space_->FinalDrain(
         transition,
         [&](ui32 level, ui64 raw) noexcept {
-            cacheOp.RouteHot(static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
+            cacheOp.Eviction().RouteHot(static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
         },
         [&](ui64 raw) noexcept {
             Memory_.RemoveColdRingEntry();
@@ -317,7 +317,7 @@ bool TSharedCache::RelocatePage(TSpaceOperation& spaceOp, ui32 index) noexcept {
         AdvanceColdMembership(source);
     }
     if (oldState == EHandleState::Hot) {
-        cacheOp.RouteHot(EHotLevel::L1, replacementItem);
+        cacheOp.Eviction().RouteHot(EHotLevel::L1, replacementItem);
     }
     cacheOp.CompletePageReplacement(sourceItem);
     return true;
@@ -362,7 +362,7 @@ bool TSharedCache::DemoteUnlinkedStickyPage(TSpaceOperation& spaceOp, ui32 index
             Memory_.Sticky().TransferBytesTo(Memory_.Hot(), bytes);
             Memory_.Sticky().TransferPageTo(Memory_.Hot(), EItemKind::Page);
             Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, bytes);
-            cacheOp.RouteHot(EHotLevel::L1, pageItem);
+            cacheOp.Eviction().RouteHot(EHotLevel::L1, pageItem);
             return true;
         }
     }
@@ -381,7 +381,7 @@ typename TSharedCache::EShrinkCutStatus TSharedCache::ReclaimShrinkHandle(
         if (state.Refs() != 0 && cacheOp.RelocatePage(index)) {
             return EShrinkCutStatus::Progress;
         }
-        if (cacheOp.EvictFromHot(index)) {
+        if (cacheOp.Eviction().EvictFromHot(index)) {
             return EShrinkCutStatus::Progress;
         }
     }

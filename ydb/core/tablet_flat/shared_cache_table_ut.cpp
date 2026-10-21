@@ -357,13 +357,13 @@ public:
 
     static bool ProcessHotAtMinimum(TTestSharedCache& cache) noexcept {
         return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
-            return cache.ProcessHotAtMinimum(spaceOp);
+            return cache.BindOperation(spaceOp).Eviction().ProcessHotAtMinimum();
         });
     }
 
     static void ProcessHotToken(TTestSharedCache& cache, TPageCacheItem page) noexcept {
         WithSpace(cache, [&](TSpaceOperation& spaceOp) {
-            cache.ProcessHot(spaceOp, TTestSharedCache::EHotLevel::L0, page.CacheItem());
+            cache.BindOperation(spaceOp).Eviction().ProcessHot(EHotLevel::L0, page.CacheItem());
         });
     }
 
@@ -399,12 +399,12 @@ public:
 
     static bool EvictFromHot(TTestSharedCache& cache, TPageCacheItem page) {
         auto operation = cache.BeginOperation();
-        return cache.EvictFromHot(operation, page.Index());
+        return operation.Eviction().EvictFromHot(page.Index());
     }
 
     static bool EvictFromHot(TTestSharedCache& cache, TCollectionCacheItem collection) {
         auto operation = cache.BeginOperation();
-        return cache.EvictFromHot(operation, collection.Index());
+        return operation.Eviction().EvictFromHot(collection.Index());
     }
 
     static void TransferColdToHot(TTestSharedCache& cache, ui64 bytes) {
