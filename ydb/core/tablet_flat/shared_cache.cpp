@@ -135,6 +135,7 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     , Table_(*Space_, *this)
     , Memory_(Space_->CurrentConfiguration().StaticBytes, hardLimit, Space_->ReservedConfiguration().Limit)
     , Collections_(TCacheCollectionServices<TTraits>(*this), Memory_, Table_, static_cast<const TTraits&>(*this))
+    , Eviction_(TCacheEvictionServices<TTraits>(*this), Memory_, Policy_)
     , Fetches_(TCacheFetchServices<TTraits>(*this), Memory_, Table_, Collections_, static_cast<const TTraits&>(*this))
     , TargetHandleCount_(Space_->CurrentConfiguration().HandleCount())
     , HardTarget_(Space_->CurrentConfiguration())
@@ -2090,22 +2091,7 @@ void TSharedCache::RefreshEvictableByteBudget() noexcept {
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::UpdateKeepColdLimit(ui64 limit) noexcept {
-    if (limit > HardLimit()) {
-        return false;
-    }
-    const ui64 previousMaximum = KeepColdMaxBytes_.exchange(limit, std::memory_order_relaxed);
-    if (previousMaximum == limit) {
-        return true;
-    }
-    ui64 current = KeepColdLimit_.load(std::memory_order_relaxed);
-    for (;;) {
-        const ui64 growth = limit > previousMaximum ? limit - previousMaximum : 0;
-        const ui64 target = Min(current, limit) + Min(growth, limit - Min(current, limit));
-        if (KeepColdLimit_.compare_exchange_weak(current, target, std::memory_order_relaxed, std::memory_order_relaxed))
-        {
-            return true;
-        }
-    }
+    return Eviction_.UpdateKeepColdLimit(limit);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -2267,7 +2253,7 @@ bool TSharedCache::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes, boo
                         (KeepColdPressure_.load(std::memory_order_relaxed) && coldFreeHandles < coldTargetHandles);
                     if (needColdHandles && KeepColdOwnedBytes() != 0) {
                         KeepColdPressure_.store(true, std::memory_order_relaxed);
-                        progress = hotCacheOp.ShrinkKeepCold() || progress;
+                        progress = hotCacheOp.Eviction().ShrinkKeepCold() || progress;
                     }
                     if (enforceCurrentLimit || forceShrinkHot || pageUsage > softLimit) {
                         progress = hotCacheOp.ProcessHotAtMinimum() || progress;
@@ -2278,7 +2264,7 @@ bool TSharedCache::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes, boo
                        coldFreeHandles > coldGrowHandles)
             {
                 targetHotSlots = hotCacheOp.GrowHotTarget(effectiveHotSlots, hotResizeStep);
-                progress = GrowKeepCold() || progress;
+                progress = Eviction_.GrowKeepCold() || progress;
             }
 
             if (targetHotSlots != 0 && Space_->BeginHotResize(targetHotSlots, HotResize_)) {
@@ -2326,10 +2312,10 @@ bool TSharedCache::ReclaimToLimits(ui64 softLimit, ui32 step, TSpaceOperation& s
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::RunMaintenance() noexcept {
     Y_DEBUG_ABORT_UNLESS(CurrentLimit() <= HardLimit());
-    if (KeepColdOwnedBytes() > KeepColdLimit() || KeepColdTrimActive_.load(std::memory_order_relaxed))
+    if (Eviction_.NeedsKeepColdTrim())
     {
         auto cacheOp = BeginOperation();
-        if (cacheOp.TrimKeepCold()) {
+        if (cacheOp.Eviction().TrimKeepCold()) {
             return true;
         }
     }
