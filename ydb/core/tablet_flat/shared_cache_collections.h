@@ -70,6 +70,14 @@ public:
             Collections_.MergeRetainedStickyPages(SpaceOp_, collection, retainedHead, retainedTail);
         }
 
+        bool LinkStickyPage(TCacheItem item, TSharedCacheItemRefImpl<TTraits>& collectionRef) noexcept {
+            return Collections_.LinkStickyPage(SpaceOp_, item, collectionRef);
+        }
+
+        void UnlinkPendingStickyPage(TCacheItem item) noexcept {
+            Collections_.UnlinkPendingStickyPage(SpaceOp_, item);
+        }
+
         bool Attach(TCollectionRegistry& registry, TCacheItem item) noexcept {
             return Collections_.Attach(SpaceOp_, registry, item);
         }
@@ -147,6 +155,11 @@ private:
     void MergeRetainedStickyPages(
         TSpaceOperation& spaceOp, TCollection& collection, ui32 retainedHead, ui32 retainedTail) noexcept;
     void DrainStickyPages(TSpaceOperation& spaceOp, TCollection& collection) noexcept;
+
+    bool LinkStickyPage(
+        TSpaceOperation& spaceOp, TCacheItem item, TSharedCacheItemRefImpl<TTraits>& collectionRef) noexcept;
+    void CancelStickyLink(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+    void UnlinkPendingStickyPage(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
 
     bool TryBeginAttach(
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item, THandleState& attachState) noexcept;

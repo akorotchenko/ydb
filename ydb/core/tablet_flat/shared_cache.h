@@ -686,9 +686,6 @@ private:
 
     TSharedCacheItemRefImpl<TTraits> BuildExternalRef(EItemKind kind, TCacheItem cacheItem) noexcept;
 
-    bool LinkStickyPage(
-        TSpaceOperation& spaceOp, TCacheItem page, TSharedCacheItemRefImpl<TTraits>& collectionRef) noexcept;
-    void UnlinkPendingStickyPage(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
     static void PublishPageUnsticky(THandle& page, THandleState state) noexcept;
     bool SetCollectionPagesCacheMode(TSpaceOperation& spaceOp, TCollection& collection, ECacheMode mode) noexcept;
     bool MakePageSticky(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
@@ -1027,14 +1024,6 @@ public: // Cache helpers
 
     Y_FORCE_INLINE void InitializeCollection(TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept {
         Cache_.InitializeCollection(SpaceOp_, cacheItem, id, bytes);
-    }
-
-    Y_FORCE_INLINE bool LinkStickyPage(TCacheItem page, TSharedCacheItemRefImpl<TTraits>& collectionRef) noexcept {
-        return Cache_.LinkStickyPage(SpaceOp_, page, collectionRef);
-    }
-
-    Y_FORCE_INLINE void UnlinkPendingStickyPage(TCacheItem page) noexcept {
-        Cache_.UnlinkPendingStickyPage(SpaceOp_, page);
     }
 
     Y_FORCE_INLINE bool SetCollectionPagesCacheMode(TCollection& collection, ECacheMode mode) noexcept {

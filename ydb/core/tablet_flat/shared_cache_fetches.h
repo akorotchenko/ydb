@@ -34,7 +34,6 @@ public:
     static ui64 PageBytes(const THandle& handle) noexcept;
     // A false result may leave a Ready reference in owner for the caller to release.
     bool TryAcquirePending(TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept;
-    void UnlinkPendingStickyPage(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
     void MakeReadyState(TSpaceOperation& spaceOp, TCacheItem item, EHandleState state, TCollection* owner) noexcept;
 
 private:

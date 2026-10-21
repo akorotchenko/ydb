@@ -31,11 +31,6 @@ bool TCacheFetchServices<TTraits>::TryAcquirePending(
 }
 
 template <class TTraits>
-void TCacheFetchServices<TTraits>::UnlinkPendingStickyPage(TSpaceOperation& spaceOp, TCacheItem page) noexcept {
-    Cache_.UnlinkPendingStickyPage(spaceOp, page);
-}
-
-template <class TTraits>
 void TCacheFetchServices<TTraits>::MakeReadyState(
     TSpaceOperation& spaceOp, TCacheItem item, EHandleState state, TCollection* owner) noexcept {
     Cache_.MakeReadyState(spaceOp, item, state, owner);
@@ -144,7 +139,7 @@ void TCacheFetches<TTraits>::FinishFailed(TOperationItemRef<TTraits>& finalizerR
     Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(completing) && completing.IsCompleting() && completing.Refs() == 1 &&
                          handle.Body.Fetch == &fetch);
     if (completing.IsStickyField()) {
-        Services_.UnlinkPendingStickyPage(spaceOp, cacheItem);
+        Collections_.BindOperation(spaceOp).UnlinkPendingStickyPage(cacheItem);
         completing = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     }
     DeletePendingFetch(handle);
