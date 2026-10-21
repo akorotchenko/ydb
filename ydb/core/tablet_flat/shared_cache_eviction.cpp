@@ -46,6 +46,11 @@ void TCacheEvictionServices<TTraits>::NotifyResourcesAvailable() noexcept {
 }
 
 template <class TTraits>
+bool TCacheEvictionServices<TTraits>::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes) noexcept {
+    return Cache_.EnforceCurrentLimit(spaceOp, bytes);
+}
+
+template <class TTraits>
 ui64 TCacheEviction<TTraits>::FractionCeil(ui64 value, double fraction) noexcept {
     Y_DEBUG_ABORT_UNLESS(fraction >= 0.0 && fraction <= 1.0);
     return fraction == 1.0 ? value : static_cast<ui64>(std::ceil(static_cast<double>(value) * fraction));
@@ -590,6 +595,196 @@ bool TCacheEviction<TTraits>::ProcessHotAtMinimum(TSpaceOperation& spaceOp) noex
                 progress = true;
             }
         }
+    }
+    return progress;
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::ExceedsLimit(ui64 usage, ui64 limit, ui64 bytes) noexcept {
+    return usage + bytes > limit;
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::EraseCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
+    if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen())
+    {
+        return false;
+    }
+
+    THandle& handle = spaceOp.Handles()[coldItem.Index()];
+    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
+        return false;
+    }
+    TCollection* pageCollection = nullptr;
+
+    TOperationItemRef<TTraits> ownerRef(spaceOp);
+    THandleState expected = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
+    for (;;) {
+        if ((!expected.IsCold() && !expected.IsKeepCold()) || (expected.IsKeepCold() && expected.Refs() != 0) ||
+            !expected.IsStickyNoneField() ||
+            (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
+            return false;
+        }
+        const TCacheItem cacheItem = TCacheItem::Make(expected.Version(), coldItem.Index());
+        if (Table_.TryBeginErase(spaceOp, cacheItem, expected, ownerRef.Get())) {
+            // The tombstone owner now pins the page and its collection during accounting and notification.
+            pageCollection =
+                expected.IsPageKind() ? Collections_.BindOperation(spaceOp).PageCollection(handle) : nullptr;
+            const ui64 bytes = Services_.PayloadBytes(handle, expected.Kind());
+            const THandleState desired = expected.IncrementRefs().WithState(EHandleState::Tombstone).WithFrequency(0);
+            if (Memory_.UpdateColdReclaimable(bytes, expected, desired)) {
+                Services_.NotifyResourcesAvailable();
+            }
+            if (expected.IsKeepCold()) {
+                Memory_.ReleaseRetainedBytes(bytes);
+                Memory_.KeepCold().TransferBytesTo(Memory_.Cold(), bytes);
+                Memory_.KeepCold().TransferPageTo(Memory_.Cold(), expected.Kind());
+                Memory_.AddColdItem();
+                Memory_.ReleaseKeepColdOwnedBytes(bytes);
+                if (pageCollection) {
+                    Collections_.AddActivePageBytes(
+                        *pageCollection, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
+                }
+            }
+            Traits_.Invoke(ESharedCacheHookPoint::AfterTombstoneOwnerClaim, TCacheItem::FromRaw(coldItem.Raw()));
+            break;
+        }
+    }
+
+    const THandleState coldState = expected;
+    // Stale ring entries may name reattached collections; check only after claiming an eviction owner.
+    if (coldState.IsCollectionKind()) {
+        Y_DEBUG_ABORT_UNLESS(
+            !handle.Body.Collection || Collections_.IsUnregisteredAndUnreferenced(*handle.Body.Collection));
+    }
+    const TCacheItem cacheItem = ownerRef.CacheItem();
+    const TSharedCacheKey key = LoadSharedCacheKey(handle, coldState.Kind());
+    if (coldState.IsPageKind() && pageCollection && pageCollection->GetCacheMode() == ECacheMode::TryKeepInMemory &&
+        pageCollection->IsKeepAllowedPage(handle.Metadata.Page.Type))
+    {
+        Traits_.NotifyKeepPageEviction(pageCollection->Id(), pageCollection->CacheItem,
+            pageCollection->KeepGeneration(),
+            NTable::NPage::TPageLocation(NTable::NPage::TPageOffset::FromRaw(key.Word(1)),
+                handle.Key2OrSize.load(std::memory_order_relaxed), handle.Metadata.Page.Type,
+                handle.Metadata.Page.Crc32));
+    }
+    Services_.AdvanceColdMembership(handle);
+    Table_.FinishErase(spaceOp, cacheItem, key);
+    return true;
+}
+
+template <class TTraits>
+void TCacheEviction<TTraits>::RouteCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
+    if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen()) {
+        return;
+    }
+
+    THandle& handle = spaceOp.Handles()[coldItem.Index()];
+    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
+        return;
+    }
+    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+    if (!state.IsCold() || !state.IsStickyNoneField() || state.Refs() != 0) {
+        return;
+    }
+
+    Memory_.AddColdRingEntry();
+    Traits_.Invoke(ESharedCacheHookPoint::BeforeColdExchange, TCacheItem::FromRaw(coldItem.Raw()));
+    const TColdCacheItem displaced = spaceOp.PutCold(coldItem);
+    if (!displaced.IsNull()) {
+        Memory_.RemoveColdRingEntry();
+        EraseCold(spaceOp, displaced);
+    }
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::ReclaimCold(TSpaceOperation& spaceOp) noexcept {
+    const TRingView cold = spaceOp.Cold();
+    for (ui64 attempt = 0; attempt < cold.Capacity; ++attempt) {
+        if (Memory_.ColdRingEntries() == 0) {
+            return false;
+        }
+        Traits_.Invoke(ESharedCacheHookPoint::BeforeColdRingPop, TCacheItem{});
+        const ui64 rawItem = cold.Pop();
+        if (rawItem != 0) {
+            Memory_.RemoveColdRingEntry();
+            if (EraseCold(spaceOp, TColdCacheItem::FromRaw(rawItem))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::DemoteKeepColdForSoftLimit(TSpaceOperation& spaceOp) noexcept {
+    const TRingView keep = spaceOp.KeepCold();
+    for (ui64 attempt = 0; attempt < keep.Capacity && Memory_.KeepColdOwnedBytes() != 0; ++attempt) {
+        const ui64 raw = keep.Pop();
+        if (raw == 0) {
+            continue;
+        }
+        const TColdCacheItem item = TColdCacheItem::FromRaw(raw);
+        if (DemoteKeepCold(spaceOp, item)) {
+            return true;
+        }
+        // The FIFO entry is gone even when a structural ref delays demotion.
+        WithdrawKeepColdEntry(spaceOp, item);
+    }
+    return false;
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept {
+    const TRingView keep = spaceOp.KeepCold();
+    for (ui64 attempt = 0; attempt < keep.Capacity && Memory_.KeepColdOwnedBytes() != 0; ++attempt) {
+        const ui64 raw = keep.Pop();
+        if (raw == 0) {
+            continue;
+        }
+        const TColdCacheItem item = TColdCacheItem::FromRaw(raw);
+        if (!MatchesKeepColdEntry(spaceOp, item)) {
+            continue;
+        }
+        Traits_.Invoke(ESharedCacheHookPoint::AfterKeepColdEntryMatched, TCacheItem::FromRaw(item.Raw()));
+        if (EraseCold(spaceOp, item)) {
+            return true;
+        }
+        WithdrawKeepColdEntry(spaceOp, item);
+    }
+    return false;
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::Reclaim(TSpaceOperation& spaceOp, ui64 bytes) noexcept {
+    if (ReclaimCold(spaceOp) || ReclaimKeepCold(spaceOp)) {
+        return true;
+    }
+    // Cold is empty, so only moving the hot/cold boundary can make room, and that is EnforceCurrentLimit's job.
+    return Services_.EnforceCurrentLimit(spaceOp, bytes);
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::ReclaimToLimits(
+    TSpaceOperation& spaceOp, ui64 softLimit, ui32 step, ui64 bytes) noexcept {
+    bool progress = false;
+    for (ui32 attempt = 0; attempt < step; ++attempt) {
+        if (ExceedsLimit(Memory_.PayloadUsage(), Memory_.CurrentLimit(), bytes)) {
+            if (!ReclaimCold(spaceOp) && !ReclaimKeepCold(spaceOp)) {
+                break;
+            }
+        } else if (softLimit == 0 && Memory_.ColdReclaimableItems() != 0) {
+            if (!ReclaimCold(spaceOp)) {
+                break;
+            }
+        } else if (Memory_.RetainedBytes() > softLimit) {
+            if (!DemoteKeepColdForSoftLimit(spaceOp)) {
+                break;
+            }
+        } else {
+            break;
+        }
+        progress = true;
     }
     return progress;
 }

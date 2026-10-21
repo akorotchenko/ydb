@@ -925,6 +925,12 @@ bool TCacheCollections<TTraits>::Detach(
 }
 
 template <class TTraits>
+bool TCacheCollections<TTraits>::IsUnregisteredAndUnreferenced(const TCollection& collection) noexcept {
+    return !collection.Registry_.load(std::memory_order_acquire) &&
+           collection.References.load(std::memory_order_acquire) == 0;
+}
+
+template <class TTraits>
 bool TCacheCollections<TTraits>::WantsStickyPage(const TCollection& collection) noexcept {
     return collection.CacheMode_.load(std::memory_order_acquire) == ECacheMode::Sticky;
 }

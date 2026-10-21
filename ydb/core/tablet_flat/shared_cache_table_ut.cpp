@@ -461,15 +461,15 @@ public:
 
     static bool EraseCold(TTestSharedCache& cache, TColdCacheItem cacheItem) {
         auto operation = cache.BeginOperation();
-        return cache.EraseCold(operation, cacheItem);
+        return operation.Eviction().EraseCold(cacheItem);
     }
 
     static bool ReclaimCold(TTestSharedCache& cache, TSpaceOperation& operation) noexcept {
-        return cache.ReclaimCold(operation);
+        return cache.BindOperation(operation).Eviction().ReclaimCold();
     }
 
     static bool ReclaimKeepCold(TTestSharedCache& cache, TSpaceOperation& operation) noexcept {
-        return cache.ReclaimKeepCold(operation);
+        return cache.BindOperation(operation).Eviction().ReclaimKeepCold();
     }
 
     static bool DemoteKeepCold(TTestSharedCache& cache, TColdCacheItem item) noexcept {
