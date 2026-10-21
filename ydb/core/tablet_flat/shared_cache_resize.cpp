@@ -200,7 +200,7 @@ TCacheItem TSharedCache::PreparePageReplacement(TSpaceOperation& spaceOp, TCache
     if (restoreSticky) {
         Y_DEBUG_ABORT_UNLESS(source.NextInOwner.load(std::memory_order_acquire) == 0);
         TOperationItemRef collectionRef(spaceOp);
-        if (!cacheOp.LinkStickyPage(replacementItem, collectionRef.Get())) {
+        if (!cacheOp.Collections().LinkStickyPage(replacementItem, collectionRef.Get())) {
             cacheOp.DiscardPageReplacement(replacementItem);
             return {};
         }
