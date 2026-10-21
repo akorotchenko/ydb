@@ -136,6 +136,7 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     , Collections_(TCacheCollectionServices<TTraits>(*this), Memory_, Table_, static_cast<const TTraits&>(*this))
     , Eviction_(TCacheEvictionServices<TTraits>(*this), Memory_, Table_, Collections_, Policy_,
           static_cast<const TTraits&>(*this))
+    , Resize_(*Space_, Memory_, Eviction_)
     , Fetches_(TCacheFetchServices<TTraits>(*this), Memory_, Table_, Collections_, static_cast<const TTraits&>(*this))
     , TargetHandleCount_(Space_->CurrentConfiguration().HandleCount())
     , HardTarget_(Space_->CurrentConfiguration())
@@ -2129,10 +2130,10 @@ bool TSharedCache::RunMaintenance() noexcept {
 
         case ETransitionPhase::Prepare:
         case ETransitionPhase::InitializeGrowth:
-            return PublishMigrationView(HardTransition_);
+            return Resize_.PublishMigrationView(HardTransition_, HotResize_);
 
         case ETransitionPhase::MigrationDrain:
-            return TryDrainTransition(HardTransition_);
+            return Resize_.TryDrainTransition(HardTransition_);
 
         case ETransitionPhase::Migrate: {
             const TSpaceState state = Space_->CurrentSpaceState();
@@ -2153,18 +2154,18 @@ bool TSharedCache::RunMaintenance() noexcept {
                         break;
                 }
             }
-            return PublishFinalView(HardTransition_);
+            return Resize_.PublishFinalView(HardTransition_, HotResize_);
         }
 
         case ETransitionPhase::AppendGrowth:
-            return AppendFreeHandles(HardTransition_);
+            return Resize_.AppendFreeHandles(HardTransition_);
 
         case ETransitionPhase::FinalDrain:
-            return TryDrainTransition(HardTransition_) && FinalDrain(HardTransition_);
+            return Resize_.TryDrainTransition(HardTransition_) && Resize_.FinalDrain(HardTransition_);
 
         case ETransitionPhase::Release:
         case ETransitionPhase::ReleaseRetry:
-            return TryReleaseTransition(HardTransition_);
+            return Resize_.TryReleaseTransition(HardTransition_);
 
         case ETransitionPhase::Commit:
             return CommitTransition(HardTransition_);

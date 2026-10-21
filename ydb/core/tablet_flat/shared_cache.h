@@ -5,6 +5,7 @@
 #include "shared_cache_eviction.h"
 #include "shared_cache_fetches.h"
 #include "shared_cache_memory.h"
+#include "shared_cache_resize.h"
 #include "shared_cache_table.h"
 
 #include <util/generic/function_ref.h>
@@ -635,15 +636,7 @@ private:
     void NotifyResourcesAvailable() noexcept;
     void ReleaseReservation(ui64 bytes, ui64 pages = 0) noexcept;
 
-    bool PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept;
-    bool PublishMigrationView(TTransition& transition) noexcept;
-    bool TryDrainTransition(TTransition& transition) noexcept;
-    bool PublishFinalView(TTransition& transition) noexcept;
-    bool AppendFreeHandles(TTransition& transition) noexcept;
-    bool FinalDrain(TTransition& transition) noexcept;
-    bool TryReleaseTransition(TTransition& transition) noexcept;
     bool CommitTransition(TTransition& transition) noexcept;
-    bool AbandonTransition(TTransition& transition) noexcept;
 
     void DiscardCandidate(TPageCacheItem page) noexcept;
 
@@ -744,6 +737,7 @@ private:
     TCacheMemory Memory_;
     TCacheCollections<TTraits> Collections_;
     TCacheEviction<TTraits> Eviction_;
+    TCacheResize<TTraits> Resize_;
     TCacheFetches<TTraits> Fetches_;
     std::atomic<ui64> TargetHandleCount_{ 0 };
     THotResize HotResize_;

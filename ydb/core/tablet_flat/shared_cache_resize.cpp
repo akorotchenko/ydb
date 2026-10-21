@@ -1,3 +1,4 @@
+#include "shared_cache_resize.h"
 #include "shared_cache.h"
 
 namespace NKikimr::NSharedCache {
@@ -7,14 +8,14 @@ namespace NKikimr::NSharedCache {
 #define TSharedCacheItemRef TSharedCacheItemRefImpl<TTraits>
 #define TOperationItemRef TOperationItemRef<TTraits>
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept {
-    const ui64 currentStaticBytes = Space_->CurrentConfiguration().StaticBytes;
+template <class TTraits>
+bool TCacheResize<TTraits>::PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept {
+    const ui64 currentStaticBytes = Space_.CurrentConfiguration().StaticBytes;
     const ui64 staticDeltaBytes = target.StaticBytes > currentStaticBytes ? target.StaticBytes - currentStaticBytes : 0;
     if (staticDeltaBytes != 0) {
         Memory_.PrepareStaticResize(staticDeltaBytes);
     }
-    if (Space_->PrepareTransition(target, transition)) {
+    if (Space_.PrepareTransition(target, transition)) {
         return true;
     }
     if (staticDeltaBytes != 0) {
@@ -23,37 +24,37 @@ bool TSharedCache::PrepareTransition(const TSharedCacheCapacity& target, TTransi
     return false;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::PublishMigrationView(TTransition& transition) noexcept {
-    if (auto hotResize = HotResize_.TryLock()) {
-        return Space_->PublishMigrationView(transition);
+template <class TTraits>
+bool TCacheResize<TTraits>::PublishMigrationView(TTransition& transition, THotResize& hotResize) noexcept {
+    if (auto hotResizeGuard = hotResize.TryLock()) {
+        return Space_.PublishMigrationView(transition);
     }
     return false;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::TryDrainTransition(TTransition& transition) noexcept {
-    return Space_->TryDrainTransition(transition);
+template <class TTraits>
+bool TCacheResize<TTraits>::TryDrainTransition(TTransition& transition) noexcept {
+    return Space_.TryDrainTransition(transition);
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::PublishFinalView(TTransition& transition) noexcept {
-    if (auto hotResize = HotResize_.TryLock()) {
-        if (HotResize_.Phase() == EHotResizePhase::Cut) {
-            auto cacheOp = BeginOperation();
-            cacheOp.Eviction().DrainHotResize(*Space_, HotResize_);
+template <class TTraits>
+bool TCacheResize<TTraits>::PublishFinalView(TTransition& transition, THotResize& hotResize) noexcept {
+    if (auto hotResizeGuard = hotResize.TryLock()) {
+        if (hotResize.Phase() == EHotResizePhase::Cut) {
+            auto spaceOp = Space_.BeginOperation();
+            Eviction_.BindOperation(spaceOp).DrainHotResize(Space_, hotResize);
         }
-        if (HotResize_.Phase() != EHotResizePhase::Idle) {
+        if (hotResize.Phase() != EHotResizePhase::Idle) {
             return false;
         }
-        return Space_->PublishFinalView(transition);
+        return Space_.PublishFinalView(transition);
     }
     return false;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::AppendFreeHandles(TTransition& transition) noexcept {
-    return Space_->AppendFreeHandles(transition);
+template <class TTraits>
+bool TCacheResize<TTraits>::AppendFreeHandles(TTransition& transition) noexcept {
+    return Space_.AppendFreeHandles(transition);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -76,29 +77,30 @@ bool TSharedCache::StartHardTransition() noexcept {
         return false;
     }
     next.Limit = HardLimit();
-    return PrepareTransition(next, HardTransition_);
+    return Resize_.PrepareTransition(next, HardTransition_);
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::FinalDrain(TTransition& transition) noexcept {
-    auto cacheOp = BeginOperation();
-    return Space_->FinalDrain(
+template <class TTraits>
+bool TCacheResize<TTraits>::FinalDrain(TTransition& transition) noexcept {
+    auto spaceOp = Space_.BeginOperation();
+    auto evictionOp = Eviction_.BindOperation(spaceOp);
+    return Space_.FinalDrain(
         transition,
         [&](ui32 level, ui64 raw) noexcept {
-            cacheOp.Eviction().RouteHot(static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
+            evictionOp.RouteHot(static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
         },
         [&](ui64 raw) noexcept {
             Memory_.RemoveColdRingEntry();
-            cacheOp.Eviction().RouteCold(TColdCacheItem::FromRaw(raw));
+            evictionOp.RouteCold(TColdCacheItem::FromRaw(raw));
         },
         [&](ui64 raw) noexcept {
-            cacheOp.Eviction().RouteKeepCold(TColdCacheItem::FromRaw(raw));
+            evictionOp.RouteKeepCold(TColdCacheItem::FromRaw(raw));
         });
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::TryReleaseTransition(TTransition& transition) noexcept {
-    return Space_->TryReleaseTransition(transition);
+template <class TTraits>
+bool TCacheResize<TTraits>::TryReleaseTransition(TTransition& transition) noexcept {
+    return Space_.TryReleaseTransition(transition);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -121,12 +123,12 @@ bool TSharedCache::CommitTransition(TTransition& transition) noexcept {
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::AbandonTransition(TTransition& transition) noexcept {
+template <class TTraits>
+bool TCacheResize<TTraits>::AbandonTransition(TTransition& transition) noexcept {
     const ETransitionPhase phase = transition.Phase();
     const ui64 oldStaticBytes = transition.OldConfiguration().StaticBytes;
     const ui64 targetStaticBytes = transition.TargetConfiguration().StaticBytes;
-    if (!Space_->AbandonTransition(transition)) {
+    if (!Space_.AbandonTransition(transition)) {
         return false;
     }
     if ((phase == ETransitionPhase::Prepare || phase == ETransitionPhase::InitializeGrowth) &&
@@ -467,17 +469,12 @@ typename TSharedCache::EShrinkCutStatus TSharedCache::ReclaimShrinkCut() noexcep
 #undef TSharedCache
 #undef SHARED_CACHE_TEMPLATE
 
-// Capacity transition members are instantiated here for both trait variants.
-template bool TSharedCacheImpl<TProdTraits>::PrepareTransition(const TSharedCacheCapacity&, TTransition&) noexcept;
-template bool TSharedCacheImpl<TProdTraits>::PublishMigrationView(TTransition&) noexcept;
-template bool TSharedCacheImpl<TProdTraits>::TryDrainTransition(TTransition&) noexcept;
-template bool TSharedCacheImpl<TProdTraits>::PublishFinalView(TTransition&) noexcept;
-template bool TSharedCacheImpl<TProdTraits>::AppendFreeHandles(TTransition&) noexcept;
+// Resize component and remaining Cache members are instantiated here for both trait variants
+template class TCacheResize<TProdTraits>;
+template class TCacheResize<TTestTraits>;
+
 template bool TSharedCacheImpl<TProdTraits>::StartHardTransition() noexcept;
-template bool TSharedCacheImpl<TProdTraits>::FinalDrain(TTransition&) noexcept;
-template bool TSharedCacheImpl<TProdTraits>::TryReleaseTransition(TTransition&) noexcept;
 template bool TSharedCacheImpl<TProdTraits>::CommitTransition(TTransition&) noexcept;
-template bool TSharedCacheImpl<TProdTraits>::AbandonTransition(TTransition&) noexcept;
 template TSharedCacheItemRefImpl<TProdTraits> TSharedCacheImpl<TProdTraits>::TryAcquirePageForRelocation(
     TSpaceOperation&, ui32) noexcept;
 template TCacheItem TSharedCacheImpl<TProdTraits>::PreparePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
@@ -491,16 +488,8 @@ template TSharedCacheImpl<TProdTraits>::EShrinkCutStatus TSharedCacheImpl<TProdT
     TSpaceOperation&, ui32) noexcept;
 template TSharedCacheImpl<TProdTraits>::EShrinkCutStatus TSharedCacheImpl<TProdTraits>::ReclaimShrinkCut() noexcept;
 
-template bool TSharedCacheImpl<TTestTraits>::PrepareTransition(const TSharedCacheCapacity&, TTransition&) noexcept;
-template bool TSharedCacheImpl<TTestTraits>::PublishMigrationView(TTransition&) noexcept;
-template bool TSharedCacheImpl<TTestTraits>::TryDrainTransition(TTransition&) noexcept;
-template bool TSharedCacheImpl<TTestTraits>::PublishFinalView(TTransition&) noexcept;
-template bool TSharedCacheImpl<TTestTraits>::AppendFreeHandles(TTransition&) noexcept;
 template bool TSharedCacheImpl<TTestTraits>::StartHardTransition() noexcept;
-template bool TSharedCacheImpl<TTestTraits>::FinalDrain(TTransition&) noexcept;
-template bool TSharedCacheImpl<TTestTraits>::TryReleaseTransition(TTransition&) noexcept;
 template bool TSharedCacheImpl<TTestTraits>::CommitTransition(TTransition&) noexcept;
-template bool TSharedCacheImpl<TTestTraits>::AbandonTransition(TTransition&) noexcept;
 template TSharedCacheItemRefImpl<TTestTraits> TSharedCacheImpl<TTestTraits>::TryAcquirePageForRelocation(
     TSpaceOperation&, ui32) noexcept;
 template TCacheItem TSharedCacheImpl<TTestTraits>::PreparePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
