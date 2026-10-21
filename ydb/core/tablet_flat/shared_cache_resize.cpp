@@ -216,7 +216,7 @@ void TSharedCache::DiscardPageReplacement(TSpaceOperation& spaceOp, TCacheItem r
     Y_DEBUG_ABORT_UNLESS(replacementItem.Matches(state) && state.IsPageKind() &&
                          (state.IsSticky() || state.IsHot() || state.IsCold()) && state.Refs() == 1 &&
                          replacement.NextInOwner.load(std::memory_order_relaxed) == 0);
-    cacheOp.DropPageItemRef(replacement);
+    cacheOp.Collections().DropPageItemRef(replacement);
     replacement.Body.PageBuffer.~TBuffer();
     replacement.Body.Fetch = nullptr;
     replacement.State.store(state.WithState(EHandleState::Begin).WithSticky(EStickyState::None).WithRefs(0).Raw(),

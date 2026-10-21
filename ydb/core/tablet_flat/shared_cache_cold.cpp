@@ -90,7 +90,7 @@ void TSharedCache::ReleaseColdDemotionPin(TSpaceOperation& spaceOp, TOperationIt
     pin.Disarm();
     // A policy demotion must not readmit the page to KeepCold when releasing its temporary ref.
     if (TCollection* owner = cacheOp.ReleaseItem(cacheItem, false)) {
-        cacheOp.DropOwnerReference(*owner);
+        cacheOp.Collections().DropOwnerReference(*owner);
     }
 }
 

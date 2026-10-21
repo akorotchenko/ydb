@@ -707,8 +707,6 @@ private:
     bool AttachCollection(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
     bool TryBeginCollectionDetach(
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
-    void PublishCollectionForReclaim(TSpaceOperation& spaceOp, TCacheItem collection) noexcept;
-    void FinishCollectionRetain(TSpaceOperation& spaceOp, TCacheItem collection) noexcept;
     bool DetachCollection(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
     bool DetachCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
     bool DeleteCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
@@ -760,10 +758,6 @@ private:
         return MatchesCandidateMetadata(spaceOp, candidate.CacheItem, existing);
     }
 
-    static void AddReference(TCollection& owner) noexcept;
-    void DropPageItemRef(TSpaceOperation& spaceOp, THandle& page) noexcept;
-    static bool DropReference(TCollection& owner) noexcept;
-    void DropOwnerReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept;
     static ui64 PayloadBytes(const THandle& handle, EItemKind kind) noexcept;
     static ui64 AccountedPageBytes(ui64 size) noexcept;
     static ui64 PageBytes(const THandle& handle) noexcept;
@@ -1101,10 +1095,6 @@ public: // Cache helpers
         return Cache_.TryBeginCollectionDetach(SpaceOp_, registry, collection);
     }
 
-    Y_FORCE_INLINE void PublishCollectionForReclaim(TCacheItem collection) noexcept {
-        Cache_.PublishCollectionForReclaim(SpaceOp_, collection);
-    }
-
     Y_FORCE_INLINE bool DetachCollection(TCollectionRegistry& registry, TCacheItem collection) noexcept {
         return Cache_.DetachCollection(SpaceOp_, registry, collection);
     }
@@ -1176,14 +1166,6 @@ public: // Cache helpers
 
     Y_FORCE_INLINE typename TCacheCollections<TTraits>::TOperation Collections() noexcept {
         return Cache_.Collections_.BindOperation(SpaceOp_);
-    }
-
-    Y_FORCE_INLINE void DropPageItemRef(THandle& page) noexcept {
-        Cache_.DropPageItemRef(SpaceOp_, page);
-    }
-
-    Y_FORCE_INLINE void DropOwnerReference(TCollection& owner) noexcept {
-        Cache_.DropOwnerReference(SpaceOp_, owner);
     }
 
     Y_FORCE_INLINE bool PromoteCold(TCacheItem cacheItem, bool force = false) noexcept {

@@ -24,6 +24,7 @@ public:
     {}
 
     TSharedCacheItemRefImpl<TTraits> TryAcquireStructural(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+    void RouteHotL1(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
 
 private:
     TSharedCacheImpl<TTraits>& Cache_;
@@ -40,6 +41,18 @@ public:
 
         TCollection* PageCollection(TCollectionCacheItem item) noexcept {
             return Collections_.PageCollection(SpaceOp_, item);
+        }
+
+        void DropOwnerReference(TCollection& owner) noexcept {
+            Collections_.DropOwnerReference(SpaceOp_, owner);
+        }
+
+        void DropPageItemRef(THandle& page) noexcept {
+            Collections_.DropPageItemRef(SpaceOp_, page);
+        }
+
+        void PublishCollectionForReclaim(TCacheItem item) noexcept {
+            Collections_.PublishCollectionForReclaim(SpaceOp_, item);
         }
 
         bool Link(TCollectionRegistry& registry, TCacheItem item) noexcept {
@@ -90,6 +103,8 @@ public:
     void PublishKeepPageBytes(TCollection& owner) noexcept;
     void SetSkipBTreeIndexV1Shadow(TCollection& owner, bool skip) noexcept;
     void AcknowledgeBytes(TCollection& owner) noexcept;
+    static void AddReference(TCollection& owner) noexcept;
+    static bool DropReference(TCollection& owner) noexcept;
 
 private:
     friend class TSharedCacheImpl<TTraits>;
@@ -101,6 +116,11 @@ private:
     static TCollection* PageCollection(TSpaceOperation& spaceOp, const THandle& page) noexcept;
     static TCollection* PageCollection(TSpaceOperation& spaceOp, TCollectionCacheItem item) noexcept;
     static void SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept;
+
+    void DropOwnerReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept;
+    void DropPageItemRef(TSpaceOperation& spaceOp, THandle& page) noexcept;
+    void PublishCollectionForReclaim(TSpaceOperation& spaceOp, TCacheItem collection) noexcept;
+    void FinishCollectionRetain(TSpaceOperation& spaceOp, TCacheItem collection) noexcept;
 
     bool Link(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item) noexcept;
     bool Unlink(
