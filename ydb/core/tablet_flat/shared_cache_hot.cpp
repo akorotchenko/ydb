@@ -121,7 +121,7 @@ void TSharedCache::ReleaseKeepColdPin(
             (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != initialColdVersion ||
             IsKeepColdQueued(handle) || !cacheOp.WantsKeepCold(handle))
         {
-            pin.Get().Drop(spaceOp);
+            pin.Drop();
             return;
         }
         const THandleState desired = expected.DecrementRefs();
@@ -180,7 +180,7 @@ void TSharedCache::ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheI
             level = level >= EHotLevel::L2 && frequency > 1 ? EHotLevel::L3 : EHotLevel::L2;
         }
 
-        evictionPin.Get().Drop(spaceOp);
+        evictionPin.Drop();
         const TCacheItem displaced = cacheOp.PutHot(level, cacheItem);
         if (displaced.IsNull()) {
             return;

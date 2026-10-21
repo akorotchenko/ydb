@@ -166,6 +166,10 @@ public:
         return std::move(Ref_);
     }
 
+    void Drop() noexcept {
+        Ref_.Drop(SpaceOp_);
+    }
+
     TSpaceOperation& SpaceOperation() const noexcept {
         return SpaceOp_;
     }

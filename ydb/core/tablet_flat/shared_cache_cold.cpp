@@ -181,7 +181,7 @@ void TSharedCache::RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldIt
     if (!cacheOp.WantsKeepCold(handle)) {
         cacheOp.WithdrawKeepColdEntry(queuedItem);
     }
-    pin.Get().Drop(spaceOp);
+    pin.Drop();
     cacheOp.Eviction().TrimKeepCold();
 }
 
