@@ -28,7 +28,7 @@ bool TSharedCache::DrainHotResize(TSpaceOperation& spaceOp) noexcept {
         }
         progress = true;
         if (raw != 0) {
-            cacheOp.ProcessHot(static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
+            cacheOp.Eviction().ProcessHot(static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
         }
     }
     return progress;

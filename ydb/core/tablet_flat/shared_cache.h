@@ -522,13 +522,6 @@ private:
         Ready,
     };
 
-    enum class EHotLevel : ui32 {
-        L0,
-        L1,
-        L2,
-        L3,
-    };
-
     enum class EShrinkCutStatus {
         Blocked,
         Progress,
@@ -732,12 +725,7 @@ private:
     static ui64 PageBytes(const THandle& handle) noexcept;
     static ui64 FractionCeil(ui64 value, double fraction) noexcept;
 
-    bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool force = false) noexcept;
     bool ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept;
-
-    bool EvictFromHot(TSpaceOperation& spaceOp, ui32 index) noexcept;
-
-    bool EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
     void UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept;
 
@@ -748,20 +736,7 @@ private:
 
     void RouteCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
 
-    TCacheItem PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept;
-
-    void RouteHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept;
-
     TSharedCacheItemRefImpl<TTraits> TryAcquireHotEvictionPin(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
-    static Y_FORCE_INLINE bool TakeHotFrequency(
-        THandle& handle, TCacheItem cacheItem, THandleState& state, ui8& frequency) noexcept;
-    Y_FORCE_INLINE void CompleteHotEviction(TSpaceOperation& spaceOp, THandle& handle, THandleState coldState,
-        ui64 bytes, TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept;
-
-    void ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept;
-
-    bool ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept;
-
     bool DrainHotResize() noexcept;
     bool DrainHotResize(TSpaceOperation& spaceOp) noexcept;
     ui32 MinimumHotSlots(const TSpaceOperation& spaceOp, bool underPressure = false) const noexcept;
@@ -1044,47 +1019,12 @@ public: // Cache helpers
         return Cache_.Eviction_.BindOperation(SpaceOp_);
     }
 
-    Y_FORCE_INLINE bool PromoteCold(TCacheItem cacheItem, bool force = false) noexcept {
-        return Cache_.PromoteCold(SpaceOp_, cacheItem, force);
-    }
-
     Y_FORCE_INLINE bool ReclaimKeepCold() noexcept {
         return Cache_.ReclaimKeepCold(SpaceOp_);
     }
 
-    Y_FORCE_INLINE bool EvictFromHot(ui32 index) noexcept {
-        return Cache_.EvictFromHot(SpaceOp_, index);
-    }
-
-    Y_FORCE_INLINE bool EvictFromHot(TCacheItem cacheItem) noexcept {
-        return Cache_.EvictFromHot(SpaceOp_, cacheItem);
-    }
-
     Y_FORCE_INLINE void RouteCold(TColdCacheItem coldItem) noexcept {
         Cache_.RouteCold(SpaceOp_, coldItem);
-    }
-
-    Y_FORCE_INLINE TCacheItem PutHot(EHotLevel level, TCacheItem cacheItem) noexcept {
-        return Cache_.PutHot(SpaceOp_, level, cacheItem);
-    }
-
-    Y_FORCE_INLINE void RouteHot(EHotLevel level, TCacheItem cacheItem) noexcept {
-        Cache_.RouteHot(SpaceOp_, level, cacheItem);
-    }
-
-    Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> TryAcquireHotEvictionPin(TCacheItem cacheItem) noexcept {
-        return Cache_.TryAcquireHotEvictionPin(SpaceOp_, cacheItem);
-    }
-
-    void CompleteHotEviction(THandle& handle, THandleState coldState, ui64 bytes, TOperationItemRef<TTraits>& pin,
-        ui32 initialColdVersion) noexcept;
-
-    Y_FORCE_INLINE void ProcessHot(EHotLevel level, TCacheItem cacheItem) noexcept {
-        Cache_.ProcessHot(SpaceOp_, level, cacheItem);
-    }
-
-    Y_FORCE_INLINE bool ProcessHotAtMinimum() noexcept {
-        return Cache_.ProcessHotAtMinimum(SpaceOp_);
     }
 
     Y_FORCE_INLINE bool DrainHotResize() noexcept {
