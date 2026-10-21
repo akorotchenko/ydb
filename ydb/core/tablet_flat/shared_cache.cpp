@@ -135,8 +135,8 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     , Table_(*Space_, *this)
     , Memory_(Space_->CurrentConfiguration().StaticBytes, hardLimit, Space_->ReservedConfiguration().Limit)
     , Collections_(TCacheCollectionServices<TTraits>(*this), Memory_, Table_, static_cast<const TTraits&>(*this))
-    , Eviction_(
-          TCacheEvictionServices<TTraits>(*this), Memory_, Collections_, Policy_, static_cast<const TTraits&>(*this))
+    , Eviction_(TCacheEvictionServices<TTraits>(*this), Memory_, Table_, Collections_, Policy_,
+          static_cast<const TTraits&>(*this))
     , Fetches_(TCacheFetchServices<TTraits>(*this), Memory_, Table_, Collections_, static_cast<const TTraits&>(*this))
     , TargetHandleCount_(Space_->CurrentConfiguration().HandleCount())
     , HardTarget_(Space_->CurrentConfiguration())
@@ -549,12 +549,12 @@ ui32 TSharedCache::TryAllocateHandle(TSpaceOperation& spaceOp) noexcept {
         // Byte headroom does not guarantee a free handle when pages are much smaller than the expected size.
         // Reclaim Cold, or shrink Hot to feed Cold, before refusing the admission.
         for (ui32 attempt = 0; attempt < spaceOp.HandleCount(); ++attempt) {
-            if (!cacheOp.ReclaimCold()) {
+            if (!cacheOp.Eviction().ReclaimCold()) {
                 const ui32 hotSlots = static_cast<ui32>(Space_->EffectiveHotSlots());
                 cacheOp.EnforceCurrentLimit(0, true);
                 // The caller's view may predate growth; drain with a fresh operation under the resize lock.
                 DrainHotResize();
-                if (hotSlots == Space_->EffectiveHotSlots() && !cacheOp.ReclaimCold()) {
+                if (hotSlots == Space_->EffectiveHotSlots() && !cacheOp.Eviction().ReclaimCold()) {
                     break;
                 }
             }
@@ -1946,74 +1946,6 @@ ESharedCacheResultStatus TSharedCache::FindOrInsert(
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::EraseCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen())
-    {
-        return false;
-    }
-
-    THandle& handle = spaceOp.Handles()[coldItem.Index()];
-    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
-        return false;
-    }
-    TCollection* pageCollection = nullptr;
-
-    TOperationItemRef ownerRef(spaceOp);
-    THandleState expected = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
-    for (;;) {
-        if ((!expected.IsCold() && !expected.IsKeepCold()) || (expected.IsKeepCold() && expected.Refs() != 0) ||
-            !expected.IsStickyNoneField() ||
-            (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
-            return false;
-        }
-        const TCacheItem cacheItem = TCacheItem::Make(expected.Version(), coldItem.Index());
-        if (cacheOp.TryBeginErase(cacheItem, expected, ownerRef.Get())) {
-            // The tombstone owner now pins the page and its collection during accounting and notification.
-            pageCollection = expected.IsPageKind() ? cacheOp.Collections().PageCollection(handle) : nullptr;
-            const ui64 bytes = PayloadBytes(handle, expected.Kind());
-            const THandleState desired = expected.IncrementRefs().WithState(EHandleState::Tombstone).WithFrequency(0);
-            UpdateColdReclaimable(bytes, expected, desired);
-            if (expected.IsKeepCold()) {
-                Memory_.ReleaseRetainedBytes(bytes);
-                Memory_.KeepCold().TransferBytesTo(Memory_.Cold(), bytes);
-                Memory_.KeepCold().TransferPageTo(Memory_.Cold(), expected.Kind());
-                Memory_.AddColdItem();
-                Memory_.ReleaseKeepColdOwnedBytes(bytes);
-                if (pageCollection) {
-                    Collections_.AddActivePageBytes(
-                        *pageCollection, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
-                }
-            }
-            InvokeHook(ESharedCacheHookPoint::AfterTombstoneOwnerClaim, coldItem);
-            break;
-        }
-    }
-
-    const THandleState coldState = expected;
-    // Stale ring entries may name reattached collections; check only after claiming an eviction owner.
-    if (coldState.IsCollectionKind()) {
-        Y_DEBUG_ABORT_UNLESS(
-            !handle.Body.Collection || (!handle.Body.Collection->Registry_.load(std::memory_order_acquire) &&
-                                           handle.Body.Collection->References.load(std::memory_order_acquire) == 0));
-    }
-    const TCacheItem cacheItem = ownerRef.CacheItem();
-    const TSharedCacheKey key = LoadSharedCacheKey(handle, coldState.Kind());
-    if (coldState.IsPageKind() && pageCollection &&
-        pageCollection->CacheMode_.load(std::memory_order_acquire) == ECacheMode::TryKeepInMemory &&
-        pageCollection->IsKeepAllowedPage(handle.Metadata.Page.Type))
-    {
-        this->NotifyKeepPageEviction(pageCollection->Id(), pageCollection->CacheItem, pageCollection->KeepGeneration(),
-            NTable::NPage::TPageLocation(NTable::NPage::TPageOffset::FromRaw(key.Word(1)),
-                handle.Key2OrSize.load(std::memory_order_relaxed), handle.Metadata.Page.Type,
-                handle.Metadata.Page.Crc32));
-    }
-    AdvanceColdMembership(handle);
-    cacheOp.FinishErase(cacheItem, key);
-    return true;
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::AdvanceBucketResize() noexcept {
     const TSpaceState spaceState = Space_->CurrentSpaceState();
     if (!spaceState.Resizing()) {
@@ -2124,7 +2056,7 @@ bool TSharedCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) 
             SoftLimitPressure_.store(true, std::memory_order_relaxed);
             // Aging/resizing can make progress without freeing bytes. Bound cooperative work so
             // concurrent activity cannot keep a requester here instead of putting it on the wait path.
-            if (reclamationAttempts++ < SharedCacheTransitionWorkBatch && cacheOp.Reclaim(bytes)) {
+            if (reclamationAttempts++ < SharedCacheTransitionWorkBatch && cacheOp.Eviction().Reclaim(bytes)) {
                 usage = Memory_.PayloadUsage();
                 continue;
             }
@@ -2176,6 +2108,12 @@ bool TSharedCache::UpdateHardLimit(ui64 limit) noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
+bool TSharedCache::ReclaimCold() noexcept {
+    auto cacheOp = BeginOperation();
+    return cacheOp.Eviction().ReclaimCold();
+}
+
+SHARED_CACHE_TEMPLATE
 bool TSharedCache::EnforceCurrentLimit() noexcept {
     auto cacheOp = BeginOperation();
     return cacheOp.EnforceCurrentLimit(0);
@@ -2194,7 +2132,7 @@ bool TSharedCache::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes, boo
     bool progress = false;
     if (hadCurrentPressure) {
         for (ui32 attempt = 0; attempt < resizeStep && ExceedsLimit(PayloadUsage(), CurrentLimit(), bytes); ++attempt) {
-            if (!cacheOp.ReclaimCold()) {
+            if (!cacheOp.Eviction().ReclaimCold()) {
                 break;
             }
             progress = true;
@@ -2277,35 +2215,10 @@ bool TSharedCache::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes, boo
     }
 
     if (enforceCurrentLimit || enforceSoftLimit || (softLimit == 0 && ColdReclaimableItems() != 0)) {
-        progress = cacheOp.ReclaimToLimits(softLimit, resizeStep, bytes) || progress;
+        progress = cacheOp.Eviction().ReclaimToLimits(softLimit, resizeStep, bytes) || progress;
         if (RetainedBytes() > softLimit) {
             SoftLimitPressure_.store(true, std::memory_order_relaxed);
         }
-    }
-    return progress;
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::ReclaimToLimits(ui64 softLimit, ui32 step, TSpaceOperation& spaceOp, ui64 bytes) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    bool progress = false;
-    for (ui32 attempt = 0; attempt < step; ++attempt) {
-        if (ExceedsLimit(PayloadUsage(), CurrentLimit(), bytes)) {
-            if (!cacheOp.ReclaimCold() && !cacheOp.ReclaimKeepCold()) {
-                break;
-            }
-        } else if (softLimit == 0 && ColdReclaimableItems() != 0) {
-            if (!cacheOp.ReclaimCold()) {
-                break;
-            }
-        } else if (RetainedBytes() > softLimit) {
-            if (!cacheOp.DemoteKeepColdForSoftLimit()) {
-                break;
-            }
-        } else {
-            break;
-        }
-        progress = true;
     }
     return progress;
 }
@@ -2649,7 +2562,7 @@ bool TSharedCache::TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheI
         UpdateColdReclaimable(coldBytes, expected, desired);
         if (publishCold) {
             const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire);
-            cacheOp.RouteCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, cacheItem.Index()));
+            cacheOp.Eviction().RouteCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, cacheItem.Index()));
         } else if (lastKeepColdRef) {
             InvokeHook(ESharedCacheHookPoint::AfterKeepColdRefReleased, cacheItem);
             // Check after releasing the final ref: a concurrent trim may have withdrawn this page's ring entry

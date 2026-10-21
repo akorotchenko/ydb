@@ -629,14 +629,6 @@ private:
         return !candidate.CacheItem.IsNull();
     }
 
-    bool EraseCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
-
-    bool ReclaimCold(TSpaceOperation& spaceOp) noexcept;
-    bool DemoteKeepColdForSoftLimit(TSpaceOperation& spaceOp) noexcept;
-    // Cooperative reclamation: takes a cold entry and, when cold is empty, lets EnforceCurrentLimit move the
-    // hot/cold boundary so that the coldest hot entries become reclaimable.
-    bool Reclaim(TSpaceOperation& spaceOp, ui64 bytes = 0) noexcept;
-
     bool AdvanceBucketResize() noexcept;
 
     bool TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages = 0) noexcept;
@@ -725,16 +717,12 @@ private:
     static ui64 PageBytes(const THandle& handle) noexcept;
     static ui64 FractionCeil(ui64 value, double fraction) noexcept;
 
-    bool ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept;
-
     void UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept;
 
     static ui32 AdvanceColdMembership(THandle& handle) noexcept;
 
     static bool AdvanceColdMembership(
         THandle& handle, ui32 expectedVersion, bool keepColdQueued, ui32& newVersion) noexcept;
-
-    void RouteCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
 
     TSharedCacheItemRefImpl<TTraits> TryAcquireHotEvictionPin(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
     bool DrainHotResize() noexcept;
@@ -747,8 +735,6 @@ private:
     void RefreshSoftLimit() noexcept;
     void RefreshEvictableByteBudget() noexcept;
     bool EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes = 0, bool forceShrinkHot = false) noexcept;
-    bool ReclaimToLimits(ui64 softLimit, ui32 step, TSpaceOperation& spaceOp, ui64 bytes = 0) noexcept;
-
     bool StartHardTransition() noexcept;
     TSharedCacheItemRefImpl<TTraits> TryAcquirePageForRelocation(TSpaceOperation& spaceOp, ui32 index) noexcept;
     TCacheItem PreparePageReplacement(TSpaceOperation& spaceOp, TCacheItem source) noexcept;
@@ -925,22 +911,6 @@ public: // Cache helpers
         return Cache_.PrepareCandidate(SpaceOp_, candidate);
     }
 
-    Y_FORCE_INLINE bool EraseCold(TColdCacheItem coldItem) noexcept {
-        return Cache_.EraseCold(SpaceOp_, coldItem);
-    }
-
-    Y_FORCE_INLINE bool ReclaimCold() noexcept {
-        return Cache_.ReclaimCold(SpaceOp_);
-    }
-
-    Y_FORCE_INLINE bool DemoteKeepColdForSoftLimit() noexcept {
-        return Cache_.DemoteKeepColdForSoftLimit(SpaceOp_);
-    }
-
-    Y_FORCE_INLINE bool Reclaim(ui64 bytes = 0) noexcept {
-        return Cache_.Reclaim(SpaceOp_, bytes);
-    }
-
     Y_FORCE_INLINE bool TryReserve(ui64 bytes, ui64 pages = 0) noexcept {
         return Cache_.TryReserve(SpaceOp_, bytes, pages);
     }
@@ -1019,14 +989,6 @@ public: // Cache helpers
         return Cache_.Eviction_.BindOperation(SpaceOp_);
     }
 
-    Y_FORCE_INLINE bool ReclaimKeepCold() noexcept {
-        return Cache_.ReclaimKeepCold(SpaceOp_);
-    }
-
-    Y_FORCE_INLINE void RouteCold(TColdCacheItem coldItem) noexcept {
-        Cache_.RouteCold(SpaceOp_, coldItem);
-    }
-
     Y_FORCE_INLINE bool DrainHotResize() noexcept {
         return Cache_.DrainHotResize(SpaceOp_);
     }
@@ -1041,10 +1003,6 @@ public: // Cache helpers
 
     Y_FORCE_INLINE ui32 GrowHotTarget(ui32 effectiveHotSlots, ui32 step) const noexcept {
         return Cache_.GrowHotTarget(SpaceOp_, effectiveHotSlots, step);
-    }
-
-    Y_FORCE_INLINE bool ReclaimToLimits(ui64 softLimit, ui32 step, ui64 bytes = 0) noexcept {
-        return Cache_.ReclaimToLimits(softLimit, step, SpaceOp_, bytes);
     }
 
     Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> TryAcquirePageForRelocation(ui32 index) noexcept {

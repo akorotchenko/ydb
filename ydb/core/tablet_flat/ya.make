@@ -90,7 +90,6 @@ SRCS(
     shared_cache_btree_walk.h
     shared_sausagecache_state.h
     shared_cache.cpp
-    shared_cache_cold.cpp
     shared_cache_collection.cpp
     shared_cache_collections.cpp
     shared_cache_events.cpp

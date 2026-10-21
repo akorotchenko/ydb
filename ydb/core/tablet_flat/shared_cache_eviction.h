@@ -14,6 +14,8 @@ template <class TTraits>
 class TOperationItemRef;
 template <class TTraits>
 class TCacheCollections;
+template <class TTraits>
+class TSharedCacheTableImpl;
 class TCollection;
 
 enum class EHotLevel : ui32 {
@@ -38,6 +40,7 @@ public:
         THandle& handle, ui32 expectedVersion, bool keepColdQueued, ui32& newVersion) noexcept;
     TCollection* ReleaseForColdDemotion(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     void NotifyResourcesAvailable() noexcept;
+    bool EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes) noexcept;
 
 private:
     TSharedCacheImpl<TTraits>& Cache_;
@@ -104,6 +107,30 @@ public:
             return Eviction_.ProcessHotAtMinimum(SpaceOp_);
         }
 
+        bool EraseCold(TColdCacheItem item) noexcept {
+            return Eviction_.EraseCold(SpaceOp_, item);
+        }
+
+        void RouteCold(TColdCacheItem item) noexcept {
+            Eviction_.RouteCold(SpaceOp_, item);
+        }
+
+        bool ReclaimCold() noexcept {
+            return Eviction_.ReclaimCold(SpaceOp_);
+        }
+
+        bool ReclaimKeepCold() noexcept {
+            return Eviction_.ReclaimKeepCold(SpaceOp_);
+        }
+
+        bool Reclaim(ui64 bytes = 0) noexcept {
+            return Eviction_.Reclaim(SpaceOp_, bytes);
+        }
+
+        bool ReclaimToLimits(ui64 softLimit, ui32 step, ui64 bytes = 0) noexcept {
+            return Eviction_.ReclaimToLimits(SpaceOp_, softLimit, step, bytes);
+        }
+
     private:
         friend class TCacheEviction;
 
@@ -118,9 +145,11 @@ public:
     };
 
     TCacheEviction(TCacheEvictionServices<TTraits> services, TCacheMemory& memory,
-        TCacheCollections<TTraits>& collections, const TSharedCachePolicy& policy, const TTraits& traits) noexcept
+        TSharedCacheTableImpl<TTraits>& table, TCacheCollections<TTraits>& collections,
+        const TSharedCachePolicy& policy, const TTraits& traits) noexcept
         : Services_(services)
         , Memory_(memory)
+        , Table_(table)
         , Collections_(collections)
         , Policy_(policy)
         , Traits_(traits)
@@ -180,9 +209,21 @@ private:
     bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem item, bool force = false) noexcept;
     bool ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept;
 
+    static bool ExceedsLimit(ui64 usage, ui64 limit, ui64 bytes) noexcept;
+    bool EraseCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
+    void RouteCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
+    bool ReclaimCold(TSpaceOperation& spaceOp) noexcept;
+    bool DemoteKeepColdForSoftLimit(TSpaceOperation& spaceOp) noexcept;
+    bool ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept;
+    // Cooperative reclamation: takes a cold entry and, when cold is empty, lets EnforceCurrentLimit move the
+    // hot/cold boundary so that the coldest hot entries become reclaimable.
+    bool Reclaim(TSpaceOperation& spaceOp, ui64 bytes = 0) noexcept;
+    bool ReclaimToLimits(TSpaceOperation& spaceOp, ui64 softLimit, ui32 step, ui64 bytes = 0) noexcept;
+
 private:
     TCacheEvictionServices<TTraits> Services_;
     TCacheMemory& Memory_;
+    TSharedCacheTableImpl<TTraits>& Table_;
     TCacheCollections<TTraits>& Collections_;
     const TSharedCachePolicy& Policy_;
     const TTraits& Traits_;

@@ -164,6 +164,7 @@ public:
     static void AddReference(TCollection& owner) noexcept;
     static bool DropReference(TCollection& owner) noexcept;
     static bool WantsStickyPage(const TCollection& collection) noexcept;
+    static bool IsUnregisteredAndUnreferenced(const TCollection& collection) noexcept;
 
 private:
     friend class TSharedCacheImpl<TTraits>;

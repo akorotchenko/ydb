@@ -89,7 +89,7 @@ bool TSharedCache::FinalDrain(TTransition& transition) noexcept {
         },
         [&](ui64 raw) noexcept {
             Memory_.RemoveColdRingEntry();
-            cacheOp.RouteCold(TColdCacheItem::FromRaw(raw));
+            cacheOp.Eviction().RouteCold(TColdCacheItem::FromRaw(raw));
         },
         [&](ui64 raw) noexcept {
             cacheOp.Eviction().RouteKeepCold(TColdCacheItem::FromRaw(raw));
@@ -391,7 +391,7 @@ typename TSharedCache::EShrinkCutStatus TSharedCache::ReclaimShrinkHandle(
         }
         if (state.Refs() == 0) {
             const ui32 coldVersion = spaceOp.Handles()[index].ColdVersion.load(std::memory_order_acquire);
-            if (cacheOp.EraseCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, index))) {
+            if (cacheOp.Eviction().EraseCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, index))) {
                 return EShrinkCutStatus::Progress;
             }
         }
