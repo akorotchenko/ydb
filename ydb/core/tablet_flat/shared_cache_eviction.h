@@ -116,6 +116,8 @@ public:
 
     bool GrowKeepCold() noexcept;
     static bool IsKeepColdQueued(const THandle& handle) noexcept;
+    void ScheduleKeepColdSweep(ui64 slots) noexcept;
+    bool SweepKeepCold(TSharedCacheSpace& space) noexcept;
 
 private:
     bool TrimKeepCold(TSpaceOperation& spaceOp) noexcept;
@@ -141,6 +143,7 @@ private:
     std::atomic<ui64> KeepColdLimit_{ 0 }; // Effective budget, resized according to Cold+Free headroom.
     std::atomic<ui64> KeepColdTrimScanRemaining_{ 0 };
     std::atomic<bool> KeepColdTrimActive_{ false };
+    std::atomic<ui64> KeepColdSweepRemaining_{ 0 };
 };
 
 } // namespace NKikimr::NSharedCache

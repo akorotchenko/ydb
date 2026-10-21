@@ -2320,21 +2320,8 @@ bool TSharedCache::RunMaintenance() noexcept {
             return true;
         }
     }
-    ui64 remaining = KeepColdSweepRemaining_.load(std::memory_order_acquire);
-    while (remaining != 0) {
-        const ui64 batch = Min<ui64>(remaining, SharedCacheTransitionWorkBatch);
-        if (KeepColdSweepRemaining_.compare_exchange_weak(
-                remaining, remaining - batch, std::memory_order_acq_rel, std::memory_order_acquire))
-        {
-            auto cacheOp = BeginOperation();
-            for (ui64 index = 0; index < batch; ++index) {
-                const ui64 raw = cacheOp.KeepCold().Pop();
-                if (raw != 0) {
-                    cacheOp.Eviction().RouteKeepCold(TColdCacheItem::FromRaw(raw));
-                }
-            }
-            return true;
-        }
+    if (Eviction_.SweepKeepCold(*Space_)) {
+        return true;
     }
     switch (HardTransition_.Phase()) {
         case ETransitionPhase::Idle:

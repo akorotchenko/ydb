@@ -59,6 +59,32 @@ bool TCacheEviction<TTraits>::UpdateKeepColdLimit(ui64 limit) noexcept {
 }
 
 template <class TTraits>
+void TCacheEviction<TTraits>::ScheduleKeepColdSweep(ui64 slots) noexcept {
+    KeepColdSweepRemaining_.store(slots, std::memory_order_release);
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::SweepKeepCold(TSharedCacheSpace& space) noexcept {
+    ui64 remaining = KeepColdSweepRemaining_.load(std::memory_order_acquire);
+    while (remaining != 0) {
+        const ui64 batch = Min<ui64>(remaining, SharedCacheTransitionWorkBatch);
+        if (KeepColdSweepRemaining_.compare_exchange_weak(
+                remaining, remaining - batch, std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            auto spaceOp = space.BeginOperation();
+            for (ui64 index = 0; index < batch; ++index) {
+                const ui64 raw = spaceOp.KeepCold().Pop();
+                if (raw != 0) {
+                    RouteKeepCold(spaceOp, TColdCacheItem::FromRaw(raw));
+                }
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class TTraits>
 bool TCacheEviction<TTraits>::TrimKeepCold(TSpaceOperation& spaceOp) noexcept {
     const ui64 limit = KeepColdLimit();
     if (Memory_.KeepColdOwnedBytes() <= limit && !KeepColdTrimActive_.load(std::memory_order_relaxed))
