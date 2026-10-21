@@ -41,7 +41,7 @@ bool TSharedCache::PublishFinalView(TTransition& transition) noexcept {
     if (auto hotResize = HotResize_.TryLock()) {
         if (HotResize_.Phase() == EHotResizePhase::Cut) {
             auto cacheOp = BeginOperation();
-            cacheOp.DrainHotResize();
+            cacheOp.Eviction().DrainHotResize(*Space_, HotResize_);
         }
         if (HotResize_.Phase() != EHotResizePhase::Idle) {
             return false;

@@ -314,18 +314,21 @@ public:
 
     static ui32 MinimumHotSlots(TTestSharedCache& cache, bool underPressure = false) noexcept {
         return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
-            return cache.MinimumHotSlots(spaceOp, underPressure);
+            return cache.Eviction_.MinimumHotSlots(*cache.Space_, spaceOp, underPressure);
         });
     }
 
     static std::array<ui64, 4> HotPolicy(TTestSharedCache& cache, const TSpaceOperation& spaceOp) noexcept {
         const ui32 effective = static_cast<ui32>(spaceOp.EffectiveHotSlots());
-        return { effective, cache.MinimumHotSlots(spaceOp), cache.ShrinkHotTarget(spaceOp, effective, 1, false),
-            cache.GrowHotTarget(spaceOp, effective, 2) };
+        return { effective, cache.Eviction_.MinimumHotSlots(*cache.Space_, spaceOp),
+            cache.Eviction_.ShrinkHotTarget(*cache.Space_, spaceOp, effective, 1, false),
+            cache.Eviction_.GrowHotTarget(spaceOp, effective, 2) };
     }
 
-    static bool EnforceWithOperation(TTestSharedCache& cache, TSpaceOperation& spaceOp) noexcept {
-        return cache.EnforceCurrentLimit(spaceOp, 0, true);
+    static bool EnforceWithOperation(
+        TTestSharedCache& cache, TSpaceOperation& spaceOp, ui64 bytes = 0, bool forceShrinkHot = true) noexcept {
+        return cache.BindOperation(spaceOp).Eviction().EnforceCurrentLimit(
+            *cache.Space_, cache.HotResize_, bytes, forceShrinkHot);
     }
 
     static THotResize::TGuard LockHotResize(TTestSharedCache& cache) noexcept {
@@ -333,15 +336,15 @@ public:
     }
 
     static std::pair<ui64, ui64> ColdByteWatermarks(const TTestSharedCache& cache) noexcept {
-        return { cache.ColdMinBytes_.load(std::memory_order_relaxed),
-            cache.ColdGrowBytes_.load(std::memory_order_relaxed) };
+        return { cache.Eviction_.ColdMinBytes_.load(std::memory_order_relaxed),
+            cache.Eviction_.ColdGrowBytes_.load(std::memory_order_relaxed) };
     }
 
     static void ShrinkHotToMinimum(TTestSharedCache& cache) noexcept {
         for (;;) {
             const ui64 before = EffectiveHotSlots(cache);
             WithSpace(cache, [&](TSpaceOperation& spaceOp) {
-                cache.EnforceCurrentLimit(spaceOp, 0, true);
+                cache.BindOperation(spaceOp).Eviction().EnforceCurrentLimit(*cache.Space_, cache.HotResize_, 0, true);
             });
             if (EffectiveHotSlots(cache) == before) {
                 return;
@@ -5876,7 +5879,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::TryReserve(*fixture.Cache, reservation));
         TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
             for (ui32 pass = 0; pass < 200; ++pass) {
-                TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp).EnforceCurrentLimit(bytes + 1);
+                TSharedCacheTestAccess::EnforceWithOperation(*fixture.Cache, spaceOp, bytes + 1, false);
             }
         });
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), 25);
@@ -6610,7 +6613,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             const ui64 incomingBytes = exceedsFree ? Max<ui64>() : freeBytes - limit / 10;
             const ui64 hotSlots = TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache);
             TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
-                TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp).EnforceCurrentLimit(incomingBytes);
+                TSharedCacheTestAccess::EnforceWithOperation(*fixture.Cache, spaceOp, incomingBytes, false);
             });
             UNIT_ASSERT(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache) < hotSlots);
         }
@@ -6621,13 +6624,13 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->UpdateSoftLimit(limit));
         const ui64 freeBytes = limit - fixture.Cache->PayloadUsage();
         TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
-            TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp).EnforceCurrentLimit(freeBytes);
+            TSharedCacheTestAccess::EnforceWithOperation(*fixture.Cache, spaceOp, freeBytes, false);
         });
         const ui64 hotSlots = TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache);
         UNIT_ASSERT(hotSlots < fixture.Capacity.HotSlotCount());
         const ui64 incomingBytes = freeBytes - limit / 4;
         TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
-            TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp).EnforceCurrentLimit(incomingBytes);
+            TSharedCacheTestAccess::EnforceWithOperation(*fixture.Cache, spaceOp, incomingBytes, false);
         });
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), hotSlots);
         fixture.Cache->EnforceCurrentLimit();
@@ -6650,13 +6653,13 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
             UNIT_ASSERT(
                 fixture.Cache->ColdReclaimableItems() + spaceOp.View().Free().Count() > spaceOp.View().ColdGrowHandles);
-            TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp).EnforceCurrentLimit(0, true);
+            TSharedCacheTestAccess::EnforceWithOperation(*fixture.Cache, spaceOp, 0, true);
         });
         const ui64 hotSlots = TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache);
         UNIT_ASSERT(hotSlots < fixture.Capacity.HotSlotCount());
         const ui64 incomingBytes = limit - fixture.Cache->PayloadUsage() + 1;
         TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
-            TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp).EnforceCurrentLimit(incomingBytes);
+            TSharedCacheTestAccess::EnforceWithOperation(*fixture.Cache, spaceOp, incomingBytes, false);
         });
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), hotSlots);
         fixture.Cache->EnforceCurrentLimit();
