@@ -794,7 +794,6 @@ private:
     TCacheEviction<TTraits> Eviction_;
     TCacheFetches<TTraits> Fetches_;
     ui64 ColdByteBudget_ = Max<ui64>(); // Protected by HotResize_; watermark calculation input.
-    std::atomic<ui64> KeepColdSweepRemaining_{ 0 };
     std::atomic<ui64> ColdMinBytes_{ 0 };
     std::atomic<ui64> ColdTargetBytes_{ 0 };
     std::atomic<ui64> ColdGrowBytes_{ 0 };

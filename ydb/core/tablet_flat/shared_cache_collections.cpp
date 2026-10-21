@@ -42,7 +42,7 @@ void TCacheCollectionServices<TTraits>::PromoteColdForSticky(TSpaceOperation& sp
 
 template <class TTraits>
 void TCacheCollectionServices<TTraits>::ScheduleKeepColdSweep(ui64 slots) noexcept {
-    Cache_.KeepColdSweepRemaining_.store(slots, std::memory_order_release);
+    Cache_.Eviction_.ScheduleKeepColdSweep(slots);
 }
 
 template <class TTraits>
