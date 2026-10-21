@@ -94,7 +94,7 @@ public:
     static bool MakePendingPageSticky(TTestSharedCache& cache, TPageCacheItem page) noexcept {
         auto spaceOp = cache.BeginOperation();
         TOperationItemRef<TTestTraits> ref(spaceOp, cache.TryAcquireStructural(spaceOp, page.CacheItem()));
-        return ref && cache.MakePageSticky(spaceOp, page.CacheItem());
+        return ref && spaceOp.Collections().MakePageSticky(page.CacheItem());
     }
 
     static bool MakePageSticky(TTestSharedCache& cache, TPageCacheItem page) noexcept {
@@ -103,7 +103,7 @@ public:
             return false;
         }
         auto spaceOp = cache.BeginOperation();
-        return cache.MakePageSticky(spaceOp, page.CacheItem());
+        return spaceOp.Collections().MakePageSticky(page.CacheItem());
     }
 
     static TPageCacheItem AllocatePage(TTestSharedCache& cache, TCollectionCacheItem collection, ui64 offset, ui64 size,
@@ -483,7 +483,7 @@ public:
 
     static bool UnstickyCutPages(TTestSharedCache& cache, TPageCacheItem page, ui64 allocationLimit) {
         auto operation = cache.BeginOperation();
-        return cache.UnstickyCutPages(operation, page.CacheItem(), allocationLimit);
+        return operation.Collections().UnstickyCutPages(page.CacheItem(), allocationLimit);
     }
 
     static bool RelocatePage(TTestSharedCache& cache, TPageCacheItem page) {

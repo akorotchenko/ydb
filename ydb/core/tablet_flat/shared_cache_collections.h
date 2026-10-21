@@ -28,6 +28,7 @@ public:
     void UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept;
     static ui32 AdvanceColdMembership(THandle& handle) noexcept;
     static ui64 PageBytes(const THandle& handle) noexcept;
+    void PromoteColdForSticky(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
 
 private:
     TSharedCacheImpl<TTraits>& Cache_;
@@ -76,6 +77,14 @@ public:
 
         void UnlinkPendingStickyPage(TCacheItem item) noexcept {
             Collections_.UnlinkPendingStickyPage(SpaceOp_, item);
+        }
+
+        bool MakePageSticky(TCacheItem item) noexcept {
+            return Collections_.MakePageSticky(SpaceOp_, item);
+        }
+
+        bool UnstickyCutPages(TCacheItem item, ui64 allocationLimit) noexcept {
+            return Collections_.UnstickyCutPages(SpaceOp_, item, allocationLimit);
         }
 
         bool Attach(TCollectionRegistry& registry, TCacheItem item) noexcept {
@@ -160,6 +169,11 @@ private:
         TSpaceOperation& spaceOp, TCacheItem item, TSharedCacheItemRefImpl<TTraits>& collectionRef) noexcept;
     void CancelStickyLink(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     void UnlinkPendingStickyPage(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+
+    bool MakePageSticky(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+    bool FinishStickyPromotion(TSpaceOperation& spaceOp, TCacheItem item, ui64 bytes) noexcept;
+    static void PublishPageUnsticky(THandle& page, THandleState state) noexcept;
+    bool UnstickyCutPages(TSpaceOperation& spaceOp, TCacheItem item, ui64 allocationLimit) noexcept;
 
     bool TryBeginAttach(
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item, THandleState& attachState) noexcept;
