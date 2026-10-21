@@ -26,7 +26,7 @@ void TCollection::DrainStickyPages() {
     auto& cache = TSharedCache::Get();
     auto binding = cache.BindCurrentThreadHazard();
     auto cacheOp = cache.BeginOperation();
-    cacheOp.DrainStickyPages(*this);
+    cacheOp.Collections().DrainStickyPages(*this);
 }
 
 TCollectionActorState& TCollection::EnsureActorState() {

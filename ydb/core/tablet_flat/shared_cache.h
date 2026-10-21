@@ -686,17 +686,10 @@ private:
 
     TSharedCacheItemRefImpl<TTraits> BuildExternalRef(EItemKind kind, TCacheItem cacheItem) noexcept;
 
-    TSharedCacheItemRefImpl<TTraits> AcquireStickyCollection(
-        TSpaceOperation& spaceOp, TCollectionCacheItem collection, TCollection*& value) noexcept;
-
     bool LinkStickyPage(
         TSpaceOperation& spaceOp, TCacheItem page, TSharedCacheItemRefImpl<TTraits>& collectionRef) noexcept;
     void UnlinkPendingStickyPage(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
-    void RestoreStickyPageList(TSpaceOperation& spaceOp, TCollection& collection, ui32 detachedHead) noexcept;
-    void DrainStickyPages(TSpaceOperation& spaceOp, TCollection& collection) noexcept;
     static void PublishPageUnsticky(THandle& page, THandleState state) noexcept;
-    void MergeRetainedStickyPages(
-        TSpaceOperation& spaceOp, TCollection& collection, ui32 retainedHead, ui32 retainedTail) noexcept;
     bool SetCollectionPagesCacheMode(TSpaceOperation& spaceOp, TCollection& collection, ECacheMode mode) noexcept;
     bool MakePageSticky(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
     bool UnstickyCutPages(TSpaceOperation& spaceOp, TCacheItem page, ui64 allocationLimit) noexcept;
@@ -921,10 +914,6 @@ public: // Cache helpers
         return Cache_.Fetches_.BindOperation(SpaceOp_);
     }
 
-    Y_FORCE_INLINE void DrainStickyPages(TCollection& collection) noexcept {
-        Cache_.DrainStickyPages(SpaceOp_, collection);
-    }
-
     Y_FORCE_INLINE bool EnforceCurrentLimit(ui64 bytes = 0, bool forceShrinkHot = false) noexcept {
         return Cache_.EnforceCurrentLimit(SpaceOp_, bytes, forceShrinkHot);
     }
@@ -1040,26 +1029,12 @@ public: // Cache helpers
         Cache_.InitializeCollection(SpaceOp_, cacheItem, id, bytes);
     }
 
-    Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> AcquireStickyCollection(
-        TCollectionCacheItem collection, TCollection*& value) noexcept {
-        return Cache_.AcquireStickyCollection(SpaceOp_, collection, value);
-    }
-
     Y_FORCE_INLINE bool LinkStickyPage(TCacheItem page, TSharedCacheItemRefImpl<TTraits>& collectionRef) noexcept {
         return Cache_.LinkStickyPage(SpaceOp_, page, collectionRef);
     }
 
     Y_FORCE_INLINE void UnlinkPendingStickyPage(TCacheItem page) noexcept {
         Cache_.UnlinkPendingStickyPage(SpaceOp_, page);
-    }
-
-    Y_FORCE_INLINE void RestoreStickyPageList(TCollection& collection, ui32 detachedHead) noexcept {
-        Cache_.RestoreStickyPageList(SpaceOp_, collection, detachedHead);
-    }
-
-    Y_FORCE_INLINE void MergeRetainedStickyPages(
-        TCollection& collection, ui32 retainedHead, ui32 retainedTail) noexcept {
-        Cache_.MergeRetainedStickyPages(SpaceOp_, collection, retainedHead, retainedTail);
     }
 
     Y_FORCE_INLINE bool SetCollectionPagesCacheMode(TCollection& collection, ECacheMode mode) noexcept {
