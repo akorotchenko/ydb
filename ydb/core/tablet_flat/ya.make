@@ -94,6 +94,7 @@ SRCS(
     shared_cache_collection.cpp
     shared_cache_collections.cpp
     shared_cache_events.cpp
+    shared_cache_eviction.cpp
     shared_cache_fetches.cpp
     shared_cache_hot.cpp
     shared_cache_hot_resize.cpp

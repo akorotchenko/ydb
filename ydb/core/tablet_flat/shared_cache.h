@@ -2,6 +2,7 @@
 
 #include "shared_cache_collection.h"
 #include "shared_cache_collections.h"
+#include "shared_cache_eviction.h"
 #include "shared_cache_fetches.h"
 #include "shared_cache_memory.h"
 #include "shared_cache_table.h"
@@ -453,16 +454,11 @@ public:
     bool UpdateKeepColdLimit(ui64 limit) noexcept;
 
     ui64 EvictableByteBudget() const noexcept {
-        const ui64 softLimit = SoftLimit();
-        return softLimit - Min(softLimit, StickyBytes());
+        return Eviction_.EvictableByteBudget();
     }
 
     ui64 KeepColdLimit() const noexcept {
-        const ui64 budget = EvictableByteBudget();
-        // KeepCold uses the remainder after the normal Hot minimum (40% with HotMin = 60%).
-        const ui64 maximum = budget - FractionCeil(budget, Policy_.HotMin);
-        return Min(Min(KeepColdLimit_.load(std::memory_order_relaxed),
-                       KeepColdMaxBytes_.load(std::memory_order_relaxed)), maximum);
+        return Eviction_.KeepColdLimit();
     }
 
     ui64 KeepColdOwnedBytes() const noexcept {
@@ -500,6 +496,7 @@ private:
     friend class TSharedCacheCollectionRefImpl<TTraits>;
     friend class TCacheFetchServices<TTraits>;
     friend class TCacheCollectionServices<TTraits>;
+    friend class TCacheEvictionServices<TTraits>;
     friend class TRequestPageWaiter;
     friend class TCompactedPageWaiter;
     friend struct TEvSaveCompactedPages;
@@ -738,10 +735,6 @@ private:
     bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool force = false) noexcept;
     bool ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept;
 
-    bool TrimKeepCold(TSpaceOperation& spaceOp) noexcept;
-    bool ShrinkKeepCold(TSpaceOperation& spaceOp) noexcept;
-    bool GrowKeepCold() noexcept;
-
     bool WantsKeepCold(TSpaceOperation& spaceOp, const THandle& page) noexcept;
 
     void RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept;
@@ -813,18 +806,15 @@ private:
     TSharedCacheTableImpl<TTraits> Table_;
     TCacheMemory Memory_;
     TCacheCollections<TTraits> Collections_;
+    TCacheEviction<TTraits> Eviction_;
     TCacheFetches<TTraits> Fetches_;
     ui64 ColdByteBudget_ = Max<ui64>(); // Protected by HotResize_; watermark calculation input.
-    std::atomic<ui64> KeepColdMaxBytes_{ 0 }; // Configured ceiling; repeated updates preserve pressure shrinkage.
-    std::atomic<ui64> KeepColdLimit_{ 0 }; // Effective budget, resized according to Cold+Free headroom.
-    std::atomic<ui64> KeepColdTrimScanRemaining_{ 0 };
     std::atomic<ui64> KeepColdSweepRemaining_{ 0 };
     std::atomic<ui64> ColdMinBytes_{ 0 };
     std::atomic<ui64> ColdTargetBytes_{ 0 };
     std::atomic<ui64> ColdGrowBytes_{ 0 };
     std::atomic<ui64> TargetHandleCount_{ 0 };
     std::atomic<bool> KeepColdPressure_{ false };
-    std::atomic<bool> KeepColdTrimActive_{ false };
     std::atomic<bool> SoftLimitPressure_{ false };
     THotResize HotResize_;
     TSharedCacheCapacity HardTarget_;
@@ -1066,20 +1056,16 @@ public: // Cache helpers
         return Cache_.Collections_.BindOperation(SpaceOp_);
     }
 
+    Y_FORCE_INLINE typename TCacheEviction<TTraits>::TOperation Eviction() noexcept {
+        return Cache_.Eviction_.BindOperation(SpaceOp_);
+    }
+
     Y_FORCE_INLINE bool PromoteCold(TCacheItem cacheItem, bool force = false) noexcept {
         return Cache_.PromoteCold(SpaceOp_, cacheItem, force);
     }
 
     Y_FORCE_INLINE bool ReclaimKeepCold() noexcept {
         return Cache_.ReclaimKeepCold(SpaceOp_);
-    }
-
-    Y_FORCE_INLINE bool TrimKeepCold() noexcept {
-        return Cache_.TrimKeepCold(SpaceOp_);
-    }
-
-    Y_FORCE_INLINE bool ShrinkKeepCold() noexcept {
-        return Cache_.ShrinkKeepCold(SpaceOp_);
     }
 
     Y_FORCE_INLINE bool WantsKeepCold(const THandle& page) noexcept {

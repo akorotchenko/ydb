@@ -351,7 +351,7 @@ public:
 
     static bool ShrinkKeepCold(TTestSharedCache& cache) noexcept {
         return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
-            return cache.ShrinkKeepCold(spaceOp);
+            return cache.BindOperation(spaceOp).Eviction().ShrinkKeepCold();
         });
     }
 
@@ -478,7 +478,7 @@ public:
     }
 
     static bool TrimKeepCold(TTestSharedCache& cache, TSpaceOperation& operation) noexcept {
-        return cache.TrimKeepCold(operation);
+        return cache.BindOperation(operation).Eviction().TrimKeepCold();
     }
 
     static bool UnstickyCutPages(TTestSharedCache& cache, TPageCacheItem page, ui64 allocationLimit) {
