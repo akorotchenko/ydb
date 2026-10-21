@@ -688,13 +688,7 @@ private:
 
     bool DetachCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
     bool DeleteCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
-    bool TryClaimCollectionDeletion(TSpaceOperation& spaceOp, TCollectionRegistry* expectedRegistry,
-        TCacheItem collection, THandleState& sourceState, TSharedCacheItemRefImpl<TTraits>& owner) noexcept;
     bool DeleteCollection(TCollectionRegistry* registry, TCollectionCacheItem collection) noexcept;
-    bool DeleteCollection(
-        TSpaceOperation& spaceOp, TCollectionRegistry* expectedRegistry, TCacheItem collection) noexcept;
-    bool MoveCollectionRegistry(TSpaceOperation& spaceOp, TCollectionRegistry& source, TCollectionRegistry& destination,
-        TCacheItem collection) noexcept;
 
     bool IsPageSticky(TPageCacheItem page) const noexcept;
     TSharedPageRefImpl<TTraits> BuildPageRef(
@@ -1015,20 +1009,6 @@ public: // Cache helpers
 
     Y_FORCE_INLINE void InitializeCollection(TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept {
         Cache_.InitializeCollection(SpaceOp_, cacheItem, id, bytes);
-    }
-
-    Y_FORCE_INLINE bool TryClaimCollectionDeletion(TCollectionRegistry* expectedRegistry, TCacheItem collection,
-        THandleState& sourceState, TSharedCacheItemRefImpl<TTraits>& owner) noexcept {
-        return Cache_.TryClaimCollectionDeletion(SpaceOp_, expectedRegistry, collection, sourceState, owner);
-    }
-
-    Y_FORCE_INLINE bool DeleteCollection(TCollectionRegistry* expectedRegistry, TCacheItem collection) noexcept {
-        return Cache_.DeleteCollection(SpaceOp_, expectedRegistry, collection);
-    }
-
-    Y_FORCE_INLINE bool MoveCollectionRegistry(
-        TCollectionRegistry& source, TCollectionRegistry& destination, TCacheItem collection) noexcept {
-        return Cache_.MoveCollectionRegistry(SpaceOp_, source, destination, collection);
     }
 
     Y_FORCE_INLINE TSharedPageRefImpl<TTraits> BuildPageRef(TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {

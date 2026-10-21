@@ -12,6 +12,9 @@ namespace NKikimr::NSharedCache {
 class TCacheMemory;
 
 template <class TTraits>
+class TSharedCacheTableImpl;
+
+template <class TTraits>
 class TSharedCacheItemRefImpl;
 template <class TTraits>
 class TOperationItemRef;
@@ -96,6 +99,14 @@ public:
             return Collections_.Detach(SpaceOp_, registry, item);
         }
 
+        bool Delete(TCollectionRegistry* expectedRegistry, TCacheItem item) noexcept {
+            return Collections_.Delete(SpaceOp_, expectedRegistry, item);
+        }
+
+        bool MoveRegistry(TCollectionRegistry& source, TCollectionRegistry& destination, TCacheItem item) noexcept {
+            return Collections_.MoveRegistry(SpaceOp_, source, destination, item);
+        }
+
         bool Attach(TCollectionRegistry& registry, TCacheItem item) noexcept {
             return Collections_.Attach(SpaceOp_, registry, item);
         }
@@ -133,9 +144,11 @@ public:
         TSpaceOperation& SpaceOp_;
     };
 
-    TCacheCollections(TCacheCollectionServices<TTraits> services, TCacheMemory& memory, const TTraits& traits) noexcept
+    TCacheCollections(TCacheCollectionServices<TTraits> services, TCacheMemory& memory,
+        TSharedCacheTableImpl<TTraits>& table, const TTraits& traits) noexcept
         : Services_(services)
         , Memory_(memory)
+        , Table_(table)
         , Traits_(traits)
     {}
 
@@ -189,6 +202,12 @@ private:
     bool TryBeginDetach(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item) noexcept;
     bool Detach(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item) noexcept;
 
+    bool TryClaimDeletion(TSpaceOperation& spaceOp, TCollectionRegistry* expectedRegistry, TCacheItem item,
+        THandleState& sourceState, TSharedCacheItemRefImpl<TTraits>& owner) noexcept;
+    bool Delete(TSpaceOperation& spaceOp, TCollectionRegistry* expectedRegistry, TCacheItem item) noexcept;
+    bool MoveRegistry(TSpaceOperation& spaceOp, TCollectionRegistry& source, TCollectionRegistry& destination,
+        TCacheItem item) noexcept;
+
     bool TryBeginAttach(
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item, THandleState& attachState) noexcept;
     void FinishAttach(TSpaceOperation& spaceOp, TCacheItem item, EHandleState detachedState) noexcept;
@@ -206,6 +225,7 @@ private:
     TCacheCollectionServices<TTraits> Services_;
     TIntrusivePtr<TCollectionRegistry> CollectionRegistry_ = new TCollectionRegistry;
     TCacheMemory& Memory_;
+    TSharedCacheTableImpl<TTraits>& Table_;
     const TTraits& Traits_;
 };
 
