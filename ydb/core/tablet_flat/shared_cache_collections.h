@@ -27,6 +27,7 @@ public:
     void RouteHotL1(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     void UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept;
     static ui32 AdvanceColdMembership(THandle& handle) noexcept;
+    static ui64 PageBytes(const THandle& handle) noexcept;
 
 private:
     TSharedCacheImpl<TTraits>& Cache_;
@@ -55,6 +56,18 @@ public:
 
         void PublishCollectionForReclaim(TCacheItem item) noexcept {
             Collections_.PublishCollectionForReclaim(SpaceOp_, item);
+        }
+
+        TSharedCacheItemRefImpl<TTraits> AcquireSticky(TCollectionCacheItem item, TCollection*& value) noexcept {
+            return Collections_.AcquireSticky(SpaceOp_, item, value);
+        }
+
+        void DrainStickyPages(TCollection& collection) noexcept {
+            Collections_.DrainStickyPages(SpaceOp_, collection);
+        }
+
+        void MergeRetainedStickyPages(TCollection& collection, ui32 retainedHead, ui32 retainedTail) noexcept {
+            Collections_.MergeRetainedStickyPages(SpaceOp_, collection, retainedHead, retainedTail);
         }
 
         bool Attach(TCollectionRegistry& registry, TCacheItem item) noexcept {
@@ -127,6 +140,13 @@ private:
     void DropPageItemRef(TSpaceOperation& spaceOp, THandle& page) noexcept;
     void PublishCollectionForReclaim(TSpaceOperation& spaceOp, TCacheItem collection) noexcept;
     void FinishCollectionRetain(TSpaceOperation& spaceOp, TCacheItem collection) noexcept;
+
+    TSharedCacheItemRefImpl<TTraits> AcquireSticky(
+        TSpaceOperation& spaceOp, TCollectionCacheItem item, TCollection*& value) noexcept;
+    static void RestoreStickyPageList(TSpaceOperation& spaceOp, TCollection& collection, ui32 detachedHead) noexcept;
+    void MergeRetainedStickyPages(
+        TSpaceOperation& spaceOp, TCollection& collection, ui32 retainedHead, ui32 retainedTail) noexcept;
+    void DrainStickyPages(TSpaceOperation& spaceOp, TCollection& collection) noexcept;
 
     bool TryBeginAttach(
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item, THandleState& attachState) noexcept;
