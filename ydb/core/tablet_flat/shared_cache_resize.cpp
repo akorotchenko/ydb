@@ -404,7 +404,8 @@ typename TSharedCache::EShrinkCutStatus TSharedCache::ReclaimShrinkHandle(
     }
     if (state.IsPageKind() && state.IsSticky()) {
         if (state.IsStickyField()) {
-            return cacheOp.UnstickyCutPages(TCacheItem::Make(state.Version(), index), spaceOp.AllocationLimit())
+            return cacheOp.Collections().UnstickyCutPages(
+                       TCacheItem::Make(state.Version(), index), spaceOp.AllocationLimit())
                        ? EShrinkCutStatus::Progress
                        : EShrinkCutStatus::Blocked;
         }

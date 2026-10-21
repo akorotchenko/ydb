@@ -686,10 +686,7 @@ private:
 
     TSharedCacheItemRefImpl<TTraits> BuildExternalRef(EItemKind kind, TCacheItem cacheItem) noexcept;
 
-    static void PublishPageUnsticky(THandle& page, THandleState state) noexcept;
     bool SetCollectionPagesCacheMode(TSpaceOperation& spaceOp, TCollection& collection, ECacheMode mode) noexcept;
-    bool MakePageSticky(TSpaceOperation& spaceOp, TCacheItem page) noexcept;
-    bool UnstickyCutPages(TSpaceOperation& spaceOp, TCacheItem page, ui64 allocationLimit) noexcept;
 
     bool TryBeginCollectionDetach(
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collection) noexcept;
@@ -1028,14 +1025,6 @@ public: // Cache helpers
 
     Y_FORCE_INLINE bool SetCollectionPagesCacheMode(TCollection& collection, ECacheMode mode) noexcept {
         return Cache_.SetCollectionPagesCacheMode(SpaceOp_, collection, mode);
-    }
-
-    Y_FORCE_INLINE bool MakePageSticky(TCacheItem page) noexcept {
-        return Cache_.MakePageSticky(SpaceOp_, page);
-    }
-
-    Y_FORCE_INLINE bool UnstickyCutPages(TCacheItem page, ui64 allocationLimit) noexcept {
-        return Cache_.UnstickyCutPages(SpaceOp_, page, allocationLimit);
     }
 
     Y_FORCE_INLINE bool TryBeginCollectionDetach(TCollectionRegistry& registry, TCacheItem collection) noexcept {
