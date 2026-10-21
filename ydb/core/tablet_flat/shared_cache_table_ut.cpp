@@ -163,28 +163,28 @@ public:
 
     static bool PrepareTransition(
         TTestSharedCache& cache, const TSharedCacheCapacity& target, TTransition& transition) noexcept {
-        return cache.PrepareTransition(target, transition);
+        return cache.Resize_.PrepareTransition(target, transition);
     }
 
     static bool PublishMigrationView(TTestSharedCache& cache, TTransition& transition) noexcept {
-        return cache.PublishMigrationView(transition);
+        return cache.Resize_.PublishMigrationView(transition, cache.HotResize_);
     }
 
     static bool TryDrainTransition(TTestSharedCache& cache, TTransition& transition) noexcept {
-        return cache.TryDrainTransition(transition);
+        return cache.Resize_.TryDrainTransition(transition);
     }
 
     static bool PublishFinalView(TTestSharedCache& cache, TTransition& transition) noexcept {
-        return cache.PublishFinalView(transition);
+        return cache.Resize_.PublishFinalView(transition, cache.HotResize_);
     }
 
     static bool AppendFreeHandles(TTestSharedCache& cache, TTransition& transition) noexcept {
-        return cache.AppendFreeHandles(transition);
+        return cache.Resize_.AppendFreeHandles(transition);
     }
 
     static bool FinalDrain(TTestSharedCache& cache, TTransition& transition) noexcept {
         do {
-            if (!cache.FinalDrain(transition)) {
+            if (!cache.Resize_.FinalDrain(transition)) {
                 return false;
             }
         } while (transition.Phase() == ETransitionPhase::FinalDrain);
@@ -192,7 +192,7 @@ public:
     }
 
     static bool TryReleaseTransition(TTestSharedCache& cache, TTransition& transition) noexcept {
-        return cache.TryReleaseTransition(transition);
+        return cache.Resize_.TryReleaseTransition(transition);
     }
 
     static bool CommitTransition(TTestSharedCache& cache, TTransition& transition) noexcept {
@@ -200,7 +200,7 @@ public:
     }
 
     static bool AbandonTransition(TTestSharedCache& cache, TTransition& transition) noexcept {
-        return cache.AbandonTransition(transition);
+        return cache.Resize_.AbandonTransition(transition);
     }
 
     template <class TCallback>
