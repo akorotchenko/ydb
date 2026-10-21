@@ -13,12 +13,12 @@
 #include <ydb/core/tablet/resource_broker.h>
 #include <ydb/core/tablet_flat/shared_sausagecache.h>
 #include <ydb/core/tablet_flat/shared_cache.h>
+#include <ydb/core/tablet_flat/shared_cache_thread_test.h>
 #include <ydb/library/services/services.pb.h>
 #include <library/cpp/time_provider/time_provider.h>
 
 #include <ydb/core/tablet_flat/test/libs/rows/tool.h>
 #include <ydb/core/testlib/actors/test_runtime.h>
-#include <ydb/core/testlib/actor_helpers.h>
 
 #include <util/generic/xrange.h>
 
@@ -49,9 +49,8 @@ namespace NFake {
             auto *types = NTable::NTest::DbgRegistry();
             auto *app = new TAppData(0, 0, 0, 0, { }, types, nullptr, nullptr, nullptr);
 
+            NSharedCache::TCacheThreadTestAccess::Setup(Env);
             Env.Initialize({ app, nullptr, nullptr, {}, {} });
-            // Keep the runtime's AppData available while the harness releases native refs outside events.
-            CacheContext = MakeHolder<TActorSystemStub>();
             Env.SetDispatchTimeout(DEFAULT_DISPATCH_TIMEOUT);
             Env.SetLogPriority(NKikimrServices::FAKE_ENV, NActors::NLog::PRI_INFO);
 
@@ -61,7 +60,6 @@ namespace NFake {
             Env.WaitFor("shared-cache initialization", [&] {
                 return bool(Env.GetAppData().SharedCache);
             });
-            CacheContext->AppData.SharedCache = Env.GetAppData().SharedCache;
         }
 
         TTestActorRuntime& operator*() noexcept
@@ -221,8 +219,6 @@ namespace NFake {
         }
 
     public:
-        // Declared before Env so its context and cache owner outlive runtime cleanup.
-        THolder<TActorSystemStub> CacheContext;
         TTestActorRuntime Env{ NActors::THeSingleSystemEnv{ } };
 
         ITimeProvider * const Time = nullptr;

@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <flat_part_loader.h>
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
@@ -224,7 +225,7 @@ namespace {
 
 }
 
-Y_UNIT_TEST_SUITE(TPartSliceLoader) {
+Y_UNIT_TEST_SUITE_F(TPartSliceLoader, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(RestoreMissingSlice) {
         auto result = RunLoaderTest(Part0(), nullptr);

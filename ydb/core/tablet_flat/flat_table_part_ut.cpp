@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/scheme/scheme_type_registry.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_part.h>
@@ -16,7 +17,7 @@ namespace NKikimr {
 namespace NTable {
 namespace NTest {
 
-Y_UNIT_TEST_SUITE(TLegacy) {
+Y_UNIT_TEST_SUITE_F(TLegacy, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     /* This is legacy place for UT, do not put here more tests */
 

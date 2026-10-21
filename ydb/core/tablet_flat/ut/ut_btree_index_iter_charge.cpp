@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include "flat_page_btree_index.h"
 #include "flat_part_charge_flat_index.h"
 #include "flat_part_index_iter_bree_index.h"
@@ -374,7 +375,7 @@ namespace {
     };
 }
 
-Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIter) {
+Y_UNIT_TEST_SUITE_F(TPartGroupBtreeIndexIter, ::NKikimr::NTable::NTest::TTableCacheTest) {
     void AssertEqual(const TPartGroupBtreeIndexIter& bTree, EReady bTreeReady, const TPartGroupFlatIndexIter& flat, EReady flatReady, const TString& message, bool allowFirstLastPageDifference = false) {
         // Note: it's possible that B-Tree index don't return Gone status for keys before the first page or keys after the last page
         if (allowFirstLastPageDifference && flatReady == EReady::Gone && bTreeReady == EReady::Data &&
@@ -543,7 +544,7 @@ Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIter) {
     }
 }
 
-Y_UNIT_TEST_SUITE(TChargeBTreeIndex) {
+Y_UNIT_TEST_SUITE_F(TChargeBTreeIndex, ::NKikimr::NTable::NTest::TTableCacheTest) {
     void StickSomePages(TTestParams params, const TPartStore& part, TTagsRef tags, const TKeyCellDefaults &keyDefaults, TTouchEnv& bTreeEnv, TTouchEnv& flatEnv) {
         if (params.StickSomePages) {
             TChargeBTreeIndex bTree(&bTreeEnv, part, tags, true);
@@ -862,7 +863,7 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndex) {
     }
 }
 
-Y_UNIT_TEST_SUITE(TPartBtreeIndexIteration) {
+Y_UNIT_TEST_SUITE_F(TPartBtreeIndexIteration, ::NKikimr::NTable::NTest::TTableCacheTest) {
     void MakeRuns(const TPartEggs& eggs, TRun& btreeRun, TRun& flatRun) {
         const auto part = *eggs.Lone();
 
@@ -1366,7 +1367,7 @@ namespace {
 // Section 3.2: V2 twin tests — V2 B-tree produces same results as V1
 // ========================================================================
 
-Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIterV2) {
+Y_UNIT_TEST_SUITE_F(TPartGroupBtreeIndexIterV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     // V2 twin: verify v2 btree iteration produces same results as v1 btree
@@ -1476,7 +1477,7 @@ Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIterV2) {
 
 }
 
-Y_UNIT_TEST_SUITE(TChargeBTreeIndexV2) {
+Y_UNIT_TEST_SUITE_F(TChargeBTreeIndexV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     // Basic sanity: V2 part can be charged (charge returns ready, produces non-zero results)
@@ -1814,7 +1815,7 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndexV2) {
 // V2 reverse-iteration twin for the raw group index
 // ========================================================================
 
-Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIterReverseV2) {
+Y_UNIT_TEST_SUITE_F(TPartGroupBtreeIndexIterReverseV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     // Reverse iteration

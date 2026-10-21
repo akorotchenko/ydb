@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/tablet_flat/flat_dbase_scheme.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_dbase.h>
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
@@ -7,7 +8,7 @@
 
 namespace NKikimr::NTable {
 
-Y_UNIT_TEST_SUITE(DBRowLocks) {
+Y_UNIT_TEST_SUITE_F(DBRowLocks, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     using namespace NTest;
 

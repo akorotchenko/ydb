@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/tablet_flat/flat_part_dump.h>
 #include "ydb/core/tablet_flat/flat_part_charge_range.h"
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
@@ -106,7 +107,7 @@ namespace {
     }
 }
 
-Y_UNIT_TEST_SUITE(TPart) {
+Y_UNIT_TEST_SUITE_F(TPart, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     Y_UNIT_TEST(State)

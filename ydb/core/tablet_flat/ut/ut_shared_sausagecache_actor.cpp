@@ -1,9 +1,10 @@
+#include <ydb/core/tablet_flat/shared_cache_thread_test.h>
 #include <ydb/core/base/counters.h>
 #include <ydb/core/cms/console/console.h>
 #include <ydb/core/protos/bootstrap.pb.h>
 #include <ydb/core/testlib/actors/block_events.h>
 #include <ydb/core/testlib/actors/test_runtime.h>
-#include <ydb/core/testlib/actor_helpers.h>
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/testlib/actors/wait_events.h>
 #include <ydb/core/testlib/basics/appdata.h>
 #include <ydb/core/testlib/basics/helpers.h>
@@ -246,8 +247,8 @@ struct TSharedPageCacheMock {
 
     TSharedPageCacheMock(const TSharedCacheConfig& config = DefaultConfig(), bool enableSchedule = false) {
         TAutoPtr<TAppPrepare> app = new TAppPrepare();
+        TCacheThreadTestAccess::Setup(Runtime);
         Runtime.Initialize(app->Unwrap());
-        CacheContext = MakeHolder<TActorSystemStub>();
         Runtime.SetLogPriority(NKikimrServices::TABLET_EXECUTOR, NLog::PRI_TRACE);
         Runtime.SetLogPriority(NKikimrServices::TABLET_SAUSAGECACHE, NLog::PRI_TRACE);
 
@@ -259,7 +260,6 @@ struct TSharedPageCacheMock {
         TDispatchOptions options;
         options.FinalEvents.emplace_back(NActors::TEvents::TSystem::Bootstrap, 1);
         Runtime.DispatchEvents(options);
-        SyncCacheContext();
 
         Sender1 = Runtime.Register(new TExecutorMock(Results, StickyResults));
         Sender2 = Runtime.Register(new TExecutorMock(Results, StickyResults));
@@ -277,7 +277,6 @@ struct TSharedPageCacheMock {
         Send(Sender1, new TEvents::TEvPoison());
         TWaitForFirstEvent<TEvents::TEvPoison> waiter(Runtime);
         waiter.Wait();
-        SyncCacheContext();
         Results.clear();
         StickyResults.clear();
     }
@@ -288,7 +287,6 @@ struct TSharedPageCacheMock {
 
         TWaitForFirstEvent<TKikimrEvents::TEvWakeup> waiter(Runtime);
         waiter.Wait();
-        SyncCacheContext();
 
         return *this;
     }
@@ -299,7 +297,6 @@ struct TSharedPageCacheMock {
 
         TWaitForFirstEvent<NMemory::TEvConsumerLimit> waiter(Runtime);
         waiter.Wait();
-        SyncCacheContext();
 
         return *this;
     }
@@ -311,7 +308,6 @@ struct TSharedPageCacheMock {
 
         TWaitForFirstEvent<NConsole::TEvConsole::TEvConfigNotificationRequest> waiter(Runtime);
         waiter.Wait();
-        SyncCacheContext();
 
         return *this;
     }
@@ -324,7 +320,6 @@ struct TSharedPageCacheMock {
 
         TWaitForFirstEvent<TEvRequest> waiter(Runtime);
         waiter.Wait();
-        SyncCacheContext();
 
         return *this;
     }
@@ -392,7 +387,6 @@ struct TSharedPageCacheMock {
 
         TWaitForFirstEvent<TEvAttach> waiter(Runtime);
         waiter.Wait();
-        SyncCacheContext();
 
         return *this;
     }
@@ -403,7 +397,6 @@ struct TSharedPageCacheMock {
 
         TWaitForFirstEvent<TEvDetach> waiter(Runtime);
         waiter.Wait();
-        SyncCacheContext();
 
         return *this;
     }
@@ -414,7 +407,6 @@ struct TSharedPageCacheMock {
 
         TWaitForFirstEvent<TEvUnregister> waiter(Runtime);
         waiter.Wait();
-        SyncCacheContext();
 
         return *this;
     }
@@ -427,7 +419,6 @@ struct TSharedPageCacheMock {
                 [&]{return Fetches->size() >= expected.size();}, TDuration::Seconds(5));
         }
 
-        SyncCacheContext();
         TVector<TFetch> actual;
         for (auto& f : *Fetches) {
             auto &fetch = *f->Get();
@@ -453,7 +444,6 @@ struct TSharedPageCacheMock {
                 [&]{return Results.size() >= expected.size();}, TDuration::Seconds(5));
         }
 
-        SyncCacheContext();
         TVector<TFetch> actual;
         THashMap<TPageId, TSharedPageRef> pages;
         for (auto& r : Results) {
@@ -510,15 +500,10 @@ struct TSharedPageCacheMock {
         }
     }
 
-    void SyncCacheContext() {
-        CacheContext->AppData.SharedCache = Runtime.GetAppData().SharedCache;
-    }
-
     void Send(TActorId sender, IEventBase* ev, ui64 cookie = 0) {
         Runtime.Send(new IEventHandle(ActorId, sender, ev, 0, cookie), 0, true);
     }
 
-    THolder<TActorSystemStub> CacheContext;
     TTestActorRuntime Runtime;
     TActorId ActorId;
     ui64 RequestId = 0;
@@ -537,6 +522,23 @@ struct TSharedPageCacheMock {
 };
 
 Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
+    Y_UNIT_TEST(QueuedResultIsAbandonedDuringRuntimeShutdown) {
+        UNIT_ASSERT(!TlsActivationContext && !TlsCacheHazard);
+        {
+            TSharedPageCacheMock sharedCache;
+            UNIT_ASSERT_VALUES_EQUAL(TActivationContext::ActorSystem(), sharedCache.Runtime.GetActorSystem(0));
+            UNIT_ASSERT_VALUES_EQUAL(&TSharedCache::Get(), sharedCache.Runtime.GetAppData().SharedCache.Get());
+            auto source = MakeIntrusiveConst<TPageCollectionMock>(19762, 1);
+            auto page = TSharedCache::Get().AdmitPage(source, _P(0), TSharedData::Copy(TString(10, 'q')));
+            UNIT_ASSERT(page);
+            auto* result = new TEvResult(source, NKikimrProto::OK, 0);
+            result->Pages.emplace_back(_P(0).Offset, page.size(), std::move(page));
+            const auto recipient = sharedCache.Runtime.AllocateEdgeActor();
+            sharedCache.Runtime.Send(new IEventHandle(recipient, {}, result), 0, true);
+        }
+        UNIT_ASSERT(!TlsActivationContext && !TlsCacheHazard);
+    }
+
     void ReviewBootWaitsForCache(bool follower) {
         TBootReadinessState state;
         auto config = TSharedPageCacheMock::DefaultConfig();
@@ -610,6 +612,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         config.SetMemoryLimit(0);
         UNIT_ASSERT_EXCEPTION_CONTAINS(
             TSharedPageCacheMock(config), yexception, "Shared-cache MemoryLimit must be positive");
+        UNIT_ASSERT(!TlsActivationContext && !TlsCacheHazard);
     }
 
     Y_UNIT_TEST(ControllerMaximumSizesCoreBeforeZeroAllocationAdmission) {
@@ -619,10 +622,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(0) });
         sharedCache.CheckFetches({});
         UNIT_ASSERT(!TSharedCache::TryGet());
-        UNIT_ASSERT(!sharedCache.CacheContext->AppData.SharedCache);
         sharedCache.Send(sharedCache.Sender1, new NMemory::TEvConsumerLimit(0, 32_MB));
         sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(0) } } });
-        UNIT_ASSERT(sharedCache.CacheContext->AppData.SharedCache == sharedCache.Runtime.GetAppData().SharedCache);
+        UNIT_ASSERT(TSharedCache::TryGet() == sharedCache.Runtime.GetAppData().SharedCache.Get());
         sharedCache.Provide(sharedCache.Collection1, { _P(0) });
         auto pages = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(0) } } });
         auto* core = &NSharedCache::TSharedCache::Get();
@@ -780,7 +782,6 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1); // Idempotent mode/update registration.
         sharedCache.Attach(sharedCache.Sender2, sharedCache.Collection1);
         auto* core = &NSharedCache::TSharedCache::Get();
-        auto binding = core->BindCurrentThreadHazard();
         TSharedCacheCollectionRef collection;
         UNIT_ASSERT(core->Find(sharedCache.Collection1->Label(), collection) == ESharedCacheResultStatus::Hit);
         const auto item = collection.CacheItem();
@@ -816,8 +817,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         CheckOwnerHoldsReleased(true);
     }
 
-    Y_UNIT_TEST(ApplicationCacheSharesOwnersAcrossThreads) {
+    Y_UNIT_TEST_F(ApplicationCacheSharesOwnersAcrossThreads, NTable::NTest::TTableCacheTest) {
         auto& pages = TSharedCache::Get();
+        auto* actorSystem = &CacheContext().ActorSystem();
         TIntrusiveConstPtr<TPageCollectionMock> source = new TPageCollectionMock(19761, 1);
         auto collection = pages.AdmitCollection(source);
         auto page = pages.AdmitPage(source, _P(0), TSharedData::Copy(TString(10, 's')));
@@ -827,10 +829,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         std::atomic<bool> start{ false };
         TVector<std::thread> threads;
         for (ui32 index = 0; index < 8; ++index) {
-            threads.emplace_back([&, owner = page.Acquire(), metadata = collection.Acquire(),
-                                     cacheOwner = TIntrusivePtr<TSharedCache>(&TSharedCache::Get())] {
-                TActorSystemStub context;
-                context.AppData.SharedCache = cacheOwner;
+            threads.emplace_back([&, index, owner = page.Acquire(), metadata = collection.Acquire()]() mutable {
+                TCacheTestThreadContext context(*actorSystem, TCacheThreadTestAccess::Hazard(pages, index + 1));
                 while (!start.load(std::memory_order_acquire)) {
                     std::this_thread::yield();
                 }
@@ -842,6 +842,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
                     UNIT_ASSERT_VALUES_EQUAL(acquired.data()[0], 's');
                     UNIT_ASSERT_VALUES_EQUAL(metadata->Id(), source->Label());
                 }
+                owner.Drop();
+                metadata.Drop();
             });
         }
         page.Drop();
@@ -980,7 +982,6 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page });
             sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { page } } });
             auto& core = TSharedCache::Get();
-            auto binding = core.BindCurrentThreadHazard();
             TSharedCacheCollectionRef collection;
             UNIT_ASSERT(core.Find(sharedCache.Collection1->Label(), collection) == ESharedCacheResultStatus::Hit);
             const auto item = collection.CacheItem();
@@ -1144,7 +1145,6 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 3 * PAGE_TOTAL_SIZE);
         UNIT_ASSERT_VALUES_EQUAL(TStringBuf(held.at(0).data(), held.at(0).size()), TStringBuf("xxxxxxxxxx"));
         if (stickyInput) {
-            auto binding = cache.BindCurrentThreadHazard();
             TSharedCacheCollectionRef collection;
             UNIT_ASSERT(cache.Find(sharedCache.Collection1->Label(), collection) == ESharedCacheResultStatus::Hit);
             TSharedPageRef unreferenced;
@@ -1221,7 +1221,6 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TWaitForFirstEvent<TEvSaveCompactedPages> waiter(sharedCache.Runtime);
             waiter.Wait();
             auto& core = TSharedCache::Get();
-            auto binding = core.BindCurrentThreadHazard();
             UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
             UNIT_ASSERT_VALUES_EQUAL(page.IsSticky(), retainPartOwnership);
 
@@ -1427,7 +1426,6 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection1, { page });
         auto pages = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { page } } });
         auto* core = &NSharedCache::TSharedCache::Get();
-        auto binding = core->BindCurrentThreadHazard();
         UNIT_ASSERT(pages.at(0).IsSticky());
         TSharedPageRef copy;
         TSharedCacheCollectionRef collection;
@@ -1595,7 +1593,6 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto* core = &NSharedCache::TSharedCache::Get();
         TSharedCacheCollectionRef collection;
         {
-            auto binding = core->BindCurrentThreadHazard();
             UNIT_ASSERT(core->Find(sharedCache.Collection1->Label(), collection) == ESharedCacheResultStatus::Hit);
         }
         UNIT_ASSERT_VALUES_EQUAL(collection->GetActorState()->KeepPreloadRequests.size(), 1);
@@ -1639,7 +1636,6 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Detach(sharedCache.Sender1, sharedCache.Collection1);
         auto* core = &NSharedCache::TSharedCache::Get();
         {
-            auto binding = core->BindCurrentThreadHazard();
             UNIT_ASSERT(core->DeleteCollection(oldItem));
         }
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory, {}, true);
@@ -1758,11 +1754,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         threads.reserve(PageCount);
         for (ui32 index = 0; index < PageCount; ++index) {
             auto page = std::move(admitted.at(index + 1));
-            threads.emplace_back([completion, index, core, owner = TIntrusivePtr<TSharedCache>(&TSharedCache::Get()),
+            threads.emplace_back([completion, index, core, actorSystem = sharedCache.Runtime.GetActorSystem(0),
                                      page = std::move(page)]() mutable {
-                TActorSystemStub context;
-                context.AppData.SharedCache = owner;
-                auto binding = core->BindThreadHazard(index + 1);
+                TCacheTestThreadContext context(*actorSystem, TCacheThreadTestAccess::Hazard(*core, index + 1));
                 completion->Complete(index, std::move(page), EPageFetchCompletion::Ready);
             });
         }
@@ -1933,7 +1927,6 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true, false, false);
         TSharedCacheCollectionRef main;
         {
-            auto binding = core.BindCurrentThreadHazard();
             UNIT_ASSERT(core.Find(sharedCache.Collection1->Label(), main) == ESharedCacheResultStatus::Hit);
         }
         for (ui32 index = 0; index < core.TargetHandleCount() - 4; ++index) {
@@ -1971,7 +1964,6 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto held = HoldAllReviewPageHandles(sharedCache);
         TSharedCacheCollectionRef main;
         {
-            auto binding = TSharedCache::Get().BindCurrentThreadHazard();
             UNIT_ASSERT(
                 TSharedCache::Get().Find(sharedCache.Collection1->Label(), main) == ESharedCacheResultStatus::Hit);
         }
@@ -2059,7 +2051,6 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckFetches({});
         UNIT_ASSERT(sharedCache.Results.empty());
         auto& core = TSharedCache::Get();
-        auto binding = core.BindCurrentThreadHazard();
         TSharedCacheCollectionRef collection;
         UNIT_ASSERT(core.Find(sharedCache.Collection2->Label(), collection) == ESharedCacheResultStatus::Miss);
     }
@@ -2273,7 +2264,6 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         auto* core = &NSharedCache::TSharedCache::Get();
         {
-            auto binding = core->BindCurrentThreadHazard();
             TSharedCacheCollectionRef collection;
             UNIT_ASSERT(core->Find(sharedCache.Collection1->Label(), collection) == ESharedCacheResultStatus::Hit);
             TSharedPageRef page;
@@ -2297,7 +2287,6 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(2), _P(3) });
         {
             auto* core = &NSharedCache::TSharedCache::Get();
-            auto binding = core->BindCurrentThreadHazard();
             TSharedCacheCollectionRef collection;
             UNIT_ASSERT(core->Find(sharedCache.Collection1->Label(), collection) == ESharedCacheResultStatus::Hit);
             TSharedCachePageRequest producer(_P(2), MakeIntrusive<TPageFetchWaiter>());

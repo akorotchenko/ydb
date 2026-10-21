@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include "flat_fwd_cache.h"
 #include "flat_fwd_env.h"
 #include "flat_page_conf.h"
@@ -379,7 +380,7 @@ namespace {
     };
 }
 
-Y_UNIT_TEST_SUITE(NFwd_TBlobs) {
+Y_UNIT_TEST_SUITE_F(NFwd_TBlobs, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NFwd;
     using namespace NTest;
 
@@ -634,7 +635,7 @@ Y_UNIT_TEST_SUITE(NFwd_TBlobs) {
     }
 }
 
-Y_UNIT_TEST_SUITE(NFwd_TLoadedPagesCircularBuffer){
+Y_UNIT_TEST_SUITE_F(NFwd_TLoadedPagesCircularBuffer, ::NKikimr::NTable::NTest::TTableCacheTest){
     Y_UNIT_TEST(Basics) {
         auto buffer = NFwd::TLoadedPagesCircularBuffer<5>();
         NPage::TFrameWriter writer(1);
@@ -671,7 +672,7 @@ Y_UNIT_TEST_SUITE(NFwd_TLoadedPagesCircularBuffer){
     }
 }
 
-Y_UNIT_TEST_SUITE(NFwd_TFlatIndexCache) {
+Y_UNIT_TEST_SUITE_F(NFwd_TFlatIndexCache, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NFwd;
 
     // 20 pages, 50 bytes each
@@ -1013,7 +1014,7 @@ Y_UNIT_TEST_SUITE(NFwd_TFlatIndexCache) {
     }
 }
 
-Y_UNIT_TEST_SUITE(NFwd_TBTreeIndexCache) {
+Y_UNIT_TEST_SUITE_F(NFwd_TBTreeIndexCache, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NFwd;
 
     /**
@@ -1836,7 +1837,7 @@ static TPartEggs CookPartV2() {
     return cook.Finish();
 }
 
-Y_UNIT_TEST_SUITE(NFwd_TBTreeIndexCacheV2) {
+Y_UNIT_TEST_SUITE_F(NFwd_TBTreeIndexCacheV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NFwd;
     using namespace NTest;
 

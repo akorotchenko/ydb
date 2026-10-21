@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include "test/libs/table/test_writer.h"
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
 #include <library/cpp/testing/unittest/registar.h>
@@ -10,7 +11,7 @@ namespace {
 
 // Note: this test requires too much memory when sanitizers are enabled
 #if !defined(_tsan_enabled_) && !defined(_msan_enabled_) && !defined(_asan_enabled_)
-Y_UNIT_TEST_SUITE(TBtreeIndexTPartLarge) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexTPartLarge, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(SmallKeys1GB) {
         TLayoutCook lay;

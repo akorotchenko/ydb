@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <library/cpp/testing/unittest/registar.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_dbase.h>
 
@@ -9,7 +10,7 @@ extern "C" {
 namespace NKikimr {
 namespace NTable {
 
-Y_UNIT_TEST_SUITE(TFlatDatabasePgTest) {
+Y_UNIT_TEST_SUITE_F(TFlatDatabasePgTest, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(BasicTypes) {
         constexpr ui32 tableId = 1;

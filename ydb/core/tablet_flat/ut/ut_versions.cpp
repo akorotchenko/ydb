@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/tablet_flat/flat_table_subset.h>
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
 #include <ydb/core/tablet_flat/test/libs/table/model/large.h>
@@ -88,7 +89,7 @@ namespace {
     }
 }
 
-Y_UNIT_TEST_SUITE(TVersions) {
+Y_UNIT_TEST_SUITE_F(TVersions, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(WreckHead)
     {

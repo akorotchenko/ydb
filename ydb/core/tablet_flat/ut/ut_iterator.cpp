@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/tablet_flat/flat_mem_warm.h>
 #include <ydb/core/tablet_flat/flat_mem_iter.h>
 #include <ydb/core/tablet_flat/flat_table_subset.h>
@@ -56,7 +57,7 @@ namespace {
 using TCheckIter = NTest::TChecker<NTest::TWrapIter, TSubset>;
 using TCheckReverseIter = NTest::TChecker<NTest::TWrapReverseIter, TSubset>;
 
-Y_UNIT_TEST_SUITE(TIterator) {
+Y_UNIT_TEST_SUITE_F(TIterator, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     Y_UNIT_TEST(Basics)

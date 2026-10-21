@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/tablet_flat/flat_dbase_scheme.h>
 #include <ydb/core/tablet_flat/flat_mem_snapshot.h>
 #include <ydb/core/tablet_flat/flat_redo_player.h>
@@ -10,7 +11,7 @@
 namespace NKikimr {
 namespace NTable {
 
-Y_UNIT_TEST_SUITE(DBase) {
+Y_UNIT_TEST_SUITE_F(DBase, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     TAlter MakeAlter(const ui32 table = 1)

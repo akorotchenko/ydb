@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/tablet_flat/flat_bloom_writer.h>
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
 #include <ydb/core/tablet_flat/test/libs/table/model/large.h>
@@ -10,7 +11,7 @@
 namespace NKikimr {
 namespace NTable {
 
-Y_UNIT_TEST_SUITE(Bloom) {
+Y_UNIT_TEST_SUITE_F(Bloom, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
     using TBloomPrefix = TScheme::TTableInfo::TByKeyFilterPrefix;
 

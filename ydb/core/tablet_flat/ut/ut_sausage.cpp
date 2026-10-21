@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include "shared_cache.h"
 #include <ydb/core/tablet_flat/flat_sausage_align.h>
 #include <ydb/core/tablet_flat/flat_sausage_meta.h>
@@ -636,7 +637,7 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         }
     }
 
-    Y_UNIT_TEST(ByteOffset_TryGetPage)
+    Y_UNIT_TEST_F(ByteOffset_TryGetPage, ::NKikimr::NTable::NTest::TTableCacheTest)
     {
         using NTable::IPages;
         using NTable::NPage::TPageLocation;

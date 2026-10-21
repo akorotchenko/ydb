@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include "flat_part_charge_range.h"
 #include "flat_stat_table.h"
 #include "flat_stat_table_mixed_index.h"
@@ -134,7 +135,7 @@ namespace {
     }
 } // namespace
 
-Y_UNIT_TEST_SUITE(BuildStatsPageLifetime) {
+Y_UNIT_TEST_SUITE_F(BuildStatsPageLifetime, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     static_assert(std::is_nothrow_copy_constructible_v<NStats::TKeyView>);
@@ -238,7 +239,6 @@ Y_UNIT_TEST_SUITE(BuildStatsPageLifetime) {
                                           : (4 * part->IndexPages.GetBTree({}).LevelCount() + 4) * pageBudget;
         UNIT_ASSERT(cache.UpdateCurrentLimit(frontierBudget));
         {
-            auto binding = cache.BindCurrentThreadHazard();
             while (cache.EnforceCurrentLimit()) {
             }
         }
@@ -262,7 +262,6 @@ Y_UNIT_TEST_SUITE(BuildStatsPageLifetime) {
                     UNIT_ASSERT_VALUES_EQUAL(workingSet.Bytes, pageSize + TSharedData::OverheadSize);
                     UNIT_ASSERT_VALUES_EQUAL(workingSet.TotalBytes, workingSet.Bytes);
                 }
-                auto binding = cache.BindCurrentThreadHazard();
                 NSharedCache::TSharedCacheCollectionRef collectionRef;
                 UNIT_ASSERT(
                     cache.Find(collection->Label(), collectionRef) == NSharedCache::ESharedCacheResultStatus::Hit);
@@ -296,7 +295,6 @@ Y_UNIT_TEST_SUITE(BuildStatsPageLifetime) {
             copiedView = {};
             UNIT_ASSERT(tracker.Empty());
             {
-                auto binding = cache.BindCurrentThreadHazard();
                 while (cache.EnforceCurrentLimit()) {
                 }
             }
@@ -382,7 +380,7 @@ Y_UNIT_TEST_SUITE(BuildStatsPageLifetime) {
     }
 }
 
-Y_UNIT_TEST_SUITE(BuildStatsFlatIndex) {
+Y_UNIT_TEST_SUITE_F(BuildStatsFlatIndex, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
     const bool WriteBTreeIndex = false;
 
@@ -478,7 +476,7 @@ Y_UNIT_TEST_SUITE(BuildStatsFlatIndex) {
     }
 }
 
-Y_UNIT_TEST_SUITE(BuildStatsMixedIndex) {
+Y_UNIT_TEST_SUITE_F(BuildStatsMixedIndex, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
     const bool WriteBTreeIndex = true;
 
@@ -613,7 +611,7 @@ Y_UNIT_TEST_SUITE(BuildStatsMixedIndex) {
     }
 }
 
-Y_UNIT_TEST_SUITE(BuildStatsBTreeIndex) {
+Y_UNIT_TEST_SUITE_F(BuildStatsBTreeIndex, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
     const bool WriteBTreeIndex = true;
 
@@ -688,7 +686,7 @@ Y_UNIT_TEST_SUITE(BuildStatsBTreeIndex) {
     }
 }
 
-Y_UNIT_TEST_SUITE(BuildStatsHistogram) {
+Y_UNIT_TEST_SUITE_F(BuildStatsHistogram, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     enum TMode {
@@ -1413,7 +1411,7 @@ Y_UNIT_TEST_SUITE(BuildStatsHistogram) {
 // Section 3.4: V2 twin stats tests
 // ========================================================================
 
-Y_UNIT_TEST_SUITE(BuildStatsBTreeIndexV2) {
+Y_UNIT_TEST_SUITE_F(BuildStatsBTreeIndexV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     // Shared twin-conf builder: V1 and V2 differ only in WriteBTreeIndexV2 and

@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
 #include <ydb/core/tablet_flat/test/libs/table/model/large.h>
@@ -12,7 +13,7 @@
 namespace NKikimr {
 namespace NTable {
 
-Y_UNIT_TEST_SUITE(TPartMulti) {
+Y_UNIT_TEST_SUITE_F(TPartMulti, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     Y_UNIT_TEST(Basics)

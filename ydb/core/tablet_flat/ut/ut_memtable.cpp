@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
 #include <ydb/core/tablet_flat/test/libs/table/model/large.h>
@@ -18,7 +19,7 @@ namespace {
 using TCheckIter = NTest::TChecker<NTest::TWrapMemtable, TIntrusiveConstPtr<TMemTable>>;
 using TCheckReverseIter = NTest::TChecker<NTest::TWrapReverseMemtable, TIntrusiveConstPtr<TMemTable>>;
 
-Y_UNIT_TEST_SUITE(Memtable)
+Y_UNIT_TEST_SUITE_F(Memtable, ::NKikimr::NTable::NTest::TTableCacheTest)
 {
     using namespace NTest;
 
