@@ -127,6 +127,58 @@ void TCacheItems<TTraits>::InitializeCollection(
     handle.State.store(initialized.Raw(), std::memory_order_relaxed);
 }
 
+template <class TTraits>
+void TCacheItems<TTraits>::DeletePayload(TCacheCollections<TTraits>& collections, THandle& handle, EItemKind kind,
+    EHandleState state, TCollection* owner) noexcept {
+    Y_DEBUG_ABORT_UNLESS(IsReady(state) || state == EHandleState::Tombstone);
+    Y_DEBUG_ABORT_UNLESS(kind == EItemKind::Page || handle.Body.Collection);
+    const bool hasPayload = kind != EItemKind::Page || bool(handle.Body.PageBuffer);
+    Y_DEBUG_ABORT_UNLESS(state == EHandleState::Tombstone || hasPayload);
+    const ui64 bytes = hasPayload ? PayloadBytes(handle, kind) : 0;
+    if (kind == EItemKind::Page) {
+        if (hasPayload && owner) {
+            collections.AddResidentPageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
+            if (state == EHandleState::Hot || state == EHandleState::Sticky || state == EHandleState::KeepCold) {
+                collections.AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
+            }
+        }
+        handle.Body.PageBuffer.~TBuffer();
+    } else {
+        Y_DEBUG_ABORT_UNLESS(hasPayload);
+        delete std::exchange(handle.Body.Collection, nullptr);
+        Memory_.RemoveCollection(bytes);
+    }
+    if (hasPayload) {
+        const i64 estimatedBytes = static_cast<i64>(bytes);
+        if (state == EHandleState::Hot) {
+            Memory_.Hot().RemoveBytes(estimatedBytes);
+            Memory_.Hot().RemovePage(kind);
+        } else if (state == EHandleState::Sticky) {
+            Memory_.Sticky().RemoveBytes(estimatedBytes);
+            Memory_.Sticky().RemovePage(kind);
+            Memory_.ReleaseStickyOwnedBytes(kind, bytes);
+        } else if (state == EHandleState::KeepCold) {
+            Memory_.KeepCold().RemoveBytes(estimatedBytes);
+            Memory_.KeepCold().RemovePage(kind);
+            Memory_.ReleaseKeepColdOwnedBytes(bytes);
+        } else {
+            Memory_.Cold().RemoveBytes(estimatedBytes);
+            Memory_.Cold().RemovePage(kind);
+            Memory_.RemoveColdItem();
+        }
+        Memory_.RemoveResident(bytes);
+        if (state == EHandleState::Hot || state == EHandleState::Sticky || state == EHandleState::KeepCold) {
+            Memory_.ReleaseRetainedBytes(bytes);
+        }
+        Memory_.ReleasePayloadCharge(bytes, kind);
+        if (kind == EItemKind::Page) {
+            if (Memory_.NotifyResourcesAvailable()) {
+                Traits_.NotifyResourcesAvailable();
+            }
+        }
+    }
+}
+
 // Native item operations are instantiated here for both trait variants
 template class TCacheItems<TProdTraits>;
 template class TCacheItems<TTestTraits>;

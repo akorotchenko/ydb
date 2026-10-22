@@ -554,8 +554,6 @@ private:
 
     void ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
-    void DeletePayload(THandle& handle, EItemKind kind, EHandleState state, TCollection* owner = nullptr) noexcept;
-
     static void DeleteReplacedPage(THandle& handle) noexcept;
 
     bool MatchesCandidateMetadata(

@@ -90,6 +90,10 @@ public:
         return { *this, spaceOp };
     }
 
+    // Payload destruction
+    void DeletePayload(TCacheCollections<TTraits>& collections, THandle& handle, EItemKind kind, EHandleState state,
+        TCollection* owner = nullptr) noexcept;
+
 private:
     // Structural reference acquisition
     TSharedCacheItemRefImpl<TTraits> TryAcquireItemRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
