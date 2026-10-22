@@ -28,7 +28,7 @@ TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::TryAcquireHotEvictionPin(
 }
 
 template <class TTraits>
-TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireHeldPage(
+TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMorePageRef(
     TSpaceOperation& spaceOp, TCacheItem item) noexcept {
     THandle& handle = spaceOp.Handles()[item.Index()];
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
@@ -45,7 +45,7 @@ TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireHeldPage(
 }
 
 template <class TTraits>
-TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireHeldCollection(
+TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMoreCollectionRef(
     TSpaceOperation& spaceOp, TCacheItem item) noexcept {
     THandle& handle = spaceOp.Handles()[item.Index()];
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
