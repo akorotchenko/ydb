@@ -74,7 +74,7 @@ bool TCacheEviction<TTraits>::DemoteKeepCold(
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
         {
-            TOperationItemRef<TTraits> pin(spaceOp, TCacheItem::Make(expected.Version(), coldItem.Index()));
+            TOperationItemRef<TTraits> itemRef(spaceOp, TCacheItem::Make(expected.Version(), coldItem.Index()));
             Traits_.Invoke(ESharedCacheHookPoint::AfterKeepColdDemoted, TCacheItem::FromRaw(coldItem.Raw()));
             const ui64 bytes = Services_.PageBytes(handle);
             Services_.AdvanceColdMembership(handle);
@@ -86,17 +86,17 @@ bool TCacheEviction<TTraits>::DemoteKeepCold(
             if (TCollection* owner = Collections_.BindOperation(spaceOp).PageCollection(handle)) {
                 Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
             }
-            ReleaseColdDemotionPin(spaceOp, pin);
+            ReleaseColdDemotionRef(spaceOp, itemRef);
             return true;
         }
     }
 }
 
 template <class TTraits>
-void TCacheEviction<TTraits>::ReleaseColdDemotionPin(
-    TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin) noexcept {
-    const TCacheItem cacheItem = pin.CacheItem();
-    pin.Disarm();
+void TCacheEviction<TTraits>::ReleaseColdDemotionRef(
+    TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& itemRef) noexcept {
+    const TCacheItem cacheItem = itemRef.CacheItem();
+    itemRef.Disarm();
     // A policy demotion must not readmit the page to KeepCold when releasing its temporary ref.
     if (TCollection* owner = Services_.ReleaseForColdDemotion(spaceOp, cacheItem)) {
         Collections_.BindOperation(spaceOp).DropOwnerReference(*owner);
@@ -163,7 +163,7 @@ void TCacheEviction<TTraits>::RouteKeepCold(TSpaceOperation& spaceOp, TColdCache
             break;
         }
     }
-    TOperationItemRef<TTraits> pin(
+    TOperationItemRef<TTraits> itemRef(
         spaceOp, TCacheItem::Make(THandleState::FromRaw(expectedRaw).Version(), coldItem.Index()));
     if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
         return;
@@ -189,14 +189,14 @@ void TCacheEviction<TTraits>::RouteKeepCold(TSpaceOperation& spaceOp, TColdCache
     if (!WantsKeepCold(spaceOp, handle)) {
         WithdrawKeepColdEntry(spaceOp, queuedItem);
     }
-    pin.Drop();
+    itemRef.Drop();
     TrimKeepCold(spaceOp);
 }
 
 template <class TTraits>
-void TCacheEviction<TTraits>::ReleaseKeepColdPin(
-    TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept {
-    const TCacheItem cacheItem = pin.CacheItem();
+void TCacheEviction<TTraits>::ReleaseKeepColdRef(
+    TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& itemRef, ui32 initialColdVersion) noexcept {
+    const TCacheItem cacheItem = itemRef.CacheItem();
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
     for (;;) {
@@ -205,14 +205,14 @@ void TCacheEviction<TTraits>::ReleaseKeepColdPin(
             (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != initialColdVersion ||
             IsKeepColdQueued(handle) || !WantsKeepCold(spaceOp, handle))
         {
-            pin.Drop();
+            itemRef.Drop();
             return;
         }
         const THandleState desired = expected.DecrementRefs();
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
         {
-            pin.Disarm();
+            itemRef.Disarm();
             RouteKeepCold(spaceOp, TColdCacheItem::Make(initialColdVersion, cacheItem.Index()));
             Services_.NotifyResourcesAvailable();
             return;
@@ -267,9 +267,9 @@ Y_FORCE_INLINE bool TCacheEviction<TTraits>::TakeHotFrequency(
 
 template <class TTraits>
 Y_FORCE_INLINE void TCacheEviction<TTraits>::CompleteHotEviction(TSpaceOperation& spaceOp, THandle& handle,
-    THandleState coldState, ui64 bytes, TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept {
+    THandleState coldState, ui64 bytes, TOperationItemRef<TTraits>& itemRef, ui32 initialColdVersion) noexcept {
     Y_DEBUG_ABORT_UNLESS(coldState.Refs() > 0);
-    Traits_.Invoke(ESharedCacheHookPoint::AfterHotEvictionPublished, pin.CacheItem());
+    Traits_.Invoke(ESharedCacheHookPoint::AfterHotEvictionPublished, itemRef.CacheItem());
     if (Memory_.UpdateColdReclaimable(bytes, coldState.WithState(EHandleState::Hot), coldState)) {
         Services_.NotifyResourcesAvailable();
     }
@@ -287,14 +287,14 @@ Y_FORCE_INLINE void TCacheEviction<TTraits>::CompleteHotEviction(TSpaceOperation
             }
         }
     }
-    ReleaseKeepColdPin(spaceOp, pin, initialColdVersion);
+    ReleaseKeepColdRef(spaceOp, itemRef, initialColdVersion);
 }
 
 template <class TTraits>
 void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept {
     for (;;) {
-        TOperationItemRef<TTraits> evictionPin(spaceOp, Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
-        if (!evictionPin) {
+        TOperationItemRef<TTraits> evictionRef(spaceOp, Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
+        if (!evictionRef) {
             return;
         }
         THandle& handle = spaceOp.Handles()[cacheItem.Index()];
@@ -319,7 +319,7 @@ void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel lev
                 if (handle.State.compare_exchange_strong(
                         hotRaw, cold.Raw(), std::memory_order_relaxed, std::memory_order_relaxed))
                 {
-                    CompleteHotEviction(spaceOp, handle, cold, bytes, evictionPin, coldVersion);
+                    CompleteHotEviction(spaceOp, handle, cold, bytes, evictionRef, coldVersion);
                     return;
                 }
 
@@ -333,7 +333,7 @@ void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel lev
             level = level >= EHotLevel::L2 && frequency > 1 ? EHotLevel::L3 : EHotLevel::L2;
         }
 
-        evictionPin.Drop();
+        evictionRef.Drop();
         const TCacheItem displaced = PutHot(spaceOp, level, cacheItem);
         if (displaced.IsNull()) {
             return;
@@ -357,8 +357,8 @@ template <class TTraits>
 bool TCacheEviction<TTraits>::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
     Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem) && !cacheItem.IsFrozen() && cacheItem.Index() >= 2);
 
-    TOperationItemRef<TTraits> evictionPin(spaceOp, Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
-    if (!evictionPin) {
+    TOperationItemRef<TTraits> evictionRef(spaceOp, Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
+    if (!evictionRef) {
         return false;
     }
     const ui32 index = cacheItem.Index();
@@ -380,7 +380,7 @@ bool TCacheEviction<TTraits>::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem 
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_relaxed, std::memory_order_relaxed))
         {
-            CompleteHotEviction(spaceOp, handle, desired, bytes, evictionPin, coldVersion);
+            CompleteHotEviction(spaceOp, handle, desired, bytes, evictionRef, coldVersion);
             return true;
         }
         if (keep) {
