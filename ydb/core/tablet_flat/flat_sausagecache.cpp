@@ -10,7 +10,6 @@ TSharedPageRef TCollection::TryGetPage(const NTable::NPage::TPageLocation& locat
     if (!cache) {
         return {};
     }
-    auto binding = cache->BindCurrentThreadHazard();
     TSharedCacheCollectionRef collection;
     if (cache->Find(Id(), collection) != ESharedCacheResultStatus::Hit) {
         return {};

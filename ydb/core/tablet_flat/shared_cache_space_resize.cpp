@@ -333,7 +333,7 @@ bool TSharedCacheSpace::TryDrainTransition(TTransition& transition) noexcept {
 
     while (transition.NextHazardIndex_ < HazardSlotCount_) {
         // Pair with registration CAS so late readers observe the published generation.
-        const ui64 hazardState = Hazards_[transition.NextHazardIndex_].State.fetch_add(0, std::memory_order_acq_rel);
+        const ui64 hazardState = Hazards_[transition.NextHazardIndex_]->State.fetch_add(0, std::memory_order_acq_rel);
         if (!SpaceHazardIsDrained(hazardState, transition.Generation_)) {
             return false;
         }

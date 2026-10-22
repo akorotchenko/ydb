@@ -88,65 +88,7 @@ void TSharedCacheSpace::RouteFreeWord(const TSpaceView& view, ui64 raw) noexcept
     }
 }
 
-TSpaceHazardBinding::TSpaceHazardBinding(const TSharedCacheSpace* space, TSpaceHazard* hazard) noexcept
-    : Space_(space)
-    , Hazard_(hazard)
-{
-    Y_DEBUG_ABORT_UNLESS(!TSharedCacheSpace::TlsSpace_);
-    Y_ABORT_UNLESS(!TSharedCacheSpace::TlsHazard_);
-    Y_IF_DEBUG(TSharedCacheSpace::TlsSpace_ = space;)
-    TSharedCacheSpace::TlsHazard_ = hazard;
-}
-
-TSpaceHazardBinding::TSpaceHazardBinding(TSpaceHazardBinding&& other) noexcept
-    : Space_(std::exchange(other.Space_, nullptr))
-    , Hazard_(std::exchange(other.Hazard_, nullptr))
-{}
-
-TSpaceHazardBinding& TSpaceHazardBinding::operator=(TSpaceHazardBinding&& other) noexcept {
-    if (this != &other) {
-        Reset();
-        Space_ = std::exchange(other.Space_, nullptr);
-        Hazard_ = std::exchange(other.Hazard_, nullptr);
-    }
-    return *this;
-}
-
-TSpaceHazardBinding::~TSpaceHazardBinding() {
-    Reset();
-}
-
-void TSpaceHazardBinding::Reset() noexcept {
-    if (Space_) {
-        Y_DEBUG_ABORT_UNLESS(TSharedCacheSpace::TlsSpace_ == Space_);
-        Y_ABORT_UNLESS(TSharedCacheSpace::TlsHazard_ == Hazard_);
-        Y_IF_DEBUG(TSharedCacheSpace::TlsSpace_ = nullptr;)
-        TSharedCacheSpace::TlsHazard_ = nullptr;
-        Y_ABORT_UNLESS(!SpaceHazardIsActive(Hazard_->State.load(std::memory_order_relaxed)));
-        Hazard_->Bound.store(false, std::memory_order_release);
-        Space_ = nullptr;
-        Hazard_ = nullptr;
-    }
-}
-
-TSpaceHazardBinding TSharedCacheSpace::BindThreadHazard(ui32 index) const noexcept {
-    Y_ABORT_UNLESS(index < HazardSlotCount_);
-    bool unbound = false;
-    Y_ABORT_UNLESS(Hazards_[index].Bound.compare_exchange_strong(unbound, true, std::memory_order_acquire));
-    return TSpaceHazardBinding(this, &Hazards_[index]);
-}
-
-TSpaceHazardBinding TSharedCacheSpace::BindAnyThreadHazard() const noexcept {
-    for (ui32 index = 0; index < HazardSlotCount_; ++index) {
-        bool unbound = false;
-        if (Hazards_[index].Bound.compare_exchange_strong(unbound, true, std::memory_order_acquire)) {
-            return TSpaceHazardBinding(this, &Hazards_[index]);
-        }
-    }
-    Y_ABORT("Shared-cache hazard slots exhausted");
-}
-
-TCacheItem TSharedCacheSpace::TakeCutSpare(ui64 allocationLimit) noexcept {
+TCacheItem TSharedCacheSpace::TakeSpareForShrink(ui64 allocationLimit) noexcept {
     const auto take = [allocationLimit](TSpaceHazard& hazard) noexcept {
         ui64 raw = hazard.SpareItem.load(std::memory_order_acquire);
         while (raw != 0) {
@@ -163,7 +105,7 @@ TCacheItem TSharedCacheSpace::TakeCutSpare(ui64 allocationLimit) noexcept {
     };
 
     for (ui32 index = 0; index < HazardSlotCount_; ++index) {
-        TCacheItem cacheItem = take(Hazards_[index]);
+        TCacheItem cacheItem = take(*Hazards_[index]);
         if (!cacheItem.IsNull()) {
             return cacheItem;
         }
@@ -192,7 +134,7 @@ bool TryCalculateSharedCacheFootprint(
         !TryAccumulateProduct(handleCount / 2, sizeof(std::atomic<ui64>), staticBytes) ||
         !TryAccumulateProduct(handleCount / 2, sizeof(std::atomic<ui64>), staticBytes) ||
         !TryAccumulateProduct(handleCount, sizeof(std::atomic<ui64>), staticBytes) ||
-        !TryAccumulateProduct(Max<ui64>(hazardCount, 1), sizeof(TSpaceHazard), staticBytes))
+        !TryAccumulateProduct(Max<ui64>(hazardCount, 1), sizeof(TSpaceHazard) + sizeof(TSpaceHazard*), staticBytes))
     {
         return false;
     }
@@ -243,17 +185,17 @@ bool TryCalculateSharedCacheCapacity(
 }
 
 THolder<TSharedCacheSpace> TSharedCacheSpace::Create(
-    const TSharedCacheCapacity& current, const TSharedCacheCapacity& reserved, ui32 hazardCount)
+    const TSharedCacheCapacity& current, const TSharedCacheCapacity& reserved, const TCacheThreadSubSystem& threads)
 {
     THolder<TSharedCacheSpace> result(new TSharedCacheSpace());
-    if (!result->Initialize(current, reserved, hazardCount)) {
+    if (!result->Initialize(current, reserved, threads)) {
         return nullptr;
     }
     return result;
 }
 
 bool TSharedCacheSpace::Initialize(
-    const TSharedCacheCapacity& current, const TSharedCacheCapacity& reserved, ui32 hazardCount)
+    const TSharedCacheCapacity& current, const TSharedCacheCapacity& reserved, const TCacheThreadSubSystem& threads)
 {
     if (current.AddressBits < MinSharedCacheAddressBits || current.AddressBits > MaxSharedCacheAddressBits ||
         reserved.AddressBits < current.AddressBits || reserved.AddressBits > MaxSharedCacheAddressBits ||
@@ -311,9 +253,13 @@ bool TSharedCacheSpace::Initialize(
             TCacheItem::Make(0, static_cast<ui32>(index)).Raw(), std::memory_order_relaxed);
     }
 
-    HazardSlotCount_ = Max<ui32>(hazardCount, 1);
-    Hazards_ = TArrayHolder<TSpaceHazard>(new TSpaceHazard[HazardSlotCount_]);
-    HazardCount_ = hazardCount;
+    Hazards_.reserve(threads.ThreadCount());
+    for (const auto& hazard : threads.Hazards_) {
+        Hazards_.push_back(hazard.get());
+    }
+    HazardSlotCount_ = Hazards_.size();
+    SetHazardSpace(Hazards_, this);
+    HazardCount_ = threads.ThreadCount();
     Capacity_ = current;
     ReservedCapacity_ = reserved;
     NewestViewOwner_ = std::move(view);

@@ -11,6 +11,8 @@
 #include "ydb/core/tablet_flat/shared_sausagecache.h"
 #include <ydb/core/protos/datashard_config.pb.h>
 
+#include <util/generic/scope.h>
+
 namespace NKikimr {
 namespace NDataShard {
 
@@ -63,7 +65,20 @@ public:
         , TTableStatsCoroBuilderArgs(args)
     {}
 
+#if CORO_THROUGH_THREADS
+    void BeforeResume() override {
+        CacheHazard_ = TlsCacheHazard;
+    }
+#endif
+
     void Run() override {
+#if CORO_THROUGH_THREADS
+        // Borrow the waiting executor's cache record on the coroutine thread
+        TlsCacheHazard = CacheHazard_;
+        Y_DEFER {
+            TlsCacheHazard = nullptr;
+        };
+#endif
         try {
             RunImpl();
         } catch (const TDtorException&) {
@@ -121,13 +136,13 @@ public:
         Send(MakeSharedPageCacheId(), request.Release());
 
         Interrupt();
-        auto ev = WaitForSpecificEvent([this](IEventHandle& event) {
+        auto ev = WaitForStatsEvent([this](IEventHandle& event) {
             if (event.GetTypeRewrite() != NSharedCache::TEvResult::EventType) {
                 return false;
             }
             const auto* result = event.Get<NSharedCache::TEvResult>();
             return result->WaitPad == RequestPad && !result->ResourcesReady;
-        }, &TTableStatsCoroBuilder::ProcessUnexpectedEvent);
+        });
         auto* result = ev->Get<NSharedCache::TEvResult>();
         if (result->WorkingSetTooLarge) {
             throw TExTableStatsError(
@@ -152,6 +167,27 @@ public:
     }
 
 private:
+    template <class TFilter>
+    THolder<IEventHandle> WaitForStatsEvent(TFilter&& filter) {
+        for (;;) {
+            THolder<IEventHandle> event;
+            {
+#if CORO_THROUGH_THREADS
+                TlsCacheHazard = nullptr;
+                Y_DEFER {
+                    // BeforeResume captured the new executor, including teardown's null record
+                    TlsCacheHazard = CacheHazard_;
+                };
+#endif
+                event = WaitForEvent();
+            }
+            if (!event || filter(*event)) {
+                return event;
+            }
+            ProcessUnexpectedEvent(event);
+        }
+    }
+
     void CheckWorkingSet() const {
         const auto& cache = TSharedCache::Get();
         if (RequestWorkingSet.TotalBytes > cache.CurrentLimit() ||
@@ -167,7 +203,6 @@ private:
             requirements.push_back({ id, pages });
         }
         auto& cache = TSharedCache::Get();
-        auto binding = cache.BindCurrentThreadHazard();
         if (cache.WorkingSetExceedsCapacity(RequestPad->RetainedCollections, requirements)) {
             throw TExTableStatsError(
                 ECode::RESOURCE_ALLOCATION_FAILED, "Statistics page working set does not fit the shared cache");
@@ -216,9 +251,9 @@ private:
                             Send(new IEventHandle(EvResume, 0, SelfActorId, {}, nullptr, 0));
 
                             Interrupt();
-                            WaitForSpecificEvent([](IEventHandle& ev) {
+                            WaitForStatsEvent([](IEventHandle& ev) {
                                 return ev.Type == EvResume;
-                            }, &TTableStatsCoroBuilder::ProcessUnexpectedEvent);
+                            });
                             Resume();
                         }
                     },
@@ -231,13 +266,13 @@ private:
                 ev->Stats.Clear();
                 CheckRetainedWorkingSet();
                 if (!ResourcesReady) {
-                    auto ready = WaitForSpecificEvent([this](IEventHandle& event) {
+                    auto ready = WaitForStatsEvent([this](IEventHandle& event) {
                         if (event.GetTypeRewrite() != NSharedCache::TEvResult::EventType) {
                             return false;
                         }
                         const auto* result = event.Get<NSharedCache::TEvResult>();
                         return (result->ResourcesReady || result->WorkingSetTooLarge) && result->WaitPad == RequestPad;
-                    }, &TTableStatsCoroBuilder::ProcessUnexpectedEvent);
+                    });
                     if (ready->Get<NSharedCache::TEvResult>()->WorkingSetTooLarge) {
                         throw TExTableStatsError(ECode::RESOURCE_ALLOCATION_FAILED,
                             "Statistics page working set does not fit the shared cache");
@@ -314,8 +349,10 @@ private:
                 /* priority */ 5,
                 /* cookie */ nullptr));
 
-        auto ev = WaitForSpecificEvent<TEvResourceBroker::TEvResourceAllocated>(&TTableStatsCoroBuilder::ProcessUnexpectedEvent);
-        auto msg = ev->Get();
+        auto ev = WaitForStatsEvent([](IEventHandle& event) {
+            return event.GetTypeRewrite() == TEvResourceBroker::TEvResourceAllocated::EventType;
+        });
+        auto msg = ev->Get<TEvResourceBroker::TEvResourceAllocated>();
         Y_ENSURE(!msg->Cookie.Get(), "Unexpected cookie in TEvResourceAllocated");
         Y_ENSURE(msg->TaskId == 1, "Unexpected task id in TEvResourceAllocated");
     }
@@ -328,6 +365,10 @@ private:
         Spent->Alter(true); // resume measurement
         CoroutineDeadline = GetCycleCountFast() + DurationToCycles(MaxCoroutineExecutionTime);
     }
+
+#if CORO_THROUGH_THREADS
+    TSpaceHazard* CacheHazard_ = nullptr;
+#endif
 
     NStats::TPageTracker PageTracker;
     NStats::TPageTracker::TWorkingSet RequestWorkingSet;

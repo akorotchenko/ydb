@@ -18,13 +18,11 @@ TCollection::~TCollection() {
 
 void TCollection::SetSkipBTreeIndexV1Shadow(bool skip) {
     auto& cache = TSharedCache::Get();
-    auto binding = cache.BindCurrentThreadHazard();
     cache.Collections_.SetSkipBTreeIndexV1Shadow(*this, skip);
 }
 
 void TCollection::DrainStickyPages() {
     auto& cache = TSharedCache::Get();
-    auto binding = cache.BindCurrentThreadHazard();
     auto cacheOp = cache.BeginOperation();
     cacheOp.Collections().DrainStickyPages(*this);
 }

@@ -45,8 +45,7 @@ namespace {
     struct TPartFixture : public benchmark::Fixture {
         using TGroupId = NPage::TGroupId;
 
-        void SetUp(::benchmark::State& state) 
-        {
+        void SetUp(::benchmark::State& state) override {
             Cache = MakeHolder<TTableCacheContext>();
             const bool useBTree = state.range(0);
             const ui32 partsCount = state.range(1);

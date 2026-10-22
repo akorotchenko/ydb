@@ -330,7 +330,6 @@ template <class TTraits>
 NTable::NPage::TPageLocation TPageFetchImpl<TTraits>::Location() const noexcept {
     Y_DEBUG_ABORT_UNLESS(FetchState_);
     TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
-    auto binding = cache.BindCurrentThreadHazard();
     auto spaceOp = cache.BeginOperation();
     const TCacheItem cacheItem = FetchState_->Page().CacheItem();
     Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
@@ -369,7 +368,6 @@ bool TPageFetchImpl<TTraits>::TryReserveMemory() noexcept {
         return false;
     }
     TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
-    auto binding = cache.BindCurrentThreadHazard();
     auto cacheOp = cache.BeginOperation();
     return cacheOp.Fetches().ReserveMemory(FetchState_->Page().CacheItem(), *FetchState_);
 }
@@ -380,7 +378,6 @@ bool TPageFetchImpl<TTraits>::Dispatch() noexcept {
         return false;
     }
     TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
-    auto binding = cache.BindCurrentThreadHazard();
     auto cacheOp = cache.BeginOperation();
     return cacheOp.Fetches().Dispatch(FetchState_->Page().CacheItem(), *FetchState_);
 }
@@ -393,7 +390,6 @@ bool TPageFetchImpl<TTraits>::MakeReady(NActors::TSharedData&& data) noexcept {
     TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
     bool ready;
     {
-        auto binding = cache.BindCurrentThreadHazard();
         auto cacheOp = cache.BeginOperation();
         // The fetch owns the insertion ref represented by FetchState_, without storing a second item identity.
         TOperationItemRef<TTraits> owner(cacheOp, FetchState_->Page().CacheItem());
@@ -417,7 +413,6 @@ bool TPageFetchImpl<TTraits>::FailReady() noexcept {
     }
     bool failed;
     {
-        auto binding = cache->BindCurrentThreadHazard();
         auto cacheOp = cache->BeginOperation();
         TOperationItemRef<TTraits> owner(cacheOp, FetchState_->Page().CacheItem());
         failed = cacheOp.Fetches().Fail(owner, *FetchState_);

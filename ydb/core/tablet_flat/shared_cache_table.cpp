@@ -122,7 +122,6 @@ void TSharedCacheItemRef::Drop() noexcept {
     if (!cacheItem.IsNull()) {
         // A missing resolver is the explicit terminal-shutdown abandonment path.
         if (TSharedCache* cache = TSharedCache::TryGet()) {
-            auto binding = cache->BindCurrentThreadHazard();
             auto cacheOp = cache->BeginOperation();
             cacheOp.Release(cacheItem);
         }

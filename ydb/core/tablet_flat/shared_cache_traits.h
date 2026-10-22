@@ -1,6 +1,7 @@
 #pragma once
 
 #include "shared_cache_item.h"
+#include "shared_cache_thread.h"
 
 namespace NActors {
 class TActorSystem;
@@ -57,7 +58,6 @@ struct TProdTraits {
 
     static void* TryGetCache() noexcept;
     static bool InstallCache(void* cache) noexcept;
-    static ui32 CurrentWorkerIndex() noexcept;
 
     void NotifyResourcesAvailable() const noexcept;
     void NotifyCollectionReleased(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem) const noexcept;
@@ -70,8 +70,6 @@ struct TProdTraits {
 };
 
 struct TTestTraits {
-    inline static thread_local void* CurrentCache = nullptr;
-
     void* Context = nullptr;
     // The TCacheItem argument follows the payload rules documented on ESharedCacheHookPoint.
     void (*Function)(void*, ESharedCacheHookPoint, TCacheItem) noexcept = nullptr;
@@ -92,25 +90,11 @@ struct TTestTraits {
     void NotifyCollectionBytesChanged(const TLogoBlobID&, TCollectionCacheItem) const noexcept {}
 
     static void* TryGetCache() noexcept {
-        return CurrentCache;
+        return TlsCacheHazard ? TlsCacheHazard->TestCache : nullptr;
     }
 
     static bool InstallCache(void*) noexcept {
         return true;
-    }
-
-    static void BindCache(void* cache) noexcept {
-        Y_DEBUG_ABORT_UNLESS(!CurrentCache);
-        CurrentCache = cache;
-    }
-
-    static void UnbindCache(void* cache) noexcept {
-        Y_DEBUG_ABORT_UNLESS(CurrentCache == cache);
-        CurrentCache = nullptr;
-    }
-
-    static ui32 CurrentWorkerIndex() noexcept {
-        return 0;
     }
 };
 
