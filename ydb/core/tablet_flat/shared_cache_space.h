@@ -312,7 +312,7 @@ private:
     friend class TSharedCacheSpace;
     friend class TSharedCacheTestAccess;
     template <class TTraits>
-    friend class TSharedCacheImpl;
+    friend class TCacheCapacity;
 
     void Reset() noexcept {
         Phase_ = ETransitionPhase::Idle;

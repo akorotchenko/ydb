@@ -88,10 +88,8 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     , Collections_(TCacheCollectionServices<TTraits>(*this), Memory_, Table_, static_cast<const TTraits&>(*this))
     , Eviction_(TCacheEvictionServices<TTraits>(*this), Memory_, Table_, Collections_, Policy_,
           static_cast<const TTraits&>(*this))
-    , Resize_(*Space_, Memory_, Eviction_)
+    , Capacity_(TCacheCapacityServices<TTraits>(*this), *Space_, Memory_, Eviction_)
     , Fetches_(TCacheFetchServices<TTraits>(*this), Memory_, Table_, Collections_, static_cast<const TTraits&>(*this))
-    , TargetHandleCount_(Space_->CurrentConfiguration().HandleCount())
-    , HardTarget_(Space_->CurrentConfiguration())
 {
     if constexpr (std::is_same_v<TTraits, TTestTraits>) {
         for (TSpaceHazard* hazard : Space_->Hazards_) {
@@ -2033,10 +2031,9 @@ bool TSharedCache::UpdateHardLimit(ui64 limit) noexcept {
     }
     target.Limit = limit;
 
-    HardTarget_ = target;
-    TargetHandleCount_.store(target.HandleCount(), std::memory_order_relaxed);
+    Capacity_.SetTarget(target);
     Memory_.SetHardLimit(limit);
-    StartHardTransition();
+    Capacity_.StartTransition();
     return true;
 }
 
@@ -2074,57 +2071,7 @@ bool TSharedCache::RunMaintenance() noexcept {
     if (Eviction_.SweepKeepCold(*Space_)) {
         return true;
     }
-    switch (HardTransition_.Phase()) {
-        case ETransitionPhase::Idle:
-            return StartHardTransition();
-
-        case ETransitionPhase::Prepare:
-        case ETransitionPhase::InitializeGrowth:
-            return Resize_.PublishMigrationView(HardTransition_, HotResize_);
-
-        case ETransitionPhase::MigrationDrain:
-            return Resize_.TryDrainTransition(HardTransition_);
-
-        case ETransitionPhase::Migrate: {
-            const TSpaceState state = Space_->CurrentSpaceState();
-            if (state.Resizing()) {
-                return AdvanceBucketResize();
-            }
-            const ui8 targetAddressBits = HardTransition_.TargetConfiguration().AddressBits;
-            if (state.AddressBits() != targetAddressBits) {
-                return Space_->BeginBucketResize(targetAddressBits);
-            }
-            if (HardTransition_.OldConfiguration().AddressBits > targetAddressBits) {
-                switch (ReclaimShrinkCut()) {
-                    case EShrinkCutStatus::Blocked:
-                        return false;
-                    case EShrinkCutStatus::Progress:
-                        return true;
-                    case EShrinkCutStatus::Complete:
-                        break;
-                }
-            }
-            return Resize_.PublishFinalView(HardTransition_, HotResize_);
-        }
-
-        case ETransitionPhase::AppendGrowth:
-            return Resize_.AppendFreeHandles(HardTransition_);
-
-        case ETransitionPhase::FinalDrain:
-            return Resize_.TryDrainTransition(HardTransition_) && Resize_.FinalDrain(HardTransition_);
-
-        case ETransitionPhase::Release:
-        case ETransitionPhase::ReleaseRetry:
-            return Resize_.TryReleaseTransition(HardTransition_);
-
-        case ETransitionPhase::Commit:
-            return CommitTransition(HardTransition_);
-
-        case ETransitionPhase::PublishMigration:
-        case ETransitionPhase::AbandonedForShutdown:
-            return false;
-    }
-    Y_UNREACHABLE();
+    return Capacity_.RunMaintenance(HotResize_);
 }
 
 SHARED_CACHE_TEMPLATE
