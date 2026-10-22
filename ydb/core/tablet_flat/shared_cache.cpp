@@ -832,29 +832,6 @@ void TSharedCache::DiscardCandidate(TCacheItem cacheItem, EItemKind kind) noexce
 }
 
 SHARED_CACHE_TEMPLATE
-TSharedCacheItemRef TSharedCache::BuildExternalRef(EItemKind kind, TCacheItem cacheItem) noexcept {
-    auto spaceOp = BeginOperation();
-    Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem) && !cacheItem.IsFrozen());
-
-    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        const bool validState =
-            kind == EItemKind::Page ? expected.IsReady() : expected.IsSticky() || expected.IsHot() || expected.IsCold();
-        Y_DEBUG_ABORT_UNLESS(
-            cacheItem.Matches(expected) && expected.Kind() == kind && validState && expected.Refs() > 0);
-        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
-        const THandleState desired = expected.IncrementRefs();
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, desired.Raw(), std::memory_order_relaxed, std::memory_order_relaxed))
-        {
-            return TSharedCacheItemRef(cacheItem);
-        }
-    }
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::IsPageSticky(TPageCacheItem page) const noexcept {
     auto spaceOp = Space_->BeginOperation();
     TCacheItem item = page.CacheItem();

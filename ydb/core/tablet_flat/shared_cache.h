@@ -512,8 +512,6 @@ private:
 
     void DiscardCandidate(TCacheItem cacheItem, EItemKind kind) noexcept;
 
-    TSharedCacheItemRefImpl<TTraits> BuildExternalRef(EItemKind kind, TCacheItem cacheItem) noexcept;
-
     bool DetachCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
     bool DeleteCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
     bool DeleteCollection(TCollectionRegistry* registry, TCollectionCacheItem collection) noexcept;
