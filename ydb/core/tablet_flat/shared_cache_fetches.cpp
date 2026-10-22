@@ -1,4 +1,5 @@
 #include "shared_cache_fetches.h"
+#include "shared_cache_items.h"
 #include "shared_cache.h"
 #include "shared_cache_collections.h"
 
@@ -16,11 +17,6 @@ bool TCacheFetchServices<TTraits>::TryReserve(TSpaceOperation& spaceOp, ui64 byt
 template <class TTraits>
 void TCacheFetchServices<TTraits>::ReleaseReservation(ui64 bytes, ui64 pages) noexcept {
     Cache_.ReleaseReservation(bytes, pages);
-}
-
-template <class TTraits>
-ui64 TCacheFetchServices<TTraits>::PageBytes(const THandle& handle) noexcept {
-    return TSharedCacheImpl<TTraits>::PageBytes(handle);
 }
 
 template <class TTraits>
@@ -145,7 +141,7 @@ void TCacheFetches<TTraits>::FinishFailed(TOperationItemRef<TTraits>& finalizerR
     DeletePendingFetch(handle);
     new (&handle.Body.PageBuffer) NActors::TSharedData::TBuffer();
     if (reserved) {
-        Services_.ReleaseReservation(Services_.PageBytes(handle), 1);
+        Services_.ReleaseReservation(TCacheItems<TTraits>::PageBytes(handle), 1);
     }
     const bool begun = Table_.TryBeginErase(spaceOp, finalizerRef.Get(), completing);
     Y_DEBUG_ABORT_UNLESS(begun);
@@ -179,7 +175,7 @@ void TCacheFetches<TTraits>::Finish(
         NActors::TSharedData data = fetch.TakeData();
         DeletePendingFetch(handle);
         new (&handle.Body.PageBuffer) NActors::TSharedData::TBuffer(std::move(data).Extract());
-        const ui64 bytes = Services_.PageBytes(handle);
+        const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
         EHandleState readyState = EHandleState::Hot;
         TCollection* owner = Collections_.BindOperation(spaceOp).PageCollection(handle);
         const bool regular = owner && owner->GetCacheMode() == ECacheMode::Regular &&
@@ -213,7 +209,7 @@ bool TCacheFetches<TTraits>::ReserveMemory(TSpaceOperation& spaceOp, TCacheItem 
     if (!state.IsWaitingForMemory()) {
         return true;
     }
-    const ui64 bytes = Services_.PageBytes(handle);
+    const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
     if (!Services_.TryReserve(spaceOp, bytes, 1)) {
         return false;
     }
@@ -243,7 +239,7 @@ bool TCacheFetches<TTraits>::TryReserveBatch(
         const auto state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
         Y_ABORT_UNLESS(MatchesPendingFetch(handle, state, item, fetch));
         if (state.IsWaitingForMemory()) {
-            bytes += Services_.PageBytes(handle);
+            bytes += TCacheItems<TTraits>::PageBytes(handle);
             waiting.push_back(&fetch);
         }
     }

@@ -346,7 +346,7 @@ void TSharedCache::DeletePayload(THandle& handle, EItemKind kind, EHandleState s
     Y_DEBUG_ABORT_UNLESS(kind == EItemKind::Page || handle.Body.Collection);
     const bool hasPayload = kind != EItemKind::Page || bool(handle.Body.PageBuffer);
     Y_DEBUG_ABORT_UNLESS(state == EHandleState::Tombstone || hasPayload);
-    const ui64 bytes = hasPayload ? PayloadBytes(handle, kind) : 0;
+    const ui64 bytes = hasPayload ? TCacheItems<TTraits>::PayloadBytes(handle, kind) : 0;
     if (kind == EItemKind::Page) {
         if (hasPayload && owner) {
             Collections_.AddResidentPageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
@@ -424,22 +424,6 @@ bool TSharedCache::MatchesCandidateMetadata(
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
     Y_DEBUG_ABORT_UNLESS(existing.Matches(state) && state.IsCollectionKind());
     return handle.Metadata.PayloadBytes == candidate.Bytes;
-}
-
-SHARED_CACHE_TEMPLATE
-ui64 TSharedCache::PayloadBytes(const THandle& handle, EItemKind kind) noexcept {
-    return kind == EItemKind::Page ? PageBytes(handle) : handle.Metadata.PayloadBytes;
-}
-
-SHARED_CACHE_TEMPLATE
-ui64 TSharedCache::PageBytes(const THandle& handle) noexcept {
-    return AccountedPageBytes(handle.Key2OrSize.load(std::memory_order_relaxed));
-}
-
-SHARED_CACHE_TEMPLATE
-ui64 TSharedCache::AccountedPageBytes(ui64 size) noexcept {
-    Y_ABORT_UNLESS(size <= Max<ui64>() - NActors::TSharedData::OverheadSize);
-    return size + NActors::TSharedData::OverheadSize;
 }
 
 SHARED_CACHE_TEMPLATE
@@ -549,7 +533,7 @@ void TSharedCache::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem cacheIt
     Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(state) && !state.IsFree() && !state.IsTombstone() && state.Refs() == 0);
     const bool pending = state.IsPending();
     const bool reserved = pending && !state.IsWaitingForMemory();
-    const ui64 reservedBytes = reserved ? PayloadBytes(handle, state.Kind()) : 0;
+    const ui64 reservedBytes = reserved ? TCacheItems<TTraits>::PayloadBytes(handle, state.Kind()) : 0;
     if (!pending) {
         Y_DEBUG_ABORT_UNLESS(state.IsReady());
         Y_DEBUG_ABORT_UNLESS(!state.IsPageKind() || !state.IsSticky());
@@ -573,7 +557,7 @@ void TSharedCache::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem cacheIt
             cacheOp.Collections().DropPageItemRef(handle);
             handle.Key0.store(0, std::memory_order_relaxed);
             if (state.IsStickyField()) {
-                Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, PageBytes(handle));
+                Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, TCacheItems<TTraits>::PageBytes(handle));
             }
             TCacheFetches<TTraits>::DeletePendingFetch(handle);
         }
@@ -620,7 +604,7 @@ TPageCacheItem TSharedCache::AllocatePage(TCollectionCacheItem collection, ui64 
     NTable::NPage::EPage type, ui32 crc32, EStickyState sticky) noexcept {
     Y_DEBUG_ABORT_UNLESS(type != NTable::NPage::EPage::Undef);
     Y_DEBUG_ABORT_UNLESS(sticky == EStickyState::None || sticky == EStickyState::Sticky);
-    const ui64 bytes = AccountedPageBytes(size);
+    const ui64 bytes = TCacheItems<TTraits>::AccountedPageBytes(size);
     auto cacheOp = BeginOperation();
     const TCacheItem cacheItem = cacheOp.TryAllocateReservedItem(bytes, 1);
     if (!cacheItem.IsNull()) {
@@ -867,7 +851,7 @@ bool TSharedCache::WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheIte
                 continue;
             }
             exceeds |= ++handles > handleLimit;
-            const ui64 charge = AccountedPageBytes(location.Size);
+            const ui64 charge = TCacheItems<TTraits>::AccountedPageBytes(location.Size);
             if (charge > byteLimit - bytes) {
                 exceeds = true;
             } else {
@@ -918,7 +902,7 @@ void TSharedCache::MakeReadyState(
     const THandleState initial = THandleState::FromRaw(expectedRaw);
     Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(initial) && (initial.IsPending() || initial.IsCompleting()));
 
-    const ui64 bytes = PayloadBytes(handle, initial.Kind());
+    const ui64 bytes = TCacheItems<TTraits>::PayloadBytes(handle, initial.Kind());
     const i64 estimatedBytes = static_cast<i64>(bytes);
     EStickyState accountedSticky = initial.Sticky();
     Y_DEBUG_ABORT_UNLESS(accountedSticky == EStickyState::None || accountedSticky == EStickyState::Sticky);
@@ -1039,7 +1023,7 @@ void TSharedCache::InitializePage(TSpaceOperation& spaceOp, TCacheItem cacheItem
     handle.Next.store(TCacheItem::Make(claimed.Version(), 0).Raw(), std::memory_order_relaxed);
     handle.NextInOwner.store(0, std::memory_order_relaxed);
     if (sticky == EStickyState::Sticky) {
-        Memory_.AddStickyOwnedBytes(AccountedPageBytes(size));
+        Memory_.AddStickyOwnedBytes(TCacheItems<TTraits>::AccountedPageBytes(size));
     }
     const THandleState initialized = claimed.WithState(reserved ? EHandleState::Begin : EHandleState::WaitingForMemory)
                                          .WithKind(EItemKind::Page)
@@ -1067,7 +1051,8 @@ void TSharedCache::DiscardCandidate(TCacheItem cacheItem, EItemKind kind) noexce
     auto cacheOp = BeginOperation();
     const THandle& handle = cacheOp.Handles()[cacheItem.Index()];
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    const ui64 reservedBytes = state.IsPending() && !state.IsWaitingForMemory() ? PayloadBytes(handle, kind) : 0;
+    const ui64 reservedBytes =
+        state.IsPending() && !state.IsWaitingForMemory() ? TCacheItems<TTraits>::PayloadBytes(handle, kind) : 0;
     cacheOp.DiscardCandidate(cacheItem, kind, reservedBytes);
 }
 
@@ -1098,10 +1083,10 @@ void TSharedCache::DiscardCandidate(
     if (expected.IsPageKind() && handle.Body.Collection) {
         owner = cacheOp.Collections().PageCollection(handle);
     }
-    UpdateColdReclaimable(PayloadBytes(handle, expected.Kind()), expected, desired);
+    UpdateColdReclaimable(TCacheItems<TTraits>::PayloadBytes(handle, expected.Kind()), expected, desired);
     handle.State.store(desired.Raw(), std::memory_order_release);
     if (expected.IsPageKind() && expected.IsStickyField() && !expected.IsReady()) {
-        Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, PageBytes(handle));
+        Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, TCacheItems<TTraits>::PageBytes(handle));
     }
     if (expected.IsReady()) {
         DeletePayload(handle, expected.Kind(), expected.State(), owner);
@@ -1157,10 +1142,10 @@ typename TSharedCache::EAcquireStatus TSharedCache::TryAcquire(
         {
             continue;
         }
-        UpdateColdReclaimable(PayloadBytes(handle, expected.Kind()), expected, desired);
+        UpdateColdReclaimable(TCacheItems<TTraits>::PayloadBytes(handle, expected.Kind()), expected, desired);
         if (expected.IsKeepCold()) {
             AdvanceColdMembership(handle);
-            const ui64 bytes = PageBytes(handle);
+            const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
             Memory_.KeepCold().TransferBytesTo(Memory_.Hot(), bytes);
             Memory_.KeepCold().TransferPageTo(Memory_.Hot(), EItemKind::Page);
             Memory_.ReleaseKeepColdOwnedBytes(bytes);
@@ -1199,7 +1184,7 @@ TSharedCacheItemRef TSharedCache::TryAcquireStructural(TSpaceOperation& spaceOp,
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_relaxed, std::memory_order_relaxed))
         {
-            UpdateColdReclaimable(PayloadBytes(handle, expected.Kind()), expected, desired);
+            UpdateColdReclaimable(TCacheItems<TTraits>::PayloadBytes(handle, expected.Kind()), expected, desired);
             return TSharedCacheItemRef(cacheItem);
         }
     }
@@ -1371,7 +1356,7 @@ ESharedCacheResultStatus TSharedCache::Find(
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate) noexcept {
     auto cacheOp = BindOperation(spaceOp);
-    const ui64 reservedBytes = AccountedPageBytes(candidate.Size);
+    const ui64 reservedBytes = TCacheItems<TTraits>::AccountedPageBytes(candidate.Size);
     bool reserved = true;
     TCacheItem cacheItem;
     if (candidate.Admission == EPageAdmission::Written) {
@@ -1542,7 +1527,7 @@ bool TSharedCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollection& colle
         candidate.Prepare = cacheOp.Find(candidate.Key, resident) == ESharedCacheResultStatus::Miss &&
                             preparedOffsets.insert(static_cast<ui64>(request.Location.Offset)).second;
         if (candidate.Prepare) {
-            const ui64 pageBytes = AccountedPageBytes(candidate.Size);
+            const ui64 pageBytes = TCacheItems<TTraits>::AccountedPageBytes(candidate.Size);
             if (reservedBytes > Max<ui64>() - pageBytes) {
                 return false;
             }
@@ -1600,7 +1585,7 @@ bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& coll
         cacheOp.InitializePage(cacheItem, collection.CacheItem, candidate.Key.Word(1), candidate.Size, candidate.Type,
             candidate.Crc32, sticky, reserved, true);
         candidate.CacheItem = cacheItem;
-        initializedBytes += AccountedPageBytes(candidate.Size);
+        initializedBytes += TCacheItems<TTraits>::AccountedPageBytes(candidate.Size);
         ++initializedPages;
     }
     return true;
@@ -2147,7 +2132,8 @@ TCollection* TSharedCache::ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cach
         }
         Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(expected) && expected.Refs() > 0);
         if (allowKeepCold && expected.IsCold() && expected.IsPageKind() && expected.Refs() == 1 &&
-            cacheOp.Eviction().WantsKeepCold(handle) && Memory_.TryAddRetainedBytes(PageBytes(handle)))
+            cacheOp.Eviction().WantsKeepCold(handle) &&
+            Memory_.TryAddRetainedBytes(TCacheItems<TTraits>::PageBytes(handle)))
         {
             if (cacheOp.TryReleaseColdPageToKeepCold(cacheItem, expectedRaw)) {
                 return nullptr;
@@ -2187,7 +2173,7 @@ bool TSharedCache::TryReleaseColdPageToKeepCold(
     // The caller has charged RetainedBytes; a failed CAS must roll back every provisional charge.
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     const THandleState expected = THandleState::FromRaw(expectedRaw);
-    const ui64 bytes = PageBytes(handle);
+    const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
     TCollection* owner = cacheOp.Collections().PageCollection(handle);
     if (owner) {
         Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
@@ -2223,7 +2209,7 @@ bool TSharedCache::TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheI
     const bool publishCold = expected.IsCold() && expected.Refs() == 1;
     const bool lastKeepColdRef = expected.IsKeepCold() && expected.Refs() == 1;
     const bool wantsKeepCold = lastKeepColdRef && cacheOp.Eviction().WantsKeepCold(handle);
-    const ui64 coldBytes = publishCold ? PayloadBytes(handle, expected.Kind()) : 0;
+    const ui64 coldBytes = publishCold ? TCacheItems<TTraits>::PayloadBytes(handle, expected.Kind()) : 0;
     // Capture while the native ref protects the payload; detach/reclaim may follow the final CAS.
     const bool notifyCollectionRelease =
         expected.IsCollectionKind() && expected.IsSticky() && expected.Refs() == 1 && expected.IsStickyField() &&

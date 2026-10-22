@@ -577,10 +577,6 @@ private:
         return MatchesCandidateMetadata(spaceOp, candidate.CacheItem, existing);
     }
 
-    static ui64 PayloadBytes(const THandle& handle, EItemKind kind) noexcept;
-    static ui64 AccountedPageBytes(ui64 size) noexcept;
-    static ui64 PageBytes(const THandle& handle) noexcept;
-
     void UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept;
 
     static ui32 AdvanceColdMembership(THandle& handle) noexcept;

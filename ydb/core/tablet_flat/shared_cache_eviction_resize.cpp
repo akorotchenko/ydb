@@ -1,4 +1,5 @@
 #include "shared_cache_eviction.h"
+#include "shared_cache_items.h"
 
 #include <cmath>
 
@@ -207,8 +208,9 @@ ui32 TCacheEviction<TTraits>::MinimumHotSlots(
     const TSharedCacheSpace& space, const TSpaceOperation& spaceOp, bool underPressure) const noexcept {
     const ui64 hotPages = Memory_.Hot().Pages();
     const ui64 hotBytes = Memory_.Hot().Bytes();
-    const ui64 meanPageBytes = hotPages ? Max<ui64>(1, hotBytes / hotPages)
-                                        : Services_.AccountedPageBytes(space.ReservedConfiguration().ExpectedPageSize);
+    const ui64 meanPageBytes =
+        hotPages ? Max<ui64>(1, hotBytes / hotPages)
+                 : TCacheItems<TTraits>::AccountedPageBytes(space.ReservedConfiguration().ExpectedPageSize);
     const ui64 hotMinBytes =
         FractionCeil(EvictableByteBudget(), underPressure ? Policy_.HotMinUnderPressure : Policy_.HotMin);
     const ui64 byteMinimumSlots = hotMinBytes / meanPageBytes + (hotMinBytes % meanPageBytes != 0);

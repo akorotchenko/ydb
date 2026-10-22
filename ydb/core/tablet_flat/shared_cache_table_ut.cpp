@@ -262,7 +262,7 @@ public:
         WithHandle(cache, page.Index(), [&](THandle& handle) {
             const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
             Y_ABORT_UNLESS(state.IsHot() && state.Refs() == 1);
-            const ui64 bytes = cache.PageBytes(handle);
+            const ui64 bytes = TCacheItems<TTestTraits>::PageBytes(handle);
             handle.State.store(state.WithState(EHandleState::KeepCold).Raw(), std::memory_order_relaxed);
             handle.ColdVersion.store(coldVersion, std::memory_order_relaxed);
             cache.Memory_.Hot().RemoveBytes(bytes);
