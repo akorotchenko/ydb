@@ -51,14 +51,7 @@ class TCacheEviction {
 public:
     class TOperation {
     public:
-        bool TrimKeepCold() noexcept {
-            return Eviction_.TrimKeepCold(SpaceOp_);
-        }
-
-        bool ShrinkKeepCold() noexcept {
-            return Eviction_.ShrinkKeepCold(SpaceOp_);
-        }
-
+        // KeepCold routing
         bool WantsKeepCold(const THandle& page) noexcept {
             return Eviction_.WantsKeepCold(SpaceOp_, page);
         }
@@ -83,6 +76,7 @@ public:
             Eviction_.ReleaseKeepColdPin(SpaceOp_, pin, initialColdVersion);
         }
 
+        // Hot routing and eviction
         void RouteHot(EHotLevel level, TCacheItem item) noexcept {
             Eviction_.RouteHot(SpaceOp_, level, item);
         }
@@ -107,6 +101,7 @@ public:
             return Eviction_.ProcessHotAtMinimum(SpaceOp_);
         }
 
+        // Cold routing and reclamation
         bool EraseCold(TColdCacheItem item) noexcept {
             return Eviction_.EraseCold(SpaceOp_, item);
         }
@@ -121,6 +116,15 @@ public:
 
         bool ReclaimKeepCold() noexcept {
             return Eviction_.ReclaimKeepCold(SpaceOp_);
+        }
+
+        // Policy resizing and maintenance
+        bool TrimKeepCold() noexcept {
+            return Eviction_.TrimKeepCold(SpaceOp_);
+        }
+
+        bool ShrinkKeepCold() noexcept {
+            return Eviction_.ShrinkKeepCold(SpaceOp_);
         }
 
         bool Reclaim(TSharedCacheSpace& space, THotResize& hotResize, ui64 bytes = 0) noexcept {
@@ -168,6 +172,7 @@ public:
         return { *this, spaceOp };
     }
 
+    // Policy resizing and maintenance
     bool UpdateKeepColdLimit(ui64 limit) noexcept;
 
     ui64 EvictableByteBudget() const noexcept {
@@ -195,17 +200,16 @@ public:
     void RefreshEvictableByteBudget() noexcept;
 
     bool GrowKeepCold() noexcept;
-    static bool IsKeepColdQueued(const THandle& handle) noexcept;
     void ScheduleKeepColdSweep(ui64 slots) noexcept;
     bool SweepKeepCold(TSharedCacheSpace& space) noexcept;
+
+    // Routing state
+    static bool IsKeepColdQueued(const THandle& handle) noexcept;
 
 private:
     friend class TSharedCacheTestAccess;
 
-    bool TrimKeepCold(TSpaceOperation& spaceOp) noexcept;
-    bool ShrinkKeepCold(TSpaceOperation& spaceOp) noexcept;
-    static ui64 FractionCeil(ui64 value, double fraction) noexcept;
-
+    // KeepCold routing
     bool WantsKeepCold(TSpaceOperation& spaceOp, const THandle& page) noexcept;
     bool DemoteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem item, TPageCacheItem expectedPage = {}) noexcept;
     void ReleaseColdDemotionPin(TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin) noexcept;
@@ -215,6 +219,7 @@ private:
     void ReleaseKeepColdPin(
         TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept;
 
+    // Hot routing and eviction
     TCacheItem PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
     void RouteHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
     static Y_FORCE_INLINE bool TakeHotFrequency(
@@ -227,12 +232,19 @@ private:
     bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem item, bool force = false) noexcept;
     bool ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept;
 
-    static bool ExceedsLimit(ui64 usage, ui64 limit, ui64 bytes) noexcept;
+    // Cold routing and reclamation
     bool EraseCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
     void RouteCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
     bool ReclaimCold(TSpaceOperation& spaceOp) noexcept;
     bool DemoteKeepColdForSoftLimit(TSpaceOperation& spaceOp) noexcept;
     bool ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept;
+
+    // Policy resizing and maintenance
+    bool TrimKeepCold(TSpaceOperation& spaceOp) noexcept;
+    bool ShrinkKeepCold(TSpaceOperation& spaceOp) noexcept;
+    static ui64 FractionCeil(ui64 value, double fraction) noexcept;
+    static bool ExceedsLimit(ui64 usage, ui64 limit, ui64 bytes) noexcept;
+
     // Cooperative reclamation: takes a cold entry and, when cold is empty, lets EnforceCurrentLimit move the
     // hot/cold boundary so that the coldest hot entries become reclaimable.
     bool Reclaim(TSpaceOperation& spaceOp, TSharedCacheSpace& space, THotResize& hotResize, ui64 bytes = 0) noexcept;
@@ -249,12 +261,15 @@ private:
         bool forceShrinkHot = false) noexcept;
 
 private:
+    // Dependencies
     TCacheEvictionServices<TTraits> Services_;
     TCacheMemory& Memory_;
     TSharedCacheTableImpl<TTraits>& Table_;
     TCacheCollections<TTraits>& Collections_;
     const TSharedCachePolicy& Policy_;
     const TTraits& Traits_;
+
+    // Policy resizing state
     ui64 ColdByteBudget_ = Max<ui64>(); // Protected by the shared HotResize lock; watermark calculation input
     std::atomic<ui64> ColdMinBytes_{ 0 };
     std::atomic<ui64> ColdTargetBytes_{ 0 };
