@@ -527,10 +527,6 @@ private:
     void DiscardCandidate(
         TSpaceOperation& spaceOp, TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes = 0) noexcept;
 
-    void InitializePage(TSpaceOperation& spaceOp, TCacheItem cacheItem, TCollectionCacheItem collection, ui64 offset,
-        ui64 size, NTable::NPage::EPage type, ui32 crc32, EStickyState sticky, bool reserved = true,
-        bool collectionOwnerHeld = false) noexcept;
-
     EAcquireStatus TryAcquire(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending,
         TSharedCacheItemRefImpl<TTraits>& ref) noexcept;
 
@@ -758,8 +754,8 @@ public: // Cache helpers
     Y_FORCE_INLINE void InitializePage(TCacheItem cacheItem, TCollectionCacheItem collection, ui64 offset, ui64 size,
         NTable::NPage::EPage type, ui32 crc32, EStickyState sticky, bool reserved = true,
         bool collectionOwnerHeld = false) noexcept {
-        Cache_.InitializePage(
-            SpaceOp_, cacheItem, collection, offset, size, type, crc32, sticky, reserved, collectionOwnerHeld);
+        Items().InitializePage(Cache_.Collections_, cacheItem, collection, offset, size, type, crc32, sticky, reserved,
+            collectionOwnerHeld);
     }
 
     Y_FORCE_INLINE TSharedPageRefImpl<TTraits> BuildPageRef(TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {

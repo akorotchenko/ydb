@@ -7,6 +7,9 @@ namespace NKikimr::NSharedCache {
 class TCacheMemory;
 
 template <class TTraits>
+class TCacheCollections;
+
+template <class TTraits>
 class TCacheItems {
 public:
     class TOperation {
@@ -40,6 +43,13 @@ public:
         }
 
         // Handle initialization
+        void InitializePage(TCacheCollections<TTraits>& collections, TCacheItem cacheItem,
+            TCollectionCacheItem collection, ui64 offset, ui64 size, NTable::NPage::EPage type, ui32 crc32,
+            EStickyState sticky, bool reserved, bool collectionOwnerHeld) noexcept {
+            Items_.InitializePage(SpaceOp_, collections, cacheItem, collection, offset, size, type, crc32, sticky,
+                reserved, collectionOwnerHeld);
+        }
+
         void InitializeCollection(TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept {
             Items_.InitializeCollection(SpaceOp_, cacheItem, id, bytes);
         }
@@ -96,6 +106,9 @@ private:
         const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
 
     // Handle initialization
+    void InitializePage(TSpaceOperation& spaceOp, TCacheCollections<TTraits>& collections, TCacheItem cacheItem,
+        TCollectionCacheItem collection, ui64 offset, ui64 size, NTable::NPage::EPage type, ui32 crc32,
+        EStickyState sticky, bool reserved, bool collectionOwnerHeld) noexcept;
     void InitializeCollection(
         TSpaceOperation& spaceOp, TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept;
 
