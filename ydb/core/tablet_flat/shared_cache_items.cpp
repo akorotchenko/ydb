@@ -7,7 +7,7 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
-TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::TryAcquireHotEvictionPin(
+TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::TryAcquireHotItemRef(
     TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
     if (!spaceOp.Contains(cacheItem) || cacheItem.IsFrozen()) {
         return {};
