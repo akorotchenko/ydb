@@ -740,16 +740,8 @@ public: // Cache helpers
         return Items().BuildCollectionRef(std::move(ref));
     }
 
-    Y_FORCE_INLINE TCollection* ReleaseTombstone(TCacheItem cacheItem) noexcept {
-        return Items().ReleaseTombstone(cacheItem);
-    }
-
     Y_FORCE_INLINE TCollection* ReleaseItem(TCacheItem cacheItem, bool allowKeepCold = true) noexcept {
         return Items().ReleaseItem(cacheItem, allowKeepCold);
-    }
-
-    Y_FORCE_INLINE bool TryReleaseItemRef(TCacheItem cacheItem, ui64& expectedRaw) noexcept {
-        return Items().TryReleaseItemRef(cacheItem, expectedRaw);
     }
 
     Y_FORCE_INLINE void ReleaseReplacing(TCacheItem cacheItem) noexcept {
