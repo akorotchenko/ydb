@@ -588,8 +588,6 @@ private:
         return !candidate.CacheItem.IsNull();
     }
 
-    bool AdvanceBucketResize() noexcept;
-
     bool TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages = 0) noexcept;
     void NotifyResourcesAvailable() noexcept;
     void ReleaseReservation(ui64 bytes, ui64 pages = 0) noexcept;

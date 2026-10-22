@@ -8,6 +8,8 @@ namespace NKikimr::NSharedCache {
 
 class TCacheMemory;
 template <class TTraits>
+class TSharedCacheTableImpl;
+template <class TTraits>
 class TCacheEviction;
 
 enum class EShrinkCutStatus {
@@ -23,7 +25,6 @@ public:
         : Cache_(cache)
     {}
 
-    bool AdvanceBucketResize() noexcept;
     EShrinkCutStatus ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui32 index) noexcept;
     void RefreshSoftLimit() noexcept;
 
@@ -34,10 +35,11 @@ private:
 template <class TTraits>
 class TCacheCapacity {
 public:
-    TCacheCapacity(TCacheCapacityServices<TTraits> services, TSharedCacheSpace& space, TCacheMemory& memory,
-        TCacheEviction<TTraits>& eviction) noexcept
+    TCacheCapacity(TCacheCapacityServices<TTraits> services, TSharedCacheSpace& space,
+        TSharedCacheTableImpl<TTraits>& table, TCacheMemory& memory, TCacheEviction<TTraits>& eviction) noexcept
         : Services_(services)
         , Space_(space)
+        , Table_(table)
         , Memory_(memory)
         , Eviction_(eviction)
         , TargetHandleCount_(space.CurrentConfiguration().HandleCount())
@@ -60,6 +62,7 @@ public:
 private:
     friend class TSharedCacheTestAccess;
 
+    // Capacity transitions
     bool PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept;
     bool PublishMigrationView(TTransition& transition, THotResize& hotResize) noexcept;
     bool TryDrainTransition(TTransition& transition) noexcept;
@@ -69,13 +72,22 @@ private:
     bool TryReleaseTransition(TTransition& transition) noexcept;
     bool CommitTransition(TTransition& transition) noexcept;
     bool AbandonTransition(TTransition& transition) noexcept;
+
+    // Bucket transitions
+    bool AdvanceBucketResize() noexcept;
+
+    // Shrink work
     EShrinkCutStatus ReclaimShrinkCut() noexcept;
 
 private:
+    // Dependencies
     TCacheCapacityServices<TTraits> Services_;
     TSharedCacheSpace& Space_;
+    TSharedCacheTableImpl<TTraits>& Table_;
     TCacheMemory& Memory_;
     TCacheEviction<TTraits>& Eviction_;
+
+    // Capacity state
     std::atomic<ui64> TargetHandleCount_;
     TSharedCacheCapacity Target_;
     TTransition Transition_;
