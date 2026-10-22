@@ -86,7 +86,7 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     , Table_(*Space_, *this)
     , Memory_(Space_->CurrentConfiguration().StaticBytes, hardLimit, Space_->ReservedConfiguration().Limit)
     , Collections_(TCacheCollectionServices<TTraits>(*this), Memory_, Table_, static_cast<const TTraits&>(*this))
-    , Eviction_(TCacheEvictionServices<TTraits>(*this), Memory_, Table_, Collections_, Policy_,
+    , Eviction_(TCacheEvictionServices<TTraits>(*this), Items_, Memory_, Table_, Collections_, Policy_,
           static_cast<const TTraits&>(*this))
     , Capacity_(TCacheCapacityServices<TTraits>(*this), *Space_, Table_, Memory_, Eviction_)
     , Fetches_(TCacheFetchServices<TTraits>(*this), Memory_, Table_, Collections_, static_cast<const TTraits&>(*this))

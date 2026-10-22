@@ -4,6 +4,7 @@
 #include "shared_cache_collections.h"
 #include "shared_cache_eviction.h"
 #include "shared_cache_fetches.h"
+#include "shared_cache_items.h"
 #include "shared_cache_memory.h"
 #include "shared_cache_capacity.h"
 #include "shared_cache_table.h"
@@ -670,7 +671,6 @@ private:
     static bool AdvanceColdMembership(
         THandle& handle, ui32 expectedVersion, bool keepColdQueued, ui32& newVersion) noexcept;
 
-    TSharedCacheItemRefImpl<TTraits> TryAcquireHotEvictionPin(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
     bool DrainHotResize() noexcept;
     void RefreshSoftLimit() noexcept;
     TSharedCacheItemRefImpl<TTraits> TryAcquirePageForRelocation(TSpaceOperation& spaceOp, ui32 index) noexcept;
@@ -687,6 +687,7 @@ private:
     THolder<TSharedCacheSpace> Space_;
     TSharedCacheTableImpl<TTraits> Table_;
     TCacheMemory Memory_;
+    TCacheItems<TTraits> Items_;
     TCacheCollections<TTraits> Collections_;
     TCacheEviction<TTraits> Eviction_;
     TCacheCapacity<TTraits> Capacity_;
@@ -911,6 +912,10 @@ public: // Cache helpers
 
     Y_FORCE_INLINE typename TCacheEviction<TTraits>::TOperation Eviction() noexcept {
         return Cache_.Eviction_.BindOperation(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE typename TCacheItems<TTraits>::TOperation Items() noexcept {
+        return Cache_.Items_.BindOperation(SpaceOp_);
     }
 
     Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> TryAcquirePageForRelocation(ui32 index) noexcept {
