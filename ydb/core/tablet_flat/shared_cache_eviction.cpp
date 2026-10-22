@@ -293,8 +293,7 @@ Y_FORCE_INLINE void TCacheEviction<TTraits>::CompleteHotEviction(TSpaceOperation
 template <class TTraits>
 void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept {
     for (;;) {
-        TOperationItemRef<TTraits> evictionPin(
-            spaceOp, Items_.BindOperation(spaceOp).TryAcquireHotEvictionPin(cacheItem));
+        TOperationItemRef<TTraits> evictionPin(spaceOp, Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
         if (!evictionPin) {
             return;
         }
@@ -358,7 +357,7 @@ template <class TTraits>
 bool TCacheEviction<TTraits>::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
     Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem) && !cacheItem.IsFrozen() && cacheItem.Index() >= 2);
 
-    TOperationItemRef<TTraits> evictionPin(spaceOp, Items_.BindOperation(spaceOp).TryAcquireHotEvictionPin(cacheItem));
+    TOperationItemRef<TTraits> evictionPin(spaceOp, Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
     if (!evictionPin) {
         return false;
     }

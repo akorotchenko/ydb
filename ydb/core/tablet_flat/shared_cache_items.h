@@ -10,8 +10,8 @@ public:
     class TOperation {
     public:
         // Native pin acquisition
-        TSharedCacheItemRefImpl<TTraits> TryAcquireHotEvictionPin(TCacheItem item) noexcept {
-            return Items_.TryAcquireHotEvictionPin(SpaceOp_, item);
+        TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TCacheItem item) noexcept {
+            return Items_.TryAcquireHotItemRef(SpaceOp_, item);
         }
 
         TSharedCacheItemRefImpl<TTraits> AcquireMorePageRef(TCacheItem item) noexcept {
@@ -48,7 +48,7 @@ public:
 
 private:
     // Native pin acquisition
-    TSharedCacheItemRefImpl<TTraits> TryAcquireHotEvictionPin(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+    TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     TSharedCacheItemRefImpl<TTraits> AcquireMorePageRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     TSharedCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
 
