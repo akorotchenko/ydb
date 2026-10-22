@@ -315,14 +315,14 @@ Y_FORCE_INLINE TCollection* TCacheItems<TTraits>::ReleaseItem(
                 expectedRaw = checked.Raw();
                 continue;
             }
-            Cache_.CompleteColdPageRelease(ownerRef);
+            cacheOp.Eviction().CompleteColdPageRelease(ownerRef);
             return nullptr;
         }
         Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(expected) && expected.Refs() > 0);
         if (allowKeepCold && expected.IsCold() && expected.IsPageKind() && expected.Refs() == 1 &&
             cacheOp.Eviction().WantsKeepCold(handle) && Cache_.Memory_.TryAddRetainedBytes(PageBytes(handle)))
         {
-            if (cacheOp.TryReleaseColdPageToKeepCold(cacheItem, expectedRaw)) {
+            if (cacheOp.Eviction().TryReleaseColdPageToKeepCold(cacheItem, expectedRaw)) {
                 return nullptr;
             }
             continue;

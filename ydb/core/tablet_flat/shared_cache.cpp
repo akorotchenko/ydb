@@ -1647,61 +1647,6 @@ void TSharedCache::Release(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexc
     }
 }
 
-SHARED_CACHE_TEMPLATE
-void TSharedCache::CompleteColdPageRelease(TOperationItemRef& ownerRef) noexcept {
-    TSpaceOperation& spaceOp = ownerRef.SpaceOperation();
-    auto cacheOp = BindOperation(spaceOp);
-    const TCacheItem cacheItem = ownerRef.CacheItem();
-    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    InvokeHook(ESharedCacheHookPoint::AfterTombstoneOwnerClaim, cacheItem);
-    if (TCollection* owner = cacheOp.Collections().PageCollection(handle);
-        owner && owner->CacheMode_.load(std::memory_order_acquire) == ECacheMode::TryKeepInMemory &&
-        owner->IsKeepAllowedPage(handle.Metadata.Page.Type)) {
-        this->NotifyKeepPageEviction(owner->Id(), owner->CacheItem, owner->KeepGeneration(),
-            NTable::NPage::TPageLocation(
-                NTable::NPage::TPageOffset::FromRaw(handle.Key1.load(std::memory_order_relaxed)),
-                handle.Key2OrSize.load(std::memory_order_relaxed), handle.Metadata.Page.Type,
-                handle.Metadata.Page.Crc32));
-    }
-    AdvanceColdMembership(handle);
-    cacheOp.FinishErase(cacheItem, LoadSharedCacheKey(handle, EItemKind::Page));
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::TryReleaseColdPageToKeepCold(
-    TSpaceOperation& spaceOp, TCacheItem cacheItem, ui64& expectedRaw) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    // The caller has charged RetainedBytes; a failed CAS must roll back every provisional charge.
-    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    const THandleState expected = THandleState::FromRaw(expectedRaw);
-    const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
-    TCollection* owner = cacheOp.Collections().PageCollection(handle);
-    if (owner) {
-        Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
-    }
-    Memory_.AddKeepColdOwnedBytes(bytes);
-    // Preserve this reference until membership and accounting are ready for the unreferenced handoff.
-    const THandleState desired = expected.WithState(EHandleState::KeepCold);
-    if (handle.State.compare_exchange_weak(
-            expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
-    {
-        TOperationItemRef itemRef(spaceOp, cacheItem);
-        InvokeHook(ESharedCacheHookPoint::AfterKeepColdPromotion, cacheItem);
-        const ui32 coldVersion = AdvanceColdMembership(handle);
-        Memory_.Cold().TransferBytesTo(Memory_.KeepCold(), bytes);
-        Memory_.Cold().TransferPageTo(Memory_.KeepCold(), EItemKind::Page);
-        Memory_.RemoveColdItem();
-        cacheOp.Eviction().ReleaseKeepColdRef(itemRef, coldVersion);
-        return true;
-    }
-    Memory_.ReleaseKeepColdOwnedBytes(bytes);
-    Memory_.ReleaseRetainedBytes(bytes);
-    if (owner) {
-        Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
-    }
-    return false;
-}
-
 #undef TSharedCacheCollectionRef
 #undef TSharedCacheItemRef
 #undef TOperationItemRef
