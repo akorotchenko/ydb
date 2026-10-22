@@ -57,14 +57,6 @@ public:
             return Items_.ReleaseItem(SpaceOp_, cacheItem, allowKeepCold);
         }
 
-        TCollection* ReleaseTombstone(TCacheItem cacheItem) noexcept {
-            return Items_.ReleaseTombstone(SpaceOp_, cacheItem);
-        }
-
-        Y_FORCE_INLINE bool TryReleaseItemRef(TCacheItem cacheItem, ui64& expectedRaw) noexcept {
-            return Items_.TryReleaseItemRef(SpaceOp_, cacheItem, expectedRaw);
-        }
-
         // Allocation
         ui32 TryAllocateHandle() noexcept {
             return Items_.TryAllocateHandle(SpaceOp_);
@@ -288,7 +280,7 @@ Y_FORCE_INLINE TCollection* TCacheItems<TTraits>::ReleaseItem(
     for (;;) {
         const THandleState expected = THandleState::FromRaw(expectedRaw);
         if (cacheItem.Matches(expected) && expected.IsTombstone()) {
-            return cacheOp.ReleaseTombstone(cacheItem);
+            return ReleaseTombstone(spaceOp, cacheItem);
         }
         if (cacheItem.Matches(expected) && expected.IsReplacing()) {
             cacheOp.ReleaseReplacing(cacheItem);
@@ -327,7 +319,7 @@ Y_FORCE_INLINE TCollection* TCacheItems<TTraits>::ReleaseItem(
             }
             continue;
         }
-        if (cacheOp.TryReleaseItemRef(cacheItem, expectedRaw)) {
+        if (TryReleaseItemRef(spaceOp, cacheItem, expectedRaw)) {
             return nullptr;
         }
     }
