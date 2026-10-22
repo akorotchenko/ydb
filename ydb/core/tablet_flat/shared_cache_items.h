@@ -1,6 +1,6 @@
 #pragma once
 
-#include "shared_cache_table.h"
+#include "shared_cache_ref.h"
 
 namespace NKikimr::NSharedCache {
 

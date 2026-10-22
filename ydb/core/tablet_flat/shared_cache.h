@@ -6,11 +6,11 @@
 #include "shared_cache_fetches.h"
 #include "shared_cache_items.h"
 #include "shared_cache_memory.h"
+#include "shared_cache_ref.h"
 #include "shared_cache_capacity.h"
 #include "shared_cache_table.h"
 
 #include <util/generic/function_ref.h>
-#include <util/generic/noncopyable.h>
 
 #include <new>
 #include <type_traits>
@@ -20,81 +20,6 @@ namespace NKikimr::NSharedCache {
 struct TSharedCacheHandleRequirement {
     TLogoBlobID CollectionId;
     TArrayRef<const NTable::NPage::TPageLocation> Pages;
-};
-
-template <class TTraits = TProdTraits>
-class TSharedPageRefImpl : private TMoveOnly {
-public:
-    TSharedPageRefImpl() noexcept = default;
-    TSharedPageRefImpl(TSharedPageRefImpl&& other) noexcept;
-    TSharedPageRefImpl& operator=(TSharedPageRefImpl&& other) noexcept;
-
-    explicit operator bool() const noexcept {
-        return bool(Ref_);
-    }
-
-    TPageCacheItem CacheItem() const noexcept;
-    const char* data() const noexcept;
-    size_t size() const noexcept;
-    NActors::TSharedData BuildSharedData() const noexcept;
-    // Construct an independent owner only when moving or borrowing cannot preserve the required lifetime.
-    TSharedPageRefImpl Acquire() const& noexcept;
-    NTable::NPage::TPageOffset GetOffset() const noexcept;
-    NTable::NPage::TPageLocation GetLocation() const noexcept;
-    TLogoBlobID GetCollectionId() const noexcept;
-    NTable::NPage::EPage GetType() const noexcept;
-    bool IsSticky() const noexcept;
-    void Drop() noexcept;
-
-private:
-    friend class TSharedCacheImpl<TTraits>;
-
-    explicit TSharedPageRefImpl(TSharedCacheItemRefImpl<TTraits>&& ref) noexcept;
-
-    template <class TCallback>
-    decltype(auto) WithHandle(TCallback&& callback) const noexcept;
-
-private:
-    TSharedCacheItemRefImpl<TTraits> Ref_;
-};
-
-template <class TTraits = TProdTraits>
-class TSharedCacheCollectionRefImpl : private TMoveOnly {
-public:
-    TSharedCacheCollectionRefImpl() noexcept = default;
-    TSharedCacheCollectionRefImpl(TSharedCacheCollectionRefImpl&& other) noexcept;
-    TSharedCacheCollectionRefImpl& operator=(TSharedCacheCollectionRefImpl&& other) noexcept;
-
-    explicit operator bool() const noexcept {
-        return bool(Ref_);
-    }
-
-    TCollectionCacheItem CacheItem() const noexcept;
-    TCollection& GetCollection() const noexcept;
-    TSharedCacheCollectionRefImpl Acquire() const& noexcept;
-    bool IsSoleReference() const noexcept;
-
-    TCollection* Get() const noexcept {
-        return Ref_ ? &GetCollection() : nullptr;
-    }
-
-    TCollection* operator->() const noexcept {
-        return &GetCollection();
-    }
-
-    TCollection& operator*() const noexcept {
-        return GetCollection();
-    }
-
-    void Drop() noexcept;
-
-private:
-    friend class TSharedCacheImpl<TTraits>;
-
-    explicit TSharedCacheCollectionRefImpl(TSharedCacheItemRefImpl<TTraits>&& ref) noexcept;
-
-private:
-    TSharedCacheItemRefImpl<TTraits> Ref_;
 };
 
 template <class TTraits = TProdTraits>
