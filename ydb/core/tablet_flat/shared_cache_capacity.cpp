@@ -4,16 +4,6 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
-EShrinkCutStatus TCacheCapacityServices<TTraits>::ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui32 index) noexcept {
-    return Cache_.ReclaimShrinkHandle(spaceOp, index);
-}
-
-template <class TTraits>
-void TCacheCapacityServices<TTraits>::RefreshSoftLimit() noexcept {
-    Cache_.RefreshSoftLimit();
-}
-
-template <class TTraits>
 void TCacheCapacity<TTraits>::SetTarget(const TSharedCacheCapacity& target) noexcept {
     Target_ = target;
     TargetHandleCount_.store(target.HandleCount(), std::memory_order_relaxed);
@@ -21,51 +11,51 @@ void TCacheCapacity<TTraits>::SetTarget(const TSharedCacheCapacity& target) noex
 
 template <class TTraits>
 bool TCacheCapacity<TTraits>::PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept {
-    const ui64 currentStaticBytes = Space_.CurrentConfiguration().StaticBytes;
+    const ui64 currentStaticBytes = Cache_.Space_->CurrentConfiguration().StaticBytes;
     const ui64 staticDeltaBytes = target.StaticBytes > currentStaticBytes ? target.StaticBytes - currentStaticBytes : 0;
     if (staticDeltaBytes != 0) {
-        Memory_.PrepareStaticResize(staticDeltaBytes);
+        Cache_.Memory_.PrepareStaticResize(staticDeltaBytes);
     }
-    if (Space_.PrepareTransition(target, transition)) {
+    if (Cache_.Space_->PrepareTransition(target, transition)) {
         return true;
     }
     if (staticDeltaBytes != 0) {
-        Memory_.CancelStaticResize(staticDeltaBytes);
+        Cache_.Memory_.CancelStaticResize(staticDeltaBytes);
     }
     return false;
 }
 
 template <class TTraits>
-bool TCacheCapacity<TTraits>::PublishMigrationView(TTransition& transition, THotResize& hotResize) noexcept {
-    if (auto hotResizeGuard = hotResize.TryLock()) {
-        return Space_.PublishMigrationView(transition);
+bool TCacheCapacity<TTraits>::PublishMigrationView(TTransition& transition) noexcept {
+    if (auto hotResizeGuard = Cache_.HotResize_.TryLock()) {
+        return Cache_.Space_->PublishMigrationView(transition);
     }
     return false;
 }
 
 template <class TTraits>
 bool TCacheCapacity<TTraits>::TryDrainTransition(TTransition& transition) noexcept {
-    return Space_.TryDrainTransition(transition);
+    return Cache_.Space_->TryDrainTransition(transition);
 }
 
 template <class TTraits>
-bool TCacheCapacity<TTraits>::PublishFinalView(TTransition& transition, THotResize& hotResize) noexcept {
-    if (auto hotResizeGuard = hotResize.TryLock()) {
-        if (hotResize.Phase() == EHotResizePhase::Cut) {
-            auto spaceOp = Space_.BeginOperation();
-            Eviction_.BindOperation(spaceOp).DrainHotResize(Space_, hotResize);
+bool TCacheCapacity<TTraits>::PublishFinalView(TTransition& transition) noexcept {
+    if (auto hotResizeGuard = Cache_.HotResize_.TryLock()) {
+        if (Cache_.HotResize_.Phase() == EHotResizePhase::Cut) {
+            auto spaceOp = Cache_.Space_->BeginOperation();
+            Cache_.Eviction_.BindOperation(spaceOp).DrainHotResize();
         }
-        if (hotResize.Phase() != EHotResizePhase::Idle) {
+        if (Cache_.HotResize_.Phase() != EHotResizePhase::Idle) {
             return false;
         }
-        return Space_.PublishFinalView(transition);
+        return Cache_.Space_->PublishFinalView(transition);
     }
     return false;
 }
 
 template <class TTraits>
 bool TCacheCapacity<TTraits>::AppendFreeHandles(TTransition& transition) noexcept {
-    return Space_.AppendFreeHandles(transition);
+    return Cache_.Space_->AppendFreeHandles(transition);
 }
 
 template <class TTraits>
@@ -74,7 +64,7 @@ bool TCacheCapacity<TTraits>::StartTransition() noexcept {
         return false;
     }
 
-    const TSharedCacheCapacity& current = Space_.CurrentConfiguration();
+    const TSharedCacheCapacity& current = Cache_.Space_->CurrentConfiguration();
     if (current.AddressBits == Target_.AddressBits) {
         return false;
     }
@@ -83,25 +73,25 @@ bool TCacheCapacity<TTraits>::StartTransition() noexcept {
         current.AddressBits < Target_.AddressBits ? current.AddressBits + 1 : current.AddressBits - 1;
     TSharedCacheCapacity next;
     if (!TryCalculateSharedCacheFootprint(
-            nextAddressBits, current.ExpectedPageSize, current.FixedBytes, Space_.HazardCount(), next))
+            nextAddressBits, current.ExpectedPageSize, current.FixedBytes, Cache_.Space_->HazardCount(), next))
     {
         return false;
     }
-    next.Limit = Memory_.HardLimit();
+    next.Limit = Cache_.Memory_.HardLimit();
     return PrepareTransition(next, Transition_);
 }
 
 template <class TTraits>
 bool TCacheCapacity<TTraits>::FinalDrain(TTransition& transition) noexcept {
-    auto spaceOp = Space_.BeginOperation();
-    auto evictionOp = Eviction_.BindOperation(spaceOp);
-    return Space_.FinalDrain(
+    auto spaceOp = Cache_.Space_->BeginOperation();
+    auto evictionOp = Cache_.Eviction_.BindOperation(spaceOp);
+    return Cache_.Space_->FinalDrain(
         transition,
         [&](ui32 level, ui64 raw) noexcept {
             evictionOp.RouteHot(static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
         },
         [&](ui64 raw) noexcept {
-            Memory_.RemoveColdRingEntry();
+            Cache_.Memory_.RemoveColdRingEntry();
             evictionOp.RouteCold(TColdCacheItem::FromRaw(raw));
         },
         [&](ui64 raw) noexcept {
@@ -111,7 +101,7 @@ bool TCacheCapacity<TTraits>::FinalDrain(TTransition& transition) noexcept {
 
 template <class TTraits>
 bool TCacheCapacity<TTraits>::TryReleaseTransition(TTransition& transition) noexcept {
-    return Space_.TryReleaseTransition(transition);
+    return Cache_.Space_->TryReleaseTransition(transition);
 }
 
 template <class TTraits>
@@ -121,16 +111,16 @@ bool TCacheCapacity<TTraits>::CommitTransition(TTransition& transition) noexcept
     const ui64 targetLimit = transition.TargetConfiguration().Limit;
     const ui64 targetHandleCount = transition.TargetConfiguration().HandleCount();
     const bool commitTargetLimit = &transition != &Transition_;
-    if (!Space_.CommitTransition(transition)) {
+    if (!Cache_.Space_->CommitTransition(transition)) {
         return false;
     }
 
-    Memory_.CommitStaticResize(oldStaticBytes, targetStaticBytes);
+    Cache_.Memory_.CommitStaticResize(oldStaticBytes, targetStaticBytes);
     if (commitTargetLimit) {
         TargetHandleCount_.store(targetHandleCount, std::memory_order_relaxed);
-        Memory_.SetHardLimit(targetLimit);
+        Cache_.Memory_.SetHardLimit(targetLimit);
     }
-    Services_.RefreshSoftLimit();
+    Cache_.RefreshSoftLimit();
     return true;
 }
 
@@ -139,14 +129,14 @@ bool TCacheCapacity<TTraits>::AbandonTransition(TTransition& transition) noexcep
     const ETransitionPhase phase = transition.Phase();
     const ui64 oldStaticBytes = transition.OldConfiguration().StaticBytes;
     const ui64 targetStaticBytes = transition.TargetConfiguration().StaticBytes;
-    if (!Space_.AbandonTransition(transition)) {
+    if (!Cache_.Space_->AbandonTransition(transition)) {
         return false;
     }
     if ((phase == ETransitionPhase::Prepare || phase == ETransitionPhase::InitializeGrowth) &&
         targetStaticBytes > oldStaticBytes)
     {
         const ui64 delta = targetStaticBytes - oldStaticBytes;
-        Memory_.CancelStaticResize(delta);
+        Cache_.Memory_.CancelStaticResize(delta);
     }
     return true;
 }
@@ -155,9 +145,9 @@ template <class TTraits>
 EShrinkCutStatus TCacheCapacity<TTraits>::ReclaimShrinkCut() noexcept {
     TTransition& transition = Transition_;
     const ui64 allocationLimit = transition.TargetConfiguration().HandleCount();
-    const TCacheItem spare = Space_.TakeSpareForShrink(allocationLimit);
+    const TCacheItem spare = Cache_.Space_->TakeSpareForShrink(allocationLimit);
     if (!spare.IsNull()) {
-        auto spaceOp = Space_.BeginOperation();
+        auto spaceOp = Cache_.Space_->BeginOperation();
         Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(spare) && spare.Index() >= allocationLimit);
         THandle& handle = spaceOp.Handles()[spare.Index()];
         const THandleState expected = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
@@ -166,7 +156,7 @@ EShrinkCutStatus TCacheCapacity<TTraits>::ReclaimShrinkCut() noexcept {
         return EShrinkCutStatus::Progress;
     }
 
-    auto spaceOp = Space_.BeginOperation();
+    auto spaceOp = Cache_.Space_->BeginOperation();
     const ui64 handleCount = spaceOp.HandleCount();
     ui64& index = transition.NextWorkIndex_;
     if (index < allocationLimit || index > handleCount) {
@@ -175,7 +165,7 @@ EShrinkCutStatus TCacheCapacity<TTraits>::ReclaimShrinkCut() noexcept {
     }
     const ui64 end = Min(handleCount, index + SharedCacheTransitionWorkBatch);
     while (index < end) {
-        switch (Services_.ReclaimShrinkHandle(spaceOp, static_cast<ui32>(index))) {
+        switch (Cache_.ReclaimShrinkHandle(spaceOp, static_cast<ui32>(index))) {
             case EShrinkCutStatus::Progress:
                 return EShrinkCutStatus::Progress;
             case EShrinkCutStatus::Blocked:
@@ -197,23 +187,23 @@ EShrinkCutStatus TCacheCapacity<TTraits>::ReclaimShrinkCut() noexcept {
 
 template <class TTraits>
 bool TCacheCapacity<TTraits>::AdvanceBucketResize() noexcept {
-    const TSpaceState spaceState = Space_.CurrentSpaceState();
+    const TSpaceState spaceState = Cache_.Space_->CurrentSpaceState();
     if (!spaceState.Resizing()) {
         return false;
     }
 
-    const TBucketResizeState resize = Space_.BucketResizeState();
-    auto spaceOp = Space_.BeginOperation();
+    const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
+    auto spaceOp = Cache_.Space_->BeginOperation();
     switch (resize.Phase()) {
         case EBucketResizePhase::Prepared:
-            return Table_.PrepareBucketSplit(spaceOp) && Table_.ActivateBucketSplitOrMerge(spaceOp);
+            return Cache_.Table_.PrepareBucketSplit(spaceOp) && Cache_.Table_.ActivateBucketSplitOrMerge(spaceOp);
 
         case EBucketResizePhase::Activated:
-            return Table_.PublishBucketSplit(spaceOp);
+            return Cache_.Table_.PublishBucketSplit(spaceOp);
 
         case EBucketResizePhase::CursorPublished:
             if (resize.Direction() == EBucketResize::Shrinking) {
-                return Table_.CloseBucketSplit(spaceOp);
+                return Cache_.Table_.CloseBucketSplit(spaceOp);
             }
             break;
 
@@ -224,33 +214,33 @@ bool TCacheCapacity<TTraits>::AdvanceBucketResize() noexcept {
             return false;
     }
 
-    if (!Table_.RemoveBucketSplit(spaceOp)) {
+    if (!Cache_.Table_.RemoveBucketSplit(spaceOp)) {
         return false;
     }
-    return resize.Cursor() != resize.PairCount() || Space_.FinishBucketResize();
+    return resize.Cursor() != resize.PairCount() || Cache_.Space_->FinishBucketResize();
 }
 
 template <class TTraits>
-bool TCacheCapacity<TTraits>::RunMaintenance(THotResize& hotResize) noexcept {
+bool TCacheCapacity<TTraits>::RunMaintenance() noexcept {
     switch (Transition_.Phase()) {
         case ETransitionPhase::Idle:
             return StartTransition();
 
         case ETransitionPhase::Prepare:
         case ETransitionPhase::InitializeGrowth:
-            return PublishMigrationView(Transition_, hotResize);
+            return PublishMigrationView(Transition_);
 
         case ETransitionPhase::MigrationDrain:
             return TryDrainTransition(Transition_);
 
         case ETransitionPhase::Migrate: {
-            const TSpaceState state = Space_.CurrentSpaceState();
+            const TSpaceState state = Cache_.Space_->CurrentSpaceState();
             if (state.Resizing()) {
                 return AdvanceBucketResize();
             }
             const ui8 targetAddressBits = Transition_.TargetConfiguration().AddressBits;
             if (state.AddressBits() != targetAddressBits) {
-                return Space_.BeginBucketResize(targetAddressBits);
+                return Cache_.Space_->BeginBucketResize(targetAddressBits);
             }
             if (Transition_.OldConfiguration().AddressBits > targetAddressBits) {
                 switch (ReclaimShrinkCut()) {
@@ -262,7 +252,7 @@ bool TCacheCapacity<TTraits>::RunMaintenance(THotResize& hotResize) noexcept {
                         break;
                 }
             }
-            return PublishFinalView(Transition_, hotResize);
+            return PublishFinalView(Transition_);
         }
 
         case ETransitionPhase::AppendGrowth:
@@ -286,8 +276,6 @@ bool TCacheCapacity<TTraits>::RunMaintenance(THotResize& hotResize) noexcept {
 }
 
 // Capacity component is instantiated here for both trait variants
-template class TCacheCapacityServices<TProdTraits>;
-template class TCacheCapacityServices<TTestTraits>;
 template class TCacheCapacity<TProdTraits>;
 template class TCacheCapacity<TTestTraits>;
 

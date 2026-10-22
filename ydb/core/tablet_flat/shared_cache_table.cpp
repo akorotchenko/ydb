@@ -279,7 +279,7 @@ Y_FORCE_INLINE typename TSharedCacheTable::TBucketRoute TSharedCacheTable::Selec
         return { .Bucket = bucket, .BaseBucket = bucket };
     }
 
-    const TBucketResizeState resize = Space_.BucketResizeState();
+    const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
     const ui32 splitBit = resize.SplitBit();
     const ui32 base = hash & (splitBit - 1);
     const bool suffix = (hash & splitBit) != 0;
@@ -324,7 +324,7 @@ SHARED_CACHE_TEMPLATE
 template <typename TSharedCacheTable::ETombstoneMode Mode>
 Y_FORCE_INLINE typename TSharedCacheTable::EBucketRouteResult TSharedCacheTable::ResolveBucketMiss(
     TSpaceState& spaceState, TBucketRoute& route, const TOrderedLink& link) const noexcept {
-    if (!Space_.RefreshBucketRoute(spaceState, route.Resize)) {
+    if (!Cache_.Space_->RefreshBucketRoute(spaceState, route.Resize)) {
         return EBucketRouteResult::Retry;
     }
     if (SelectGrowthBucket<Mode>(route, link)) {
@@ -347,7 +347,7 @@ Y_FORCE_INLINE ESharedCacheResultStatus TSharedCacheTable::FindOrInsert(TSpaceOp
         for (;;) {
             if (!FindLinkOnBucket<Mode>(spaceOp, key, hash, route.Bucket, route.FollowsSplitSuffix, orderedLink))
             {
-                Space_.RefreshBucketRoute(spaceState, route.Resize);
+                Cache_.Space_->RefreshBucketRoute(spaceState, route.Resize);
                 retry = true;
                 break;
             }
@@ -404,7 +404,7 @@ bool TSharedCacheTable::InsertAt(
     TSpaceOperation& spaceOp, TInsertPosition& insertPosition, TCacheItem candidate) noexcept {
     TSpaceState spaceState = insertPosition.SpaceState;
     TBucketResizeState resizeState = insertPosition.ResizeState;
-    if (!Space_.RefreshBucketRoute(spaceState, resizeState)) {
+    if (!Cache_.Space_->RefreshBucketRoute(spaceState, resizeState)) {
         insertPosition.OwnerRef.Drop(spaceOp);
         return false;
     }
@@ -529,7 +529,7 @@ bool TSharedCacheTable::FindLink(
                 return true;
             }
         }
-        if (Space_.RefreshBucketRoute(spaceState, route.Resize)) {
+        if (Cache_.Space_->RefreshBucketRoute(spaceState, route.Resize)) {
             return false;
         }
     }

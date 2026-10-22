@@ -168,7 +168,7 @@ public:
     }
 
     static bool PublishMigrationView(TTestSharedCache& cache, TTransition& transition) noexcept {
-        return cache.Capacity_.PublishMigrationView(transition, cache.HotResize_);
+        return cache.Capacity_.PublishMigrationView(transition);
     }
 
     static bool TryDrainTransition(TTestSharedCache& cache, TTransition& transition) noexcept {
@@ -176,7 +176,7 @@ public:
     }
 
     static bool PublishFinalView(TTestSharedCache& cache, TTransition& transition) noexcept {
-        return cache.Capacity_.PublishFinalView(transition, cache.HotResize_);
+        return cache.Capacity_.PublishFinalView(transition);
     }
 
     static bool AppendFreeHandles(TTestSharedCache& cache, TTransition& transition) noexcept {
@@ -315,21 +315,20 @@ public:
 
     static ui32 MinimumHotSlots(TTestSharedCache& cache, bool underPressure = false) noexcept {
         return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
-            return cache.Eviction_.MinimumHotSlots(*cache.Space_, spaceOp, underPressure);
+            return cache.Eviction_.MinimumHotSlots(spaceOp, underPressure);
         });
     }
 
     static std::array<ui64, 4> HotPolicy(TTestSharedCache& cache, const TSpaceOperation& spaceOp) noexcept {
         const ui32 effective = static_cast<ui32>(spaceOp.EffectiveHotSlots());
-        return { effective, cache.Eviction_.MinimumHotSlots(*cache.Space_, spaceOp),
-            cache.Eviction_.ShrinkHotTarget(*cache.Space_, spaceOp, effective, 1, false),
+        return { effective, cache.Eviction_.MinimumHotSlots(spaceOp),
+            cache.Eviction_.ShrinkHotTarget(spaceOp, effective, 1, false),
             cache.Eviction_.GrowHotTarget(spaceOp, effective, 2) };
     }
 
     static bool EnforceWithOperation(
         TTestSharedCache& cache, TSpaceOperation& spaceOp, ui64 bytes = 0, bool forceShrinkHot = true) noexcept {
-        return cache.BindOperation(spaceOp).Eviction().EnforceCurrentLimit(
-            *cache.Space_, cache.HotResize_, bytes, forceShrinkHot);
+        return cache.BindOperation(spaceOp).Eviction().EnforceCurrentLimit(bytes, forceShrinkHot);
     }
 
     static THotResize::TGuard LockHotResize(TTestSharedCache& cache) noexcept {
@@ -345,7 +344,7 @@ public:
         for (;;) {
             const ui64 before = EffectiveHotSlots(cache);
             WithSpace(cache, [&](TSpaceOperation& spaceOp) {
-                cache.BindOperation(spaceOp).Eviction().EnforceCurrentLimit(*cache.Space_, cache.HotResize_, 0, true);
+                cache.BindOperation(spaceOp).Eviction().EnforceCurrentLimit(0, true);
             });
             if (EffectiveHotSlots(cache) == before) {
                 return;

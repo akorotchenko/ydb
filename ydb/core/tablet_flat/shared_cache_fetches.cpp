@@ -10,29 +10,6 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
-bool TCacheFetchServices<TTraits>::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) noexcept {
-    return Cache_.TryReserve(spaceOp, bytes, pages);
-}
-
-template <class TTraits>
-void TCacheFetchServices<TTraits>::ReleaseReservation(ui64 bytes, ui64 pages) noexcept {
-    Cache_.ReleaseReservation(bytes, pages);
-}
-
-template <class TTraits>
-bool TCacheFetchServices<TTraits>::TryAcquirePending(
-    TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept {
-    return Cache_.TryAcquire(spaceOp, page.CacheItem(), true, owner.Get()) ==
-           TSharedCacheImpl<TTraits>::EAcquireStatus::Pending;
-}
-
-template <class TTraits>
-void TCacheFetchServices<TTraits>::MakeReadyState(
-    TSpaceOperation& spaceOp, TCacheItem item, EHandleState state, TCollection* owner) noexcept {
-    Cache_.MakeReadyState(spaceOp, item, state, owner);
-}
-
-template <class TTraits>
 bool TCacheFetches<TTraits>::MatchesPendingFetch(
     const THandle& handle, THandleState state, TCacheItem cacheItem, const TPageFetchState& fetch) noexcept {
     return cacheItem.Matches(state) && state.IsPageKind() && state.IsPending() && handle.Body.Fetch == &fetch &&
@@ -42,7 +19,8 @@ bool TCacheFetches<TTraits>::MatchesPendingFetch(
 template <class TTraits>
 TIntrusivePtr<TPageFetchState> TCacheFetches<TTraits>::TryAcquire(
     TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept {
-    if (!Services_.TryAcquirePending(spaceOp, page, owner)) {
+    if (Cache_.TryAcquire(spaceOp, page.CacheItem(), true, owner.Get()) !=
+        TSharedCacheImpl<TTraits>::EAcquireStatus::Pending) {
         return {};
     }
     TIntrusivePtr<TPageFetchState> fetch = spaceOp.Handles()[page.Index()].Body.Fetch;
@@ -135,19 +113,19 @@ void TCacheFetches<TTraits>::FinishFailed(TOperationItemRef<TTraits>& finalizerR
     Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(completing) && completing.IsCompleting() && completing.Refs() == 1 &&
                          handle.Body.Fetch == &fetch);
     if (completing.IsStickyField()) {
-        Collections_.BindOperation(spaceOp).UnlinkPendingStickyPage(cacheItem);
+        Cache_.Collections_.BindOperation(spaceOp).UnlinkPendingStickyPage(cacheItem);
         completing = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     }
     DeletePendingFetch(handle);
     new (&handle.Body.PageBuffer) NActors::TSharedData::TBuffer();
     if (reserved) {
-        Services_.ReleaseReservation(TCacheItems<TTraits>::PageBytes(handle), 1);
+        Cache_.ReleaseReservation(TCacheItems<TTraits>::PageBytes(handle), 1);
     }
-    const bool begun = Table_.TryBeginErase(spaceOp, finalizerRef.Get(), completing);
+    const bool begun = Cache_.Table_.TryBeginErase(spaceOp, finalizerRef.Get(), completing);
     Y_DEBUG_ABORT_UNLESS(begun);
-    Traits_.Invoke(ESharedCacheHookPoint::AfterTombstoneOwnerClaim, cacheItem);
+    Cache_.InvokeHook(ESharedCacheHookPoint::AfterTombstoneOwnerClaim, cacheItem);
     const TSharedCacheKey key = LoadSharedCacheKey(handle, EItemKind::Page);
-    Table_.FinishErase(spaceOp, cacheItem, key);
+    Cache_.Table_.FinishErase(spaceOp, cacheItem, key);
     TPageFetchState::DrainWaiters(waiters, [cacheItem](TIntrusivePtr<TPageFetchWaiter> waiter) {
         waiter->Complete(TPageCacheItem::FromValidated(cacheItem), EPageFetchCompletion::Failed);
     });
@@ -171,27 +149,27 @@ void TCacheFetches<TTraits>::Finish(
 
     Y_DEBUG_ABORT_UNLESS(reserved && fetch.Completion() == EPageFetchCompletion::Ready);
     {
-        Traits_.Invoke(ESharedCacheHookPoint::BeforePageReadyState, page);
+        Cache_.InvokeHook(ESharedCacheHookPoint::BeforePageReadyState, page);
         NActors::TSharedData data = fetch.TakeData();
         DeletePendingFetch(handle);
         new (&handle.Body.PageBuffer) NActors::TSharedData::TBuffer(std::move(data).Extract());
         const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
         EHandleState readyState = EHandleState::Hot;
-        TCollection* owner = Collections_.BindOperation(spaceOp).PageCollection(handle);
+        TCollection* owner = Cache_.Collections_.BindOperation(spaceOp).PageCollection(handle);
         const bool regular = owner && owner->GetCacheMode() == ECacheMode::Regular &&
                              !THandleState::FromRaw(handle.State.load(std::memory_order_acquire)).IsStickyField();
         if (regular) {
-            if (!Memory_.TryAddRetainedBytes(bytes)) {
+            if (!Cache_.Memory_.TryAddRetainedBytes(bytes)) {
                 readyState = EHandleState::Cold;
             }
         } else {
-            Memory_.AddRetainedBytes(bytes);
+            Cache_.Memory_.AddRetainedBytes(bytes);
         }
         if (owner) {
-            Collections_.AddResidentPageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
+            Cache_.Collections_.AddResidentPageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
         }
-        Memory_.CompleteReservedPage();
-        Services_.MakeReadyState(spaceOp, page, readyState, owner);
+        Cache_.Memory_.CompleteReservedPage();
+        Cache_.MakeReadyState(spaceOp, page, readyState, owner);
     }
     TPageFetchState::DrainWaiters(waiters, [page](TIntrusivePtr<TPageFetchWaiter> waiter) {
         waiter->Complete(TPageCacheItem::FromValidated(page), EPageFetchCompletion::Ready);
@@ -210,14 +188,14 @@ bool TCacheFetches<TTraits>::ReserveMemory(TSpaceOperation& spaceOp, TCacheItem 
         return true;
     }
     const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
-    if (!Services_.TryReserve(spaceOp, bytes, 1)) {
+    if (!Cache_.TryReserve(spaceOp, bytes, 1)) {
         return false;
     }
     // Only the move-only fetch owner reserves memory. Subscribers may change refs/Sticky concurrently.
     for (;;) {
         state = THandleState::FromRaw(raw);
         if (!MatchesPendingFetch(handle, state, item, fetch) || !state.IsWaitingForMemory()) {
-            Services_.ReleaseReservation(bytes, 1);
+            Cache_.ReleaseReservation(bytes, 1);
             return false;
         }
         if (handle.State.compare_exchange_weak(raw, state.WithState(EHandleState::Begin).Raw(),
@@ -245,7 +223,7 @@ bool TCacheFetches<TTraits>::TryReserveBatch(
     }
     // Reserve the missing batch as a whole; two non-transactional requests must not each
     // hold a partial batch while waiting for the other one's bytes.
-    if (!Services_.TryReserve(spaceOp, bytes, waiting.size())) {
+    if (!Cache_.TryReserve(spaceOp, bytes, waiting.size())) {
         return false;
     }
     for (auto* fetch : waiting) {
@@ -417,8 +395,6 @@ bool TPageFetchImpl<TTraits>::FailReady() noexcept {
     return failed;
 }
 
-template class TCacheFetchServices<TProdTraits>;
-template class TCacheFetchServices<TTestTraits>;
 template class TCacheFetches<TProdTraits>;
 template class TCacheFetches<TTestTraits>;
 

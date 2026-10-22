@@ -10,32 +10,10 @@
 
 namespace NKikimr::NSharedCache {
 
-class TCacheMemory;
-
-template <class TTraits>
-class TSharedCacheTableImpl;
-
 template <class TTraits>
 class TSharedCacheItemRefImpl;
 template <class TTraits>
 class TOperationItemRef;
-
-template <class TTraits>
-class TCacheCollectionServices {
-public:
-    explicit TCacheCollectionServices(TSharedCacheImpl<TTraits>& cache) noexcept
-        : Cache_(cache)
-    {}
-
-    void RouteHotL1(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
-    void UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept;
-    static ui32 AdvanceColdMembership(THandle& handle) noexcept;
-    void PromoteColdForSticky(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
-    void ScheduleKeepColdSweep(ui64 slots) noexcept;
-
-private:
-    TSharedCacheImpl<TTraits>& Cache_;
-};
 
 template <class TTraits>
 class TCacheCollections {
@@ -143,13 +121,8 @@ public:
         TSpaceOperation& SpaceOp_;
     };
 
-    TCacheCollections(TCacheCollectionServices<TTraits> services, TCacheItems<TTraits>& items, TCacheMemory& memory,
-        TSharedCacheTableImpl<TTraits>& table, const TTraits& traits) noexcept
-        : Services_(services)
-        , Items_(items)
-        , Memory_(memory)
-        , Table_(table)
-        , Traits_(traits)
+    explicit TCacheCollections(TSharedCacheImpl<TTraits>& cache) noexcept
+        : Cache_(cache)
     {}
 
     TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
@@ -170,7 +143,7 @@ private:
     friend class TSharedCacheImpl<TTraits>;
 
     typename TCacheItems<TTraits>::TOperation Items(TSpaceOperation& spaceOp) const noexcept {
-        return Items_.BindOperation(spaceOp);
+        return Cache_.Items_.BindOperation(spaceOp);
     }
 
     TCollectionRegistry& Registry() noexcept {
@@ -227,12 +200,8 @@ private:
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, TFunctionRef<void(TCollection&)> callback) noexcept;
 
 private:
-    TCacheCollectionServices<TTraits> Services_;
-    TCacheItems<TTraits>& Items_;
+    TSharedCacheImpl<TTraits>& Cache_;
     TIntrusivePtr<TCollectionRegistry> CollectionRegistry_ = new TCollectionRegistry;
-    TCacheMemory& Memory_;
-    TSharedCacheTableImpl<TTraits>& Table_;
-    const TTraits& Traits_;
 };
 
 } // namespace NKikimr::NSharedCache

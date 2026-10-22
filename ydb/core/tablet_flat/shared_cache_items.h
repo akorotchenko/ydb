@@ -1,13 +1,9 @@
 #pragma once
 
 #include "shared_cache_ref.h"
+#include "shared_cache_space.h"
 
 namespace NKikimr::NSharedCache {
-
-class TCacheMemory;
-
-template <class TTraits>
-class TCacheCollections;
 
 template <class TTraits>
 class TCacheItems {
@@ -42,12 +38,17 @@ public:
             return Items_.BuildCollectionRef(SpaceOp_, std::move(ref));
         }
 
+        // Candidate cleanup
+        void DiscardCandidate(TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes) noexcept {
+            Items_.DiscardCandidate(SpaceOp_, cacheItem, kind, reservedBytes);
+        }
+
         // Handle initialization
-        void InitializePage(TCacheCollections<TTraits>& collections, TCacheItem cacheItem,
-            TCollectionCacheItem collection, ui64 offset, ui64 size, NTable::NPage::EPage type, ui32 crc32,
-            EStickyState sticky, bool reserved, bool collectionOwnerHeld) noexcept {
-            Items_.InitializePage(SpaceOp_, collections, cacheItem, collection, offset, size, type, crc32, sticky,
-                reserved, collectionOwnerHeld);
+        void InitializePage(TCacheItem cacheItem, TCollectionCacheItem collection, ui64 offset, ui64 size,
+            NTable::NPage::EPage type, ui32 crc32, EStickyState sticky, bool reserved,
+            bool collectionOwnerHeld) noexcept {
+            Items_.InitializePage(
+                SpaceOp_, cacheItem, collection, offset, size, type, crc32, sticky, reserved, collectionOwnerHeld);
         }
 
         void InitializeCollection(TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept {
@@ -81,9 +82,8 @@ public:
         return size + NActors::TSharedData::OverheadSize;
     }
 
-    TCacheItems(TCacheMemory& memory, const TTraits& traits) noexcept
-        : Memory_(memory)
-        , Traits_(traits)
+    explicit TCacheItems(TSharedCacheImpl<TTraits>& cache) noexcept
+        : Cache_(cache)
     {}
 
     TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
@@ -91,12 +91,36 @@ public:
     }
 
     // Payload destruction
-    void DeletePayload(TCacheCollections<TTraits>& collections, THandle& handle, EItemKind kind, EHandleState state,
-        TCollection* owner = nullptr) noexcept;
+    void DeletePayload(THandle& handle, EItemKind kind, EHandleState state, TCollection* owner = nullptr) noexcept;
 
 private:
     // Structural reference acquisition
-    TSharedCacheItemRefImpl<TTraits> TryAcquireItemRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+    TSharedCacheItemRefImpl<TTraits> TryAcquireItemRef(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
+        if (!spaceOp.Contains(cacheItem) || cacheItem.IsFrozen())
+        {
+            return {};
+        }
+
+        THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+        ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+        for (;;) {
+            const THandleState expected = THandleState::FromRaw(expectedRaw);
+            if (!cacheItem.Matches(expected) || expected.IsFree() || expected.IsReplacing() || expected.IsReplaced() ||
+                expected.IsTombstone())
+            {
+                return {};
+            }
+
+            Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
+            const THandleState desired = expected.IncrementRefs();
+            if (handle.State.compare_exchange_weak(
+                    expectedRaw, desired.Raw(), std::memory_order_relaxed, std::memory_order_relaxed))
+            {
+                Cache_.UpdateColdReclaimable(PayloadBytes(handle, expected.Kind()), expected, desired);
+                return TSharedCacheItemRefImpl<TTraits>(cacheItem);
+            }
+        }
+    }
 
     // Native reference acquisition
     TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
@@ -109,17 +133,19 @@ private:
     TSharedCacheCollectionRefImpl<TTraits> BuildCollectionRef(
         const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
 
+    // Candidate cleanup
+    void DiscardCandidate(TSpaceOperation& spaceOp, TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes) noexcept;
+
     // Handle initialization
-    void InitializePage(TSpaceOperation& spaceOp, TCacheCollections<TTraits>& collections, TCacheItem cacheItem,
-        TCollectionCacheItem collection, ui64 offset, ui64 size, NTable::NPage::EPage type, ui32 crc32,
-        EStickyState sticky, bool reserved, bool collectionOwnerHeld) noexcept;
+    void InitializePage(TSpaceOperation& spaceOp, TCacheItem cacheItem, TCollectionCacheItem collection, ui64 offset,
+        ui64 size, NTable::NPage::EPage type, ui32 crc32, EStickyState sticky, bool reserved,
+        bool collectionOwnerHeld) noexcept;
     void InitializeCollection(
         TSpaceOperation& spaceOp, TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept;
 
 private:
     // Dependencies
-    TCacheMemory& Memory_;
-    const TTraits& Traits_;
+    TSharedCacheImpl<TTraits>& Cache_;
 };
 
 } // namespace NKikimr::NSharedCache

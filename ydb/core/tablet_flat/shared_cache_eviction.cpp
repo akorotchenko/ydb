@@ -7,30 +7,8 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
-ui32 TCacheEvictionServices<TTraits>::AdvanceColdMembership(THandle& handle) noexcept {
-    return TSharedCacheImpl<TTraits>::AdvanceColdMembership(handle);
-}
-
-template <class TTraits>
-bool TCacheEvictionServices<TTraits>::AdvanceColdMembership(
-    THandle& handle, ui32 expectedVersion, bool keepColdQueued, ui32& newVersion) noexcept {
-    return TSharedCacheImpl<TTraits>::AdvanceColdMembership(handle, expectedVersion, keepColdQueued, newVersion);
-}
-
-template <class TTraits>
-TCollection* TCacheEvictionServices<TTraits>::ReleaseForColdDemotion(
-    TSpaceOperation& spaceOp, TCacheItem item) noexcept {
-    return Cache_.ReleaseItem(spaceOp, item, false);
-}
-
-template <class TTraits>
-void TCacheEvictionServices<TTraits>::NotifyResourcesAvailable() noexcept {
-    Cache_.NotifyResourcesAvailable();
-}
-
-template <class TTraits>
 bool TCacheEviction<TTraits>::WantsKeepCold(TSpaceOperation& spaceOp, const THandle& page) noexcept {
-    if (TCollection* collection = Collections_.BindOperation(spaceOp).PageCollection(page)) {
+    if (TCollection* collection = Cache_.Collections_.BindOperation(spaceOp).PageCollection(page)) {
         return collection->GetCacheMode() == ECacheMode::TryKeepInMemory &&
                collection->IsKeepAllowedPage(page.Metadata.Page.Type);
     }
@@ -61,16 +39,16 @@ bool TCacheEviction<TTraits>::DemoteKeepCold(
                 expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
         {
             TOperationItemRef<TTraits> itemRef(spaceOp, TCacheItem::Make(expected.Version(), coldItem.Index()));
-            Traits_.Invoke(ESharedCacheHookPoint::AfterKeepColdDemoted, TCacheItem::FromRaw(coldItem.Raw()));
+            Cache_.InvokeHook(ESharedCacheHookPoint::AfterKeepColdDemoted, TCacheItem::FromRaw(coldItem.Raw()));
             const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
-            Services_.AdvanceColdMembership(handle);
-            Memory_.ReleaseRetainedBytes(bytes);
-            Memory_.KeepCold().TransferBytesTo(Memory_.Cold(), bytes);
-            Memory_.KeepCold().TransferPageTo(Memory_.Cold(), EItemKind::Page);
-            Memory_.AddColdItem();
-            Memory_.ReleaseKeepColdOwnedBytes(bytes);
-            if (TCollection* owner = Collections_.BindOperation(spaceOp).PageCollection(handle)) {
-                Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
+            Cache_.AdvanceColdMembership(handle);
+            Cache_.Memory_.ReleaseRetainedBytes(bytes);
+            Cache_.Memory_.KeepCold().TransferBytesTo(Cache_.Memory_.Cold(), bytes);
+            Cache_.Memory_.KeepCold().TransferPageTo(Cache_.Memory_.Cold(), EItemKind::Page);
+            Cache_.Memory_.AddColdItem();
+            Cache_.Memory_.ReleaseKeepColdOwnedBytes(bytes);
+            if (TCollection* owner = Cache_.Collections_.BindOperation(spaceOp).PageCollection(handle)) {
+                Cache_.Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
             }
             ReleaseColdDemotionRef(spaceOp, itemRef);
             return true;
@@ -84,8 +62,8 @@ void TCacheEviction<TTraits>::ReleaseColdDemotionRef(
     const TCacheItem cacheItem = itemRef.CacheItem();
     itemRef.Disarm();
     // A policy demotion must not readmit the page to KeepCold when releasing its temporary ref.
-    if (TCollection* owner = Services_.ReleaseForColdDemotion(spaceOp, cacheItem)) {
-        Collections_.BindOperation(spaceOp).DropOwnerReference(*owner);
+    if (TCollection* owner = Cache_.ReleaseItem(spaceOp, cacheItem, false)) {
+        Cache_.Collections_.BindOperation(spaceOp).DropOwnerReference(*owner);
     }
 }
 
@@ -99,7 +77,7 @@ void TCacheEviction<TTraits>::WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TC
     }
     THandle& handle = spaceOp.Handles()[coldItem.Index()];
     ui32 coldVersion;
-    if (!Services_.AdvanceColdMembership(handle, coldItem.ColdVersion(), false, coldVersion)) {
+    if (!Cache_.AdvanceColdMembership(handle, coldItem.ColdVersion(), false, coldVersion)) {
         return;
     }
     DemoteKeepCold(spaceOp, TColdCacheItem::Make(coldVersion, coldItem.Index()));
@@ -159,12 +137,12 @@ void TCacheEviction<TTraits>::RouteKeepCold(TSpaceOperation& spaceOp, TColdCache
         return;
     }
     ui32 queuedVersion;
-    if (!Services_.AdvanceColdMembership(handle, coldItem.ColdVersion(), true, queuedVersion)) {
+    if (!Cache_.AdvanceColdMembership(handle, coldItem.ColdVersion(), true, queuedVersion)) {
         return;
     }
     const TColdCacheItem queuedItem = TColdCacheItem::Make(queuedVersion, coldItem.Index());
     const ui64 displaced = spaceOp.KeepCold().PutAndPop(queuedItem.Raw());
-    Traits_.Invoke(ESharedCacheHookPoint::AfterKeepColdQueued, TCacheItem::FromRaw(queuedItem.Raw()));
+    Cache_.InvokeHook(ESharedCacheHookPoint::AfterKeepColdQueued, TCacheItem::FromRaw(queuedItem.Raw()));
     if (displaced != 0) {
         const TColdCacheItem displacedItem = TColdCacheItem::FromRaw(displaced);
         if (!DemoteKeepCold(spaceOp, displacedItem)) {
@@ -200,7 +178,7 @@ void TCacheEviction<TTraits>::ReleaseKeepColdRef(
         {
             itemRef.Disarm();
             RouteKeepCold(spaceOp, TColdCacheItem::Make(initialColdVersion, cacheItem.Index()));
-            Services_.NotifyResourcesAvailable();
+            Cache_.NotifyResourcesAvailable();
             return;
         }
     }
@@ -210,7 +188,7 @@ template <class TTraits>
 TCacheItem TCacheEviction<TTraits>::PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept {
     const TRingExchangeResult exchange =
         spaceOp.Hot(ToUnderlying(level)).PutAndPopWithHook(cacheItem.Raw(), [&]() noexcept {
-            Traits_.Invoke(ESharedCacheHookPoint::BeforeHotExchange, cacheItem);
+            Cache_.InvokeHook(ESharedCacheHookPoint::BeforeHotExchange, cacheItem);
         });
     // The operation protects the mapping; a concurrent cut may still exclude this slot.
     if (!spaceOp.IsAllowedHotSlot(exchange.Slot)) {
@@ -255,21 +233,21 @@ template <class TTraits>
 Y_FORCE_INLINE void TCacheEviction<TTraits>::CompleteHotEviction(TSpaceOperation& spaceOp, THandle& handle,
     THandleState coldState, ui64 bytes, TOperationItemRef<TTraits>& itemRef, ui32 initialColdVersion) noexcept {
     Y_DEBUG_ABORT_UNLESS(coldState.Refs() > 0);
-    Traits_.Invoke(ESharedCacheHookPoint::AfterHotEvictionPublished, itemRef.CacheItem());
-    if (Memory_.UpdateColdReclaimable(bytes, coldState.WithState(EHandleState::Hot), coldState)) {
-        Services_.NotifyResourcesAvailable();
+    Cache_.InvokeHook(ESharedCacheHookPoint::AfterHotEvictionPublished, itemRef.CacheItem());
+    if (Cache_.Memory_.UpdateColdReclaimable(bytes, coldState.WithState(EHandleState::Hot), coldState)) {
+        Cache_.NotifyResourcesAvailable();
     }
     if (coldState.IsKeepCold()) {
-        Memory_.Hot().TransferBytesTo(Memory_.KeepCold(), bytes);
-        Memory_.Hot().TransferPageTo(Memory_.KeepCold(), coldState.Kind());
+        Cache_.Memory_.Hot().TransferBytesTo(Cache_.Memory_.KeepCold(), bytes);
+        Cache_.Memory_.Hot().TransferPageTo(Cache_.Memory_.KeepCold(), coldState.Kind());
     } else {
-        Memory_.ReleaseRetainedBytes(bytes);
-        Memory_.Hot().TransferBytesTo(Memory_.Cold(), bytes);
-        Memory_.Hot().TransferPageTo(Memory_.Cold(), coldState.Kind());
-        Memory_.AddColdItem();
+        Cache_.Memory_.ReleaseRetainedBytes(bytes);
+        Cache_.Memory_.Hot().TransferBytesTo(Cache_.Memory_.Cold(), bytes);
+        Cache_.Memory_.Hot().TransferPageTo(Cache_.Memory_.Cold(), coldState.Kind());
+        Cache_.Memory_.AddColdItem();
         if (coldState.IsPageKind()) {
-            if (TCollection* owner = Collections_.BindOperation(spaceOp).PageCollection(handle)) {
-                Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
+            if (TCollection* owner = Cache_.Collections_.BindOperation(spaceOp).PageCollection(handle)) {
+                Cache_.Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
             }
         }
     }
@@ -279,7 +257,8 @@ Y_FORCE_INLINE void TCacheEviction<TTraits>::CompleteHotEviction(TSpaceOperation
 template <class TTraits>
 void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept {
     for (;;) {
-        TOperationItemRef<TTraits> evictionRef(spaceOp, Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
+        TOperationItemRef<TTraits> evictionRef(
+            spaceOp, Cache_.Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
         if (!evictionRef) {
             return;
         }
@@ -298,7 +277,7 @@ void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel lev
                 const ui64 bytes = TCacheItems<TTraits>::PayloadBytes(handle, state.Kind());
                 const bool keep = state.IsPageKind() && state.Refs() == 1 && WantsKeepCold(spaceOp, handle);
                 if (keep) {
-                    Memory_.AddKeepColdOwnedBytes(bytes);
+                    Cache_.Memory_.AddKeepColdOwnedBytes(bytes);
                 }
                 const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
                 const THandleState cold = state.WithState(keep ? EHandleState::KeepCold : EHandleState::Cold);
@@ -310,7 +289,7 @@ void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel lev
                 }
 
                 if (keep) {
-                    Memory_.ReleaseKeepColdOwnedBytes(bytes);
+                    Cache_.Memory_.ReleaseKeepColdOwnedBytes(bytes);
                 }
 
                 level = EHotLevel::L0;
@@ -343,7 +322,8 @@ template <class TTraits>
 bool TCacheEviction<TTraits>::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
     Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem) && !cacheItem.IsFrozen() && cacheItem.Index() >= 2);
 
-    TOperationItemRef<TTraits> evictionRef(spaceOp, Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
+    TOperationItemRef<TTraits> evictionRef(
+        spaceOp, Cache_.Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
     if (!evictionRef) {
         return false;
     }
@@ -358,7 +338,7 @@ bool TCacheEviction<TTraits>::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem 
         const ui64 bytes = TCacheItems<TTraits>::PayloadBytes(handle, expected.Kind());
         const bool keep = expected.IsPageKind() && expected.Refs() == 1 && WantsKeepCold(spaceOp, handle);
         if (keep) {
-            Memory_.AddKeepColdOwnedBytes(bytes);
+            Cache_.Memory_.AddKeepColdOwnedBytes(bytes);
         }
         const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
         const THandleState desired =
@@ -370,7 +350,7 @@ bool TCacheEviction<TTraits>::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem 
             return true;
         }
         if (keep) {
-            Memory_.ReleaseKeepColdOwnedBytes(bytes);
+            Cache_.Memory_.ReleaseKeepColdOwnedBytes(bytes);
         }
     }
 }
@@ -386,30 +366,30 @@ bool TCacheEviction<TTraits>::PromoteCold(TSpaceOperation& spaceOp, TCacheItem c
         }
         Y_DEBUG_ABORT_UNLESS(expected.IsPageKind() && expected.Refs() != 0);
         const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
-        TCollection* owner = Collections_.BindOperation(spaceOp).PageCollection(handle);
+        TCollection* owner = Cache_.Collections_.BindOperation(spaceOp).PageCollection(handle);
         const bool protectedPage = force || !owner || owner->GetCacheMode() != ECacheMode::Regular;
         if (protectedPage) {
-            Memory_.AddRetainedBytes(bytes);
-        } else if (!Memory_.TryAddRetainedBytes(bytes)) {
+            Cache_.Memory_.AddRetainedBytes(bytes);
+        } else if (!Cache_.Memory_.TryAddRetainedBytes(bytes)) {
             return false;
         }
-        Memory_.Hot().AddBytes(bytes);
-        Memory_.Hot().AddPage(EItemKind::Page);
+        Cache_.Memory_.Hot().AddBytes(bytes);
+        Cache_.Memory_.Hot().AddPage(EItemKind::Page);
         const THandleState desired = expected.WithState(EHandleState::Hot).WithFrequency(0);
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed)) {
-            Services_.AdvanceColdMembership(handle);
-            Memory_.Cold().RemoveBytes(bytes);
-            Memory_.Cold().RemovePage(EItemKind::Page);
-            Memory_.RemoveColdItem();
+            Cache_.AdvanceColdMembership(handle);
+            Cache_.Memory_.Cold().RemoveBytes(bytes);
+            Cache_.Memory_.Cold().RemovePage(EItemKind::Page);
+            Cache_.Memory_.RemoveColdItem();
             if (owner) {
-                Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
+                Cache_.Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, static_cast<i64>(bytes));
             }
             return true;
         }
-        Memory_.Hot().RemoveBytes(bytes);
-        Memory_.Hot().RemovePage(EItemKind::Page);
-        Memory_.ReleaseRetainedBytes(bytes);
+        Cache_.Memory_.Hot().RemoveBytes(bytes);
+        Cache_.Memory_.Hot().RemovePage(EItemKind::Page);
+        Cache_.Memory_.ReleaseRetainedBytes(bytes);
     }
 }
 
@@ -453,27 +433,27 @@ bool TCacheEviction<TTraits>::EraseCold(TSpaceOperation& spaceOp, TColdCacheItem
             return false;
         }
         const TCacheItem cacheItem = TCacheItem::Make(expected.Version(), coldItem.Index());
-        if (Table_.TryBeginErase(spaceOp, cacheItem, expected, ownerRef.Get())) {
+        if (Cache_.Table_.TryBeginErase(spaceOp, cacheItem, expected, ownerRef.Get())) {
             // The tombstone owner now pins the page and its collection during accounting and notification.
             pageCollection =
-                expected.IsPageKind() ? Collections_.BindOperation(spaceOp).PageCollection(handle) : nullptr;
+                expected.IsPageKind() ? Cache_.Collections_.BindOperation(spaceOp).PageCollection(handle) : nullptr;
             const ui64 bytes = TCacheItems<TTraits>::PayloadBytes(handle, expected.Kind());
             const THandleState desired = expected.IncrementRefs().WithState(EHandleState::Tombstone).WithFrequency(0);
-            if (Memory_.UpdateColdReclaimable(bytes, expected, desired)) {
-                Services_.NotifyResourcesAvailable();
+            if (Cache_.Memory_.UpdateColdReclaimable(bytes, expected, desired)) {
+                Cache_.NotifyResourcesAvailable();
             }
             if (expected.IsKeepCold()) {
-                Memory_.ReleaseRetainedBytes(bytes);
-                Memory_.KeepCold().TransferBytesTo(Memory_.Cold(), bytes);
-                Memory_.KeepCold().TransferPageTo(Memory_.Cold(), expected.Kind());
-                Memory_.AddColdItem();
-                Memory_.ReleaseKeepColdOwnedBytes(bytes);
+                Cache_.Memory_.ReleaseRetainedBytes(bytes);
+                Cache_.Memory_.KeepCold().TransferBytesTo(Cache_.Memory_.Cold(), bytes);
+                Cache_.Memory_.KeepCold().TransferPageTo(Cache_.Memory_.Cold(), expected.Kind());
+                Cache_.Memory_.AddColdItem();
+                Cache_.Memory_.ReleaseKeepColdOwnedBytes(bytes);
                 if (pageCollection) {
-                    Collections_.AddActivePageBytes(
+                    Cache_.Collections_.AddActivePageBytes(
                         *pageCollection, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
                 }
             }
-            Traits_.Invoke(ESharedCacheHookPoint::AfterTombstoneOwnerClaim, TCacheItem::FromRaw(coldItem.Raw()));
+            Cache_.InvokeHook(ESharedCacheHookPoint::AfterTombstoneOwnerClaim, TCacheItem::FromRaw(coldItem.Raw()));
             break;
         }
     }
@@ -482,21 +462,20 @@ bool TCacheEviction<TTraits>::EraseCold(TSpaceOperation& spaceOp, TColdCacheItem
     // Stale ring entries may name reattached collections; check only after claiming an eviction owner.
     if (coldState.IsCollectionKind()) {
         Y_DEBUG_ABORT_UNLESS(
-            !handle.Body.Collection || Collections_.IsUnregisteredAndUnreferenced(*handle.Body.Collection));
+            !handle.Body.Collection || Cache_.Collections_.IsUnregisteredAndUnreferenced(*handle.Body.Collection));
     }
     const TCacheItem cacheItem = ownerRef.CacheItem();
     const TSharedCacheKey key = LoadSharedCacheKey(handle, coldState.Kind());
     if (coldState.IsPageKind() && pageCollection && pageCollection->GetCacheMode() == ECacheMode::TryKeepInMemory &&
         pageCollection->IsKeepAllowedPage(handle.Metadata.Page.Type))
     {
-        Traits_.NotifyKeepPageEviction(pageCollection->Id(), pageCollection->CacheItem,
-            pageCollection->KeepGeneration(),
+        Cache_.NotifyKeepPageEviction(pageCollection->Id(), pageCollection->CacheItem, pageCollection->KeepGeneration(),
             NTable::NPage::TPageLocation(NTable::NPage::TPageOffset::FromRaw(key.Word(1)),
                 handle.Key2OrSize.load(std::memory_order_relaxed), handle.Metadata.Page.Type,
                 handle.Metadata.Page.Crc32));
     }
-    Services_.AdvanceColdMembership(handle);
-    Table_.FinishErase(spaceOp, cacheItem, key);
+    Cache_.AdvanceColdMembership(handle);
+    Cache_.Table_.FinishErase(spaceOp, cacheItem, key);
     return true;
 }
 
@@ -515,11 +494,11 @@ void TCacheEviction<TTraits>::RouteCold(TSpaceOperation& spaceOp, TColdCacheItem
         return;
     }
 
-    Memory_.AddColdRingEntry();
-    Traits_.Invoke(ESharedCacheHookPoint::BeforeColdExchange, TCacheItem::FromRaw(coldItem.Raw()));
+    Cache_.Memory_.AddColdRingEntry();
+    Cache_.InvokeHook(ESharedCacheHookPoint::BeforeColdExchange, TCacheItem::FromRaw(coldItem.Raw()));
     const TColdCacheItem displaced = spaceOp.PutCold(coldItem);
     if (!displaced.IsNull()) {
-        Memory_.RemoveColdRingEntry();
+        Cache_.Memory_.RemoveColdRingEntry();
         EraseCold(spaceOp, displaced);
     }
 }
@@ -528,13 +507,13 @@ template <class TTraits>
 bool TCacheEviction<TTraits>::ReclaimCold(TSpaceOperation& spaceOp) noexcept {
     const TRingView cold = spaceOp.Cold();
     for (ui64 attempt = 0; attempt < cold.Capacity; ++attempt) {
-        if (Memory_.ColdRingEntries() == 0) {
+        if (Cache_.Memory_.ColdRingEntries() == 0) {
             return false;
         }
-        Traits_.Invoke(ESharedCacheHookPoint::BeforeColdRingPop, TCacheItem{});
+        Cache_.InvokeHook(ESharedCacheHookPoint::BeforeColdRingPop, TCacheItem{});
         const ui64 rawItem = cold.Pop();
         if (rawItem != 0) {
-            Memory_.RemoveColdRingEntry();
+            Cache_.Memory_.RemoveColdRingEntry();
             if (EraseCold(spaceOp, TColdCacheItem::FromRaw(rawItem))) {
                 return true;
             }
@@ -546,7 +525,7 @@ bool TCacheEviction<TTraits>::ReclaimCold(TSpaceOperation& spaceOp) noexcept {
 template <class TTraits>
 bool TCacheEviction<TTraits>::DemoteKeepColdForSoftLimit(TSpaceOperation& spaceOp) noexcept {
     const TRingView keep = spaceOp.KeepCold();
-    for (ui64 attempt = 0; attempt < keep.Capacity && Memory_.KeepColdOwnedBytes() != 0; ++attempt) {
+    for (ui64 attempt = 0; attempt < keep.Capacity && Cache_.Memory_.KeepColdOwnedBytes() != 0; ++attempt) {
         const ui64 raw = keep.Pop();
         if (raw == 0) {
             continue;
@@ -564,7 +543,7 @@ bool TCacheEviction<TTraits>::DemoteKeepColdForSoftLimit(TSpaceOperation& spaceO
 template <class TTraits>
 bool TCacheEviction<TTraits>::ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept {
     const TRingView keep = spaceOp.KeepCold();
-    for (ui64 attempt = 0; attempt < keep.Capacity && Memory_.KeepColdOwnedBytes() != 0; ++attempt) {
+    for (ui64 attempt = 0; attempt < keep.Capacity && Cache_.Memory_.KeepColdOwnedBytes() != 0; ++attempt) {
         const ui64 raw = keep.Pop();
         if (raw == 0) {
             continue;
@@ -573,7 +552,7 @@ bool TCacheEviction<TTraits>::ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept
         if (!MatchesKeepColdEntry(spaceOp, item)) {
             continue;
         }
-        Traits_.Invoke(ESharedCacheHookPoint::AfterKeepColdEntryMatched, TCacheItem::FromRaw(item.Raw()));
+        Cache_.InvokeHook(ESharedCacheHookPoint::AfterKeepColdEntryMatched, TCacheItem::FromRaw(item.Raw()));
         if (EraseCold(spaceOp, item)) {
             return true;
         }
@@ -582,8 +561,6 @@ bool TCacheEviction<TTraits>::ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept
     return false;
 }
 
-template class TCacheEvictionServices<TProdTraits>;
-template class TCacheEvictionServices<TTestTraits>;
 template class TCacheEviction<TProdTraits>;
 template class TCacheEviction<TTestTraits>;
 
