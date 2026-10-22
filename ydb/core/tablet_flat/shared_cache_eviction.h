@@ -13,6 +13,8 @@ class TSharedCacheItemRefImpl;
 template <class TTraits>
 class TOperationItemRef;
 template <class TTraits>
+class TCacheItems;
+template <class TTraits>
 class TCacheCollections;
 template <class TTraits>
 class TSharedCacheTableImpl;
@@ -35,7 +37,6 @@ public:
     static ui64 PageBytes(const THandle& handle) noexcept;
     static ui64 AccountedPageBytes(ui64 size) noexcept;
     static ui64 PayloadBytes(const THandle& handle, EItemKind kind) noexcept;
-    TSharedCacheItemRefImpl<TTraits> TryAcquireHotEvictionPin(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     static ui32 AdvanceColdMembership(THandle& handle) noexcept;
     static bool AdvanceColdMembership(
         THandle& handle, ui32 expectedVersion, bool keepColdQueued, ui32& newVersion) noexcept;
@@ -157,10 +158,11 @@ public:
         TSpaceOperation& SpaceOp_;
     };
 
-    TCacheEviction(TCacheEvictionServices<TTraits> services, TCacheMemory& memory,
+    TCacheEviction(TCacheEvictionServices<TTraits> services, TCacheItems<TTraits>& items, TCacheMemory& memory,
         TSharedCacheTableImpl<TTraits>& table, TCacheCollections<TTraits>& collections,
         const TSharedCachePolicy& policy, const TTraits& traits) noexcept
         : Services_(services)
+        , Items_(items)
         , Memory_(memory)
         , Table_(table)
         , Collections_(collections)
@@ -263,6 +265,7 @@ private:
 private:
     // Dependencies
     TCacheEvictionServices<TTraits> Services_;
+    TCacheItems<TTraits>& Items_;
     TCacheMemory& Memory_;
     TSharedCacheTableImpl<TTraits>& Table_;
     TCacheCollections<TTraits>& Collections_;

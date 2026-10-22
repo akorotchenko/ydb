@@ -21,12 +21,6 @@ ui64 TCacheEvictionServices<TTraits>::PayloadBytes(const THandle& handle, EItemK
 }
 
 template <class TTraits>
-TSharedCacheItemRefImpl<TTraits> TCacheEvictionServices<TTraits>::TryAcquireHotEvictionPin(
-    TSpaceOperation& spaceOp, TCacheItem item) noexcept {
-    return Cache_.TryAcquireHotEvictionPin(spaceOp, item);
-}
-
-template <class TTraits>
 ui32 TCacheEvictionServices<TTraits>::AdvanceColdMembership(THandle& handle) noexcept {
     return TSharedCacheImpl<TTraits>::AdvanceColdMembership(handle);
 }
@@ -299,7 +293,8 @@ Y_FORCE_INLINE void TCacheEviction<TTraits>::CompleteHotEviction(TSpaceOperation
 template <class TTraits>
 void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept {
     for (;;) {
-        TOperationItemRef<TTraits> evictionPin(spaceOp, Services_.TryAcquireHotEvictionPin(spaceOp, cacheItem));
+        TOperationItemRef<TTraits> evictionPin(
+            spaceOp, Items_.BindOperation(spaceOp).TryAcquireHotEvictionPin(cacheItem));
         if (!evictionPin) {
             return;
         }
@@ -363,7 +358,7 @@ template <class TTraits>
 bool TCacheEviction<TTraits>::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
     Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem) && !cacheItem.IsFrozen() && cacheItem.Index() >= 2);
 
-    TOperationItemRef<TTraits> evictionPin(spaceOp, Services_.TryAcquireHotEvictionPin(spaceOp, cacheItem));
+    TOperationItemRef<TTraits> evictionPin(spaceOp, Items_.BindOperation(spaceOp).TryAcquireHotEvictionPin(cacheItem));
     if (!evictionPin) {
         return false;
     }

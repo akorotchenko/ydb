@@ -75,6 +75,8 @@ class TSharedCacheTableImpl;
 template <class TTraits>
 class TSharedCacheImpl;
 template <class TTraits>
+class TCacheItems;
+template <class TTraits>
 class TSharedCacheCollectionRefImpl;
 template <class TTraits>
 class TOperationItemRef;
@@ -110,6 +112,7 @@ public:
 private:
     friend class TSharedCacheTableImpl<TTraits>;
     friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheItems<TTraits>;
     friend class TSharedPageRefImpl<TTraits>;
     friend class TSharedCacheCollectionRefImpl<TTraits>;
     friend class TOperationItemRef<TTraits>;
