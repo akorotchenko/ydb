@@ -606,9 +606,6 @@ private:
         ui64 size, NTable::NPage::EPage type, ui32 crc32, EStickyState sticky, bool reserved = true,
         bool collectionOwnerHeld = false) noexcept;
 
-    void InitializeCollection(
-        TSpaceOperation& spaceOp, TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept;
-
     EAcquireStatus TryAcquire(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending,
         TSharedCacheItemRefImpl<TTraits>& ref) noexcept;
 
@@ -849,10 +846,6 @@ public: // Cache helpers
         bool collectionOwnerHeld = false) noexcept {
         Cache_.InitializePage(
             SpaceOp_, cacheItem, collection, offset, size, type, crc32, sticky, reserved, collectionOwnerHeld);
-    }
-
-    Y_FORCE_INLINE void InitializeCollection(TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept {
-        Cache_.InitializeCollection(SpaceOp_, cacheItem, id, bytes);
     }
 
     Y_FORCE_INLINE TSharedPageRefImpl<TTraits> BuildPageRef(TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {

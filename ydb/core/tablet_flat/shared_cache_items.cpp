@@ -1,5 +1,7 @@
 #include "shared_cache_items.h"
 
+#include <new>
+
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
@@ -59,7 +61,27 @@ TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireHeldCollection(
     }
 }
 
-// Native item acquisition is instantiated here for both trait variants
+template <class TTraits>
+void TCacheItems<TTraits>::InitializeCollection(
+    TSpaceOperation& spaceOp, TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept {
+    Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AccessibleHandleCount());
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    const THandleState claimed = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+    Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(claimed) && claimed.IsBegin() && claimed.Refs() == 0);
+    const ui64* words = id.GetRaw();
+    handle.Key0.store(words[0], std::memory_order_relaxed);
+    handle.Key1.store(words[1], std::memory_order_relaxed);
+    handle.Key2OrSize.store(words[2], std::memory_order_relaxed);
+    new (&handle.Body.Collection) TCollection*(nullptr);
+    handle.Metadata.PayloadBytes = bytes;
+    handle.Next.store(TCacheItem::Make(claimed.Version(), 0).Raw(), std::memory_order_relaxed);
+    handle.NextInOwner.store(0, std::memory_order_relaxed);
+    const THandleState initialized =
+        claimed.WithKind(EItemKind::Collection).WithFrequency(0).WithSticky(EStickyState::Sticky);
+    handle.State.store(initialized.Raw(), std::memory_order_relaxed);
+}
+
+// Native item operations are instantiated here for both trait variants
 template class TCacheItems<TProdTraits>;
 template class TCacheItems<TTestTraits>;
 
