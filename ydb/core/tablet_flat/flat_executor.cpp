@@ -889,7 +889,6 @@ void TExecutor::AddPageCollection(const TSharedCacheCollectionRef& pageCollectio
 
 TSharedCacheCollectionRef TExecutor::FindPageCollection(const TLogoBlobID& id) const {
     auto& cache = TSharedCache::Get();
-    auto binding = cache.BindCurrentThreadHazard();
     TSharedCacheCollectionRef collection;
     cache.Find(id, collection);
     return collection;

@@ -40,7 +40,6 @@ namespace NBoot {
             Components.resize(LargeGlobIds.size());
 
             auto* cache = TSharedCache::TryGet();
-            auto binding = cache ? cache->BindCurrentThreadHazard() : TSharedCacheThreadBinding<TProdTraits>{};
             for (auto slot: xrange(LargeGlobIds.size())) {
                 if (cache) {
                     cache->Find(LargeGlobIds[slot].Lead, Prebuilt[slot]);

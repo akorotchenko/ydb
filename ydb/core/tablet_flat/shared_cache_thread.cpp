@@ -2,24 +2,28 @@
 
 namespace NKikimr::NSharedCache {
 
+TCacheThreadSubSystem::TCacheThreadSubSystem(ui32 threadCount) {
+    Hazards_.reserve(threadCount);
+    while (Hazards_.size() < threadCount) {
+        Hazards_.push_back(std::make_unique<TSpaceHazard>());
+    }
+}
+
 void TCacheThreadSubSystem::OnExecutorThreadPrepare(NActors::TThreadContext* context) {
-    const ui32 index = static_cast<ui32>(Indices_.size());
-    Y_ABORT_UNLESS(Indices_.emplace(context, index).second);
+    auto hazard = std::make_unique<TSpaceHazard>();
+    Y_ABORT_UNLESS(Threads_.emplace(context, hazard.get()).second);
+    Hazards_.push_back(std::move(hazard));
 }
 
 void TCacheThreadSubSystem::OnExecutorThreadStart(NActors::TThreadContext* context) {
-    Y_ABORT_UNLESS(TCacheThreadContext::Index_ == TCacheThreadContext::InvalidIndex);
-    const auto it = Indices_.find(context);
-    Y_ABORT_UNLESS(it != Indices_.end());
-    TCacheThreadContext::Domain_ = this;
-    TCacheThreadContext::Index_ = it->second;
+    Y_ABORT_UNLESS(!TlsCacheHazard);
+    TlsCacheHazard = Threads_.at(context);
 }
 
 void TCacheThreadSubSystem::OnExecutorThreadStop(NActors::TThreadContext* context) {
-    Y_DEBUG_ABORT_UNLESS(TCacheThreadContext::Domain_ == this);
-    Y_DEBUG_ABORT_UNLESS(TCacheThreadContext::Index_ == Indices_.at(context));
-    TCacheThreadContext::Index_ = TCacheThreadContext::InvalidIndex;
-    TCacheThreadContext::Domain_ = nullptr;
+    Y_DEBUG_ABORT_UNLESS(TlsCacheHazard == Threads_.at(context));
+    Y_DEBUG_ABORT_UNLESS(TlsCacheHazard->State.load(std::memory_order_relaxed) == 0);
+    TlsCacheHazard = nullptr;
 }
 
 } // namespace NKikimr::NSharedCache

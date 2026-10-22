@@ -424,7 +424,7 @@ SHARED_CACHE_TEMPLATE
 typename TSharedCache::EShrinkCutStatus TSharedCache::ReclaimShrinkCut() noexcept {
     TTransition& transition = HardTransition_;
     const ui64 allocationLimit = transition.TargetConfiguration().HandleCount();
-    const TCacheItem spare = Space_->TakeCutSpare(allocationLimit);
+    const TCacheItem spare = Space_->TakeSpareForShrink(allocationLimit);
     if (!spare.IsNull()) {
         auto cacheOp = BeginOperation();
         Y_DEBUG_ABORT_UNLESS(cacheOp.Contains(spare) && spare.Index() >= allocationLimit);

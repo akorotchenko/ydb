@@ -3,8 +3,10 @@
 #include "shared_cache_cyclic_buffer.h"
 #include "shared_cache_item.h"
 #include "shared_cache_mapping.h"
+#include "shared_cache_thread.h"
 
 #include <util/generic/ptr.h>
+#include <util/generic/vector.h>
 
 #include <array>
 #include <atomic>
@@ -501,15 +503,6 @@ bool TryCalculateSharedCacheFootprint(
 bool TryCalculateSharedCacheCapacity(
     ui64 limit, ui64 expectedPageSize, ui64 fixedBytes, ui32 hazardCount, TSharedCacheCapacity& result) noexcept;
 
-struct alignas(64) TSpaceHazard {
-    std::atomic<ui64> State{ 0 }; // {generation:32, active-count:32}
-    std::atomic<ui64> SpareItem{ 0 };
-    std::atomic<bool> Bound{ false }; // One thread owns this slot while its binding exists.
-};
-
-static_assert(sizeof(TSpaceHazard) == 64);
-static_assert(alignof(TSpaceHazard) == 64);
-
 inline constexpr ui64 SpaceHazardGeneration(ui64 state) noexcept;
 inline constexpr ui32 SpaceHazardActiveCount(ui64 state) noexcept;
 
@@ -726,31 +719,10 @@ inline constexpr bool SpaceHazardIsDrained(ui64 state, ui64 generation) noexcept
 class TSharedCacheSpaceTestAccess;
 class TSharedCacheTestAccess;
 
-class TSpaceHazardBinding {
-public:
-    TSpaceHazardBinding() noexcept = default;
-    TSpaceHazardBinding(const TSpaceHazardBinding&) = delete;
-    TSpaceHazardBinding& operator=(const TSpaceHazardBinding&) = delete;
-    TSpaceHazardBinding(TSpaceHazardBinding&& other) noexcept;
-    TSpaceHazardBinding& operator=(TSpaceHazardBinding&& other) noexcept;
-    ~TSpaceHazardBinding();
-
-private:
-    friend class TSharedCacheSpace;
-
-    TSpaceHazardBinding(const TSharedCacheSpace* space, TSpaceHazard* hazard) noexcept;
-
-    void Reset() noexcept;
-
-private:
-    const TSharedCacheSpace* Space_ = nullptr;
-    TSpaceHazard* Hazard_ = nullptr;
-};
-
 class TSharedCacheSpace {
 public:
-    static THolder<TSharedCacheSpace> Create(
-        const TSharedCacheCapacity& current, const TSharedCacheCapacity& reserved, ui32 hazardCount);
+    static THolder<TSharedCacheSpace> Create(const TSharedCacheCapacity& current, const TSharedCacheCapacity& reserved,
+        const TCacheThreadSubSystem& threads);
 
     TSharedCacheSpace(const TSharedCacheSpace&) = delete;
     TSharedCacheSpace& operator=(const TSharedCacheSpace&) = delete;
@@ -812,21 +784,13 @@ public:
         return HazardCount_;
     }
 
-    bool ThreadHazardBound() const noexcept {
-        Y_DEBUG_ABORT_UNLESS(!TlsHazard_ || TlsSpace_ == this);
-        return TlsHazard_;
-    }
-
     bool BeginBucketResize(ui8 newAddressBits) noexcept;
     bool AdvanceBucketResizePhase(EBucketResizePhase phase) noexcept;
     bool PublishBucketResizeCursor(ui32 cursor) noexcept;
     bool PrepareNextBucketResizePair() noexcept;
     bool FinishBucketResize() noexcept;
 
-    TSpaceHazardBinding BindThreadHazard(ui32 index) const noexcept;
-    TSpaceHazardBinding BindAnyThreadHazard() const noexcept;
-
-    TCacheItem TakeCutSpare(ui64 allocationLimit) noexcept;
+    TCacheItem TakeSpareForShrink(ui64 allocationLimit) noexcept;
 
     bool BeginHotResize(ui32 targetEffectiveHotSlots, THotResize& resize) noexcept;
     bool DrainHotResize(THotResize& resize, ui32& level, ui64& raw) noexcept;
@@ -960,7 +924,9 @@ public:
     }
 
 private:
-    friend class TSpaceHazardBinding;
+    friend class TCacheThreadTestAccess;
+    template <class TTraits>
+    friend class TSharedCacheImpl;
     friend class TSharedCacheSpaceTestAccess;
     friend class TSharedCacheTestAccess;
     friend class TSpaceOperation;
@@ -1045,14 +1011,14 @@ private:
     }
 
     Y_FORCE_INLINE TSpaceHazard& CurrentThreadHazard() const noexcept {
-        Y_DEBUG_ABORT_UNLESS(TlsSpace_ == this);
-        Y_DEBUG_ABORT_UNLESS(TlsHazard_);
-        return *TlsHazard_;
+        Y_DEBUG_ABORT_UNLESS(TlsCacheHazard && TlsCacheHazard->Space == this);
+        return *TlsCacheHazard;
     }
 
     TSharedCacheSpace() = default;
 
-    bool Initialize(const TSharedCacheCapacity& current, const TSharedCacheCapacity& reserved, ui32 hazardCount);
+    bool Initialize(const TSharedCacheCapacity& current, const TSharedCacheCapacity& reserved,
+        const TCacheThreadSubSystem& threads);
 
 private:
     TSharedCacheMapping HandlesMapping_;
@@ -1066,10 +1032,7 @@ private:
     std::array<TSpaceView, 2> SpaceViews_;
     THolder<TS5FifoRings> S5FifoRings_;
     THolder<TFreeRingCursor> FreeRingCursor_;
-    TArrayHolder<TSpaceHazard> Hazards_;
-
-    inline static thread_local TSpaceHazard* TlsHazard_ = nullptr;
-    inline static thread_local const TSharedCacheSpace* TlsSpace_ = nullptr;
+    TVector<TSpaceHazard*> Hazards_;
 
     ui32 HazardCount_ = 0;
     ui32 HazardSlotCount_ = 1;

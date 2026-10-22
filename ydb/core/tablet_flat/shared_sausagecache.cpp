@@ -161,7 +161,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (!Cache) {
             return nullptr;
         }
-        auto binding = Cache->BindCurrentThreadHazard();
         TSharedCacheCollectionRef ref;
         if (Cache->Find(id, ref) != ESharedCacheResultStatus::Hit || !ref->GetActorState()) {
             return nullptr;
@@ -173,7 +172,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (!Cache) {
             return;
         }
-        auto binding = Cache->BindCurrentThreadHazard();
         Cache->ForEachCollection([&](TCollection& collection) {
             if (collection.GetActorState()) {
                 callback(collection);
@@ -195,7 +193,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (!collection.CacheItem) {
             return {};
         }
-        auto binding = Cache->BindCurrentThreadHazard();
         TSharedPageRef page;
         if (Cache->Find(collection.CacheItem, static_cast<ui64>(offset), page) == ESharedCacheResultStatus::Hit) {
             return page.BuildSharedData();
@@ -252,7 +249,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (Cache) {
             return true;
         }
-        constexpr ui32 HazardCount = NActors::MaxWorkers;
+        const auto* threads = TActivationContext::ActorSystem()->GetSubSystem<TCacheThreadSubSystem>();
+        Y_ENSURE(threads, "Shared-cache thread records must be prepared before cache initialization");
+        const ui32 hazardCount = threads->ThreadCount();
         // Small metadata pages can exhaust handles while the byte budget still has room.
         ui8 minimumAddressBits = Max<ui8>(MinSharedCacheAddressBits, MinimumAddressBits);
         while (TSharedCacheCapacity{ .AddressBits = minimumAddressBits }.HotSlotCount() <
@@ -262,24 +261,23 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
         TSharedCacheCapacity minimum;
         if (!TryCalculateSharedCacheFootprint(
-                minimumAddressBits, TSharedCache::ExpectedPageSize, 0, HazardCount, minimum))
+                minimumAddressBits, TSharedCache::ExpectedPageSize, 0, hazardCount, minimum))
         {
             return false;
         }
         const ui64 targetLimit = GetTargetCacheHardLimitBytes();
         const ui64 allocationLimit = Max(targetLimit, minimum.TotalBytes);
         TSharedCacheCapacity current;
-        if (!TryCalculateSharedCacheCapacity(
-                allocationLimit, TSharedCache::ExpectedPageSize, 0, HazardCount, current))
+        if (!TryCalculateSharedCacheCapacity(allocationLimit, TSharedCache::ExpectedPageSize, 0, hazardCount, current))
         {
             return false;
         }
         TSharedCacheCapacity reserved;
         if (!TryCalculateSharedCacheFootprint(
-                MaxSharedCacheAddressBits, TSharedCache::ExpectedPageSize, 0, HazardCount, reserved)) {
+                MaxSharedCacheAddressBits, TSharedCache::ExpectedPageSize, 0, hazardCount, reserved)) {
             return false;
         }
-        auto space = TSharedCacheSpace::Create(current, reserved, HazardCount);
+        auto space = TSharedCacheSpace::Create(current, reserved, *threads);
         TProdTraits traits;
         traits.KeepEvictionActorSystem = TActivationContext::ActorSystem();
         traits.KeepEvictionActor = SelfId();
@@ -296,7 +294,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         const TLogoBlobID& pageCollectionId = pageCollection->Label();
         Y_ENSURE(pageCollectionId);
         Y_ENSURE(InitializeCache(), "Cannot initialize shared cache");
-        auto binding = Cache->BindCurrentThreadHazard();
         const TCollectionLocation location{ .Id = pageCollectionId, .BackingSize = pageCollection->BackingSize() };
         TCollectionCacheItem inserted;
         TSharedCacheCollectionRef ref;
@@ -368,7 +365,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     void DoGC() {
         if (Cache) {
-            auto binding = Cache->BindCurrentThreadHazard();
             const ui64 staticBytes = Cache->StaticBytes();
             const bool pressure = Cache->RetainedBytes() > Cache->SoftLimit();
             const ui32 workLimit =
@@ -451,7 +447,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     void DetachCollection(TCollection& collection) {
         CancelRequests(collection.Id());
-        auto binding = Cache->BindCurrentThreadHazard();
         Y_ENSURE(Cache->SetCollectionPagesCacheMode(collection.CacheItem, ECacheMode::Regular));
         // The registry keeps the unified object alive until replies and walks drain.
         ActualizeCacheSizeLimit();
@@ -468,7 +463,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         ResourceWaits.clear();
         Fetches.clear();
         if (Cache) {
-            auto binding = Cache->BindCurrentThreadHazard();
             ForEachCollection([&](TCollection& collection) {
                 collection.ResetActorState();
                 Y_ENSURE(Cache->DetachCollection(collection.CacheItem));
@@ -495,7 +489,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             if (inserted) {
                 Counters.Owners->Inc();
             }
-            auto binding = Cache->BindCurrentThreadHazard();
             TSharedCacheCollectionRef ref;
             Y_ENSURE(Cache->Find(collection.Id(), ref) == ESharedCacheResultStatus::Hit);
             Y_ENSURE(ownerIt->second.Collections.emplace(TRegisteredCollection{ .Ref = std::move(ref) }).second);
@@ -685,7 +678,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
         TSharedCacheCollectionRef ownership;
         {
-            auto binding = Cache->BindCurrentThreadHazard();
             Y_ENSURE(Cache->Find(pageCollectionId, ownership) == ESharedCacheResultStatus::Hit);
             if (ownership.IsSoleReference()) {
                 // Preserve writer Sticky pages through part handoff, and demote abandoned ones.
@@ -810,7 +802,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             requests.emplace_back(
                 locations[index], new TRequestPageWaiter(admission.Completion, index), admission.Sticky[index]);
         }
-        auto binding = Cache->BindCurrentThreadHazard();
         if (!Cache->FindOrInsertBatch(admission.CollectionItem, requests, recordStats, true)) {
             return false;
         }
@@ -987,7 +978,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             }
             return;
         }
-        auto binding = Cache->BindCurrentThreadHazard();
         const ui64 generation = Cache->ResourceGeneration();
         const size_t count = ResourceWaits.size();
         for (size_t index = 0; index < count; ++index) {
@@ -1147,7 +1137,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     void Handle(NSharedCache::TEvCollectionBytesChanged::TPtr& ev, const TActorContext&) {
         const auto* msg = ev->Get();
-        auto binding = Cache->BindCurrentThreadHazard();
 
         if (Cache->AcknowledgeCollectionBytes(msg->CacheItem)) {
             if (auto* collection = FindCollection(msg->CollectionId);
@@ -1159,7 +1148,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     void Handle(NSharedCache::TEvCollectionReleased::TPtr& ev, const TActorContext&) {
         const auto* msg = ev->Get();
-        auto binding = Cache->BindCurrentThreadHazard();
         TSharedCacheCollectionRef collection;
         const auto status = Cache->Find(msg->CollectionId, collection);
         if (status == ESharedCacheResultStatus::Hit) {
@@ -1346,7 +1334,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             const TLogoBlobID id = collection.Id();
             Walks.EraseCollection(id);
             KeepPreloadRetryBlocked.erase(id);
-            auto binding = Cache->BindCurrentThreadHazard();
             // Detach releases the registry hold; no access to collection follows it.
             collection.ResetActorState();
             Y_ENSURE(Cache->DetachCollection(collection.CacheItem));
@@ -1600,7 +1587,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (mode == previous) {
             return false;
         }
-        auto binding = Cache->BindCurrentThreadHazard();
         if (!Cache->SetCollectionPagesCacheMode(collection.CacheItem, mode)) {
             LOG_WARN_S(ctx, NKikimrServices::TABLET_SAUSAGECACHE,
                 "Cannot apply cache mode " << mode << " to page collection " << collection.Id());
@@ -1737,9 +1723,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 const TPageLocation location = *locationIt;
                 ESharedCacheResultStatus status;
                 {
-                auto binding = Cache->BindCurrentThreadHazard();
-                TSharedPageRef page;
-                status = Cache->Find(collection->CacheItem, static_cast<ui64>(location.Offset), page);
+                    TSharedPageRef page;
+                    status = Cache->Find(collection->CacheItem, static_cast<ui64>(location.Offset), page);
             }
                 if (status == ESharedCacheResultStatus::Hit) {
                     locationIt = pagesToLoad.erase(locationIt);

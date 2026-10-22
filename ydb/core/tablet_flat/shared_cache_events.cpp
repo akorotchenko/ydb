@@ -12,7 +12,6 @@ TSharedCacheCollectionRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitCollectio
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection)
     requires std::is_same_v<TTraits, TProdTraits>
 {
-    auto binding = BindCurrentThreadHazard();
     const TCollectionLocation location{ .Id = collection->Label(), .BackingSize = collection->BackingSize() };
     TCollectionCacheItem inserted;
     TSharedCacheCollectionRefImpl<TTraits> hit;
@@ -66,7 +65,6 @@ TSharedPageRef TEvSaveCompactedPages::AddWrittenPage(
 
 TSharedPageRef TEvSaveCompactedPages::AddPage(
     TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky, TSharedCache::EPageAdmission admission) {
-    auto binding = cachePages.BindCurrentThreadHazard();
     if (!CacheItem) {
         auto collection = cachePages.AdmitCollection(PageCollection);
         CacheItem = collection.CacheItem();
@@ -215,7 +213,6 @@ void TRequestPageWaiter::Complete(TPageCacheItem page, EPageFetchCompletion comp
     if (completion == EPageFetchCompletion::Ready) {
         TSharedPageRef cachePage;
         if (TSharedCache* cache = TSharedCache::TryGet()) {
-            auto binding = cache->BindCurrentThreadHazard();
             if (cache->AcquirePage(page, cachePage)) {
                 result = std::move(cachePage);
             } else {

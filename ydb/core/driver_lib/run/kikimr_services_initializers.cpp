@@ -168,6 +168,7 @@
 #include <ydb/core/tablet/tablet_list_renderer.h>
 #include <ydb/core/tablet/tablet_monitoring_proxy.h>
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
+#include <ydb/core/tablet_flat/shared_cache_thread.h>
 
 #include <ydb/core/tracing/tablet_info.h>
 
@@ -1489,6 +1490,7 @@ TSharedCacheInitializer::TSharedCacheInitializer(const TKikimrRunConfig& runConf
 void TSharedCacheInitializer::InitializeServices(
         NActors::TActorSystemSetup* setup,
         const NKikimr::TAppData* appData) {
+    setup->RegisterSubSystem(std::make_unique<NSharedCache::TCacheThreadSubSystem>());
     NKikimrSharedCache::TSharedCacheConfig config;
     if (Config.HasBootstrapConfig() && Config.GetBootstrapConfig().HasSharedCacheConfig()) {
         config.MergeFrom(Config.GetBootstrapConfig().GetSharedCacheConfig());

@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/shared_cache_thread_test.h>
 #include "helpers.h"
 #include "storage.h"
 #include "appdata.h"
@@ -164,6 +165,7 @@ namespace NKikimr {
 
     void SetupSharedPageCache(TTestActorRuntime& runtime, ui32 nodeIndex, const NSharedCache::TSharedCacheConfig& config)
     {
+        NSharedCache::TCacheThreadTestAccess::Setup(runtime);
         runtime.AddLocalService(NSharedCache::MakeSharedPageCacheId(0),
             TActorSetupCmd(
                 NSharedCache::CreateSharedPageCache(config, runtime.GetDynamicCounters(nodeIndex)),

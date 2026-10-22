@@ -5,7 +5,6 @@
 #include <ydb/core/base/appdata_fwd.h>
 
 #include <ydb/library/actors/core/actorsystem.h>
-#include <ydb/library/actors/core/thread_context.h>
 
 #include <util/generic/cast.h>
 #include <util/generic/hash_set.h>
@@ -46,10 +45,6 @@ bool TProdTraits::InstallCache(void* cache) noexcept {
     return true;
 }
 
-ui32 TProdTraits::CurrentWorkerIndex() noexcept {
-    return NActors::TlsThreadContext ? NActors::TlsThreadContext->WorkerId() : Max<ui32>();
-}
-
 void TProdTraits::NotifyKeepPageEviction(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem,
     ui64 generation, NTable::NPage::TPageLocation location) const noexcept {
     if (KeepEvictionActorSystem && KeepEvictionActor) {
@@ -85,49 +80,6 @@ void TProdTraits::NotifyResourcesAvailable() const noexcept {
 #define TOperationItemRef TOperationItemRef<TTraits>
 
 SHARED_CACHE_TEMPLATE
-TSharedCacheThreadBinding<TTraits>::TSharedCacheThreadBinding(void* cache, TSpaceHazardBinding&& hazard) noexcept
-    : Cache_(cache)
-    , Hazard_(std::move(hazard))
-{
-    if constexpr (requires { TTraits::BindCache(cache); }) {
-        TTraits::BindCache(cache);
-    }
-}
-
-SHARED_CACHE_TEMPLATE
-TSharedCacheThreadBinding<TTraits>::TSharedCacheThreadBinding(TSharedCacheThreadBinding&& other) noexcept
-    : Cache_(std::exchange(other.Cache_, nullptr))
-    , Hazard_(std::move(other.Hazard_))
-{}
-
-SHARED_CACHE_TEMPLATE
-TSharedCacheThreadBinding<TTraits>& TSharedCacheThreadBinding<TTraits>::operator=(
-    TSharedCacheThreadBinding&& other) noexcept {
-    if (this != &other) {
-        Reset();
-        Cache_ = std::exchange(other.Cache_, nullptr);
-        Hazard_ = std::move(other.Hazard_);
-    }
-    return *this;
-}
-
-SHARED_CACHE_TEMPLATE
-TSharedCacheThreadBinding<TTraits>::~TSharedCacheThreadBinding() {
-    Reset();
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCacheThreadBinding<TTraits>::Reset() noexcept {
-    if (Cache_) {
-        if constexpr (requires { TTraits::UnbindCache(Cache_); }) {
-            TTraits::UnbindCache(Cache_);
-        }
-        Cache_ = nullptr;
-        Hazard_ = {};
-    }
-}
-
-SHARED_CACHE_TEMPLATE
 TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit, TTraits traits) noexcept
     : TTraits(std::move(traits))
     , Space_(std::move(space))
@@ -141,6 +93,11 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     , TargetHandleCount_(Space_->CurrentConfiguration().HandleCount())
     , HardTarget_(Space_->CurrentConfiguration())
 {
+    if constexpr (std::is_same_v<TTraits, TTestTraits>) {
+        for (TSpaceHazard* hazard : Space_->Hazards_) {
+            hazard->TestCache = this;
+        }
+    }
     RefreshSoftLimit();
 }
 
@@ -198,7 +155,6 @@ template <class TCallback>
 decltype(auto) TSharedPageRefImpl<TTraits>::WithHandle(TCallback&& callback) const noexcept {
     Y_DEBUG_ABORT_UNLESS(Ref_);
     TSharedCache& cache = TSharedCache::Get();
-    auto binding = cache.BindCurrentThreadHazard();
     auto spaceOp = cache.BeginOperation();
     const TCacheItem item = Ref_.CacheItem();
     const THandle& handle = spaceOp.Handles()[item.Index()];
@@ -237,7 +193,6 @@ TSharedPageRefImpl<TTraits> TSharedPageRefImpl<TTraits>::Acquire() const& noexce
         return {};
     }
     TSharedCache& cache = TSharedCache::Get();
-    auto binding = cache.BindCurrentThreadHazard();
     return cache.AcquireHeldPage(Ref_.CacheItem());
 }
 
@@ -267,7 +222,6 @@ NTable::NPage::EPage TSharedPageRefImpl<TTraits>::GetType() const noexcept {
 SHARED_CACHE_TEMPLATE
 TLogoBlobID TSharedPageRefImpl<TTraits>::GetCollectionId() const noexcept {
     TSharedCache& cache = TSharedCache::Get();
-    auto binding = cache.BindCurrentThreadHazard();
     auto cacheOp = cache.BeginOperation();
     const THandle& page = cacheOp.Handles()[CacheItem().Index()];
     return cacheOp.Collections().PageCollection(page)->Id();
@@ -279,7 +233,6 @@ bool TSharedPageRefImpl<TTraits>::IsSticky() const noexcept {
         return false;
     }
     TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
-    auto binding = cache.BindCurrentThreadHazard();
     return cache.IsPageSticky(CacheItem());
 }
 
@@ -319,7 +272,6 @@ SHARED_CACHE_TEMPLATE
 TCollection& TSharedCacheCollectionRef::GetCollection() const noexcept {
     Y_DEBUG_ABORT_UNLESS(Ref_);
     TSharedCache& cache = TSharedCache::Get();
-    auto binding = cache.BindCurrentThreadHazard();
     auto spaceOp = cache.BeginOperation();
     const THandle& handle = spaceOp.Handles()[Ref_.Index()];
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
@@ -333,7 +285,6 @@ TSharedCacheCollectionRef TSharedCacheCollectionRef::Acquire() const& noexcept {
         return {};
     }
     TSharedCache& cache = TSharedCache::Get();
-    auto binding = cache.BindCurrentThreadHazard();
     return cache.AcquireHeldCollection(Ref_.CacheItem());
 }
 
@@ -341,7 +292,6 @@ SHARED_CACHE_TEMPLATE
 bool TSharedCacheCollectionRef::IsSoleReference() const noexcept {
     Y_DEBUG_ABORT_UNLESS(Ref_);
     auto& cache = TSharedCache::Get();
-    auto binding = cache.BindCurrentThreadHazard();
     auto spaceOp = cache.BeginOperation();
     const THandleState state =
         THandleState::FromRaw(spaceOp.Handles()[Ref_.Index()].State.load(std::memory_order_acquire));
@@ -2475,11 +2425,9 @@ bool TSharedCache::TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheI
 #undef TSharedCache
 #undef SHARED_CACHE_TEMPLATE
 
-template class TSharedCacheThreadBinding<TProdTraits>;
 template class TSharedPageRefImpl<TProdTraits>;
 template class TSharedCacheCollectionRefImpl<TProdTraits>;
 template class TSharedCacheImpl<TProdTraits>;
-template class TSharedCacheThreadBinding<TTestTraits>;
 template class TSharedPageRefImpl<TTestTraits>;
 template class TSharedCacheCollectionRefImpl<TTestTraits>;
 template class TSharedCacheImpl<TTestTraits>;

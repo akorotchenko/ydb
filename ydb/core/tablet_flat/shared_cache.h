@@ -21,29 +21,6 @@ struct TSharedCacheHandleRequirement {
     TArrayRef<const NTable::NPage::TPageLocation> Pages;
 };
 
-template <class TTraits>
-class TSharedCacheThreadBinding {
-public:
-    TSharedCacheThreadBinding() noexcept = default;
-    TSharedCacheThreadBinding(const TSharedCacheThreadBinding&) = delete;
-    TSharedCacheThreadBinding& operator=(const TSharedCacheThreadBinding&) = delete;
-    TSharedCacheThreadBinding(TSharedCacheThreadBinding&& other) noexcept;
-    TSharedCacheThreadBinding& operator=(TSharedCacheThreadBinding&& other) noexcept;
-    ~TSharedCacheThreadBinding();
-
-private:
-    template <class>
-    friend class TSharedCacheImpl;
-
-    TSharedCacheThreadBinding(void* cache, TSpaceHazardBinding&& hazard) noexcept;
-
-    void Reset() noexcept;
-
-private:
-    void* Cache_ = nullptr;
-    TSpaceHazardBinding Hazard_;
-};
-
 template <class TTraits = TProdTraits>
 class TSharedPageRefImpl : private TMoveOnly {
 public:
@@ -267,21 +244,6 @@ public:
         return static_cast<TSharedCacheImpl*>(TTraits::TryGetCache());
     }
 
-    TSharedCacheThreadBinding<TTraits> BindThreadHazard(ui32 index) const noexcept {
-        return { const_cast<TSharedCacheImpl*>(this), Space_->BindThreadHazard(index) };
-    }
-
-    TSharedCacheThreadBinding<TTraits> BindCurrentThreadHazard() const noexcept {
-        if (Space_->ThreadHazardBound()) {
-            return {};
-        }
-        const ui32 worker = TTraits::CurrentWorkerIndex();
-        if (worker != Max<ui32>()) {
-            return BindThreadHazard(worker);
-        }
-        return { const_cast<TSharedCacheImpl*>(this), Space_->BindAnyThreadHazard() };
-    }
-
     bool MakeReady(TPageCacheItem page, NActors::TSharedData&& data) noexcept;
 
     bool FailReady(TPageCacheItem page) noexcept;
@@ -490,6 +452,7 @@ private:
     TOperationView BindOperation(TSpaceOperation& spaceOp) noexcept;
 
     friend class TSharedCacheTestAccess;
+    friend class TCacheThreadTestAccess;
     friend class TCollection;
     friend class TSharedCacheItemRefImpl<TTraits>;
     friend class TSharedCacheTableImpl<TTraits>;

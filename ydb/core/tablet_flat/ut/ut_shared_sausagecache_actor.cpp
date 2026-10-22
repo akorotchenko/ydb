@@ -528,7 +528,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TSharedPageCacheMock sharedCache;
             UNIT_ASSERT_VALUES_EQUAL(TActivationContext::ActorSystem(), sharedCache.Runtime.GetActorSystem(0));
             UNIT_ASSERT_VALUES_EQUAL(&TSharedCache::Get(), sharedCache.Runtime.GetAppData().SharedCache.Get());
-            auto source = MakeIntrusiveConst<TPageCollectionMock>(19762, 1);
+            auto source = MakeIntrusiveConst<TPageCollectionMock>(ui64{ 19762 }, ui32{ 1 });
             auto page = TSharedCache::Get().AdmitPage(source, _P(0), TSharedData::Copy(TString(10, 'q')));
             UNIT_ASSERT(page);
             auto* result = new TEvResult(source, NKikimrProto::OK, 0);

@@ -85,39 +85,42 @@ public:
     explicit TApplicationContext(ui64 cacheBytes)
         : AppData_(0, 0, 0, 0, {}, nullptr, nullptr, nullptr, nullptr)
     {
+        Y_ABORT_UNLESS(!TlsActivationContext && !NSharedCache::TlsCacheHazard);
         THolder<TActorSystemSetup> setup = MakeHolder<TActorSystemSetup>();
         System_ = MakeHolder<TActorSystem>(setup, &AppData_);
         Thread_ = MakeHolder<TExecutorThread>(0, System_.Get(), nullptr, "pdisktool");
         Context_ = MakeHolder<TActorContext>(Mailbox_, *Thread_, GetCycleCountFast(), TActorId{});
-        Previous_ = TlsActivationContext;
         TlsActivationContext = Context_.Get();
+        NSharedCache::TlsCacheHazard = &CacheThreads_.Hazard();
 
         try {
             NSharedCache::TSharedCacheCapacity capacity;
-            constexpr ui32 hazards = NActors::MaxWorkers;
+            constexpr ui32 hazards = 1;
             Y_ENSURE(NSharedCache::TryCalculateSharedCacheCapacity(
                 cacheBytes, NSharedCache::TSharedCache::ExpectedPageSize, 0, hazards, capacity));
             auto core = NSharedCache::TSharedCache::Create(
-                NSharedCache::TSharedCacheSpace::Create(capacity, capacity, hazards), capacity.Limit);
+                NSharedCache::TSharedCacheSpace::Create(capacity, capacity, CacheThreads_), capacity.Limit);
             Y_ENSURE(core);
             Y_ENSURE(core->UpdateSoftLimit(0));
         } catch (...) {
-            TlsActivationContext = Previous_;
+            TlsActivationContext = nullptr;
+            NSharedCache::TlsCacheHazard = nullptr;
             throw;
         }
     }
 
     ~TApplicationContext() {
-        TlsActivationContext = Previous_;
+        TlsActivationContext = nullptr;
+        NSharedCache::TlsCacheHazard = nullptr;
     }
 
 private:
+    NSharedCache::TCacheThreadSubSystem CacheThreads_{ 1 };
     TAppData AppData_;
     THolder<TActorSystem> System_;
     TMailbox Mailbox_;
     THolder<TExecutorThread> Thread_;
     THolder<TActorContext> Context_;
-    TActivationContext* Previous_ = nullptr;
 };
 
 // Synchronous offline reads use the normal cache; readers own the pages for as long as they use them.
@@ -131,7 +134,6 @@ public:
 
     ~TOfflinePages() override {
         auto& cache = TSharedCache::Get();
-        auto binding = cache.BindCurrentThreadHazard();
         for (auto& [_, entry] : Cache) {
             if (entry.Collection) {
                 cache.DetachCollection(entry.Collection.CacheItem());
@@ -212,7 +214,6 @@ public:
         }
 
         auto& cache = TSharedCache::Get();
-        auto binding = cache.BindCurrentThreadHazard();
         NSharedCache::TSharedCacheCollectionRef collection;
         TSharedPageRef page;
         if (cache.Find(label, collection) == NSharedCache::ESharedCacheResultStatus::Hit &&
