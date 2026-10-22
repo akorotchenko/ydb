@@ -38,6 +38,19 @@ public:
             return Items_.BuildCollectionRef(SpaceOp_, std::move(ref));
         }
 
+        // Native allocation
+        ui32 TryAllocateHandle() noexcept {
+            return Items_.TryAllocateHandle(SpaceOp_);
+        }
+
+        TCacheItem Allocate() noexcept {
+            return Items_.Allocate(SpaceOp_);
+        }
+
+        TCacheItem TryAllocateReservedItem(ui64 bytes, ui64 pages) noexcept {
+            return Items_.TryAllocateReservedItem(SpaceOp_, bytes, pages);
+        }
+
         // Spare handles
         void RefillSpareItem() noexcept {
             Items_.RefillSpareItem(SpaceOp_);
@@ -141,6 +154,11 @@ private:
         const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
     TSharedCacheCollectionRefImpl<TTraits> BuildCollectionRef(
         const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
+
+    // Native allocation
+    ui32 TryAllocateHandle(TSpaceOperation& spaceOp) noexcept;
+    TCacheItem Allocate(TSpaceOperation& spaceOp) noexcept;
+    TCacheItem TryAllocateReservedItem(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) noexcept;
 
     // Spare handles
     void RefillSpareItem(TSpaceOperation& spaceOp) noexcept;

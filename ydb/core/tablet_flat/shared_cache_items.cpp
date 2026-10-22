@@ -63,6 +63,65 @@ TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMoreCollectionRef(
 }
 
 template <class TTraits>
+ui32 TCacheItems<TTraits>::TryAllocateHandle(TSpaceOperation& spaceOp) noexcept {
+    auto evictionOp = Cache_.Eviction_.BindOperation(spaceOp);
+    const TCacheItem spare = TCacheItem::FromRaw(spaceOp.Hazard().SpareItem.exchange(0, std::memory_order_relaxed));
+    if (spare.IsNull()) {
+        if (const ui32 index = spaceOp.TryAllocateHandle()) {
+            return index;
+        }
+        // Byte headroom does not guarantee a free handle when pages are much smaller than the expected size.
+        // Reclaim Cold, or shrink Hot to feed Cold, before refusing the admission.
+        for (ui32 attempt = 0; attempt < spaceOp.HandleCount(); ++attempt) {
+            if (!evictionOp.ReclaimCold()) {
+                const ui32 hotSlots = static_cast<ui32>(Cache_.Space_->EffectiveHotSlots());
+                evictionOp.EnforceCurrentLimit(0, true);
+                // The caller's view may predate growth; drain with a fresh operation under the resize lock.
+                Cache_.DrainHotResize();
+                if (hotSlots == Cache_.Space_->EffectiveHotSlots() && !evictionOp.ReclaimCold()) {
+                    break;
+                }
+            }
+            if (const ui32 index = spaceOp.TryAllocateHandle()) {
+                return index;
+            }
+        }
+        return 0;
+    }
+
+    Y_ABORT_UNLESS(!spare.IsFrozen() && spare.Index() >= 2 && spare.Index() < spaceOp.AccessibleHandleCount());
+    const THandle& handle = spaceOp.Handles()[spare.Index()];
+    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+    Y_ABORT_UNLESS(spare.Matches(state) && state.IsBegin() && state.Refs() == 0);
+    return spare.Index();
+}
+
+template <class TTraits>
+TCacheItem TCacheItems<TTraits>::Allocate(TSpaceOperation& spaceOp) noexcept {
+    const ui32 index = TryAllocateHandle(spaceOp);
+    if (!index) {
+        return {};
+    }
+    const THandleState state = THandleState::FromRaw(spaceOp.Handles()[index].State.load(std::memory_order_relaxed));
+    Y_DEBUG_ABORT_UNLESS(state.IsBegin() && state.Refs() == 0);
+    spaceOp.Handles()[index].Key0.store(0, std::memory_order_relaxed);
+    spaceOp.Handles()[index].Body.Fetch = nullptr;
+    return TCacheItem::Make(state.Version(), index);
+}
+
+template <class TTraits>
+TCacheItem TCacheItems<TTraits>::TryAllocateReservedItem(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) noexcept {
+    if (!Cache_.TryReserve(spaceOp, bytes, pages)) {
+        return {};
+    }
+    const TCacheItem cacheItem = Allocate(spaceOp);
+    if (cacheItem.IsNull()) {
+        Cache_.ReleaseReservation(bytes, pages);
+    }
+    return cacheItem;
+}
+
+template <class TTraits>
 void TCacheItems<TTraits>::RefillSpareItem(TSpaceOperation& spaceOp) noexcept {
     if (spaceOp.Hazard().SpareItem.load(std::memory_order_relaxed) != 0) {
         return;

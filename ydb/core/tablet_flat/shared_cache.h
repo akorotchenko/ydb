@@ -448,11 +448,6 @@ private:
 
     TCollectionCacheItem AllocateCollection(const TLogoBlobID& id, ui64 bytes) noexcept;
 
-    TCacheItem Allocate(TSpaceOperation& spaceOp) noexcept;
-    TCacheItem TryAllocateReservedItem(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages = 0) noexcept;
-
-    ui32 TryAllocateHandle(TSpaceOperation& spaceOp) noexcept;
-
     bool MakeReady(
         TCollectionRegistry& registry, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept;
 
@@ -660,15 +655,15 @@ public: // Cache helpers
     }
 
     Y_FORCE_INLINE TCacheItem Allocate() noexcept {
-        return Cache_.Allocate(SpaceOp_);
+        return Items().Allocate();
     }
 
     Y_FORCE_INLINE TCacheItem TryAllocateReservedItem(ui64 bytes, ui64 pages = 0) noexcept {
-        return Cache_.TryAllocateReservedItem(SpaceOp_, bytes, pages);
+        return Items().TryAllocateReservedItem(bytes, pages);
     }
 
     Y_FORCE_INLINE ui32 TryAllocateHandle() noexcept {
-        return Cache_.TryAllocateHandle(SpaceOp_);
+        return Items().TryAllocateHandle();
     }
 
     Y_FORCE_INLINE void RefillSpareItem() noexcept {
