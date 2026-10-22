@@ -534,8 +534,6 @@ private:
     EAcquireStatus TryAcquire(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending,
         TSharedCacheItemRefImpl<TTraits>& ref) noexcept;
 
-    TSharedCacheItemRefImpl<TTraits> TryAcquireStructural(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
-
     TSharedCacheItemRefImpl<TTraits> BuildExternalRef(EItemKind kind, TCacheItem cacheItem) noexcept;
 
     bool DetachCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
@@ -662,7 +660,7 @@ public: // Cache helpers
     }
 
     Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> TryAcquireStructural(TCacheItem item) noexcept {
-        return Cache_.TryAcquireStructural(SpaceOp_, item);
+        return Items().TryAcquireStructural(item);
     }
 
     Y_FORCE_INLINE void Release(TCacheItem item) noexcept {

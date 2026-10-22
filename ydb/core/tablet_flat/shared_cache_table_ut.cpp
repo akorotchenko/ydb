@@ -89,12 +89,12 @@ public:
 
     static TTestSharedCacheItemRef AcquireStructural(TTestSharedCache& cache, TCacheItem item) noexcept {
         auto operation = cache.BeginOperation();
-        return cache.TryAcquireStructural(operation, item);
+        return operation.TryAcquireStructural(item);
     }
 
     static bool MakePendingPageSticky(TTestSharedCache& cache, TPageCacheItem page) noexcept {
         auto spaceOp = cache.BeginOperation();
-        TOperationItemRef<TTestTraits> ref(spaceOp, cache.TryAcquireStructural(spaceOp, page.CacheItem()));
+        TOperationItemRef<TTestTraits> ref(spaceOp, spaceOp.TryAcquireStructural(page.CacheItem()));
         return ref && spaceOp.Collections().MakePageSticky(page.CacheItem());
     }
 

@@ -4,11 +4,18 @@
 
 namespace NKikimr::NSharedCache {
 
+class TCacheMemory;
+
 template <class TTraits>
 class TCacheItems {
 public:
     class TOperation {
     public:
+        // Structural protection
+        TSharedCacheItemRefImpl<TTraits> TryAcquireStructural(TCacheItem item) noexcept {
+            return Items_.TryAcquireItemRef(SpaceOp_, item);
+        }
+
         // Native reference acquisition
         TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TCacheItem item) noexcept {
             return Items_.TryAcquireHotItemRef(SpaceOp_, item);
@@ -64,13 +71,19 @@ public:
         return size + NActors::TSharedData::OverheadSize;
     }
 
-    TCacheItems() noexcept = default;
+    TCacheItems(TCacheMemory& memory, const TTraits& traits) noexcept
+        : Memory_(memory)
+        , Traits_(traits)
+    {}
 
     TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
         return { *this, spaceOp };
     }
 
 private:
+    // Structural reference acquisition
+    TSharedCacheItemRefImpl<TTraits> TryAcquireItemRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+
     // Native reference acquisition
     TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     TSharedCacheItemRefImpl<TTraits> AcquireMorePageRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
@@ -85,6 +98,11 @@ private:
     // Handle initialization
     void InitializeCollection(
         TSpaceOperation& spaceOp, TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept;
+
+private:
+    // Dependencies
+    TCacheMemory& Memory_;
+    const TTraits& Traits_;
 };
 
 } // namespace NKikimr::NSharedCache

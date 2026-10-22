@@ -1,4 +1,5 @@
 #include "shared_cache.h"
+#include "shared_cache_items_acquire_impl.h"
 #include "shared_cache_items_ref_impl.h"
 #include "shared_cache_events.h"
 #include "shared_cache_traits.h"
@@ -86,7 +87,9 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     , Space_(std::move(space))
     , Table_(*Space_, *this)
     , Memory_(Space_->CurrentConfiguration().StaticBytes, hardLimit, Space_->ReservedConfiguration().Limit)
-    , Collections_(TCacheCollectionServices<TTraits>(*this), Memory_, Table_, static_cast<const TTraits&>(*this))
+    , Items_(Memory_, static_cast<const TTraits&>(*this))
+    , Collections_(TCacheCollectionServices<TTraits>(*this), Items_, Memory_, Table_,
+          static_cast<const TTraits&>(*this))
     , Eviction_(TCacheEvictionServices<TTraits>(*this), Items_, Memory_, Table_, Collections_, Policy_,
           static_cast<const TTraits&>(*this))
     , Capacity_(TCacheCapacityServices<TTraits>(*this), *Space_, Table_, Memory_, Eviction_)
@@ -1163,34 +1166,6 @@ typename TSharedCache::EAcquireStatus TSharedCache::TryAcquire(
 }
 
 SHARED_CACHE_TEMPLATE
-TSharedCacheItemRef TSharedCache::TryAcquireStructural(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
-    if (!spaceOp.Contains(cacheItem) || cacheItem.IsFrozen())
-    {
-        return {};
-    }
-
-    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        if (!cacheItem.Matches(expected) || expected.IsFree() || expected.IsReplacing() || expected.IsReplaced() ||
-            expected.IsTombstone())
-        {
-            return {};
-        }
-
-        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
-        const THandleState desired = expected.IncrementRefs();
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, desired.Raw(), std::memory_order_relaxed, std::memory_order_relaxed))
-        {
-            UpdateColdReclaimable(TCacheItems<TTraits>::PayloadBytes(handle, expected.Kind()), expected, desired);
-            return TSharedCacheItemRef(cacheItem);
-        }
-    }
-}
-
-SHARED_CACHE_TEMPLATE
 TSharedCacheItemRef TSharedCache::BuildExternalRef(EItemKind kind, TCacheItem cacheItem) noexcept {
     auto spaceOp = BeginOperation();
     Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem) && !cacheItem.IsFrozen());
@@ -2251,6 +2226,12 @@ bool TSharedCache::TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheI
 #undef TOperationItemRef
 #undef TSharedCache
 #undef SHARED_CACHE_TEMPLATE
+
+// Native item acquisition is instantiated with its existing callers
+template TSharedCacheItemRefImpl<TProdTraits> TCacheItems<TProdTraits>::TryAcquireItemRef(
+    TSpaceOperation&, TCacheItem) noexcept;
+template TSharedCacheItemRefImpl<TTestTraits> TCacheItems<TTestTraits>::TryAcquireItemRef(
+    TSpaceOperation&, TCacheItem) noexcept;
 
 // Typed-reference builders are instantiated with their callers and constructors
 template TSharedPageRefImpl<TProdTraits> TCacheItems<TProdTraits>::BuildPageRef(

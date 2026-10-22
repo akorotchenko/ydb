@@ -1,6 +1,7 @@
 #pragma once
 
 #include "shared_cache_collection.h"
+#include "shared_cache_items.h"
 #include "shared_cache_space.h"
 
 #include <util/generic/function_ref.h>
@@ -26,7 +27,6 @@ public:
         : Cache_(cache)
     {}
 
-    TSharedCacheItemRefImpl<TTraits> TryAcquireStructural(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     void RouteHotL1(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     void UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept;
     static ui32 AdvanceColdMembership(THandle& handle) noexcept;
@@ -143,9 +143,10 @@ public:
         TSpaceOperation& SpaceOp_;
     };
 
-    TCacheCollections(TCacheCollectionServices<TTraits> services, TCacheMemory& memory,
+    TCacheCollections(TCacheCollectionServices<TTraits> services, TCacheItems<TTraits>& items, TCacheMemory& memory,
         TSharedCacheTableImpl<TTraits>& table, const TTraits& traits) noexcept
         : Services_(services)
+        , Items_(items)
         , Memory_(memory)
         , Table_(table)
         , Traits_(traits)
@@ -167,6 +168,10 @@ public:
 
 private:
     friend class TSharedCacheImpl<TTraits>;
+
+    typename TCacheItems<TTraits>::TOperation Items(TSpaceOperation& spaceOp) const noexcept {
+        return Items_.BindOperation(spaceOp);
+    }
 
     TCollectionRegistry& Registry() noexcept {
         return *CollectionRegistry_;
@@ -223,6 +228,7 @@ private:
 
 private:
     TCacheCollectionServices<TTraits> Services_;
+    TCacheItems<TTraits>& Items_;
     TIntrusivePtr<TCollectionRegistry> CollectionRegistry_ = new TCollectionRegistry;
     TCacheMemory& Memory_;
     TSharedCacheTableImpl<TTraits>& Table_;
