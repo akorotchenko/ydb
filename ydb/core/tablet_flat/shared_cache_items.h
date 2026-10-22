@@ -9,7 +9,7 @@ class TCacheItems {
 public:
     class TOperation {
     public:
-        // Native pin acquisition
+        // Native reference acquisition
         TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TCacheItem item) noexcept {
             return Items_.TryAcquireHotItemRef(SpaceOp_, item);
         }
@@ -47,7 +47,7 @@ public:
     }
 
 private:
-    // Native pin acquisition
+    // Native reference acquisition
     TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     TSharedCacheItemRefImpl<TTraits> AcquireMorePageRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     TSharedCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;

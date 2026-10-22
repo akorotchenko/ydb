@@ -73,8 +73,8 @@ public:
             Eviction_.RouteKeepCold(SpaceOp_, item);
         }
 
-        void ReleaseKeepColdPin(TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept {
-            Eviction_.ReleaseKeepColdPin(SpaceOp_, pin, initialColdVersion);
+        void ReleaseKeepColdRef(TOperationItemRef<TTraits>& itemRef, ui32 initialColdVersion) noexcept {
+            Eviction_.ReleaseKeepColdRef(SpaceOp_, itemRef, initialColdVersion);
         }
 
         // Hot routing and eviction
@@ -214,12 +214,12 @@ private:
     // KeepCold routing
     bool WantsKeepCold(TSpaceOperation& spaceOp, const THandle& page) noexcept;
     bool DemoteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem item, TPageCacheItem expectedPage = {}) noexcept;
-    void ReleaseColdDemotionPin(TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin) noexcept;
+    void ReleaseColdDemotionRef(TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& itemRef) noexcept;
     void WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
     bool MatchesKeepColdEntry(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
     void RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
-    void ReleaseKeepColdPin(
-        TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept;
+    void ReleaseKeepColdRef(
+        TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& itemRef, ui32 initialColdVersion) noexcept;
 
     // Hot routing and eviction
     TCacheItem PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
@@ -227,7 +227,7 @@ private:
     static Y_FORCE_INLINE bool TakeHotFrequency(
         THandle& handle, TCacheItem item, THandleState& state, ui8& frequency) noexcept;
     Y_FORCE_INLINE void CompleteHotEviction(TSpaceOperation& spaceOp, THandle& handle, THandleState coldState,
-        ui64 bytes, TOperationItemRef<TTraits>& pin, ui32 initialColdVersion) noexcept;
+        ui64 bytes, TOperationItemRef<TTraits>& itemRef, ui32 initialColdVersion) noexcept;
     void ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
     bool EvictFromHot(TSpaceOperation& spaceOp, ui32 index) noexcept;
     bool EvictFromHot(TSpaceOperation& spaceOp, TCacheItem item) noexcept;

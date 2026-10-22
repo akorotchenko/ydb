@@ -2227,13 +2227,13 @@ bool TSharedCache::TryReleaseColdPageToKeepCold(
     if (handle.State.compare_exchange_weak(
             expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
     {
-        TOperationItemRef pin(spaceOp, cacheItem);
+        TOperationItemRef itemRef(spaceOp, cacheItem);
         InvokeHook(ESharedCacheHookPoint::AfterKeepColdPromotion, cacheItem);
         const ui32 coldVersion = AdvanceColdMembership(handle);
         Memory_.Cold().TransferBytesTo(Memory_.KeepCold(), bytes);
         Memory_.Cold().TransferPageTo(Memory_.KeepCold(), EItemKind::Page);
         Memory_.RemoveColdItem();
-        cacheOp.Eviction().ReleaseKeepColdPin(pin, coldVersion);
+        cacheOp.Eviction().ReleaseKeepColdRef(itemRef, coldVersion);
         return true;
     }
     Memory_.ReleaseKeepColdOwnedBytes(bytes);
