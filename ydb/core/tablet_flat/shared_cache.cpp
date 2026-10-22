@@ -325,14 +325,14 @@ TSharedCache::~TSharedCacheImpl() {
             }
             TCacheFetches<TTraits>::DeletePendingFetch(handle);
         } else if (state.IsReady() || state.IsTombstone()) {
-            DeletePayload(handle, state.Kind(), state.State());
+            Items_.DeletePayload(Collections_, handle, state.Kind(), state.State());
         }
     }
     for (ui64 index = 2; index < space.HandleCount; ++index) {
         THandle& handle = space.Handles[index];
         const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
         if (state.IsCollectionKind() && (state.IsReady() || state.IsTombstone())) {
-            DeletePayload(handle, state.Kind(), state.State());
+            Items_.DeletePayload(Collections_, handle, state.Kind(), state.State());
         }
     }
 }
@@ -341,55 +341,6 @@ SHARED_CACHE_TEMPLATE
 void TSharedCache::DeleteReplacedPage(THandle& handle) noexcept {
     Y_DEBUG_ABORT_UNLESS(handle.Body.PageBuffer);
     handle.Body.PageBuffer.~TBuffer();
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::DeletePayload(THandle& handle, EItemKind kind, EHandleState state, TCollection* owner) noexcept {
-    Y_DEBUG_ABORT_UNLESS(IsReady(state) || state == EHandleState::Tombstone);
-    Y_DEBUG_ABORT_UNLESS(kind == EItemKind::Page || handle.Body.Collection);
-    const bool hasPayload = kind != EItemKind::Page || bool(handle.Body.PageBuffer);
-    Y_DEBUG_ABORT_UNLESS(state == EHandleState::Tombstone || hasPayload);
-    const ui64 bytes = hasPayload ? TCacheItems<TTraits>::PayloadBytes(handle, kind) : 0;
-    if (kind == EItemKind::Page) {
-        if (hasPayload && owner) {
-            Collections_.AddResidentPageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
-            if (state == EHandleState::Hot || state == EHandleState::Sticky || state == EHandleState::KeepCold) {
-                Collections_.AddActivePageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
-            }
-        }
-        handle.Body.PageBuffer.~TBuffer();
-    } else {
-        Y_DEBUG_ABORT_UNLESS(hasPayload);
-        delete std::exchange(handle.Body.Collection, nullptr);
-        Memory_.RemoveCollection(bytes);
-    }
-    if (hasPayload) {
-        const i64 estimatedBytes = static_cast<i64>(bytes);
-        if (state == EHandleState::Hot) {
-            Memory_.Hot().RemoveBytes(estimatedBytes);
-            Memory_.Hot().RemovePage(kind);
-        } else if (state == EHandleState::Sticky) {
-            Memory_.Sticky().RemoveBytes(estimatedBytes);
-            Memory_.Sticky().RemovePage(kind);
-            Memory_.ReleaseStickyOwnedBytes(kind, bytes);
-        } else if (state == EHandleState::KeepCold) {
-            Memory_.KeepCold().RemoveBytes(estimatedBytes);
-            Memory_.KeepCold().RemovePage(kind);
-            Memory_.ReleaseKeepColdOwnedBytes(bytes);
-        } else {
-            Memory_.Cold().RemoveBytes(estimatedBytes);
-            Memory_.Cold().RemovePage(kind);
-            Memory_.RemoveColdItem();
-        }
-        Memory_.RemoveResident(bytes);
-        if (state == EHandleState::Hot || state == EHandleState::Sticky || state == EHandleState::KeepCold) {
-            Memory_.ReleaseRetainedBytes(bytes);
-        }
-        Memory_.ReleasePayloadCharge(bytes, kind);
-        if (kind == EItemKind::Page) {
-            NotifyResourcesAvailable();
-        }
-    }
 }
 
 SHARED_CACHE_TEMPLATE
@@ -544,7 +495,7 @@ void TSharedCache::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem cacheIt
                              handle.Body.Collection->StickyPageListHead.load(std::memory_order_acquire) == 0);
         Y_DEBUG_ABORT_UNLESS(
             !state.IsCollectionKind() || handle.Body.Collection->Registry_.load(std::memory_order_acquire) == nullptr);
-        DeletePayload(handle, state.Kind(), state.State(),
+        Items_.DeletePayload(Collections_, handle, state.Kind(), state.State(),
             state.IsPageKind() ? cacheOp.Collections().PageCollection(handle) : nullptr);
         cacheOp.Collections().DropPageItemRef(handle);
         if (state.IsPageKind()) {
@@ -1050,7 +1001,7 @@ void TSharedCache::DiscardCandidate(
         Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, TCacheItems<TTraits>::PageBytes(handle));
     }
     if (expected.IsReady()) {
-        DeletePayload(handle, expected.Kind(), expected.State(), owner);
+        Items_.DeletePayload(Collections_, handle, expected.Kind(), expected.State(), owner);
     } else if (expected.IsPageKind() && expected.IsPending()) {
         TCacheFetches<TTraits>::DeletePendingFetch(handle);
     }
@@ -1935,7 +1886,7 @@ TCollection* TSharedCache::ReleaseTombstone(TSpaceOperation& spaceOp, TCacheItem
                 expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
         {
             Y_ABORT_UNLESS(handle.NextInOwner.load(std::memory_order_acquire) == 0);
-            DeletePayload(handle, expected.Kind(), expected.State(), owner);
+            Items_.DeletePayload(Collections_, handle, expected.Kind(), expected.State(), owner);
             Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(cacheItem.Index(), nextVersion));
             NotifyResourcesAvailable();
             if (expected.IsCollectionKind()) {
