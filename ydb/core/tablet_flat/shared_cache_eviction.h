@@ -34,9 +34,6 @@ public:
         : Cache_(cache)
     {}
 
-    static ui64 PageBytes(const THandle& handle) noexcept;
-    static ui64 AccountedPageBytes(ui64 size) noexcept;
-    static ui64 PayloadBytes(const THandle& handle, EItemKind kind) noexcept;
     static ui32 AdvanceColdMembership(THandle& handle) noexcept;
     static bool AdvanceColdMembership(
         THandle& handle, ui32 expectedVersion, bool keepColdQueued, ui32& newVersion) noexcept;

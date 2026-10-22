@@ -50,6 +50,20 @@ public:
         TSpaceOperation& SpaceOp_;
     };
 
+    // Payload sizes
+    static ui64 PayloadBytes(const THandle& handle, EItemKind kind) noexcept {
+        return kind == EItemKind::Page ? PageBytes(handle) : handle.Metadata.PayloadBytes;
+    }
+
+    static ui64 PageBytes(const THandle& handle) noexcept {
+        return AccountedPageBytes(handle.Key2OrSize.load(std::memory_order_relaxed));
+    }
+
+    static ui64 AccountedPageBytes(ui64 size) noexcept {
+        Y_ABORT_UNLESS(size <= Max<ui64>() - NActors::TSharedData::OverheadSize);
+        return size + NActors::TSharedData::OverheadSize;
+    }
+
     TCacheItems() noexcept = default;
 
     TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {

@@ -30,7 +30,6 @@ public:
     void RouteHotL1(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     void UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept;
     static ui32 AdvanceColdMembership(THandle& handle) noexcept;
-    static ui64 PageBytes(const THandle& handle) noexcept;
     void PromoteColdForSticky(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     void ScheduleKeepColdSweep(ui64 slots) noexcept;
 

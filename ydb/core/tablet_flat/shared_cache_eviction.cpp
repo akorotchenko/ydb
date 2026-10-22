@@ -1,24 +1,10 @@
 #include "shared_cache_eviction.h"
+#include "shared_cache_items.h"
 #include "shared_cache.h"
 
 #include <util/generic/cast.h>
 
 namespace NKikimr::NSharedCache {
-
-template <class TTraits>
-ui64 TCacheEvictionServices<TTraits>::PageBytes(const THandle& handle) noexcept {
-    return TSharedCacheImpl<TTraits>::PageBytes(handle);
-}
-
-template <class TTraits>
-ui64 TCacheEvictionServices<TTraits>::AccountedPageBytes(ui64 size) noexcept {
-    return TSharedCacheImpl<TTraits>::AccountedPageBytes(size);
-}
-
-template <class TTraits>
-ui64 TCacheEvictionServices<TTraits>::PayloadBytes(const THandle& handle, EItemKind kind) noexcept {
-    return TSharedCacheImpl<TTraits>::PayloadBytes(handle, kind);
-}
 
 template <class TTraits>
 ui32 TCacheEvictionServices<TTraits>::AdvanceColdMembership(THandle& handle) noexcept {
@@ -76,7 +62,7 @@ bool TCacheEviction<TTraits>::DemoteKeepCold(
         {
             TOperationItemRef<TTraits> itemRef(spaceOp, TCacheItem::Make(expected.Version(), coldItem.Index()));
             Traits_.Invoke(ESharedCacheHookPoint::AfterKeepColdDemoted, TCacheItem::FromRaw(coldItem.Raw()));
-            const ui64 bytes = Services_.PageBytes(handle);
+            const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
             Services_.AdvanceColdMembership(handle);
             Memory_.ReleaseRetainedBytes(bytes);
             Memory_.KeepCold().TransferBytesTo(Memory_.Cold(), bytes);
@@ -309,7 +295,7 @@ void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel lev
                 level = EHotLevel::L0;
             } else {
                 ui64 hotRaw = state.Raw();
-                const ui64 bytes = Services_.PayloadBytes(handle, state.Kind());
+                const ui64 bytes = TCacheItems<TTraits>::PayloadBytes(handle, state.Kind());
                 const bool keep = state.IsPageKind() && state.Refs() == 1 && WantsKeepCold(spaceOp, handle);
                 if (keep) {
                     Memory_.AddKeepColdOwnedBytes(bytes);
@@ -369,7 +355,7 @@ bool TCacheEviction<TTraits>::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem 
         if (!cacheItem.Matches(expected) || !expected.IsHot() || !expected.IsStickyNoneField()) {
             return false;
         }
-        const ui64 bytes = Services_.PayloadBytes(handle, expected.Kind());
+        const ui64 bytes = TCacheItems<TTraits>::PayloadBytes(handle, expected.Kind());
         const bool keep = expected.IsPageKind() && expected.Refs() == 1 && WantsKeepCold(spaceOp, handle);
         if (keep) {
             Memory_.AddKeepColdOwnedBytes(bytes);
@@ -399,7 +385,7 @@ bool TCacheEviction<TTraits>::PromoteCold(TSpaceOperation& spaceOp, TCacheItem c
             return false;
         }
         Y_DEBUG_ABORT_UNLESS(expected.IsPageKind() && expected.Refs() != 0);
-        const ui64 bytes = Services_.PageBytes(handle);
+        const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
         TCollection* owner = Collections_.BindOperation(spaceOp).PageCollection(handle);
         const bool protectedPage = force || !owner || owner->GetCacheMode() != ECacheMode::Regular;
         if (protectedPage) {
@@ -471,7 +457,7 @@ bool TCacheEviction<TTraits>::EraseCold(TSpaceOperation& spaceOp, TColdCacheItem
             // The tombstone owner now pins the page and its collection during accounting and notification.
             pageCollection =
                 expected.IsPageKind() ? Collections_.BindOperation(spaceOp).PageCollection(handle) : nullptr;
-            const ui64 bytes = Services_.PayloadBytes(handle, expected.Kind());
+            const ui64 bytes = TCacheItems<TTraits>::PayloadBytes(handle, expected.Kind());
             const THandleState desired = expected.IncrementRefs().WithState(EHandleState::Tombstone).WithFrequency(0);
             if (Memory_.UpdateColdReclaimable(bytes, expected, desired)) {
                 Services_.NotifyResourcesAvailable();

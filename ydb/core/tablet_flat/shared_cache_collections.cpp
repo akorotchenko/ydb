@@ -1,4 +1,5 @@
 #include "shared_cache_collections.h"
+#include "shared_cache_items.h"
 #include "shared_cache.h"
 #include "shared_cache_memory.h"
 #include "shared_cache_table.h"
@@ -28,11 +29,6 @@ void TCacheCollectionServices<TTraits>::UpdateColdReclaimable(
 template <class TTraits>
 ui32 TCacheCollectionServices<TTraits>::AdvanceColdMembership(THandle& handle) noexcept {
     return TSharedCacheImpl<TTraits>::AdvanceColdMembership(handle);
-}
-
-template <class TTraits>
-ui64 TCacheCollectionServices<TTraits>::PageBytes(const THandle& handle) noexcept {
-    return TSharedCacheImpl<TTraits>::PageBytes(handle);
 }
 
 template <class TTraits>
@@ -512,7 +508,7 @@ void TCacheCollections<TTraits>::DrainStickyPages(TSpaceOperation& spaceOp, TCol
                                  (((pending || resident) && expected.IsStickyField()) || reserved) &&
                                  page.Key0.load(std::memory_order_relaxed) == collectionItem.Raw());
 
-            const ui64 bytes = Services_.PageBytes(page);
+            const ui64 bytes = TCacheItems<TTraits>::PageBytes(page);
             THandleState desired = expected.WithSticky(EStickyState::None);
             if (!pending) {
                 desired = desired.WithFrequency(0);
@@ -607,11 +603,11 @@ void TCacheCollections<TTraits>::CancelStickyLink(TSpaceOperation& spaceOp, TCac
                 expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
         {
             if (expected.IsHot()) {
-                Memory_.Sticky().TransferBytesTo(Memory_.Hot(), Services_.PageBytes(page));
+                Memory_.Sticky().TransferBytesTo(Memory_.Hot(), TCacheItems<TTraits>::PageBytes(page));
                 Memory_.Sticky().TransferPageTo(Memory_.Hot(), EItemKind::Page);
                 Services_.RouteHotL1(spaceOp, pageItem);
             }
-            Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, Services_.PageBytes(page));
+            Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, TCacheItems<TTraits>::PageBytes(page));
             return;
         }
     }
@@ -622,7 +618,7 @@ void TCacheCollections<TTraits>::UnlinkPendingStickyPage(TSpaceOperation& spaceO
     THandle& target = spaceOp.Handles()[pageItem.Index()];
     TCollection* collection = PageCollection(spaceOp, target);
     Y_ABORT_UNLESS(collection);
-    const ui64 bytes = Services_.PageBytes(target);
+    const ui64 bytes = TCacheItems<TTraits>::PageBytes(target);
     for (;;) {
         const THandleState state = THandleState::FromRaw(target.State.load(std::memory_order_acquire));
         if (!state.IsStickyField()) {
@@ -687,7 +683,7 @@ bool TCacheCollections<TTraits>::MakePageSticky(TSpaceOperation& spaceOp, TCache
     if (admissionMode == ECacheMode::TryKeepInMemory) {
         return false;
     }
-    const ui64 bytes = Services_.PageBytes(page);
+    const ui64 bytes = TCacheItems<TTraits>::PageBytes(page);
     if (THandleState::FromRaw(page.State.load(std::memory_order_acquire)).IsCold()) {
         Services_.PromoteColdForSticky(spaceOp, pageItem);
     }
