@@ -524,8 +524,6 @@ private:
 
     void Release(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
-    void CompleteColdPageRelease(TOperationItemRef<TTraits>& ownerRef) noexcept;
-    bool TryReleaseColdPageToKeepCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, ui64& expectedRaw) noexcept;
     void ReleaseReplacing(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
     void ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
@@ -748,10 +746,6 @@ public: // Cache helpers
 
     Y_FORCE_INLINE TCollection* ReleaseItem(TCacheItem cacheItem, bool allowKeepCold = true) noexcept {
         return Items().ReleaseItem(cacheItem, allowKeepCold);
-    }
-
-    Y_FORCE_INLINE bool TryReleaseColdPageToKeepCold(TCacheItem cacheItem, ui64& expectedRaw) noexcept {
-        return Cache_.TryReleaseColdPageToKeepCold(SpaceOp_, cacheItem, expectedRaw);
     }
 
     Y_FORCE_INLINE bool TryReleaseItemRef(TCacheItem cacheItem, ui64& expectedRaw) noexcept {

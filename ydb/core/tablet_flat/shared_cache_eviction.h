@@ -30,6 +30,10 @@ public:
             return Eviction_.WantsKeepCold(SpaceOp_, page);
         }
 
+        bool TryReleaseColdPageToKeepCold(TCacheItem item, ui64& expectedRaw) noexcept {
+            return Eviction_.TryReleaseColdPageToKeepCold(SpaceOp_, item, expectedRaw);
+        }
+
         bool DemoteKeepCold(TColdCacheItem item, TPageCacheItem expectedPage = {}) noexcept {
             return Eviction_.DemoteKeepCold(SpaceOp_, item, expectedPage);
         }
@@ -76,6 +80,10 @@ public:
         }
 
         // Cold routing and reclamation
+        void CompleteColdPageRelease(TOperationItemRef<TTraits>& ownerRef) noexcept {
+            Eviction_.CompleteColdPageRelease(ownerRef);
+        }
+
         bool EraseCold(TColdCacheItem item) noexcept {
             return Eviction_.EraseCold(SpaceOp_, item);
         }
@@ -178,6 +186,7 @@ private:
 
     // KeepCold routing
     bool WantsKeepCold(TSpaceOperation& spaceOp, const THandle& page) noexcept;
+    bool TryReleaseColdPageToKeepCold(TSpaceOperation& spaceOp, TCacheItem item, ui64& expectedRaw) noexcept;
     bool DemoteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem item, TPageCacheItem expectedPage = {}) noexcept;
     void ReleaseColdDemotionRef(TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& itemRef) noexcept;
     void WithdrawKeepColdEntry(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
@@ -200,6 +209,7 @@ private:
     bool ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept;
 
     // Cold routing and reclamation
+    void CompleteColdPageRelease(TOperationItemRef<TTraits>& ownerRef) noexcept;
     bool EraseCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
     void RouteCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
     bool ReclaimCold(TSpaceOperation& spaceOp) noexcept;
