@@ -1,4 +1,5 @@
 #include "shared_cache.h"
+#include "shared_cache_items_ref_impl.h"
 #include "shared_cache_events.h"
 #include "shared_cache_traits.h"
 
@@ -1259,20 +1260,6 @@ bool TSharedCache::IsPageSticky(TPageCacheItem page) const noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
-TSharedPageRefImpl<TTraits> TSharedCache::BuildPageRef(
-    const TSpaceOperation& spaceOp, TSharedCacheItemRef&& ref) const noexcept {
-    Y_DEBUG_ABORT_UNLESS(&Get() == this && ref);
-    const TCacheItem cacheItem = ref.CacheItem_;
-    Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
-    const THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(state) && state.IsPageKind() &&
-                         (state.IsReady() || state.IsReplacing() || state.IsReplaced() || state.IsTombstone()) &&
-                         state.Refs() > 0 && handle.Body.PageBuffer.data());
-    return TSharedPageRefImpl<TTraits>(std::move(ref));
-}
-
-SHARED_CACHE_TEMPLATE
 bool TSharedCache::AcquirePage(TPageCacheItem page, TSharedPageRefImpl<TTraits>& result) noexcept {
     result.Drop();
     TCacheItem cacheItem = page.CacheItem();
@@ -1324,22 +1311,6 @@ SHARED_CACHE_TEMPLATE
 TSharedCacheCollectionRef TSharedCache::AcquireMoreCollectionRef(TCacheItem item) noexcept {
     auto cacheOp = BeginOperation();
     return cacheOp.BuildCollectionRef(cacheOp.Items().AcquireMoreCollectionRef(item));
-}
-
-SHARED_CACHE_TEMPLATE
-TSharedCacheCollectionRef TSharedCache::BuildCollectionRef(
-    const TSpaceOperation& spaceOp, TSharedCacheItemRef&& ref) const noexcept {
-    Y_DEBUG_ABORT_UNLESS(&Get() == this);
-    const TCacheItem cacheItem = ref.CacheItem_;
-    Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
-    const THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    Y_DEBUG_ABORT_UNLESS([&] {
-        const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
-        return cacheItem.Matches(state) && state.IsCollectionKind() &&
-               (state.IsSticky() || state.IsHot() || state.IsCold() || state.IsTombstone()) && state.Refs() > 0 &&
-               handle.Body.Collection;
-    }());
-    return TSharedCacheCollectionRef(std::move(ref));
 }
 
 SHARED_CACHE_TEMPLATE
@@ -2294,6 +2265,16 @@ bool TSharedCache::TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheI
 #undef TOperationItemRef
 #undef TSharedCache
 #undef SHARED_CACHE_TEMPLATE
+
+// Typed-reference builders are instantiated with their callers and constructors
+template TSharedPageRefImpl<TProdTraits> TCacheItems<TProdTraits>::BuildPageRef(
+    const TSpaceOperation&, TSharedCacheItemRefImpl<TProdTraits>&&) const noexcept;
+template TSharedCacheCollectionRefImpl<TProdTraits> TCacheItems<TProdTraits>::BuildCollectionRef(
+    const TSpaceOperation&, TSharedCacheItemRefImpl<TProdTraits>&&) const noexcept;
+template TSharedPageRefImpl<TTestTraits> TCacheItems<TTestTraits>::BuildPageRef(
+    const TSpaceOperation&, TSharedCacheItemRefImpl<TTestTraits>&&) const noexcept;
+template TSharedCacheCollectionRefImpl<TTestTraits> TCacheItems<TTestTraits>::BuildCollectionRef(
+    const TSpaceOperation&, TSharedCacheItemRefImpl<TTestTraits>&&) const noexcept;
 
 template class TSharedPageRefImpl<TProdTraits>;
 template class TSharedCacheCollectionRefImpl<TProdTraits>;

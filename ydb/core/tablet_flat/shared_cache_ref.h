@@ -148,7 +148,7 @@ public:
     void Drop() noexcept;
 
 private:
-    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheItems<TTraits>;
 
     explicit TSharedPageRefImpl(TSharedCacheItemRefImpl<TTraits>&& ref) noexcept;
 
@@ -190,7 +190,7 @@ public:
     void Drop() noexcept;
 
 private:
-    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheItems<TTraits>;
 
     explicit TSharedCacheCollectionRefImpl(TSharedCacheItemRefImpl<TTraits>&& ref) noexcept;
 

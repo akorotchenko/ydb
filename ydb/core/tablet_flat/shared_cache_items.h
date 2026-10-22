@@ -22,6 +22,16 @@ public:
             return Items_.AcquireMoreCollectionRef(SpaceOp_, item);
         }
 
+        // Reference construction
+        TSharedPageRefImpl<TTraits> BuildPageRef(TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {
+            return Items_.BuildPageRef(SpaceOp_, std::move(ref));
+        }
+
+        TSharedCacheCollectionRefImpl<TTraits> BuildCollectionRef(
+            TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {
+            return Items_.BuildCollectionRef(SpaceOp_, std::move(ref));
+        }
+
         // Handle initialization
         void InitializeCollection(TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept {
             Items_.InitializeCollection(SpaceOp_, cacheItem, id, bytes);
@@ -51,6 +61,12 @@ private:
     TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     TSharedCacheItemRefImpl<TTraits> AcquireMorePageRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     TSharedCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+
+    // Reference construction
+    TSharedPageRefImpl<TTraits> BuildPageRef(
+        const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
+    TSharedCacheCollectionRefImpl<TTraits> BuildCollectionRef(
+        const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
 
     // Handle initialization
     void InitializeCollection(
