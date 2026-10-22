@@ -14,12 +14,12 @@ public:
             return Items_.TryAcquireHotEvictionPin(SpaceOp_, item);
         }
 
-        TSharedCacheItemRefImpl<TTraits> AcquireHeldPage(TCacheItem item) noexcept {
-            return Items_.AcquireHeldPage(SpaceOp_, item);
+        TSharedCacheItemRefImpl<TTraits> AcquireMorePageRef(TCacheItem item) noexcept {
+            return Items_.AcquireMorePageRef(SpaceOp_, item);
         }
 
-        TSharedCacheItemRefImpl<TTraits> AcquireHeldCollection(TCacheItem item) noexcept {
-            return Items_.AcquireHeldCollection(SpaceOp_, item);
+        TSharedCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TCacheItem item) noexcept {
+            return Items_.AcquireMoreCollectionRef(SpaceOp_, item);
         }
 
         // Handle initialization
@@ -49,8 +49,8 @@ public:
 private:
     // Native pin acquisition
     TSharedCacheItemRefImpl<TTraits> TryAcquireHotEvictionPin(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
-    TSharedCacheItemRefImpl<TTraits> AcquireHeldPage(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
-    TSharedCacheItemRefImpl<TTraits> AcquireHeldCollection(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+    TSharedCacheItemRefImpl<TTraits> AcquireMorePageRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+    TSharedCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
 
     // Handle initialization
     void InitializeCollection(

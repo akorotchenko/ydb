@@ -620,8 +620,8 @@ private:
     bool IsPageSticky(TPageCacheItem page) const noexcept;
     TSharedPageRefImpl<TTraits> BuildPageRef(
         const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
-    TSharedPageRefImpl<TTraits> AcquireHeldPage(TCacheItem item) noexcept;
-    TSharedCacheCollectionRefImpl<TTraits> AcquireHeldCollection(TCacheItem item) noexcept;
+    TSharedPageRefImpl<TTraits> AcquireMorePageRef(TCacheItem item) noexcept;
+    TSharedCacheCollectionRefImpl<TTraits> AcquireMoreCollectionRef(TCacheItem item) noexcept;
 
     bool AcquirePage(TPageCacheItem page, TSharedPageRefImpl<TTraits>& result) noexcept;
 

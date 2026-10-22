@@ -191,7 +191,7 @@ TSharedPageRefImpl<TTraits> TSharedPageRefImpl<TTraits>::Acquire() const& noexce
         return {};
     }
     TSharedCache& cache = TSharedCache::Get();
-    return cache.AcquireHeldPage(Ref_.CacheItem());
+    return cache.AcquireMorePageRef(Ref_.CacheItem());
 }
 
 SHARED_CACHE_TEMPLATE
@@ -283,7 +283,7 @@ TSharedCacheCollectionRef TSharedCacheCollectionRef::Acquire() const& noexcept {
         return {};
     }
     TSharedCache& cache = TSharedCache::Get();
-    return cache.AcquireHeldCollection(Ref_.CacheItem());
+    return cache.AcquireMoreCollectionRef(Ref_.CacheItem());
 }
 
 SHARED_CACHE_TEMPLATE
@@ -1315,15 +1315,15 @@ bool TSharedCache::AcquirePage(TPageCacheItem page, TSharedPageRefImpl<TTraits>&
 }
 
 SHARED_CACHE_TEMPLATE
-TSharedPageRefImpl<TTraits> TSharedCache::AcquireHeldPage(TCacheItem item) noexcept {
+TSharedPageRefImpl<TTraits> TSharedCache::AcquireMorePageRef(TCacheItem item) noexcept {
     auto cacheOp = BeginOperation();
-    return cacheOp.BuildPageRef(cacheOp.Items().AcquireHeldPage(item));
+    return cacheOp.BuildPageRef(cacheOp.Items().AcquireMorePageRef(item));
 }
 
 SHARED_CACHE_TEMPLATE
-TSharedCacheCollectionRef TSharedCache::AcquireHeldCollection(TCacheItem item) noexcept {
+TSharedCacheCollectionRef TSharedCache::AcquireMoreCollectionRef(TCacheItem item) noexcept {
     auto cacheOp = BeginOperation();
-    return cacheOp.BuildCollectionRef(cacheOp.Items().AcquireHeldCollection(item));
+    return cacheOp.BuildCollectionRef(cacheOp.Items().AcquireMoreCollectionRef(item));
 }
 
 SHARED_CACHE_TEMPLATE
