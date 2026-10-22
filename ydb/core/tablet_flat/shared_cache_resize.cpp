@@ -1,4 +1,3 @@
-#include "shared_cache_resize.h"
 #include "shared_cache.h"
 
 namespace NKikimr::NSharedCache {
@@ -7,138 +6,6 @@ namespace NKikimr::NSharedCache {
 #define TSharedCache TSharedCacheImpl<TTraits>
 #define TSharedCacheItemRef TSharedCacheItemRefImpl<TTraits>
 #define TOperationItemRef TOperationItemRef<TTraits>
-
-template <class TTraits>
-bool TCacheResize<TTraits>::PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept {
-    const ui64 currentStaticBytes = Space_.CurrentConfiguration().StaticBytes;
-    const ui64 staticDeltaBytes = target.StaticBytes > currentStaticBytes ? target.StaticBytes - currentStaticBytes : 0;
-    if (staticDeltaBytes != 0) {
-        Memory_.PrepareStaticResize(staticDeltaBytes);
-    }
-    if (Space_.PrepareTransition(target, transition)) {
-        return true;
-    }
-    if (staticDeltaBytes != 0) {
-        Memory_.CancelStaticResize(staticDeltaBytes);
-    }
-    return false;
-}
-
-template <class TTraits>
-bool TCacheResize<TTraits>::PublishMigrationView(TTransition& transition, THotResize& hotResize) noexcept {
-    if (auto hotResizeGuard = hotResize.TryLock()) {
-        return Space_.PublishMigrationView(transition);
-    }
-    return false;
-}
-
-template <class TTraits>
-bool TCacheResize<TTraits>::TryDrainTransition(TTransition& transition) noexcept {
-    return Space_.TryDrainTransition(transition);
-}
-
-template <class TTraits>
-bool TCacheResize<TTraits>::PublishFinalView(TTransition& transition, THotResize& hotResize) noexcept {
-    if (auto hotResizeGuard = hotResize.TryLock()) {
-        if (hotResize.Phase() == EHotResizePhase::Cut) {
-            auto spaceOp = Space_.BeginOperation();
-            Eviction_.BindOperation(spaceOp).DrainHotResize(Space_, hotResize);
-        }
-        if (hotResize.Phase() != EHotResizePhase::Idle) {
-            return false;
-        }
-        return Space_.PublishFinalView(transition);
-    }
-    return false;
-}
-
-template <class TTraits>
-bool TCacheResize<TTraits>::AppendFreeHandles(TTransition& transition) noexcept {
-    return Space_.AppendFreeHandles(transition);
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::StartHardTransition() noexcept {
-    if (HardTransition_.Phase() != ETransitionPhase::Idle) {
-        return false;
-    }
-
-    const TSharedCacheCapacity& current = Space_->CurrentConfiguration();
-    if (current.AddressBits == HardTarget_.AddressBits) {
-        return false;
-    }
-
-    const ui8 nextAddressBits =
-        current.AddressBits < HardTarget_.AddressBits ? current.AddressBits + 1 : current.AddressBits - 1;
-    TSharedCacheCapacity next;
-    if (!TryCalculateSharedCacheFootprint(
-            nextAddressBits, current.ExpectedPageSize, current.FixedBytes, Space_->HazardCount(), next))
-    {
-        return false;
-    }
-    next.Limit = HardLimit();
-    return Resize_.PrepareTransition(next, HardTransition_);
-}
-
-template <class TTraits>
-bool TCacheResize<TTraits>::FinalDrain(TTransition& transition) noexcept {
-    auto spaceOp = Space_.BeginOperation();
-    auto evictionOp = Eviction_.BindOperation(spaceOp);
-    return Space_.FinalDrain(
-        transition,
-        [&](ui32 level, ui64 raw) noexcept {
-            evictionOp.RouteHot(static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
-        },
-        [&](ui64 raw) noexcept {
-            Memory_.RemoveColdRingEntry();
-            evictionOp.RouteCold(TColdCacheItem::FromRaw(raw));
-        },
-        [&](ui64 raw) noexcept {
-            evictionOp.RouteKeepCold(TColdCacheItem::FromRaw(raw));
-        });
-}
-
-template <class TTraits>
-bool TCacheResize<TTraits>::TryReleaseTransition(TTransition& transition) noexcept {
-    return Space_.TryReleaseTransition(transition);
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::CommitTransition(TTransition& transition) noexcept {
-    const ui64 oldStaticBytes = transition.OldConfiguration().StaticBytes;
-    const ui64 targetStaticBytes = transition.TargetConfiguration().StaticBytes;
-    const ui64 targetLimit = transition.TargetConfiguration().Limit;
-    const ui64 targetHandleCount = transition.TargetConfiguration().HandleCount();
-    const bool commitTargetLimit = &transition != &HardTransition_;
-    if (!Space_->CommitTransition(transition)) {
-        return false;
-    }
-
-    Memory_.CommitStaticResize(oldStaticBytes, targetStaticBytes);
-    if (commitTargetLimit) {
-        TargetHandleCount_.store(targetHandleCount, std::memory_order_relaxed);
-        Memory_.SetHardLimit(targetLimit);
-    }
-    RefreshSoftLimit();
-    return true;
-}
-
-template <class TTraits>
-bool TCacheResize<TTraits>::AbandonTransition(TTransition& transition) noexcept {
-    const ETransitionPhase phase = transition.Phase();
-    const ui64 oldStaticBytes = transition.OldConfiguration().StaticBytes;
-    const ui64 targetStaticBytes = transition.TargetConfiguration().StaticBytes;
-    if (!Space_.AbandonTransition(transition)) {
-        return false;
-    }
-    if ((phase == ETransitionPhase::Prepare || phase == ETransitionPhase::InitializeGrowth) &&
-        targetStaticBytes > oldStaticBytes)
-    {
-        const ui64 delta = targetStaticBytes - oldStaticBytes;
-        Memory_.CancelStaticResize(delta);
-    }
-    return true;
-}
 
 SHARED_CACHE_TEMPLATE
 TSharedCacheItemRef TSharedCache::TryAcquirePageForRelocation(TSpaceOperation& spaceOp, ui32 index) noexcept {
@@ -371,8 +238,7 @@ bool TSharedCache::DemoteUnlinkedStickyPage(TSpaceOperation& spaceOp, ui32 index
 }
 
 SHARED_CACHE_TEMPLATE
-typename TSharedCache::EShrinkCutStatus TSharedCache::ReclaimShrinkHandle(
-    TSpaceOperation& spaceOp, ui32 index) noexcept {
+EShrinkCutStatus TSharedCache::ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui32 index) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     const THandleState state = THandleState::FromRaw(spaceOp.Handles()[index].State.load(std::memory_order_acquire));
     if (state.IsFree()) {
@@ -420,61 +286,13 @@ typename TSharedCache::EShrinkCutStatus TSharedCache::ReclaimShrinkHandle(
     return EShrinkCutStatus::Blocked;
 }
 
-SHARED_CACHE_TEMPLATE
-typename TSharedCache::EShrinkCutStatus TSharedCache::ReclaimShrinkCut() noexcept {
-    TTransition& transition = HardTransition_;
-    const ui64 allocationLimit = transition.TargetConfiguration().HandleCount();
-    const TCacheItem spare = Space_->TakeSpareForShrink(allocationLimit);
-    if (!spare.IsNull()) {
-        auto cacheOp = BeginOperation();
-        Y_DEBUG_ABORT_UNLESS(cacheOp.Contains(spare) && spare.Index() >= allocationLimit);
-        THandle& handle = cacheOp.Handles()[spare.Index()];
-        const THandleState expected = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-        Y_DEBUG_ABORT_UNLESS(spare.Matches(expected) && expected.IsBegin() && expected.Refs() == 0);
-        handle.State.store(expected.WithState(EHandleState::Free).Raw(), std::memory_order_release);
-        return EShrinkCutStatus::Progress;
-    }
-
-    auto cacheOp = BeginOperation();
-    const ui64 handleCount = cacheOp.HandleCount();
-    ui64& index = transition.NextWorkIndex_;
-    if (index < allocationLimit || index > handleCount) {
-        index = allocationLimit;
-        transition.CutBlocked_ = false;
-    }
-    const ui64 end = Min(handleCount, index + SharedCacheTransitionWorkBatch);
-    while (index < end) {
-        switch (cacheOp.ReclaimShrinkHandle(static_cast<ui32>(index))) {
-            case EShrinkCutStatus::Progress:
-                return EShrinkCutStatus::Progress;
-            case EShrinkCutStatus::Blocked:
-                transition.CutBlocked_ = true;
-                break;
-            case EShrinkCutStatus::Complete:
-                break;
-        }
-        ++index;
-    }
-    if (index < handleCount) {
-        return EShrinkCutStatus::Progress;
-    }
-    const bool blocked = transition.CutBlocked_;
-    index = 0;
-    transition.CutBlocked_ = false;
-    return blocked ? EShrinkCutStatus::Blocked : EShrinkCutStatus::Complete;
-}
-
 #undef TOperationItemRef
 #undef TSharedCacheItemRef
 #undef TSharedCache
 #undef SHARED_CACHE_TEMPLATE
 
-// Resize component and remaining Cache members are instantiated here for both trait variants
-template class TCacheResize<TProdTraits>;
-template class TCacheResize<TTestTraits>;
+// Native relocation and shrink kernels are instantiated here for both trait variants
 
-template bool TSharedCacheImpl<TProdTraits>::StartHardTransition() noexcept;
-template bool TSharedCacheImpl<TProdTraits>::CommitTransition(TTransition&) noexcept;
 template TSharedCacheItemRefImpl<TProdTraits> TSharedCacheImpl<TProdTraits>::TryAcquirePageForRelocation(
     TSpaceOperation&, ui32) noexcept;
 template TCacheItem TSharedCacheImpl<TProdTraits>::PreparePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
@@ -484,12 +302,8 @@ template bool TSharedCacheImpl<TProdTraits>::PublishPageReplacement(
 template void TSharedCacheImpl<TProdTraits>::CompletePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
 template bool TSharedCacheImpl<TProdTraits>::RelocatePage(TSpaceOperation&, ui32) noexcept;
 template bool TSharedCacheImpl<TProdTraits>::DemoteUnlinkedStickyPage(TSpaceOperation&, ui32) noexcept;
-template TSharedCacheImpl<TProdTraits>::EShrinkCutStatus TSharedCacheImpl<TProdTraits>::ReclaimShrinkHandle(
-    TSpaceOperation&, ui32) noexcept;
-template TSharedCacheImpl<TProdTraits>::EShrinkCutStatus TSharedCacheImpl<TProdTraits>::ReclaimShrinkCut() noexcept;
+template EShrinkCutStatus TSharedCacheImpl<TProdTraits>::ReclaimShrinkHandle(TSpaceOperation&, ui32) noexcept;
 
-template bool TSharedCacheImpl<TTestTraits>::StartHardTransition() noexcept;
-template bool TSharedCacheImpl<TTestTraits>::CommitTransition(TTransition&) noexcept;
 template TSharedCacheItemRefImpl<TTestTraits> TSharedCacheImpl<TTestTraits>::TryAcquirePageForRelocation(
     TSpaceOperation&, ui32) noexcept;
 template TCacheItem TSharedCacheImpl<TTestTraits>::PreparePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
@@ -499,8 +313,6 @@ template bool TSharedCacheImpl<TTestTraits>::PublishPageReplacement(
 template void TSharedCacheImpl<TTestTraits>::CompletePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
 template bool TSharedCacheImpl<TTestTraits>::RelocatePage(TSpaceOperation&, ui32) noexcept;
 template bool TSharedCacheImpl<TTestTraits>::DemoteUnlinkedStickyPage(TSpaceOperation&, ui32) noexcept;
-template TSharedCacheImpl<TTestTraits>::EShrinkCutStatus TSharedCacheImpl<TTestTraits>::ReclaimShrinkHandle(
-    TSpaceOperation&, ui32) noexcept;
-template TSharedCacheImpl<TTestTraits>::EShrinkCutStatus TSharedCacheImpl<TTestTraits>::ReclaimShrinkCut() noexcept;
+template EShrinkCutStatus TSharedCacheImpl<TTestTraits>::ReclaimShrinkHandle(TSpaceOperation&, ui32) noexcept;
 
 } // namespace NKikimr::NSharedCache

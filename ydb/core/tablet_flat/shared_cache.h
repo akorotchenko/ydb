@@ -5,7 +5,7 @@
 #include "shared_cache_eviction.h"
 #include "shared_cache_fetches.h"
 #include "shared_cache_memory.h"
-#include "shared_cache_resize.h"
+#include "shared_cache_capacity.h"
 #include "shared_cache_table.h"
 
 #include <util/generic/function_ref.h>
@@ -312,11 +312,11 @@ public:
 
     // Serialized controller access, like UpdateHardLimit and RunMaintenance.
     bool NeedsCapacityMaintenance() const noexcept {
-        return HardTransition_.Phase() != ETransitionPhase::Idle || PhysicalHandleCount() != TargetHandleCount();
+        return Capacity_.NeedsMaintenance();
     }
 
     ui64 TargetHandleCount() const noexcept {
-        return TargetHandleCount_.load(std::memory_order_relaxed);
+        return Capacity_.TargetHandleCount();
     }
 
     // Serialized controller access; workers use their active space view.
@@ -461,6 +461,7 @@ private:
     friend class TCacheFetchServices<TTraits>;
     friend class TCacheCollectionServices<TTraits>;
     friend class TCacheEvictionServices<TTraits>;
+    friend class TCacheCapacityServices<TTraits>;
     friend class TRequestPageWaiter;
     friend class TCompactedPageWaiter;
     friend struct TEvSaveCompactedPages;
@@ -484,12 +485,6 @@ private:
         Stale,
         Pending,
         Ready,
-    };
-
-    enum class EShrinkCutStatus {
-        Blocked,
-        Progress,
-        Complete,
     };
 
     enum class EPageAdmission {
@@ -599,8 +594,6 @@ private:
     void NotifyResourcesAvailable() noexcept;
     void ReleaseReservation(ui64 bytes, ui64 pages = 0) noexcept;
 
-    bool CommitTransition(TTransition& transition) noexcept;
-
     void DiscardCandidate(TPageCacheItem page) noexcept;
 
     void DiscardCandidate(TCollectionCacheItem collection) noexcept;
@@ -682,7 +675,6 @@ private:
     TSharedCacheItemRefImpl<TTraits> TryAcquireHotEvictionPin(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
     bool DrainHotResize() noexcept;
     void RefreshSoftLimit() noexcept;
-    bool StartHardTransition() noexcept;
     TSharedCacheItemRefImpl<TTraits> TryAcquirePageForRelocation(TSpaceOperation& spaceOp, ui32 index) noexcept;
     TCacheItem PreparePageReplacement(TSpaceOperation& spaceOp, TCacheItem source) noexcept;
     void DiscardPageReplacement(TSpaceOperation& spaceOp, TCacheItem replacement) noexcept;
@@ -692,7 +684,6 @@ private:
     bool RelocatePage(TSpaceOperation& spaceOp, ui32 index) noexcept;
     bool DemoteUnlinkedStickyPage(TSpaceOperation& spaceOp, ui32 index) noexcept;
     EShrinkCutStatus ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui32 index) noexcept;
-    EShrinkCutStatus ReclaimShrinkCut() noexcept;
 
 private:
     THolder<TSharedCacheSpace> Space_;
@@ -700,12 +691,9 @@ private:
     TCacheMemory Memory_;
     TCacheCollections<TTraits> Collections_;
     TCacheEviction<TTraits> Eviction_;
-    TCacheResize<TTraits> Resize_;
+    TCacheCapacity<TTraits> Capacity_;
     TCacheFetches<TTraits> Fetches_;
-    std::atomic<ui64> TargetHandleCount_{ 0 };
     THotResize HotResize_;
-    TSharedCacheCapacity HardTarget_;
-    TTransition HardTransition_;
 
     inline static constexpr TSharedCachePolicy Policy_ = SharedCachePolicyFor<TTraits>;
 };
