@@ -408,11 +408,7 @@ private:
 
     explicit TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit, TTraits traits) noexcept;
 
-    enum class EAcquireStatus {
-        Stale,
-        Pending,
-        Ready,
-    };
+    using EAcquireStatus = typename TCacheItems<TTraits>::EAcquireStatus;
 
     enum class EPageAdmission {
         Bounded,
@@ -515,9 +511,6 @@ private:
     void DiscardCandidate(TCollectionCacheItem collection) noexcept;
 
     void DiscardCandidate(TCacheItem cacheItem, EItemKind kind) noexcept;
-
-    EAcquireStatus TryAcquire(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending,
-        TSharedCacheItemRefImpl<TTraits>& ref) noexcept;
 
     TSharedCacheItemRefImpl<TTraits> BuildExternalRef(EItemKind kind, TCacheItem cacheItem) noexcept;
 
@@ -635,7 +628,7 @@ public: // Cache table operations
 public: // Cache helpers
     Y_FORCE_INLINE EAcquireStatus TryAcquire(
         TCacheItem item, bool allowPending, TSharedCacheItemRefImpl<TTraits>& ref) noexcept {
-        return Cache_.TryAcquire(SpaceOp_, item, allowPending, ref);
+        return Items().TryAcquire(item, allowPending, ref);
     }
 
     Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> TryAcquireStructural(TCacheItem item) noexcept {
