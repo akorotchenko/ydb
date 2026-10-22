@@ -63,6 +63,67 @@ TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMoreCollectionRef(
 }
 
 template <class TTraits>
+TCollection* TCacheItems<TTraits>::ReleaseTombstone(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
+    auto cacheOp = Cache_.BindOperation(spaceOp);
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        Y_ABORT_UNLESS(cacheItem.Matches(expected) && expected.IsTombstone() && expected.Refs() > 0);
+        if (expected.Refs() > 1) {
+            const THandleState desired = expected.DecrementRefs();
+            if (handle.State.compare_exchange_weak(
+                    expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
+            {
+                return nullptr;
+            }
+            continue;
+        }
+
+        if (cacheItem.IsResizeMarker()) {
+            const ui32 nextVersion = AdvanceItemVersion(expected.Version());
+            const THandleState desired = expected.WithVersion(nextVersion)
+                                             .WithState(EHandleState::Free)
+                                             .WithFrequency(0)
+                                             .WithSticky(EStickyState::None)
+                                             .WithRefs(0);
+            if (handle.State.compare_exchange_weak(
+                    expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
+            {
+                return nullptr;
+            }
+            continue;
+        }
+
+        TCollection* owner = expected.IsPageKind() ? cacheOp.Collections().PageCollection(handle) : nullptr;
+        const TSharedCacheKey key = LoadSharedCacheKey(handle, expected.Kind());
+        cacheOp.FinishErase(cacheItem, key);
+        Y_DEBUG_ABORT_UNLESS(!expected.IsCollectionKind() ||
+                             handle.Body.Collection->StickyPageListHead.load(std::memory_order_acquire) == 0);
+        const ui32 nextVersion = AdvanceItemVersion(expected.Version());
+        const THandleState desired = expected.WithVersion(nextVersion)
+                                         .WithState(EHandleState::Free)
+                                         .WithFrequency(0)
+                                         .WithSticky(EStickyState::None)
+                                         .WithRefs(0);
+        Cache_.InvokeHook(ESharedCacheHookPoint::BeforeTombstoneFinalCas, cacheItem);
+        if (handle.State.compare_exchange_weak(
+                expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
+        {
+            Y_ABORT_UNLESS(handle.NextInOwner.load(std::memory_order_acquire) == 0);
+            DeletePayload(handle, expected.Kind(), expected.State(), owner);
+            Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(cacheItem.Index(), nextVersion));
+            Cache_.NotifyResourcesAvailable();
+            if (expected.IsCollectionKind()) {
+                Cache_.NotifyCollectionReleased(
+                    TLogoBlobID(key.Word(0), key.Word(1), key.Word(2)), TCollectionCacheItem::FromValidated(cacheItem));
+            }
+            return owner;
+        }
+    }
+}
+
+template <class TTraits>
 ui32 TCacheItems<TTraits>::TryAllocateHandle(TSpaceOperation& spaceOp) noexcept {
     auto evictionOp = Cache_.Eviction_.BindOperation(spaceOp);
     const TCacheItem spare = TCacheItem::FromRaw(spaceOp.Hazard().SpareItem.exchange(0, std::memory_order_relaxed));

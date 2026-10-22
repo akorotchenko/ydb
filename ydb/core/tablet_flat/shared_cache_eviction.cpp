@@ -62,7 +62,7 @@ void TCacheEviction<TTraits>::ReleaseColdDemotionRef(
     const TCacheItem cacheItem = itemRef.CacheItem();
     itemRef.Disarm();
     // A policy demotion must not readmit the page to KeepCold when releasing its temporary ref.
-    if (TCollection* owner = Cache_.ReleaseItem(spaceOp, cacheItem, false)) {
+    if (TCollection* owner = Cache_.Items_.BindOperation(spaceOp).ReleaseItem(cacheItem, false)) {
         Cache_.Collections_.BindOperation(spaceOp).DropOwnerReference(*owner);
     }
 }

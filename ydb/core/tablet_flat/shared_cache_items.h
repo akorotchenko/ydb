@@ -1,6 +1,8 @@
 #pragma once
 
 #include "shared_cache_ref.h"
+#include "shared_cache_collection.h"
+#include "shared_cache_traits.h"
 #include "shared_cache_space.h"
 
 namespace NKikimr::NSharedCache {
@@ -36,6 +38,19 @@ public:
         TSharedCacheCollectionRefImpl<TTraits> BuildCollectionRef(
             TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {
             return Items_.BuildCollectionRef(SpaceOp_, std::move(ref));
+        }
+
+        // Native reference release
+        Y_FORCE_INLINE TCollection* ReleaseItem(TCacheItem cacheItem, bool allowKeepCold) noexcept {
+            return Items_.ReleaseItem(SpaceOp_, cacheItem, allowKeepCold);
+        }
+
+        TCollection* ReleaseTombstone(TCacheItem cacheItem) noexcept {
+            return Items_.ReleaseTombstone(SpaceOp_, cacheItem);
+        }
+
+        Y_FORCE_INLINE bool TryReleaseItemRef(TCacheItem cacheItem, ui64& expectedRaw) noexcept {
+            return Items_.TryReleaseItemRef(SpaceOp_, cacheItem, expectedRaw);
         }
 
         // Native allocation
@@ -155,6 +170,14 @@ private:
     TSharedCacheCollectionRefImpl<TTraits> BuildCollectionRef(
         const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
 
+    // Native reference release
+    Y_FORCE_INLINE TCollection* ReleaseItem(
+        TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowKeepCold) noexcept;
+
+    Y_FORCE_INLINE bool TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheItem, ui64& expectedRaw) noexcept;
+
+    TCollection* ReleaseTombstone(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
+
     // Native allocation
     ui32 TryAllocateHandle(TSpaceOperation& spaceOp) noexcept;
     TCacheItem Allocate(TSpaceOperation& spaceOp) noexcept;
@@ -178,5 +201,107 @@ private:
     // Dependencies
     TSharedCacheImpl<TTraits>& Cache_;
 };
+
+// Native reference release
+template <class TTraits>
+Y_FORCE_INLINE TCollection* TCacheItems<TTraits>::ReleaseItem(
+    TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowKeepCold) noexcept {
+    auto cacheOp = Cache_.BindOperation(spaceOp);
+    Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        if (cacheItem.Matches(expected) && expected.IsTombstone()) {
+            return cacheOp.ReleaseTombstone(cacheItem);
+        }
+        if (cacheItem.Matches(expected) && expected.IsReplacing()) {
+            cacheOp.ReleaseReplacing(cacheItem);
+            return nullptr;
+        }
+        if (cacheItem.Matches(expected) && expected.IsReplaced()) {
+            cacheOp.ReleaseReplaced(cacheItem);
+            return nullptr;
+        }
+        if (cacheItem.Matches(expected) && expected.IsPageKind() && expected.IsPending())
+        {
+            TPageFetchState* fetch = handle.Body.Fetch;
+            Y_DEBUG_ABORT_UNLESS(fetch && fetch->Page().CacheItem() == cacheItem);
+            TOperationItemRef<TTraits> ownerRef(spaceOp, cacheItem);
+            cacheOp.Fetches().Release(ownerRef, *fetch);
+            return nullptr;
+        }
+        if (cacheItem.Matches(expected) && expected.IsCold() && expected.IsPageKind() && expected.Refs() == 1 &&
+            Cache_.SoftLimit() == 0) {
+            TOperationItemRef<TTraits> ownerRef(spaceOp, cacheItem);
+            THandleState checked = expected;
+            if (!cacheOp.TryBeginErase(ownerRef.Get(), checked)) {
+                ownerRef.Disarm();
+                expectedRaw = checked.Raw();
+                continue;
+            }
+            Cache_.CompleteColdPageRelease(ownerRef);
+            return nullptr;
+        }
+        Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(expected) && expected.Refs() > 0);
+        if (allowKeepCold && expected.IsCold() && expected.IsPageKind() && expected.Refs() == 1 &&
+            cacheOp.Eviction().WantsKeepCold(handle) && Cache_.Memory_.TryAddRetainedBytes(PageBytes(handle)))
+        {
+            if (cacheOp.TryReleaseColdPageToKeepCold(cacheItem, expectedRaw)) {
+                return nullptr;
+            }
+            continue;
+        }
+        if (cacheOp.TryReleaseItemRef(cacheItem, expectedRaw)) {
+            return nullptr;
+        }
+    }
+}
+
+template <class TTraits>
+Y_FORCE_INLINE bool TCacheItems<TTraits>::TryReleaseItemRef(
+    TSpaceOperation& spaceOp, TCacheItem cacheItem, ui64& expectedRaw) noexcept {
+    auto cacheOp = Cache_.BindOperation(spaceOp);
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    const THandleState expected = THandleState::FromRaw(expectedRaw);
+    const bool publishCold = expected.IsCold() && expected.Refs() == 1;
+    const bool lastKeepColdRef = expected.IsKeepCold() && expected.Refs() == 1;
+    const bool wantsKeepCold = lastKeepColdRef && cacheOp.Eviction().WantsKeepCold(handle);
+    const ui64 coldBytes = publishCold ? PayloadBytes(handle, expected.Kind()) : 0;
+    // Capture while the native ref protects the payload; detach/reclaim may follow the final CAS.
+    const bool notifyCollectionRelease =
+        expected.IsCollectionKind() && expected.IsSticky() && expected.Refs() == 1 && expected.IsStickyField() &&
+        handle.Body.Collection->GetActorState() &&
+        handle.Body.Collection->StickyPageListHead.load(std::memory_order_acquire) != 0;
+    const TLogoBlobID collectionId = notifyCollectionRelease ? handle.Body.Collection->Id() : TLogoBlobID{};
+    const THandleState desired = expected.DecrementRefs();
+    if (handle.State.compare_exchange_weak(
+            expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
+    {
+        if (notifyCollectionRelease) {
+            // No native metadata owner remains to hand these writer-held Sticky pages to an executor.
+            Cache_.NotifyCollectionReleased(collectionId, TCollectionCacheItem::FromValidated(cacheItem));
+        }
+        Cache_.UpdateColdReclaimable(coldBytes, expected, desired);
+        if (publishCold) {
+            const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire);
+            cacheOp.Eviction().RouteCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, cacheItem.Index()));
+        } else if (lastKeepColdRef) {
+            Cache_.InvokeHook(ESharedCacheHookPoint::AfterKeepColdRefReleased, cacheItem);
+            // Check after releasing the final ref: a concurrent trim may have withdrawn this page's ring entry
+            // while the ref was being dropped. Policy was read while the original page was still pinned.
+            if (!Cache_.Eviction_.IsKeepColdQueued(handle) || !wantsKeepCold) {
+                const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire);
+                cacheOp.Eviction().DemoteKeepCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, cacheItem.Index()),
+                    TPageCacheItem::FromValidated(cacheItem));
+            }
+        }
+        if (expected.IsReady() && desired.Refs() == 0 && expected.IsStickyNoneField()) {
+            Cache_.NotifyResourcesAvailable();
+        }
+        return true;
+    }
+    return false;
+}
 
 } // namespace NKikimr::NSharedCache
