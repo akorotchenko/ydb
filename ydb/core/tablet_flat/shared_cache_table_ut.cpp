@@ -8209,6 +8209,67 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::NextInOwner(*fixture.Cache, page.Index()), 0);
         }
     }
+    Y_UNIT_TEST(StickyListDetachRetainsInFlightPromotion) {
+        TFixture fixture;
+        const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(16, 17, 19));
+        const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, collectionKey);
+        UNIT_ASSERT(collection);
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+
+        const auto existingKey = TSharedCacheKey::Page(collection, 1);
+        const TPageCacheItem existing =
+            AllocatePage(*fixture.Cache, existingKey, 4096, NTable::NPage::EPage::DataPage, 0, EStickyState::Sticky);
+        UNIT_ASSERT(existing);
+        UNIT_ASSERT(fixture.Cache->MakeReady(existing, MakePageData(existing.Index())));
+
+        const auto promotingKey = TSharedCacheKey::Page(collection, 2);
+        const TPageCacheItem promoting = AllocatePage(*fixture.Cache, promotingKey, 4096);
+        UNIT_ASSERT(promoting);
+        UNIT_ASSERT(fixture.Cache->MakeReady(promoting, MakePageData(promoting.Index())));
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, promoting.Index()).IsHot());
+
+        TSharedCacheGate gate;
+        gate.Slots[0].Arm(ESharedCacheHookPoint::AfterStickyPageLinked, promoting.CacheItem());
+        TSharedCacheHookGuard hookGuard(*fixture.Cache, gate.Hooks);
+        auto cache = fixture.Cache;
+        bool promoted = false;
+        TGateThread promoter(gate, [&] {
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
+            promoted = TSharedCacheTestAccess::MakePageSticky(*cache, promoting);
+        });
+        gate.Slots[0].Wait();
+
+        UNIT_ASSERT(TSharedCacheTestAccess::UnstickyCutPages(*cache, existing, 0));
+        UNIT_ASSERT_VALUES_EQUAL(
+            TSharedCacheTestAccess::StickyPageListHead(*fixture.Cache, collection), promoting.Index());
+        const THandleState promotingState = TSharedCacheTestAccess::HandleState(*fixture.Cache, promoting.Index());
+        UNIT_ASSERT(promotingState.IsHot());
+        UNIT_ASSERT(promotingState.IsStickyField());
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::NextInOwner(*fixture.Cache, promoting.Index()), 0);
+        const THandleState existingState = TSharedCacheTestAccess::HandleState(*fixture.Cache, existing.Index());
+        UNIT_ASSERT(existingState.IsSticky());
+        UNIT_ASSERT(existingState.IsTransitionField());
+
+        gate.Slots[0].Release();
+        promoter.Join();
+        UNIT_ASSERT(promoted);
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, promoting.Index()).IsSticky());
+
+        UNIT_ASSERT(TSharedCacheTestAccess::UnstickyCutPages(*cache, existing, 0));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::StickyPageListHead(*fixture.Cache, collection), 0);
+        for (TPageCacheItem page : { existing, promoting }) {
+            const THandleState state = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+            UNIT_ASSERT(state.IsSticky());
+            UNIT_ASSERT(state.IsTransitionField());
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::NextInOwner(*fixture.Cache, page.Index()), 0);
+        }
+    }
     Y_UNIT_TEST(StickyListMergePreservesConcurrentInsertions) {
         TFixture fixture;
         const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(16, 17, 18));

@@ -766,11 +766,12 @@ bool TCacheCollections<TTraits>::UnstickyCutPages(
         THandle& page = spaceOp.Handles()[current];
         const ui32 next = page.NextInOwner.load(std::memory_order_acquire);
         const THandleState state = THandleState::FromRaw(page.State.load(std::memory_order_acquire));
-        Y_DEBUG_ABORT_UNLESS(state.IsPageKind() && (state.IsPending() || state.IsCompleting() || state.IsSticky()) &&
-                             state.IsStickyField() &&
-                             page.Key0.load(std::memory_order_relaxed) == collectionItem.Raw());
+        Y_DEBUG_ABORT_UNLESS(
+            state.IsPageKind() && (state.IsPending() || state.IsCompleting() || state.IsHot() || state.IsSticky()) &&
+            state.IsStickyField() && page.Key0.load(std::memory_order_relaxed) == collectionItem.Raw());
 
-        if (current < allocationLimit || state.IsPending() || state.IsCompleting()) {
+        // Keep in-flight pages linked until they publish the Sticky state
+        if (current < allocationLimit || !state.IsSticky()) {
             if (retainedTail == 0) {
                 retainedTail = current;
             }
