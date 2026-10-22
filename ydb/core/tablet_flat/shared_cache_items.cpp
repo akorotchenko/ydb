@@ -1,4 +1,6 @@
 #include "shared_cache_items.h"
+#include "shared_cache_space.h"
+#include "shared_cache_traits.h"
 
 #include <new>
 

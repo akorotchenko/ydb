@@ -1,6 +1,7 @@
 #pragma once
 
 #include "shared_cache_fwd.h"
+#include "shared_cache_ref.h"
 #include "shared_cache_space.h"
 #include "shared_cache_traits.h"
 
@@ -69,122 +70,6 @@ inline int CompareSharedCacheKeys(const TSharedCacheKey& left, const TSharedCach
 
 void StoreSharedCacheKey(THandle& handle, const TSharedCacheKey& key) noexcept;
 TSharedCacheKey LoadSharedCacheKey(const THandle& handle, EItemKind kind) noexcept;
-
-template <class TTraits>
-class TSharedCacheTableImpl;
-template <class TTraits>
-class TSharedCacheImpl;
-template <class TTraits>
-class TCacheItems;
-template <class TTraits>
-class TSharedCacheCollectionRefImpl;
-template <class TTraits>
-class TOperationItemRef;
-
-template <class TTraits = TProdTraits>
-class TSharedCacheItemRefImpl {
-public:
-    TSharedCacheItemRefImpl() noexcept = default;
-    TSharedCacheItemRefImpl(const TSharedCacheItemRefImpl&) = delete;
-    TSharedCacheItemRefImpl& operator=(const TSharedCacheItemRefImpl&) = delete;
-    TSharedCacheItemRefImpl(TSharedCacheItemRefImpl&& other) noexcept;
-    TSharedCacheItemRefImpl& operator=(TSharedCacheItemRefImpl&& other) noexcept;
-    ~TSharedCacheItemRefImpl();
-
-    explicit operator bool() const noexcept {
-        return !CacheItem_.IsNull();
-    }
-
-    ui32 Index() const noexcept {
-        return CacheItem_.Index();
-    }
-
-    ui32 Version() const noexcept {
-        return CacheItem_.Version();
-    }
-
-    TCacheItem CacheItem() const noexcept {
-        return CacheItem_;
-    }
-
-    void Drop() noexcept;
-
-private:
-    friend class TSharedCacheTableImpl<TTraits>;
-    friend class TSharedCacheImpl<TTraits>;
-    friend class TCacheItems<TTraits>;
-    friend class TSharedPageRefImpl<TTraits>;
-    friend class TSharedCacheCollectionRefImpl<TTraits>;
-    friend class TOperationItemRef<TTraits>;
-
-    explicit TSharedCacheItemRefImpl(TCacheItem cacheItem) noexcept;
-
-    TCacheItem Take() noexcept;
-    void Disarm() noexcept;
-    void Drop(TSpaceOperation& spaceOp) noexcept;
-
-private:
-    TCacheItem CacheItem_;
-};
-
-template <class TTraits>
-class TOperationItemRef {
-public:
-    explicit TOperationItemRef(TSpaceOperation& spaceOp) noexcept
-        : SpaceOp_(spaceOp)
-    {}
-
-    TOperationItemRef(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept
-        : SpaceOp_(spaceOp)
-        , Ref_(cacheItem)
-    {}
-
-    TOperationItemRef(TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) noexcept
-        : SpaceOp_(spaceOp)
-        , Ref_(std::move(ref))
-    {}
-
-    TOperationItemRef(const TOperationItemRef&) = delete;
-    TOperationItemRef& operator=(const TOperationItemRef&) = delete;
-    TOperationItemRef(TOperationItemRef&&) = delete;
-    TOperationItemRef& operator=(TOperationItemRef&&) = delete;
-
-    ~TOperationItemRef() {
-        Ref_.Drop(SpaceOp_);
-    }
-
-    explicit operator bool() const noexcept {
-        return bool(Ref_);
-    }
-
-    TCacheItem CacheItem() const noexcept {
-        return Ref_.CacheItem();
-    }
-
-    TSharedCacheItemRefImpl<TTraits>& Get() noexcept {
-        return Ref_;
-    }
-
-    TSharedCacheItemRefImpl<TTraits> Take() noexcept {
-        return std::move(Ref_);
-    }
-
-    void Drop() noexcept {
-        Ref_.Drop(SpaceOp_);
-    }
-
-    TSpaceOperation& SpaceOperation() const noexcept {
-        return SpaceOp_;
-    }
-
-    void Disarm() noexcept {
-        Ref_.Disarm();
-    }
-
-private:
-    TSpaceOperation& SpaceOp_;
-    TSharedCacheItemRefImpl<TTraits> Ref_;
-};
 
 template <class TTraits = TProdTraits>
 class TSharedCacheTableImpl {
