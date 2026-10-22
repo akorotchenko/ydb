@@ -533,12 +533,8 @@ private:
 
     void Release(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
-    TCollection* ReleaseTombstone(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
-    TCollection* ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowKeepCold = true) noexcept;
     void CompleteColdPageRelease(TOperationItemRef<TTraits>& ownerRef) noexcept;
     bool TryReleaseColdPageToKeepCold(TSpaceOperation& spaceOp, TCacheItem cacheItem, ui64& expectedRaw) noexcept;
-    bool TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheItem, ui64& expectedRaw) noexcept;
-
     void ReleaseReplacing(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
     void ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
@@ -756,11 +752,11 @@ public: // Cache helpers
     }
 
     Y_FORCE_INLINE TCollection* ReleaseTombstone(TCacheItem cacheItem) noexcept {
-        return Cache_.ReleaseTombstone(SpaceOp_, cacheItem);
+        return Items().ReleaseTombstone(cacheItem);
     }
 
     Y_FORCE_INLINE TCollection* ReleaseItem(TCacheItem cacheItem, bool allowKeepCold = true) noexcept {
-        return Cache_.ReleaseItem(SpaceOp_, cacheItem, allowKeepCold);
+        return Items().ReleaseItem(cacheItem, allowKeepCold);
     }
 
     Y_FORCE_INLINE bool TryReleaseColdPageToKeepCold(TCacheItem cacheItem, ui64& expectedRaw) noexcept {
@@ -768,7 +764,7 @@ public: // Cache helpers
     }
 
     Y_FORCE_INLINE bool TryReleaseItemRef(TCacheItem cacheItem, ui64& expectedRaw) noexcept {
-        return Cache_.TryReleaseItemRef(SpaceOp_, cacheItem, expectedRaw);
+        return Items().TryReleaseItemRef(cacheItem, expectedRaw);
     }
 
     Y_FORCE_INLINE void ReleaseReplacing(TCacheItem cacheItem) noexcept {
