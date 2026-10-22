@@ -4,11 +4,6 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
-bool TCacheCapacityServices<TTraits>::AdvanceBucketResize() noexcept {
-    return Cache_.AdvanceBucketResize();
-}
-
-template <class TTraits>
 EShrinkCutStatus TCacheCapacityServices<TTraits>::ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui32 index) noexcept {
     return Cache_.ReclaimShrinkHandle(spaceOp, index);
 }
@@ -201,6 +196,41 @@ EShrinkCutStatus TCacheCapacity<TTraits>::ReclaimShrinkCut() noexcept {
 }
 
 template <class TTraits>
+bool TCacheCapacity<TTraits>::AdvanceBucketResize() noexcept {
+    const TSpaceState spaceState = Space_.CurrentSpaceState();
+    if (!spaceState.Resizing()) {
+        return false;
+    }
+
+    const TBucketResizeState resize = Space_.BucketResizeState();
+    auto spaceOp = Space_.BeginOperation();
+    switch (resize.Phase()) {
+        case EBucketResizePhase::Prepared:
+            return Table_.PrepareBucketSplit(spaceOp) && Table_.ActivateBucketSplitOrMerge(spaceOp);
+
+        case EBucketResizePhase::Activated:
+            return Table_.PublishBucketSplit(spaceOp);
+
+        case EBucketResizePhase::CursorPublished:
+            if (resize.Direction() == EBucketResize::Shrinking) {
+                return Table_.CloseBucketSplit(spaceOp);
+            }
+            break;
+
+        case EBucketResizePhase::Closed:
+            break;
+
+        case EBucketResizePhase::Stable:
+            return false;
+    }
+
+    if (!Table_.RemoveBucketSplit(spaceOp)) {
+        return false;
+    }
+    return resize.Cursor() != resize.PairCount() || Space_.FinishBucketResize();
+}
+
+template <class TTraits>
 bool TCacheCapacity<TTraits>::RunMaintenance(THotResize& hotResize) noexcept {
     switch (Transition_.Phase()) {
         case ETransitionPhase::Idle:
@@ -216,7 +246,7 @@ bool TCacheCapacity<TTraits>::RunMaintenance(THotResize& hotResize) noexcept {
         case ETransitionPhase::Migrate: {
             const TSpaceState state = Space_.CurrentSpaceState();
             if (state.Resizing()) {
-                return Services_.AdvanceBucketResize();
+                return AdvanceBucketResize();
             }
             const ui8 targetAddressBits = Transition_.TargetConfiguration().AddressBits;
             if (state.AddressBits() != targetAddressBits) {

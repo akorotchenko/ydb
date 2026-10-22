@@ -88,7 +88,7 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     , Collections_(TCacheCollectionServices<TTraits>(*this), Memory_, Table_, static_cast<const TTraits&>(*this))
     , Eviction_(TCacheEvictionServices<TTraits>(*this), Memory_, Table_, Collections_, Policy_,
           static_cast<const TTraits&>(*this))
-    , Capacity_(TCacheCapacityServices<TTraits>(*this), *Space_, Memory_, Eviction_)
+    , Capacity_(TCacheCapacityServices<TTraits>(*this), *Space_, Table_, Memory_, Eviction_)
     , Fetches_(TCacheFetchServices<TTraits>(*this), Memory_, Table_, Collections_, static_cast<const TTraits&>(*this))
 {
     if constexpr (std::is_same_v<TTraits, TTestTraits>) {
@@ -1885,41 +1885,6 @@ ESharedCacheResultStatus TSharedCache::FindOrInsert(
         return acquireStatus == EAcquireStatus::Pending ? ESharedCacheResultStatus::Pending
                                                         : ESharedCacheResultStatus::Hit;
     }
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::AdvanceBucketResize() noexcept {
-    const TSpaceState spaceState = Space_->CurrentSpaceState();
-    if (!spaceState.Resizing()) {
-        return false;
-    }
-
-    const TBucketResizeState resize = Space_->BucketResizeState();
-    auto cacheOp = BeginOperation();
-    switch (resize.Phase()) {
-        case EBucketResizePhase::Prepared:
-            return cacheOp.PrepareBucketSplit() && cacheOp.ActivateBucketSplitOrMerge();
-
-        case EBucketResizePhase::Activated:
-            return cacheOp.PublishBucketSplit();
-
-        case EBucketResizePhase::CursorPublished:
-            if (resize.Direction() == EBucketResize::Shrinking) {
-                return cacheOp.CloseBucketSplit();
-            }
-            break;
-
-        case EBucketResizePhase::Closed:
-            break;
-
-        case EBucketResizePhase::Stable:
-            return false;
-    }
-
-    if (!cacheOp.RemoveBucketSplit()) {
-        return false;
-    }
-    return resize.Cursor() != resize.PairCount() || Space_->FinishBucketResize();
 }
 
 SHARED_CACHE_TEMPLATE

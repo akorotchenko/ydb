@@ -150,7 +150,7 @@ public:
     }
 
     static bool AdvanceBucketResize(TTestSharedCache& cache) noexcept {
-        return cache.AdvanceBucketResize();
+        return cache.Capacity_.AdvanceBucketResize();
     }
 
     static bool TryReserve(TTestSharedCache& cache, ui64 bytes) noexcept {
