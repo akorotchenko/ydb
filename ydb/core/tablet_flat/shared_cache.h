@@ -453,10 +453,6 @@ private:
 
     ui32 TryAllocateHandle(TSpaceOperation& spaceOp) noexcept;
 
-    void RefillSpareItem(TSpaceOperation& spaceOp) noexcept;
-
-    void RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
-
     bool MakeReady(
         TCollectionRegistry& registry, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept;
 
@@ -676,11 +672,11 @@ public: // Cache helpers
     }
 
     Y_FORCE_INLINE void RefillSpareItem() noexcept {
-        Cache_.RefillSpareItem(SpaceOp_);
+        Items().RefillSpareItem();
     }
 
     Y_FORCE_INLINE void RecycleCandidate(TCacheItem cacheItem) noexcept {
-        Cache_.RecycleCandidate(SpaceOp_, cacheItem);
+        Items().RecycleCandidate(cacheItem);
     }
 
     Y_FORCE_INLINE bool MakeReady(

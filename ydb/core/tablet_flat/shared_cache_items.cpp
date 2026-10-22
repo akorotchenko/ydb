@@ -63,6 +63,78 @@ TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMoreCollectionRef(
 }
 
 template <class TTraits>
+void TCacheItems<TTraits>::RefillSpareItem(TSpaceOperation& spaceOp) noexcept {
+    if (spaceOp.Hazard().SpareItem.load(std::memory_order_relaxed) != 0) {
+        return;
+    }
+    const ui32 index = spaceOp.TryAllocateHandle();
+    if (!index) {
+        return;
+    }
+    THandle& handle = spaceOp.Handles()[index];
+    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
+    // A recycled free handle may retain a destroyed buffer's union bits. Begin also represents
+    // these uninitialized spares, so pending-page cleanup must see a blank fetch payload.
+    handle.Key0.store(0, std::memory_order_relaxed);
+    handle.Body.Fetch = nullptr;
+    const TCacheItem cacheItem = TCacheItem::Make(state.Version(), index);
+    if (!spaceOp.TryStoreSpareItem(cacheItem)) {
+        DiscardCandidate(spaceOp, cacheItem, state.Kind(), 0);
+    }
+}
+
+template <class TTraits>
+void TCacheItems<TTraits>::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
+    auto collectionsOp = Cache_.Collections_.BindOperation(spaceOp);
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+    if (state.IsPageKind() && state.IsPending() && state.IsStickyField()) {
+        collectionsOp.UnlinkPendingStickyPage(cacheItem);
+        state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+    }
+    Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(state) && !state.IsFree() && !state.IsTombstone() && state.Refs() == 0);
+    const bool pending = state.IsPending();
+    const bool reserved = pending && !state.IsWaitingForMemory();
+    const ui64 reservedBytes = reserved ? PayloadBytes(handle, state.Kind()) : 0;
+    if (!pending) {
+        Y_DEBUG_ABORT_UNLESS(state.IsReady());
+        Y_DEBUG_ABORT_UNLESS(!state.IsPageKind() || !state.IsSticky());
+        Y_DEBUG_ABORT_UNLESS(!state.IsCollectionKind() ||
+                             handle.Body.Collection->StickyPageListHead.load(std::memory_order_acquire) == 0);
+        Y_DEBUG_ABORT_UNLESS(
+            !state.IsCollectionKind() || handle.Body.Collection->Registry_.load(std::memory_order_acquire) == nullptr);
+        DeletePayload(
+            handle, state.Kind(), state.State(), state.IsPageKind() ? collectionsOp.PageCollection(handle) : nullptr);
+        collectionsOp.DropPageItemRef(handle);
+        if (state.IsPageKind()) {
+            handle.Key0.store(0, std::memory_order_relaxed);
+            handle.Body.Fetch = nullptr;
+        }
+        state = state.WithState(EHandleState::Begin).WithFrequency(0).WithSticky(EStickyState::None);
+        handle.State.store(state.Raw(), std::memory_order_relaxed);
+    }
+    if (pending) {
+        const bool page = state.IsPageKind();
+        if (page) {
+            collectionsOp.DropPageItemRef(handle);
+            handle.Key0.store(0, std::memory_order_relaxed);
+            if (state.IsStickyField()) {
+                Cache_.Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, PageBytes(handle));
+            }
+            TCacheFetches<TTraits>::DeletePendingFetch(handle);
+        }
+        if (reserved) {
+            Cache_.ReleaseReservation(reservedBytes, page ? 1 : 0);
+        }
+        state = state.WithState(EHandleState::Begin).WithFrequency(0).WithSticky(EStickyState::None);
+        handle.State.store(state.Raw(), std::memory_order_release);
+    }
+    if (!spaceOp.TryStoreSpareItem(cacheItem)) {
+        DiscardCandidate(spaceOp, cacheItem, state.Kind(), 0);
+    }
+}
+
+template <class TTraits>
 void TCacheItems<TTraits>::DiscardCandidate(
     TSpaceOperation& spaceOp, TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes) noexcept {
     auto collectionsOp = Cache_.Collections_.BindOperation(spaceOp);

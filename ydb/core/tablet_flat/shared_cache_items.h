@@ -38,7 +38,16 @@ public:
             return Items_.BuildCollectionRef(SpaceOp_, std::move(ref));
         }
 
+        // Spare handles
+        void RefillSpareItem() noexcept {
+            Items_.RefillSpareItem(SpaceOp_);
+        }
+
         // Candidate cleanup
+        void RecycleCandidate(TCacheItem cacheItem) noexcept {
+            Items_.RecycleCandidate(SpaceOp_, cacheItem);
+        }
+
         void DiscardCandidate(TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes) noexcept {
             Items_.DiscardCandidate(SpaceOp_, cacheItem, kind, reservedBytes);
         }
@@ -133,7 +142,11 @@ private:
     TSharedCacheCollectionRefImpl<TTraits> BuildCollectionRef(
         const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
 
+    // Spare handles
+    void RefillSpareItem(TSpaceOperation& spaceOp) noexcept;
+
     // Candidate cleanup
+    void RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
     void DiscardCandidate(TSpaceOperation& spaceOp, TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes) noexcept;
 
     // Handle initialization
