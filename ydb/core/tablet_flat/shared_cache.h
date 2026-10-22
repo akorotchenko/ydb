@@ -543,15 +543,10 @@ private:
     bool DeleteCollection(TCollectionRegistry* registry, TCollectionCacheItem collection) noexcept;
 
     bool IsPageSticky(TPageCacheItem page) const noexcept;
-    TSharedPageRefImpl<TTraits> BuildPageRef(
-        const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
     TSharedPageRefImpl<TTraits> AcquireMorePageRef(TCacheItem item) noexcept;
     TSharedCacheCollectionRefImpl<TTraits> AcquireMoreCollectionRef(TCacheItem item) noexcept;
 
     bool AcquirePage(TPageCacheItem page, TSharedPageRefImpl<TTraits>& result) noexcept;
-
-    TSharedCacheCollectionRefImpl<TTraits> BuildCollectionRef(
-        const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
 
     void Release(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
@@ -774,12 +769,14 @@ public: // Cache helpers
     }
 
     Y_FORCE_INLINE TSharedPageRefImpl<TTraits> BuildPageRef(TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {
-        return Cache_.BuildPageRef(SpaceOp_, std::move(ref));
+        Y_DEBUG_ABORT_UNLESS(&TSharedCacheImpl<TTraits>::Get() == &Cache_);
+        return Items().BuildPageRef(std::move(ref));
     }
 
     Y_FORCE_INLINE TSharedCacheCollectionRefImpl<TTraits> BuildCollectionRef(
         TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {
-        return Cache_.BuildCollectionRef(SpaceOp_, std::move(ref));
+        Y_DEBUG_ABORT_UNLESS(&TSharedCacheImpl<TTraits>::Get() == &Cache_);
+        return Items().BuildCollectionRef(std::move(ref));
     }
 
     Y_FORCE_INLINE TCollection* ReleaseTombstone(TCacheItem cacheItem) noexcept {
@@ -832,7 +829,7 @@ public: // Cache helpers
         return Cache_.Eviction_.BindOperation(SpaceOp_);
     }
 
-    Y_FORCE_INLINE typename TCacheItems<TTraits>::TOperation Items() noexcept {
+    Y_FORCE_INLINE typename TCacheItems<TTraits>::TOperation Items() const noexcept {
         return Cache_.Items_.BindOperation(SpaceOp_);
     }
 
