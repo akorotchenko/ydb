@@ -126,7 +126,7 @@ bool TSharedCacheTable::SplitMarkerIsSoleOwner(const TSpaceOperation& spaceOp, T
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCacheTable::PrepareBucketSplit(TSpaceOperation& spaceOp) noexcept {
-    const TBucketResizeState resize = Space_.BucketResizeState();
+    const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
     const ui32 pairCount = resize.PairCount();
     if (!resize || resize.Phase() != EBucketResizePhase::Prepared || resize.Cursor() >= pairCount)
     {
@@ -158,7 +158,7 @@ bool TSharedCacheTable::PrepareBucketSplit(TSpaceOperation& spaceOp) noexcept {
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCacheTable::ActivateBucketSplitOrMerge(TSpaceOperation& spaceOp) noexcept {
-    const TBucketResizeState resize = Space_.BucketResizeState();
+    const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
     const ui32 pairCount = resize.PairCount();
     if (!resize || resize.Phase() != EBucketResizePhase::Prepared || resize.Cursor() >= pairCount)
     {
@@ -184,7 +184,7 @@ bool TSharedCacheTable::ActivateBucketSplit(
         return false;
     }
     if (boundary.Expected == marker) {
-        return Space_.AdvanceBucketResizePhase(EBucketResizePhase::Activated);
+        return Cache_.Space_->AdvanceBucketResizePhase(EBucketResizePhase::Activated);
     }
     TOperationItemRef ownerRef(spaceOp);
     if (!boundary.Owner.IsNull()) {
@@ -217,7 +217,7 @@ bool TSharedCacheTable::ActivateBucketSplit(
         return false;
     }
     Cache_.InvokeHook(ESharedCacheHookPoint::AfterBucketSplitActivated, marker);
-    return Space_.AdvanceBucketResizePhase(EBucketResizePhase::Activated);
+    return Cache_.Space_->AdvanceBucketResizePhase(EBucketResizePhase::Activated);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -248,17 +248,17 @@ bool TSharedCacheTable::ActivateBucketMerge(
         return false;
     }
     Cache_.InvokeHook(ESharedCacheHookPoint::AfterBucketSplitActivated, marker);
-    return Space_.AdvanceBucketResizePhase(EBucketResizePhase::Activated);
+    return Cache_.Space_->AdvanceBucketResizePhase(EBucketResizePhase::Activated);
 }
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCacheTable::PublishBucketSplit(TSpaceOperation& spaceOp) noexcept {
-    const TBucketResizeState resize = Space_.BucketResizeState();
+    const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
     if (!resize || resize.Phase() != EBucketResizePhase::Activated || resize.Cursor() >= resize.PairCount())
     {
         return false;
     }
-    if (!Space_.PublishBucketResizeCursor(resize.Cursor() + 1)) {
+    if (!Cache_.Space_->PublishBucketResizeCursor(resize.Cursor() + 1)) {
         return false;
     }
     const THandleState markerState =
@@ -270,7 +270,7 @@ bool TSharedCacheTable::PublishBucketSplit(TSpaceOperation& spaceOp) noexcept {
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCacheTable::CloseBucketSplit(TSpaceOperation& spaceOp) noexcept {
-    const TBucketResizeState resize = Space_.BucketResizeState();
+    const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
     if (!resize || resize.Direction() != EBucketResize::Shrinking ||
         resize.Phase() != EBucketResizePhase::CursorPublished || resize.Cursor() == 0)
     {
@@ -290,13 +290,13 @@ bool TSharedCacheTable::CloseBucketSplit(TSpaceOperation& spaceOp) noexcept {
         return false;
     }
     Cache_.InvokeHook(ESharedCacheHookPoint::AfterShrinkBucketClosed, marker);
-    return Space_.AdvanceBucketResizePhase(EBucketResizePhase::Closed);
+    return Cache_.Space_->AdvanceBucketResizePhase(EBucketResizePhase::Closed);
 }
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCacheTable::RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept {
     auto cacheOp = Cache_.BindOperation(spaceOp);
-    const TBucketResizeState resize = Space_.BucketResizeState();
+    const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
     if (!resize || (resize.Direction() == EBucketResize::Shrinking && resize.Phase() != EBucketResizePhase::Closed) ||
         (resize.Direction() == EBucketResize::Growing && resize.Phase() != EBucketResizePhase::CursorPublished) ||
         resize.Cursor() == 0)
@@ -364,7 +364,7 @@ bool TSharedCacheTable::RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept {
     cacheOp.Release(markerIdentity);
     const ui32 pairCount = resize.PairCount();
     if (resize.Cursor() < pairCount) {
-        return Space_.PrepareNextBucketResizePair();
+        return Cache_.Space_->PrepareNextBucketResizePair();
     }
     return true;
 }

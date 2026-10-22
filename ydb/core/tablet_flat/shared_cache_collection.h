@@ -149,6 +149,9 @@ private:
     friend class TCacheCollections;
 
     template <class>
+    friend class TCacheItems;
+
+    template <class>
     friend class TSharedCacheImpl;
 
     std::atomic<TCollectionActorState*> ActorState_{ nullptr };

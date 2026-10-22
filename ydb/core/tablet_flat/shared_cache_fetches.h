@@ -14,30 +14,7 @@ namespace NKikimr::NSharedCache {
 
 template <class TTraits>
 class TOperationItemRef;
-template <class TTraits>
-class TSharedCacheTableImpl;
-template <class TTraits>
-class TCacheCollections;
-class TCacheMemory;
 class TCollection;
-
-// Coordinator services until the remaining component owners are extracted
-template <class TTraits>
-class TCacheFetchServices {
-public:
-    explicit TCacheFetchServices(TSharedCacheImpl<TTraits>& cache) noexcept
-        : Cache_(cache)
-    {}
-
-    bool TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) noexcept;
-    void ReleaseReservation(ui64 bytes, ui64 pages) noexcept;
-    // A false result may leave a Ready reference in owner for the caller to release.
-    bool TryAcquirePending(TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept;
-    void MakeReadyState(TSpaceOperation& spaceOp, TCacheItem item, EHandleState state, TCollection* owner) noexcept;
-
-private:
-    TSharedCacheImpl<TTraits>& Cache_;
-};
 
 template <class TTraits>
 class TCacheFetches {
@@ -85,13 +62,8 @@ public:
         TSpaceOperation& SpaceOp_;
     };
 
-    TCacheFetches(TCacheFetchServices<TTraits> services, TCacheMemory& memory, TSharedCacheTableImpl<TTraits>& table,
-        TCacheCollections<TTraits>& collections, const TTraits& traits) noexcept
-        : Services_(services)
-        , Memory_(memory)
-        , Table_(table)
-        , Collections_(collections)
-        , Traits_(traits)
+    explicit TCacheFetches(TSharedCacheImpl<TTraits>& cache) noexcept
+        : Cache_(cache)
     {}
 
     TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
@@ -120,11 +92,7 @@ private:
     bool Dispatch(TSpaceOperation& spaceOp, TCacheItem cacheItem, TPageFetchState& fetch) noexcept;
 
 private:
-    TCacheFetchServices<TTraits> Services_;
-    TCacheMemory& Memory_;
-    TSharedCacheTableImpl<TTraits>& Table_;
-    TCacheCollections<TTraits>& Collections_;
-    const TTraits& Traits_;
+    TSharedCacheImpl<TTraits>& Cache_;
 };
 
 template <class TTraits = TProdTraits>

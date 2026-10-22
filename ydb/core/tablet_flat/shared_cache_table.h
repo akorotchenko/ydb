@@ -90,9 +90,8 @@ public: // Cache table operations
         TBucketResizeState ResizeState;
     };
 
-    TSharedCacheTableImpl(TSharedCacheSpace& space, TSharedCacheImpl<TTraits>& cache) noexcept
-        : Space_(space)
-        , Cache_(cache)
+    explicit TSharedCacheTableImpl(TSharedCacheImpl<TTraits>& cache) noexcept
+        : Cache_(cache)
     {}
 
     ESharedCacheResultStatus Find(TSpaceOperation& spaceOp, const TSharedCacheKey& key, TCacheItem& cacheItem) noexcept;
@@ -197,7 +196,6 @@ private: // Resize helpers
     bool SplitMarkerIsSoleOwner(const TSpaceOperation& spaceOp, TCacheItem marker) const noexcept;
 
 private: // Data members
-    TSharedCacheSpace& Space_;
     TSharedCacheImpl<TTraits>& Cache_;
 };
 

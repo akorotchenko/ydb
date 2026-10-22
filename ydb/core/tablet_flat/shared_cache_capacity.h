@@ -6,12 +6,6 @@
 
 namespace NKikimr::NSharedCache {
 
-class TCacheMemory;
-template <class TTraits>
-class TSharedCacheTableImpl;
-template <class TTraits>
-class TCacheEviction;
-
 enum class EShrinkCutStatus {
     Blocked,
     Progress,
@@ -19,40 +13,21 @@ enum class EShrinkCutStatus {
 };
 
 template <class TTraits>
-class TCacheCapacityServices {
-public:
-    explicit TCacheCapacityServices(TSharedCacheImpl<TTraits>& cache) noexcept
-        : Cache_(cache)
-    {}
-
-    EShrinkCutStatus ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui32 index) noexcept;
-    void RefreshSoftLimit() noexcept;
-
-private:
-    TSharedCacheImpl<TTraits>& Cache_;
-};
-
-template <class TTraits>
 class TCacheCapacity {
 public:
-    TCacheCapacity(TCacheCapacityServices<TTraits> services, TSharedCacheSpace& space,
-        TSharedCacheTableImpl<TTraits>& table, TCacheMemory& memory, TCacheEviction<TTraits>& eviction) noexcept
-        : Services_(services)
-        , Space_(space)
-        , Table_(table)
-        , Memory_(memory)
-        , Eviction_(eviction)
-        , TargetHandleCount_(space.CurrentConfiguration().HandleCount())
-        , Target_(space.CurrentConfiguration())
+    explicit TCacheCapacity(TSharedCacheImpl<TTraits>& cache) noexcept
+        : Cache_(cache)
+        , TargetHandleCount_(cache.Space_->CurrentConfiguration().HandleCount())
+        , Target_(cache.Space_->CurrentConfiguration())
     {}
 
     void SetTarget(const TSharedCacheCapacity& target) noexcept;
     bool StartTransition() noexcept;
-    bool RunMaintenance(THotResize& hotResize) noexcept;
+    bool RunMaintenance() noexcept;
 
     bool NeedsMaintenance() const noexcept {
         return Transition_.Phase() != ETransitionPhase::Idle ||
-               Space_.CurrentConfiguration().HandleCount() != TargetHandleCount();
+               Cache_.Space_->CurrentConfiguration().HandleCount() != TargetHandleCount();
     }
 
     ui64 TargetHandleCount() const noexcept {
@@ -64,9 +39,9 @@ private:
 
     // Capacity transitions
     bool PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept;
-    bool PublishMigrationView(TTransition& transition, THotResize& hotResize) noexcept;
+    bool PublishMigrationView(TTransition& transition) noexcept;
     bool TryDrainTransition(TTransition& transition) noexcept;
-    bool PublishFinalView(TTransition& transition, THotResize& hotResize) noexcept;
+    bool PublishFinalView(TTransition& transition) noexcept;
     bool AppendFreeHandles(TTransition& transition) noexcept;
     bool FinalDrain(TTransition& transition) noexcept;
     bool TryReleaseTransition(TTransition& transition) noexcept;
@@ -81,11 +56,7 @@ private:
 
 private:
     // Dependencies
-    TCacheCapacityServices<TTraits> Services_;
-    TSharedCacheSpace& Space_;
-    TSharedCacheTableImpl<TTraits>& Table_;
-    TCacheMemory& Memory_;
-    TCacheEviction<TTraits>& Eviction_;
+    TSharedCacheImpl<TTraits>& Cache_;
 
     // Capacity state
     std::atomic<ui64> TargetHandleCount_;

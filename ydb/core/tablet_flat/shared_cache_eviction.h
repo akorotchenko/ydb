@@ -12,36 +12,12 @@ template <class TTraits>
 class TSharedCacheItemRefImpl;
 template <class TTraits>
 class TOperationItemRef;
-template <class TTraits>
-class TCacheItems;
-template <class TTraits>
-class TCacheCollections;
-template <class TTraits>
-class TSharedCacheTableImpl;
-class TCollection;
 
 enum class EHotLevel : ui32 {
     L0,
     L1,
     L2,
     L3,
-};
-
-template <class TTraits>
-class TCacheEvictionServices {
-public:
-    explicit TCacheEvictionServices(TSharedCacheImpl<TTraits>& cache) noexcept
-        : Cache_(cache)
-    {}
-
-    static ui32 AdvanceColdMembership(THandle& handle) noexcept;
-    static bool AdvanceColdMembership(
-        THandle& handle, ui32 expectedVersion, bool keepColdQueued, ui32& newVersion) noexcept;
-    TCollection* ReleaseForColdDemotion(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
-    void NotifyResourcesAvailable() noexcept;
-
-private:
-    TSharedCacheImpl<TTraits>& Cache_;
 };
 
 template <class TTraits>
@@ -125,21 +101,20 @@ public:
             return Eviction_.ShrinkKeepCold(SpaceOp_);
         }
 
-        bool Reclaim(TSharedCacheSpace& space, THotResize& hotResize, ui64 bytes = 0) noexcept {
-            return Eviction_.Reclaim(SpaceOp_, space, hotResize, bytes);
+        bool Reclaim(ui64 bytes = 0) noexcept {
+            return Eviction_.Reclaim(SpaceOp_, bytes);
         }
 
         bool ReclaimToLimits(ui64 softLimit, ui32 step, ui64 bytes = 0) noexcept {
             return Eviction_.ReclaimToLimits(SpaceOp_, softLimit, step, bytes);
         }
 
-        bool EnforceCurrentLimit(
-            TSharedCacheSpace& space, THotResize& hotResize, ui64 bytes = 0, bool forceShrinkHot = false) noexcept {
-            return Eviction_.EnforceCurrentLimit(SpaceOp_, space, hotResize, bytes, forceShrinkHot);
+        bool EnforceCurrentLimit(ui64 bytes = 0, bool forceShrinkHot = false) noexcept {
+            return Eviction_.EnforceCurrentLimit(SpaceOp_, bytes, forceShrinkHot);
         }
 
-        bool DrainHotResize(TSharedCacheSpace& space, THotResize& hotResize) noexcept {
-            return Eviction_.DrainHotResize(SpaceOp_, space, hotResize);
+        bool DrainHotResize() noexcept {
+            return Eviction_.DrainHotResize(SpaceOp_);
         }
 
     private:
@@ -155,16 +130,8 @@ public:
         TSpaceOperation& SpaceOp_;
     };
 
-    TCacheEviction(TCacheEvictionServices<TTraits> services, TCacheItems<TTraits>& items, TCacheMemory& memory,
-        TSharedCacheTableImpl<TTraits>& table, TCacheCollections<TTraits>& collections,
-        const TSharedCachePolicy& policy, const TTraits& traits) noexcept
-        : Services_(services)
-        , Items_(items)
-        , Memory_(memory)
-        , Table_(table)
-        , Collections_(collections)
-        , Policy_(policy)
-        , Traits_(traits)
+    explicit TCacheEviction(TSharedCacheImpl<TTraits>& cache) noexcept
+        : Cache_(cache)
     {}
 
     TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
@@ -175,20 +142,21 @@ public:
     bool UpdateKeepColdLimit(ui64 limit) noexcept;
 
     ui64 EvictableByteBudget() const noexcept {
-        const ui64 softLimit = Memory_.SoftLimit();
-        return softLimit - Min(softLimit, Memory_.Sticky().Bytes());
+        const ui64 softLimit = Cache_.Memory_.SoftLimit();
+        return softLimit - Min(softLimit, Cache_.Memory_.Sticky().Bytes());
     }
 
     ui64 KeepColdLimit() const noexcept {
         const ui64 budget = EvictableByteBudget();
         // KeepCold uses the remainder after the normal Hot minimum (40% with HotMin = 60%).
-        const ui64 maximum = budget - FractionCeil(budget, Policy_.HotMin);
+        const ui64 maximum = budget - FractionCeil(budget, Cache_.Policy_.HotMin);
         return Min(Min(KeepColdLimit_.load(std::memory_order_relaxed),
                        KeepColdMaxBytes_.load(std::memory_order_relaxed)), maximum);
     }
 
     bool NeedsKeepColdTrim() const noexcept {
-        return Memory_.KeepColdOwnedBytes() > KeepColdLimit() || KeepColdTrimActive_.load(std::memory_order_relaxed);
+        return Cache_.Memory_.KeepColdOwnedBytes() > KeepColdLimit() ||
+               KeepColdTrimActive_.load(std::memory_order_relaxed);
     }
 
     void MarkSoftLimitPressure() noexcept {
@@ -200,7 +168,7 @@ public:
 
     bool GrowKeepCold() noexcept;
     void ScheduleKeepColdSweep(ui64 slots) noexcept;
-    bool SweepKeepCold(TSharedCacheSpace& space) noexcept;
+    bool SweepKeepCold() noexcept;
 
     // Routing state
     static bool IsKeepColdQueued(const THandle& handle) noexcept;
@@ -246,28 +214,20 @@ private:
 
     // Cooperative reclamation: takes a cold entry and, when cold is empty, lets EnforceCurrentLimit move the
     // hot/cold boundary so that the coldest hot entries become reclaimable.
-    bool Reclaim(TSpaceOperation& spaceOp, TSharedCacheSpace& space, THotResize& hotResize, ui64 bytes = 0) noexcept;
+    bool Reclaim(TSpaceOperation& spaceOp, ui64 bytes = 0) noexcept;
     bool ReclaimToLimits(TSpaceOperation& spaceOp, ui64 softLimit, ui32 step, ui64 bytes = 0) noexcept;
 
-    ui32 MinimumHotSlots(
-        const TSharedCacheSpace& space, const TSpaceOperation& spaceOp, bool underPressure = false) const noexcept;
-    ui32 ShrinkHotTarget(const TSharedCacheSpace& space, const TSpaceOperation& spaceOp, ui32 effectiveHotSlots,
-        ui32 step, bool underPressure) const noexcept;
+    ui32 MinimumHotSlots(const TSpaceOperation& spaceOp, bool underPressure = false) const noexcept;
+    ui32 ShrinkHotTarget(
+        const TSpaceOperation& spaceOp, ui32 effectiveHotSlots, ui32 step, bool underPressure) const noexcept;
     ui32 GrowHotTarget(const TSpaceOperation& spaceOp, ui32 effectiveHotSlots, ui32 step) const noexcept;
     ui32 HotResizeStep(ui32 effectiveHotSlots) const noexcept;
-    bool DrainHotResize(TSpaceOperation& spaceOp, TSharedCacheSpace& space, THotResize& hotResize) noexcept;
-    bool EnforceCurrentLimit(TSpaceOperation& spaceOp, TSharedCacheSpace& space, THotResize& hotResize, ui64 bytes = 0,
-        bool forceShrinkHot = false) noexcept;
+    bool DrainHotResize(TSpaceOperation& spaceOp) noexcept;
+    bool EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64 bytes = 0, bool forceShrinkHot = false) noexcept;
 
 private:
     // Dependencies
-    TCacheEvictionServices<TTraits> Services_;
-    TCacheItems<TTraits>& Items_;
-    TCacheMemory& Memory_;
-    TSharedCacheTableImpl<TTraits>& Table_;
-    TCacheCollections<TTraits>& Collections_;
-    const TSharedCachePolicy& Policy_;
-    const TTraits& Traits_;
+    TSharedCacheImpl<TTraits>& Cache_;
 
     // Policy resizing state
     ui64 ColdByteBudget_ = Max<ui64>(); // Protected by the shared HotResize lock; watermark calculation input

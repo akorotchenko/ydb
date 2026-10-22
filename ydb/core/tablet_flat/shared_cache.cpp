@@ -1,5 +1,4 @@
 #include "shared_cache.h"
-#include "shared_cache_items_acquire_impl.h"
 #include "shared_cache_items_ref_impl.h"
 #include "shared_cache_events.h"
 #include "shared_cache_traits.h"
@@ -85,15 +84,13 @@ SHARED_CACHE_TEMPLATE
 TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit, TTraits traits) noexcept
     : TTraits(std::move(traits))
     , Space_(std::move(space))
-    , Table_(*Space_, *this)
+    , Table_(*this)
     , Memory_(Space_->CurrentConfiguration().StaticBytes, hardLimit, Space_->ReservedConfiguration().Limit)
-    , Items_(Memory_, static_cast<const TTraits&>(*this))
-    , Collections_(TCacheCollectionServices<TTraits>(*this), Items_, Memory_, Table_,
-          static_cast<const TTraits&>(*this))
-    , Eviction_(TCacheEvictionServices<TTraits>(*this), Items_, Memory_, Table_, Collections_, Policy_,
-          static_cast<const TTraits&>(*this))
-    , Capacity_(TCacheCapacityServices<TTraits>(*this), *Space_, Table_, Memory_, Eviction_)
-    , Fetches_(TCacheFetchServices<TTraits>(*this), Memory_, Table_, Collections_, static_cast<const TTraits&>(*this))
+    , Items_(*this)
+    , Collections_(*this)
+    , Eviction_(*this)
+    , Capacity_(*this)
+    , Fetches_(*this)
 {
     if constexpr (std::is_same_v<TTraits, TTestTraits>) {
         for (TSpaceHazard* hazard : Space_->Hazards_) {
@@ -325,14 +322,14 @@ TSharedCache::~TSharedCacheImpl() {
             }
             TCacheFetches<TTraits>::DeletePendingFetch(handle);
         } else if (state.IsReady() || state.IsTombstone()) {
-            Items_.DeletePayload(Collections_, handle, state.Kind(), state.State());
+            Items_.DeletePayload(handle, state.Kind(), state.State());
         }
     }
     for (ui64 index = 2; index < space.HandleCount; ++index) {
         THandle& handle = space.Handles[index];
         const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
         if (state.IsCollectionKind() && (state.IsReady() || state.IsTombstone())) {
-            Items_.DeletePayload(Collections_, handle, state.Kind(), state.State());
+            Items_.DeletePayload(handle, state.Kind(), state.State());
         }
     }
 }
@@ -432,7 +429,7 @@ ui32 TSharedCache::TryAllocateHandle(TSpaceOperation& spaceOp) noexcept {
         for (ui32 attempt = 0; attempt < spaceOp.HandleCount(); ++attempt) {
             if (!cacheOp.Eviction().ReclaimCold()) {
                 const ui32 hotSlots = static_cast<ui32>(Space_->EffectiveHotSlots());
-                cacheOp.Eviction().EnforceCurrentLimit(*Space_, HotResize_, 0, true);
+                cacheOp.Eviction().EnforceCurrentLimit(0, true);
                 // The caller's view may predate growth; drain with a fresh operation under the resize lock.
                 DrainHotResize();
                 if (hotSlots == Space_->EffectiveHotSlots() && !cacheOp.Eviction().ReclaimCold()) {
@@ -495,7 +492,7 @@ void TSharedCache::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem cacheIt
                              handle.Body.Collection->StickyPageListHead.load(std::memory_order_acquire) == 0);
         Y_DEBUG_ABORT_UNLESS(
             !state.IsCollectionKind() || handle.Body.Collection->Registry_.load(std::memory_order_acquire) == nullptr);
-        Items_.DeletePayload(Collections_, handle, state.Kind(), state.State(),
+        Items_.DeletePayload(handle, state.Kind(), state.State(),
             state.IsPageKind() ? cacheOp.Collections().PageCollection(handle) : nullptr);
         cacheOp.Collections().DropPageItemRef(handle);
         if (state.IsPageKind()) {
@@ -966,52 +963,6 @@ void TSharedCache::DiscardCandidate(TCacheItem cacheItem, EItemKind kind) noexce
     const ui64 reservedBytes =
         state.IsPending() && !state.IsWaitingForMemory() ? TCacheItems<TTraits>::PayloadBytes(handle, kind) : 0;
     cacheOp.DiscardCandidate(cacheItem, kind, reservedBytes);
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCache::DiscardCandidate(
-    TSpaceOperation& spaceOp, TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    const ui32 index = cacheItem.Index();
-    Y_DEBUG_ABORT_UNLESS(index >= 2 && index < spaceOp.AccessibleHandleCount());
-
-    THandle& handle = spaceOp.Handles()[index];
-    THandleState expected = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    if (expected.IsPageKind() && expected.IsPending() && expected.IsStickyField()) {
-        cacheOp.Collections().UnlinkPendingStickyPage(cacheItem);
-        expected = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    }
-    Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(expected) && expected.Kind() == kind && !expected.IsFree() &&
-                         !expected.IsTombstone() && expected.Refs() == 0);
-
-    Y_DEBUG_ABORT_UNLESS(!expected.IsPageKind() || !expected.IsSticky());
-    Y_DEBUG_ABORT_UNLESS(!expected.IsCollectionKind() || !expected.IsReady() ||
-                         handle.Body.Collection->StickyPageListHead.load(std::memory_order_acquire) == 0);
-    Y_DEBUG_ABORT_UNLESS(!expected.IsCollectionKind() || !expected.IsReady() ||
-                         handle.Body.Collection->Registry_.load(std::memory_order_acquire) == nullptr);
-
-    const THandleState desired = expected.WithState(EHandleState::Free).WithFrequency(0).WithSticky(EStickyState::None);
-    TCollection* owner = nullptr;
-    if (expected.IsPageKind() && handle.Body.Collection) {
-        owner = cacheOp.Collections().PageCollection(handle);
-    }
-    UpdateColdReclaimable(TCacheItems<TTraits>::PayloadBytes(handle, expected.Kind()), expected, desired);
-    handle.State.store(desired.Raw(), std::memory_order_release);
-    if (expected.IsPageKind() && expected.IsStickyField() && !expected.IsReady()) {
-        Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, TCacheItems<TTraits>::PageBytes(handle));
-    }
-    if (expected.IsReady()) {
-        Items_.DeletePayload(Collections_, handle, expected.Kind(), expected.State(), owner);
-    } else if (expected.IsPageKind() && expected.IsPending()) {
-        TCacheFetches<TTraits>::DeletePendingFetch(handle);
-    }
-    if (owner) {
-        cacheOp.Collections().DropOwnerReference(*owner);
-    }
-    if (reservedBytes != 0) {
-        ReleaseReservation(reservedBytes, expected.IsPageKind() ? 1 : 0);
-    }
-    Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(index, desired.Version()));
 }
 
 SHARED_CACHE_TEMPLATE
@@ -1749,8 +1700,7 @@ bool TSharedCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) 
             Eviction_.MarkSoftLimitPressure();
             // Aging/resizing can make progress without freeing bytes. Bound cooperative work so
             // concurrent activity cannot keep a requester here instead of putting it on the wait path.
-            if (reclamationAttempts++ < SharedCacheTransitionWorkBatch &&
-                cacheOp.Eviction().Reclaim(*Space_, HotResize_, bytes)) {
+            if (reclamationAttempts++ < SharedCacheTransitionWorkBatch && cacheOp.Eviction().Reclaim(bytes)) {
                 usage = Memory_.PayloadUsage();
                 continue;
             }
@@ -1804,7 +1754,7 @@ SHARED_CACHE_TEMPLATE
 bool TSharedCache::DrainHotResize() noexcept {
     if (auto hotResize = HotResize_.TryLock()) {
         auto cacheOp = BeginOperation();
-        return cacheOp.Eviction().DrainHotResize(*Space_, HotResize_);
+        return cacheOp.Eviction().DrainHotResize();
     }
     return false;
 }
@@ -1818,7 +1768,7 @@ bool TSharedCache::ReclaimCold() noexcept {
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::EnforceCurrentLimit() noexcept {
     auto cacheOp = BeginOperation();
-    return cacheOp.Eviction().EnforceCurrentLimit(*Space_, HotResize_, 0);
+    return cacheOp.Eviction().EnforceCurrentLimit(0);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -1831,10 +1781,10 @@ bool TSharedCache::RunMaintenance() noexcept {
             return true;
         }
     }
-    if (Eviction_.SweepKeepCold(*Space_)) {
+    if (Eviction_.SweepKeepCold()) {
         return true;
     }
-    return Capacity_.RunMaintenance(HotResize_);
+    return Capacity_.RunMaintenance();
 }
 
 SHARED_CACHE_TEMPLATE
@@ -1886,7 +1836,7 @@ TCollection* TSharedCache::ReleaseTombstone(TSpaceOperation& spaceOp, TCacheItem
                 expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
         {
             Y_ABORT_UNLESS(handle.NextInOwner.load(std::memory_order_acquire) == 0);
-            Items_.DeletePayload(Collections_, handle, expected.Kind(), expected.State(), owner);
+            Items_.DeletePayload(handle, expected.Kind(), expected.State(), owner);
             Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(cacheItem.Index(), nextVersion));
             NotifyResourcesAvailable();
             if (expected.IsCollectionKind()) {
@@ -2135,12 +2085,6 @@ bool TSharedCache::TryReleaseItemRef(TSpaceOperation& spaceOp, TCacheItem cacheI
 #undef TOperationItemRef
 #undef TSharedCache
 #undef SHARED_CACHE_TEMPLATE
-
-// Native item acquisition is instantiated with its existing callers
-template TSharedCacheItemRefImpl<TProdTraits> TCacheItems<TProdTraits>::TryAcquireItemRef(
-    TSpaceOperation&, TCacheItem) noexcept;
-template TSharedCacheItemRefImpl<TTestTraits> TCacheItems<TTestTraits>::TryAcquireItemRef(
-    TSpaceOperation&, TCacheItem) noexcept;
 
 // Typed-reference builders are instantiated with their callers and constructors
 template TSharedPageRefImpl<TProdTraits> TCacheItems<TProdTraits>::BuildPageRef(

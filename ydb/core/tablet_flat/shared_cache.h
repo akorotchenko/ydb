@@ -382,12 +382,13 @@ private:
     friend class TCollection;
     friend class TSharedCacheItemRefImpl<TTraits>;
     friend class TSharedCacheTableImpl<TTraits>;
+    friend class TCacheItems<TTraits>;
     friend class TSharedPageRefImpl<TTraits>;
     friend class TSharedCacheCollectionRefImpl<TTraits>;
-    friend class TCacheFetchServices<TTraits>;
-    friend class TCacheCollectionServices<TTraits>;
-    friend class TCacheEvictionServices<TTraits>;
-    friend class TCacheCapacityServices<TTraits>;
+    friend class TCacheFetches<TTraits>;
+    friend class TCacheCollections<TTraits>;
+    friend class TCacheEviction<TTraits>;
+    friend class TCacheCapacity<TTraits>;
     friend class TRequestPageWaiter;
     friend class TCompactedPageWaiter;
     friend struct TEvSaveCompactedPages;
@@ -523,9 +524,6 @@ private:
     void DiscardCandidate(TCollectionCacheItem collection) noexcept;
 
     void DiscardCandidate(TCacheItem cacheItem, EItemKind kind) noexcept;
-
-    void DiscardCandidate(
-        TSpaceOperation& spaceOp, TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes = 0) noexcept;
 
     EAcquireStatus TryAcquire(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending,
         TSharedCacheItemRefImpl<TTraits>& ref) noexcept;
@@ -746,14 +744,13 @@ public: // Cache helpers
     }
 
     Y_FORCE_INLINE void DiscardCandidate(TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes = 0) noexcept {
-        Cache_.DiscardCandidate(SpaceOp_, cacheItem, kind, reservedBytes);
+        Items().DiscardCandidate(cacheItem, kind, reservedBytes);
     }
 
     Y_FORCE_INLINE void InitializePage(TCacheItem cacheItem, TCollectionCacheItem collection, ui64 offset, ui64 size,
         NTable::NPage::EPage type, ui32 crc32, EStickyState sticky, bool reserved = true,
         bool collectionOwnerHeld = false) noexcept {
-        Items().InitializePage(Cache_.Collections_, cacheItem, collection, offset, size, type, crc32, sticky, reserved,
-            collectionOwnerHeld);
+        Items().InitializePage(cacheItem, collection, offset, size, type, crc32, sticky, reserved, collectionOwnerHeld);
     }
 
     Y_FORCE_INLINE TSharedPageRefImpl<TTraits> BuildPageRef(TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {
