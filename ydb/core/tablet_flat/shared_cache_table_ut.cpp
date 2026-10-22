@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/shared_cache_thread_test.h>
 #include "shared_cache.h"
 #include "shared_cache_traits.h"
 
@@ -389,7 +390,7 @@ public:
     }
 
     static ui64 SpareItem(const TTestSharedCache& cache, ui32 index) noexcept {
-        return cache.Space_->Hazards_[index].SpareItem.load(std::memory_order_relaxed);
+        return cache.Space_->Hazards_[index]->SpareItem.load(std::memory_order_relaxed);
     }
 
     static TSpaceState CurrentSpaceState(const TSharedCacheSpace& space) noexcept {
@@ -1146,25 +1147,32 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
     struct TFixture {
         TFixture(ui8 addressBits = 6, ui32 hazards = 8, ui8 reservedAddressBits = 0, ui64 hardLimit = 0) {
+            Y_ABORT_UNLESS(!TlsCacheHazard);
             UNIT_ASSERT(TryCalculateSharedCacheFootprint(addressBits, 4096, 0, hazards, Capacity));
             if (reservedAddressBits == 0) {
                 reservedAddressBits = addressBits;
             }
             UNIT_ASSERT(TryCalculateSharedCacheFootprint(reservedAddressBits, 4096, 0, hazards, ReservedCapacity));
-            auto space = TSharedCacheSpace::Create(Capacity, ReservedCapacity, hazards);
+            Threads = MakeHolder<TCacheThreadSubSystem>(hazards);
+            auto space = TSharedCacheSpace::Create(Capacity, ReservedCapacity, *Threads);
             UNIT_ASSERT(space);
             Space = space.Get();
             Cache = TTestSharedCache::Create(std::move(space), hardLimit ? hardLimit : Capacity.Limit);
             UNIT_ASSERT(Cache);
-            MainHazard = Cache->BindThreadHazard(hazards - 1);
+            TlsCacheHazard = &TCacheThreadTestAccess::Hazard(*Cache, hazards - 1);
         }
 
+        ~TFixture() {
+            Y_DEBUG_ABORT_UNLESS(!TlsCacheHazard || TlsCacheHazard->State.load(std::memory_order_relaxed) == 0);
+            TlsCacheHazard = nullptr;
+        }
+
+        THolder<TCacheThreadSubSystem> Threads;
         TSharedCacheCapacity Capacity;
         TSharedCacheCapacity ReservedCapacity;
         TSharedCacheSpace* Space = nullptr;
         TCollectionRegistry Registry;
         TIntrusivePtr<TTestSharedCache> Cache;
-        TSharedCacheThreadBinding<TTestTraits> MainHazard;
     };
 
     TSharedCacheKey ReviewKeyForBucket(TCollectionCacheItem collection, ui32 mask, ui32 bucket, ui64 startOffset,
@@ -1400,13 +1408,21 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
         TPageCacheItem inserted;
         TGateThread insertion(gate, [&] {
-            auto binding = fixture.Cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             inserted = InsertReadyPage(*fixture.Cache, keys[1]);
         });
         gate.Slots[0].Wait();
         bool relocated = false;
         TGateThread relocation(gate, [&] {
-            auto binding = fixture.Cache->BindThreadHazard(1);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 1);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             relocated = TSharedCacheTestAccess::RelocatePage(*fixture.Cache, source);
         });
         gate.Slots[1].Wait();
@@ -1447,14 +1463,22 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
         bool relocated = false;
         TGateThread relocation(gate, [&] {
-            auto binding = fixture.Cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             relocated = TSharedCacheTestAccess::RelocatePage(*fixture.Cache, source);
         });
         gate.Slots[0].Wait();
         bool acquired = false;
         TTestSharedPageRef page;
         TGateThread reader(gate, [&] {
-            auto binding = fixture.Cache->BindThreadHazard(1);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 1);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             acquired = querySticky ? sourceHold.Ref.IsSticky()
                                    : TSharedCacheTestAccess::AcquirePage(*fixture.Cache, source, page);
         });
@@ -1606,7 +1630,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         bool reclaimed = false;
         TGateThread consumer(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             reclaimed = TSharedCacheTestAccess::WithSpace(*cache, [&](TSpaceOperation& op) {
                 return TSharedCacheTestAccess::ReclaimKeepCold(*cache, op);
             });
@@ -1614,7 +1642,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         gate.Slots[0].Wait();
         bool demoted = false;
         TGateThread demoter(gate, [&] {
-            auto binding = cache->BindThreadHazard(1);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 1);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             demoted = TSharedCacheTestAccess::DemoteKeepCold(*cache, token);
         });
         gate.Slots[1].Wait();
@@ -1880,7 +1912,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 if (dispatched) {
                     UNIT_ASSERT(fetch.Dispatch());
                 }
-                fixture.MainHazard = {};
+                TlsCacheHazard = nullptr;
                 UNIT_ASSERT(!TTestSharedCache::TryGet());
             }
             UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
@@ -1906,7 +1938,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                         EStickyState::None, firstWaiter, hit, first) == ESharedCacheResultStatus::Inserted);
         UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, collection, MakePageLocation(11),
                         EStickyState::None, secondWaiter, hit, second) == ESharedCacheResultStatus::Inserted);
-        fixture.MainHazard = {};
+        TlsCacheHazard = nullptr;
         first = std::move(second);
         UNIT_ASSERT(first);
         UNIT_ASSERT(!second);
@@ -1931,7 +1963,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, MakeCollectionCacheItem(65, 66),
                             MakePageLocation(12), EStickyState::None, waiter, hit,
                             fetch) == ESharedCacheResultStatus::Inserted);
-            fixture.MainHazard = {};
+            TlsCacheHazard = nullptr;
             fixture.Cache.Drop();
             UNIT_ASSERT_VALUES_EQUAL(waiter->RefCount(), 1);
             UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
@@ -1968,7 +2000,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(!fetch);
             UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
             UNIT_ASSERT_VALUES_EQUAL(waiter->RefCount(), 2);
-            fixture.MainHazard = {};
+            TlsCacheHazard = nullptr;
             structural.Drop();
             fixture.Cache.Drop();
             UNIT_ASSERT_VALUES_EQUAL(completed.load(), 0);
@@ -2947,7 +2979,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         bool succeeded = false;
         auto fetch = std::move(requests[0].Fetch());
         TGateThread completer(gate, [&] {
-            auto binding = fixture.Cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             succeeded = fetch.MakeReady(MakePageData(page.Index()));
         });
         gate.Slots[0].Wait();
@@ -2979,7 +3015,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         bool succeeded = false;
         auto fetch = std::move(requests[0].Fetch());
         TGateThread completer(gate, [&] {
-            auto binding = fixture.Cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             succeeded = fetch.MakeReady(MakePageData(page.Index()));
         });
         gate.Slots[0].Wait();
@@ -3308,7 +3348,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
         bool detached = false;
         TGateThread detacher(gate, [&] {
-            auto binding = fixture.Cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             detached = TSharedCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection);
         });
         gate.Slots[0].Wait();
@@ -3576,7 +3620,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         ESharedCacheResultStatus subscribeStatus = ESharedCacheResultStatus::Miss;
         TGateThread subscriber(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             TTestSharedPageRef subscriberHit;
             TTestPageFetch subscriberFetch;
             TIntrusivePtr<TPageFetchWaiter> second = new TTestPageFetchWaiter(completed, ready, completedItem);
@@ -3615,7 +3663,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         for (ui32 thread = 0; thread < ThreadCount; ++thread) {
             threads.emplace_back([&, thread] {
-                auto binding = fixture.Cache->BindThreadHazard(thread);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, thread);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 while (!start.load(std::memory_order_acquire)) {
                     std::this_thread::yield();
                 }
@@ -3893,7 +3945,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TTestSharedCacheCollectionRef attached;
             ESharedCacheResultStatus status = ESharedCacheResultStatus::Miss;
             TGateThread attacher(gate, [&] {
-                auto binding = cache->BindThreadHazard(0);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 TCollectionCacheItem duplicate;
                 status = TSharedCacheTestAccess::FindOrInsert(*cache, fixture.Registry, location, duplicate, attached);
             });
@@ -4002,7 +4058,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
             bool ready = false;
             TGateThread publisher(gate, [&] {
-                auto binding = fixture.Cache->BindThreadHazard(0);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 ready = fetch.MakeReady(MakePageData(page.Index()));
             });
             gate.Slots[0].Wait();
@@ -4091,7 +4151,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             auto cache = fixture.Cache;
             bool erased = false;
             TGateThread releaser(gate, [&] {
-                auto binding = cache->BindThreadHazard(0);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 erased = TSharedCacheTestAccess::EraseCold(*cache, MakeColdItem(*cache, pages[0].Index()));
             });
             gate.Slots[0].Wait();
@@ -4230,7 +4294,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         std::array<std::thread, 2> workers;
         for (ui32 index = 0; index < workers.size(); ++index) {
             workers[index] = std::thread([&, index] {
-                auto binding = fixture.Cache->BindThreadHazard(index);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, index);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 while (!start.load(std::memory_order_acquire)) {
                     std::this_thread::yield();
                 }
@@ -4278,7 +4346,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TPageCacheItem duplicate;
         TTestSharedPageRef hit;
         std::thread worker([&] {
-            auto binding = fixture.Cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             status = FindOrInsertPage(
                 *fixture.Cache, collection, MakePageLocation(key.Word(1)), EStickyState::None, duplicate, hit);
             UNIT_ASSERT(hit.CacheItem() == inserted);
@@ -4312,7 +4384,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TPageCacheItem inserted;
         TTestSharedPageRef hit;
         TGateThread writer(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             status = FindOrInsertPage(
                 *cache, PageCollection(key), MakePageLocation(key.Word(1)), EStickyState::None, inserted, hit);
         });
@@ -4601,7 +4677,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             std::atomic<bool> ready = false;
             std::atomic<bool> done = false;
             std::thread worker([&] {
-                auto binding = fixture.Cache->BindThreadHazard(0);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
                     ready.store(true, std::memory_order_release);
                     do {
@@ -5004,7 +5084,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
         auto cache = fixture.Cache;
         TGateThread publisher(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*cache, page));
         });
         gate.Slots[0].Wait();
@@ -5282,7 +5366,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         bool relocated = false;
         TGateThread relocator(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             relocated = cache->RunMaintenance();
         });
         gate.Slots[0].Wait();
@@ -5328,7 +5416,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         gate.Slots[0].Arm(ESharedCacheHookPoint::AfterReplacedPublished, coldSource.CacheItem());
         bool coldRelocated = false;
         TGateThread coldRelocator(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             coldRelocated = cache->RunMaintenance();
         });
         gate.Slots[0].Wait();
@@ -6030,7 +6122,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             auto cache = fixture.Cache;
             bool ready = false;
             TGateThread writer(gate, [&] {
-                auto binding = cache->BindThreadHazard(0);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 ready = requests.front().Fetch().MakeReady(MakePageData(page.Index()));
             });
             gate.Slots[0].Wait();
@@ -6265,7 +6361,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TSharedCacheHookGuard hookGuard(*fixture.Cache, gate.Hooks);
         auto cache = fixture.Cache;
         TGateThread releaser(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             held.Drop();
         });
         gate.Slots[0].Wait();
@@ -6754,7 +6854,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         bool ready = false;
         TGateThread readyThread(gate, [&] {
-            auto binding = fixture.Cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             ready = fixture.Cache->MakeReady(cacheItem, MakePageData(cacheItem.Index()));
         });
         gate.Slots[0].Wait();
@@ -6843,7 +6947,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         bool firstActivation = true;
         TGateThread firstActivator(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             firstActivation = TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*cache);
         });
         gate.Slots[0].Wait();
@@ -6915,7 +7023,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         bool removed = true;
         TGateThread remover(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             removed = TSharedCacheTestAccess::RemoveBucketSplit(*cache);
         });
         gate.Slots[0].Wait();
@@ -6993,7 +7105,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         bool removed = false;
         TGateThread remover(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             removed = TSharedCacheTestAccess::RemoveBucketSplit(*cache);
         });
         gate.Slots[0].Wait();
@@ -7045,13 +7161,21 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         bool removed = false;
         TGateThread remover(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             removed = TSharedCacheTestAccess::RemoveBucketSplit(*cache);
         });
         gate.Slots[0].Wait();
         bool erased = false;
         TGateThread eraser(gate, [&] {
-            auto binding = cache->BindThreadHazard(1);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 1);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             erased = TSharedCacheTestAccess::EraseCold(*cache, MakeColdItem(*cache, successor.Index()));
         });
         gate.Slots[1].Wait();
@@ -7134,7 +7258,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         bool firstActivation = true;
         TGateThread firstActivator(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             firstActivation = TSharedCacheTestAccess::AdvanceBucketResize(*cache);
         });
         gate.Slots[0].Wait();
@@ -7150,7 +7278,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         bool activated = false;
         TGateThread activator(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             activated = TSharedCacheTestAccess::AdvanceBucketResize(*cache);
         });
         gate.Slots[1].Wait();
@@ -7180,7 +7312,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         gate.Slots[0].Arm(ESharedCacheHookPoint::AfterBucketResizeCursorPublished);
         bool published = false;
         TGateThread publisher(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             published = TSharedCacheTestAccess::AdvanceBucketResize(*cache);
         });
         gate.Slots[0].Wait();
@@ -7197,7 +7333,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         gate.Slots[0].Arm(ESharedCacheHookPoint::AfterBucketSplitRemoved);
         bool removed = false;
         TGateThread remover(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             removed = TSharedCacheTestAccess::AdvanceBucketResize(*cache);
         });
         gate.Slots[0].Wait();
@@ -7257,7 +7397,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         bool closed = false;
         TGateThread closer(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             closed = TSharedCacheTestAccess::AdvanceBucketResize(*cache);
         });
         gate.Slots[0].Wait();
@@ -7281,7 +7425,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         gate.Slots[0].Arm(ESharedCacheHookPoint::AfterBucketSplitRemoved);
         bool removed = false;
         TGateThread remover(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             removed = TSharedCacheTestAccess::AdvanceBucketResize(*cache);
         });
         gate.Slots[0].Wait();
@@ -7350,7 +7498,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         for (ui32 reader = 0; reader < ReaderCount; ++reader) {
             threads[reader] = std::thread([&, reader] {
-                auto binding = cache->BindThreadHazard(reader);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, reader);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 ui64 random = 0x9E3779B97F4A7C15ULL + reader;
                 ready.fetch_add(1, std::memory_order_release);
                 while (!start.load(std::memory_order_acquire)) {
@@ -7382,7 +7534,12 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         for (ui32 writer = 0; writer < WriterCount; ++writer) {
             threads[ReaderCount + writer] = std::thread([&, writer] {
-                auto binding = cache->BindThreadHazard(ReaderCount + writer);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard =
+                    &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, ReaderCount + writer);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 ui64 random = 0xD1B54A32D192ED03ULL + writer;
                 ready.fetch_add(1, std::memory_order_release);
                 while (!start.load(std::memory_order_acquire)) {
@@ -7748,7 +7905,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         bool promoted = true;
         TGateThread promoter(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             promoted = TSharedCacheTestAccess::MakePageSticky(*cache, page);
         });
         gate.Slots[0].Wait();
@@ -7781,7 +7942,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         std::array<std::thread, 2> workers;
         for (ui32 index = 0; index < workers.size(); ++index) {
             workers[index] = std::thread([&, index] {
-                auto binding = fixture.Cache->BindThreadHazard(index);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, index);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 while (!start.load(std::memory_order_acquire)) {
                     std::this_thread::yield();
                 }
@@ -7817,7 +7982,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         std::array<std::thread, 2> workers;
         for (ui32 index = 0; index < workers.size(); ++index) {
             workers[index] = std::thread([&, index] {
-                auto binding = fixture.Cache->BindThreadHazard(index);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, index);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 while (!start.load(std::memory_order_acquire)) {
                     std::this_thread::yield();
                 }
@@ -7856,7 +8025,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
         bool ready = false;
         TGateThread completer(gate, [&] {
-            auto binding = fixture.Cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             ready = fixture.Cache->MakeReady(page, MakePageData(page.Index()));
         });
         gate.Slots[0].Wait();
@@ -7895,7 +8068,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         bool completed = false;
         TGateThread completer(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             completed = cache->MakeReady(completing, MakePageData(completing.Index()));
         });
         gate.Slots[0].Wait();
@@ -7950,7 +8127,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         bool ready = false;
         TGateThread completer(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             TSharedCacheTestAccess::MakePendingPageSticky(*cache, pending);
             ready = cache->MakeReady(pending, MakePageData(pending.Index()));
         });
@@ -7996,7 +8177,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         bool ready = false;
         TGateThread completer(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             TSharedCacheTestAccess::MakePendingPageSticky(*cache, pending);
             ready = cache->MakeReady(pending, MakePageData(pending.Index()));
         });
@@ -8055,7 +8240,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         bool cut = false;
         TGateThread cutter(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             cut = TSharedCacheTestAccess::UnstickyCutPages(*cache, existing, fixture.Capacity.HandleCount());
         });
         gate.Slots[0].Wait();
@@ -8124,7 +8313,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         bool cut = false;
         TGateThread cutter(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             cut = TSharedCacheTestAccess::UnstickyCutPages(*cache, cutPage, cutPage.Index());
         });
         gate.Slots[0].Wait();
@@ -8175,7 +8368,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             auto cache = fixture.Cache;
             bool evicted = false;
             TGateThread evictor(gate, [&] {
-                auto binding = cache->BindThreadHazard(0);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 evicted = TSharedCacheTestAccess::EvictFromHot(*cache, page);
             });
             gate.Slots[0].Wait();
@@ -8229,7 +8426,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             auto cache = fixture.Cache;
             bool evicted = false;
             TGateThread evictor(gate, [&] {
-                auto binding = cache->BindThreadHazard(0);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 evicted = TSharedCacheTestAccess::EvictFromHot(*cache, page);
             });
             gate.Slots[0].Wait();
@@ -8328,7 +8529,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto hold = std::move(found.Ref);
         fixture.Cache.Reset();
         hold.Drop();
-        fixture.MainHazard = {};
+        TlsCacheHazard = nullptr;
         applicationOwner.Reset();
     }
     Y_UNIT_TEST(UnboundDropAbandonsItemForFinalSweep) {
@@ -8338,10 +8539,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto found = FindPage(*fixture.Cache, key);
         UNIT_ASSERT(found.Status == ESharedCacheResultStatus::Hit);
 
-        fixture.MainHazard = {};
+        TlsCacheHazard = nullptr;
         found.Ref.Drop();
 
-        fixture.MainHazard = fixture.Cache->BindThreadHazard(TSharedCacheTestAccess::HazardCount(*fixture.Cache) - 1);
+        TlsCacheHazard =
+            &TCacheThreadTestAccess::Hazard(*fixture.Cache, TSharedCacheTestAccess::HazardCount(*fixture.Cache) - 1);
         const THandleState abandoned = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
         UNIT_ASSERT_VALUES_EQUAL(abandoned.Refs(), 1);
     }
@@ -8401,7 +8603,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TPageCacheItem inserted;
         TTestSharedPageRef hit;
         TGateThread writer(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             status = FindOrInsertPage(
                 *cache, PageCollection(keys[1]), MakePageLocation(keys[1].Word(1)), EStickyState::None, inserted, hit);
         });
@@ -8451,7 +8657,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TPageCacheItem inserted;
         TTestSharedPageRef hit;
         TGateThread writer(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             status = FindOrInsertPage(
                 *cache, PageCollection(keys[1]), MakePageLocation(keys[1].Word(1)), EStickyState::None, inserted, hit);
         });
@@ -8497,7 +8707,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         std::atomic<bool> reclaimed = false;
         TGateThread owner(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             reclaimed.store(cache->ReclaimCold(), std::memory_order_release);
         });
         gate.Slots[0].Wait();
@@ -8507,7 +8721,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TPageCacheItem inserted;
         TTestSharedPageRef hit;
         TGateThread writer(gate, [&] {
-            auto binding = cache->BindThreadHazard(1);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 1);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             status = FindOrInsertPage(
                 *cache, PageCollection(keys[1]), MakePageLocation(keys[1].Word(1)), EStickyState::None, inserted, hit);
         });
@@ -8554,14 +8772,22 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         std::atomic<bool> reclaimed = false;
         TGateThread owner(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             reclaimed.store(cache->ReclaimCold(), std::memory_order_release);
         });
         gate.Slots[0].Wait();
 
         gate.Slots[1].Arm(ESharedCacheHookPoint::AfterTombstoneHelperClaim, target.CacheItem());
         TGateThread helper(gate, [&] {
-            auto binding = cache->BindThreadHazard(1);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 1);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             auto hold = TSharedCacheTestAccess::AcquireTombstoneHelper(*cache, target.CacheItem());
             hold.Drop();
         });
@@ -8599,7 +8825,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto cache = fixture.Cache;
         std::atomic<bool> reclaimed = false;
         TGateThread owner(gate, [&] {
-            auto binding = cache->BindThreadHazard(0);
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
             reclaimed.store(cache->ReclaimCold(), std::memory_order_release);
         });
 
@@ -8894,11 +9124,15 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TActorSystemStub context;
         TSharedCacheCapacity capacity;
         UNIT_ASSERT(TryCalculateSharedCacheFootprint(11, 4096, 0, 1, capacity));
-        auto space = TSharedCacheSpace::Create(capacity, capacity, 1);
+        auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
         UNIT_ASSERT(space);
         auto cache = TSharedCache::Create(std::move(space), capacity.Limit);
         UNIT_ASSERT(cache);
-        auto binding = cache->BindCurrentThreadHazard();
+        Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+        NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache);
+        Y_DEFER {
+            NSharedCache::TlsCacheHazard = nullptr;
+        };
 
         const TCollectionCacheItem collection = MakeCollectionCacheItem(61, 62);
         TPageCacheItem inserted;
@@ -8931,7 +9165,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 while (!start.load(std::memory_order_acquire)) {
                     std::this_thread::yield();
                 }
-                auto hazard = fixture.Cache->BindThreadHazard(thread);
+                Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+                NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, thread);
+                Y_DEFER {
+                    NSharedCache::TlsCacheHazard = nullptr;
+                };
                 const auto candidate = AllocatePage(*fixture.Cache, key, 4096);
                 Y_ABORT_UNLESS(candidate);
                 candidates[thread] = candidate;
