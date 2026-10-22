@@ -1337,35 +1337,13 @@ bool TSharedCache::AcquirePage(TPageCacheItem page, TSharedPageRefImpl<TTraits>&
 SHARED_CACHE_TEMPLATE
 TSharedPageRefImpl<TTraits> TSharedCache::AcquireHeldPage(TCacheItem item) noexcept {
     auto cacheOp = BeginOperation();
-    THandle& handle = cacheOp.Handles()[item.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        // The source owner protects this physical item, including a withdrawn or relocated predecessor.
-        Y_ABORT_UNLESS(item.Matches(expected) && expected.IsPageKind() && expected.Refs() != 0);
-        Y_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, expected.IncrementRefs().Raw(), std::memory_order_relaxed, std::memory_order_relaxed)) {
-            return cacheOp.BuildPageRef(TSharedCacheItemRef(item));
-        }
-    }
+    return cacheOp.BuildPageRef(cacheOp.Items().AcquireHeldPage(item));
 }
 
 SHARED_CACHE_TEMPLATE
 TSharedCacheCollectionRef TSharedCache::AcquireHeldCollection(TCacheItem item) noexcept {
     auto cacheOp = BeginOperation();
-    THandle& handle = cacheOp.Handles()[item.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        Y_ABORT_UNLESS(
-            item.Matches(expected) && expected.IsCollectionKind() && expected.Refs() != 0 && handle.Body.Collection);
-        Y_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, expected.IncrementRefs().Raw(), std::memory_order_relaxed, std::memory_order_relaxed)) {
-            return cacheOp.BuildCollectionRef(TSharedCacheItemRef(item));
-        }
-    }
+    return cacheOp.BuildCollectionRef(cacheOp.Items().AcquireHeldCollection(item));
 }
 
 SHARED_CACHE_TEMPLATE
