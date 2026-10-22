@@ -10,12 +10,6 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
-TSharedCacheItemRefImpl<TTraits> TCacheCollectionServices<TTraits>::TryAcquireStructural(
-    TSpaceOperation& spaceOp, TCacheItem item) noexcept {
-    return Cache_.TryAcquireStructural(spaceOp, item);
-}
-
-template <class TTraits>
 void TCacheCollectionServices<TTraits>::RouteHotL1(TSpaceOperation& spaceOp, TCacheItem item) noexcept {
     Cache_.Eviction_.BindOperation(spaceOp).RouteHot(EHotLevel::L1, item);
 }
@@ -218,7 +212,7 @@ void TCacheCollections<TTraits>::Unlink(
 template <class TTraits>
 bool TCacheCollections<TTraits>::Unlink(
     TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collectionItem) noexcept {
-    TOperationItemRef<TTraits> collectionRef(spaceOp, Services_.TryAcquireStructural(spaceOp, collectionItem));
+    TOperationItemRef<TTraits> collectionRef(spaceOp, Items(spaceOp).TryAcquireStructural(collectionItem));
     if (!collectionRef) {
         return false;
     }
@@ -245,7 +239,7 @@ void TCacheCollections<TTraits>::ForEach(
         Y_DEBUG_ABORT_UNLESS(state.IsCollectionKind() && handle.Body.Collection &&
                              handle.Body.Collection->Registry_.load(std::memory_order_acquire) == &registry);
         TOperationItemRef<TTraits> ref(
-            spaceOp, Services_.TryAcquireStructural(spaceOp, TCacheItem::Make(state.Version(), current)));
+            spaceOp, Items(spaceOp).TryAcquireStructural(TCacheItem::Make(state.Version(), current)));
         Y_ABORT_UNLESS(ref);
         callback(*handle.Body.Collection);
         current = next;
@@ -267,8 +261,7 @@ bool TCacheCollections<TTraits>::DropReference(TCollection& owner) noexcept {
 template <class TTraits>
 void TCacheCollections<TTraits>::DropOwnerReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept {
     // Keep the payload alive after dropping the page's collection ownership.
-    TOperationItemRef<TTraits> collectionRef(
-        spaceOp, Services_.TryAcquireStructural(spaceOp, owner.CacheItem.CacheItem()));
+    TOperationItemRef<TTraits> collectionRef(spaceOp, Items(spaceOp).TryAcquireStructural(owner.CacheItem.CacheItem()));
     Y_ABORT_UNLESS(collectionRef);
     const bool lastOwner = DropReference(owner);
     Traits_.Invoke(ESharedCacheHookPoint::AfterCollectionOwnerReferenceDropped, collectionRef.CacheItem());
@@ -432,8 +425,7 @@ template <class TTraits>
 TSharedCacheItemRefImpl<TTraits> TCacheCollections<TTraits>::AcquireSticky(
     TSpaceOperation& spaceOp, TCollectionCacheItem collectionItem, TCollection*& collectionValue) noexcept {
     collectionValue = nullptr;
-    TOperationItemRef<TTraits> collectionRef(
-        spaceOp, Services_.TryAcquireStructural(spaceOp, collectionItem.CacheItem()));
+    TOperationItemRef<TTraits> collectionRef(spaceOp, Items(spaceOp).TryAcquireStructural(collectionItem.CacheItem()));
     if (!collectionRef) {
         return {};
     }
@@ -1009,7 +1001,7 @@ bool TCacheCollections<TTraits>::Delete(
 template <class TTraits>
 bool TCacheCollections<TTraits>::MoveRegistry(TSpaceOperation& spaceOp, TCollectionRegistry& source,
     TCollectionRegistry& destination, TCacheItem collectionItem) noexcept {
-    TOperationItemRef<TTraits> collectionRef(spaceOp, Services_.TryAcquireStructural(spaceOp, collectionItem));
+    TOperationItemRef<TTraits> collectionRef(spaceOp, Items(spaceOp).TryAcquireStructural(collectionItem));
     if (!collectionRef) {
         return false;
     }
