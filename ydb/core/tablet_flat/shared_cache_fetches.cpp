@@ -19,7 +19,7 @@ bool TCacheFetches<TTraits>::MatchesPendingFetch(
 template <class TTraits>
 TIntrusivePtr<TPageFetchState> TCacheFetches<TTraits>::TryAcquire(
     TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept {
-    if (Cache_.TryAcquire(spaceOp, page.CacheItem(), true, owner.Get()) !=
+    if (Cache_.Items_.BindOperation(spaceOp).TryAcquire(page.CacheItem(), true, owner.Get()) !=
         TSharedCacheImpl<TTraits>::EAcquireStatus::Pending) {
         return {};
     }

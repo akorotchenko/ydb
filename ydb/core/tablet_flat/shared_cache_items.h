@@ -2,6 +2,7 @@
 
 #include "shared_cache_ref.h"
 #include "shared_cache_collection.h"
+#include "shared_cache_eviction.h"
 #include "shared_cache_traits.h"
 #include "shared_cache_space.h"
 
@@ -10,6 +11,12 @@ namespace NKikimr::NSharedCache {
 template <class TTraits>
 class TCacheItems {
 public:
+    enum class EAcquireStatus {
+        Stale,
+        Pending,
+        Ready,
+    };
+
     class TOperation {
     public:
         // Structural protection
@@ -17,7 +24,12 @@ public:
             return Items_.TryAcquireItemRef(SpaceOp_, item);
         }
 
-        // Native reference acquisition
+        // Reference acquisition
+        Y_FORCE_INLINE EAcquireStatus TryAcquire(
+            TCacheItem cacheItem, bool allowPending, TSharedCacheItemRefImpl<TTraits>& ref) noexcept {
+            return Items_.TryAcquire(SpaceOp_, cacheItem, allowPending, ref);
+        }
+
         TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TCacheItem item) noexcept {
             return Items_.TryAcquireHotItemRef(SpaceOp_, item);
         }
@@ -40,7 +52,7 @@ public:
             return Items_.BuildCollectionRef(SpaceOp_, std::move(ref));
         }
 
-        // Native reference release
+        // Reference release
         Y_FORCE_INLINE TCollection* ReleaseItem(TCacheItem cacheItem, bool allowKeepCold) noexcept {
             return Items_.ReleaseItem(SpaceOp_, cacheItem, allowKeepCold);
         }
@@ -53,7 +65,7 @@ public:
             return Items_.TryReleaseItemRef(SpaceOp_, cacheItem, expectedRaw);
         }
 
-        // Native allocation
+        // Allocation
         ui32 TryAllocateHandle() noexcept {
             return Items_.TryAllocateHandle(SpaceOp_);
         }
@@ -159,7 +171,9 @@ private:
         }
     }
 
-    // Native reference acquisition
+    // Reference acquisition
+    Y_FORCE_INLINE EAcquireStatus TryAcquire(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending,
+        TSharedCacheItemRefImpl<TTraits>& ref) noexcept;
     TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     TSharedCacheItemRefImpl<TTraits> AcquireMorePageRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     TSharedCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
@@ -170,7 +184,7 @@ private:
     TSharedCacheCollectionRefImpl<TTraits> BuildCollectionRef(
         const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept;
 
-    // Native reference release
+    // Reference release
     Y_FORCE_INLINE TCollection* ReleaseItem(
         TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowKeepCold) noexcept;
 
@@ -178,7 +192,7 @@ private:
 
     TCollection* ReleaseTombstone(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
-    // Native allocation
+    // Allocation
     ui32 TryAllocateHandle(TSpaceOperation& spaceOp) noexcept;
     TCacheItem Allocate(TSpaceOperation& spaceOp) noexcept;
     TCacheItem TryAllocateReservedItem(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) noexcept;
@@ -202,7 +216,68 @@ private:
     TSharedCacheImpl<TTraits>& Cache_;
 };
 
-// Native reference release
+// Reference acquisition
+template <class TTraits>
+Y_FORCE_INLINE typename TCacheItems<TTraits>::EAcquireStatus TCacheItems<TTraits>::TryAcquire(
+    TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending, TSharedCacheItemRefImpl<TTraits>& ref) noexcept {
+    auto cacheOp = Cache_.BindOperation(spaceOp);
+    if (!spaceOp.Contains(cacheItem)) {
+        return EAcquireStatus::Stale;
+    }
+
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        if (!cacheItem.Matches(expected) || expected.IsFree() || expected.IsReplacing() || expected.IsReplaced() ||
+            expected.IsTombstone())
+        {
+            return EAcquireStatus::Stale;
+        }
+
+        if (expected.IsPending() && !allowPending) {
+            return EAcquireStatus::Pending;
+        }
+        if (!expected.IsPending() && !expected.IsReady()) {
+            return EAcquireStatus::Stale;
+        }
+
+        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
+        THandleState desired = expected.IncrementRefs();
+        const bool pending = expected.IsPending();
+        if (expected.IsHot()) {
+            desired = desired.WithFrequency(Min<ui8>(expected.Frequency() + 1, 2));
+        }
+
+        if (expected.IsKeepCold()) {
+            desired = desired.WithState(EHandleState::Hot).WithFrequency(0);
+        }
+        if (!handle.State.compare_exchange_weak(
+                expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed))
+        {
+            continue;
+        }
+        Cache_.UpdateColdReclaimable(PayloadBytes(handle, expected.Kind()), expected, desired);
+        if (expected.IsKeepCold()) {
+            Cache_.AdvanceColdMembership(handle);
+            const ui64 bytes = PageBytes(handle);
+            Cache_.Memory_.KeepCold().TransferBytesTo(Cache_.Memory_.Hot(), bytes);
+            Cache_.Memory_.KeepCold().TransferPageTo(Cache_.Memory_.Hot(), EItemKind::Page);
+            Cache_.Memory_.ReleaseKeepColdOwnedBytes(bytes);
+            cacheOp.Eviction().RouteHot(EHotLevel::L1, cacheItem);
+        } else if (expected.IsCold() && expected.IsPageKind()) {
+            if (cacheOp.Eviction().PromoteCold(cacheItem)) {
+                cacheOp.Eviction().RouteHot(EHotLevel::L1, cacheItem);
+            } else {
+                Cache_.AdvanceColdMembership(handle);
+            }
+        }
+        ref = TSharedCacheItemRefImpl<TTraits>(cacheItem);
+        return pending ? EAcquireStatus::Pending : EAcquireStatus::Ready;
+    }
+}
+
+// Reference release
 template <class TTraits>
 Y_FORCE_INLINE TCollection* TCacheItems<TTraits>::ReleaseItem(
     TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowKeepCold) noexcept {

@@ -832,66 +832,6 @@ void TSharedCache::DiscardCandidate(TCacheItem cacheItem, EItemKind kind) noexce
 }
 
 SHARED_CACHE_TEMPLATE
-typename TSharedCache::EAcquireStatus TSharedCache::TryAcquire(
-    TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending, TSharedCacheItemRef& ref) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    if (!spaceOp.Contains(cacheItem)) {
-        return EAcquireStatus::Stale;
-    }
-
-    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        if (!cacheItem.Matches(expected) || expected.IsFree() || expected.IsReplacing() || expected.IsReplaced() ||
-            expected.IsTombstone())
-        {
-            return EAcquireStatus::Stale;
-        }
-
-        if (expected.IsPending() && !allowPending) {
-            return EAcquireStatus::Pending;
-        }
-        if (!expected.IsPending() && !expected.IsReady()) {
-            return EAcquireStatus::Stale;
-        }
-
-        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
-        THandleState desired = expected.IncrementRefs();
-        const bool pending = expected.IsPending();
-        if (expected.IsHot()) {
-            desired = desired.WithFrequency(Min<ui8>(expected.Frequency() + 1, 2));
-        }
-
-        if (expected.IsKeepCold()) {
-            desired = desired.WithState(EHandleState::Hot).WithFrequency(0);
-        }
-        if (!handle.State.compare_exchange_weak(
-                expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed))
-        {
-            continue;
-        }
-        UpdateColdReclaimable(TCacheItems<TTraits>::PayloadBytes(handle, expected.Kind()), expected, desired);
-        if (expected.IsKeepCold()) {
-            AdvanceColdMembership(handle);
-            const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
-            Memory_.KeepCold().TransferBytesTo(Memory_.Hot(), bytes);
-            Memory_.KeepCold().TransferPageTo(Memory_.Hot(), EItemKind::Page);
-            Memory_.ReleaseKeepColdOwnedBytes(bytes);
-            cacheOp.Eviction().RouteHot(EHotLevel::L1, cacheItem);
-        } else if (expected.IsCold() && expected.IsPageKind()) {
-            if (cacheOp.Eviction().PromoteCold(cacheItem)) {
-                cacheOp.Eviction().RouteHot(EHotLevel::L1, cacheItem);
-            } else {
-                AdvanceColdMembership(handle);
-            }
-        }
-        ref = TSharedCacheItemRef(cacheItem);
-        return pending ? EAcquireStatus::Pending : EAcquireStatus::Ready;
-    }
-}
-
-SHARED_CACHE_TEMPLATE
 TSharedCacheItemRef TSharedCache::BuildExternalRef(EItemKind kind, TCacheItem cacheItem) noexcept {
     auto spaceOp = BeginOperation();
     Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem) && !cacheItem.IsFrozen());

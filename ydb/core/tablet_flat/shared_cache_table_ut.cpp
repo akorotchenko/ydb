@@ -554,7 +554,7 @@ public:
             TCacheItem cacheItem;
             Y_ABORT_UNLESS(cache.Table_.Find(operation, key, cacheItem) == ESharedCacheResultStatus::Hit);
             UNIT_ASSERT(cache.Space_->AdvanceSpaceGeneration());
-            const auto status = cache.TryAcquire(operation, cacheItem, false, ref);
+            const auto status = operation.TryAcquire(cacheItem, false, ref);
             Y_ABORT_UNLESS(status == (expectPending ? TTestSharedCache::EAcquireStatus::Pending
                                                     : TTestSharedCache::EAcquireStatus::Ready));
         }
@@ -567,7 +567,7 @@ public:
         TCacheItem cacheItem;
         Y_ABORT_UNLESS(cache.Table_.Find(operation, key, cacheItem) == ESharedCacheResultStatus::Hit);
         TTestSharedCacheItemRef ref;
-        Y_ABORT_UNLESS(cache.TryAcquire(operation, cacheItem, true, ref) == TTestSharedCache::EAcquireStatus::Pending);
+        Y_ABORT_UNLESS(operation.TryAcquire(cacheItem, true, ref) == TTestSharedCache::EAcquireStatus::Pending);
         return ref;
     }
 
