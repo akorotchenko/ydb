@@ -22,6 +22,11 @@ public:
             return Items_.AcquireHeldCollection(SpaceOp_, item);
         }
 
+        // Handle initialization
+        void InitializeCollection(TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept {
+            Items_.InitializeCollection(SpaceOp_, cacheItem, id, bytes);
+        }
+
     private:
         friend class TCacheItems;
 
@@ -46,6 +51,10 @@ private:
     TSharedCacheItemRefImpl<TTraits> TryAcquireHotEvictionPin(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     TSharedCacheItemRefImpl<TTraits> AcquireHeldPage(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     TSharedCacheItemRefImpl<TTraits> AcquireHeldCollection(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+
+    // Handle initialization
+    void InitializeCollection(
+        TSpaceOperation& spaceOp, TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept;
 };
 
 } // namespace NKikimr::NSharedCache
