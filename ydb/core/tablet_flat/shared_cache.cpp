@@ -417,67 +417,6 @@ bool TSharedCache::AdvanceColdMembership(
 }
 
 SHARED_CACHE_TEMPLATE
-ui32 TSharedCache::TryAllocateHandle(TSpaceOperation& spaceOp) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    const TCacheItem spare = TCacheItem::FromRaw(spaceOp.Hazard().SpareItem.exchange(0, std::memory_order_relaxed));
-    if (spare.IsNull()) {
-        if (const ui32 index = spaceOp.TryAllocateHandle()) {
-            return index;
-        }
-        // Byte headroom does not guarantee a free handle when pages are much smaller than the expected size.
-        // Reclaim Cold, or shrink Hot to feed Cold, before refusing the admission.
-        for (ui32 attempt = 0; attempt < spaceOp.HandleCount(); ++attempt) {
-            if (!cacheOp.Eviction().ReclaimCold()) {
-                const ui32 hotSlots = static_cast<ui32>(Space_->EffectiveHotSlots());
-                cacheOp.Eviction().EnforceCurrentLimit(0, true);
-                // The caller's view may predate growth; drain with a fresh operation under the resize lock.
-                DrainHotResize();
-                if (hotSlots == Space_->EffectiveHotSlots() && !cacheOp.Eviction().ReclaimCold()) {
-                    break;
-                }
-            }
-            if (const ui32 index = spaceOp.TryAllocateHandle()) {
-                return index;
-            }
-        }
-        return 0;
-    }
-
-    Y_ABORT_UNLESS(!spare.IsFrozen() && spare.Index() >= 2 && spare.Index() < spaceOp.AccessibleHandleCount());
-    const THandle& handle = spaceOp.Handles()[spare.Index()];
-    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    Y_ABORT_UNLESS(spare.Matches(state) && state.IsBegin() && state.Refs() == 0);
-    return spare.Index();
-}
-
-SHARED_CACHE_TEMPLATE
-TCacheItem TSharedCache::Allocate(TSpaceOperation& spaceOp) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    const ui32 index = cacheOp.TryAllocateHandle();
-    if (!index) {
-        return {};
-    }
-    const THandleState state = THandleState::FromRaw(spaceOp.Handles()[index].State.load(std::memory_order_relaxed));
-    Y_DEBUG_ABORT_UNLESS(state.IsBegin() && state.Refs() == 0);
-    spaceOp.Handles()[index].Key0.store(0, std::memory_order_relaxed);
-    spaceOp.Handles()[index].Body.Fetch = nullptr;
-    return TCacheItem::Make(state.Version(), index);
-}
-
-SHARED_CACHE_TEMPLATE
-TCacheItem TSharedCache::TryAllocateReservedItem(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
-    if (!cacheOp.TryReserve(bytes, pages)) {
-        return {};
-    }
-    const TCacheItem cacheItem = cacheOp.Allocate();
-    if (cacheItem.IsNull()) {
-        ReleaseReservation(bytes, pages);
-    }
-    return cacheItem;
-}
-
-SHARED_CACHE_TEMPLATE
 TPageCacheItem TSharedCache::AllocatePage(TCollectionCacheItem collection, ui64 offset, ui64 size,
     NTable::NPage::EPage type, ui32 crc32, EStickyState sticky) noexcept {
     Y_DEBUG_ABORT_UNLESS(type != NTable::NPage::EPage::Undef);
