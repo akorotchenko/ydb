@@ -75,6 +75,9 @@ TCollection* TCacheItems<TTraits>::ReleaseTombstone(TSpaceOperation& spaceOp, TC
             if (handle.State.compare_exchange_weak(
                     expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
             {
+                if (cacheItem.IsResizeMarker() && expected.Refs() == 2) {
+                    Cache_.NotifyResourcesAvailable();
+                }
                 return nullptr;
             }
             continue;
@@ -90,6 +93,7 @@ TCollection* TCacheItems<TTraits>::ReleaseTombstone(TSpaceOperation& spaceOp, TC
             if (handle.State.compare_exchange_weak(
                     expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
             {
+                Cache_.NotifyResourcesAvailable();
                 return nullptr;
             }
             continue;
