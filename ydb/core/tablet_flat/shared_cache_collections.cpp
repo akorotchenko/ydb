@@ -392,6 +392,7 @@ bool TCacheCollections<TTraits>::Attach(
     Y_ABORT_UNLESS(Link(spaceOp, registry, collectionItem));
     AddReference(*spaceOp.Handles()[collectionItem.Index()].Body.Collection);
     FinishAttach(spaceOp, collectionItem, detachedState);
+    Cache_.NotifyResourcesAvailable();
     return true;
 }
 
@@ -886,6 +887,7 @@ bool TCacheCollections<TTraits>::Detach(
     if (DropReference(*handle.Body.Collection)) {
         PublishCollectionForReclaim(spaceOp, collectionItem);
     }
+    Cache_.NotifyResourcesAvailable();
     return true;
 }
 

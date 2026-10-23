@@ -705,6 +705,7 @@ bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* regi
     }
     cacheOp.MakeReadyState(cacheItem);
     Y_UNUSED(value.Release());
+    NotifyResourcesAvailable();
     return true;
 }
 
