@@ -106,59 +106,67 @@ TRequestCompletion::TRequestCompletion(TRequestCompletionParams&& params) noexce
     Y_DEBUG_ABORT_UNLESS(Locations_.size() <= Max<ui32>());
     Y_DEBUG_ABORT_UNLESS(ActorSystem_ && ReplyTo_ && PageCollection_);
     if (RemainingPages_.load(std::memory_order_relaxed) == 0) {
-        SendResult();
+        SendResult(TakeResult());
     }
 }
 
 void TRequestCompletion::Complete(ui32 index, TSharedPageRef page, EPageFetchCompletion completion) noexcept {
-    Y_DEBUG_ABORT_UNLESS(index < ReadyPages_.size());
+    Y_DEBUG_ABORT_UNLESS(index < Locations_.size());
     Y_DEBUG_ABORT_UNLESS(completion != EPageFetchCompletion::Pending);
-    TGuard<TMutex> guard(Mutex_);
-    if (completion == EPageFetchCompletion::Ready && Status_.load(std::memory_order_relaxed) == NKikimrProto::OK) {
-        Y_DEBUG_ABORT_UNLESS(page);
-        ReadyPages_[index] = std::move(page);
-        if (WaitPad_) {
-            WaitPad_->HasPinnedPages.store(true, std::memory_order_release);
-        }
-    } else {
-        TEvResult::EStatus expected = NKikimrProto::OK;
-        if (Status_.compare_exchange_strong(expected, NKikimrProto::ERROR, std::memory_order_relaxed)) {
-            for (auto& readyPage : ReadyPages_) {
-                readyPage.Drop();
+    TVector<TSharedPageRef> releasedPages;
+    THolder<TEvResult> result;
+    {
+        TGuard<TMutex> guard(Mutex_);
+        if (completion == EPageFetchCompletion::Ready && Status_.load(std::memory_order_relaxed) == NKikimrProto::OK) {
+            Y_DEBUG_ABORT_UNLESS(page);
+            ReadyPages_[index] = std::move(page);
+            if (WaitPad_) {
+                WaitPad_->HasPinnedPages.store(true, std::memory_order_release);
+            }
+        } else {
+            TEvResult::EStatus expected = NKikimrProto::OK;
+            if (Status_.compare_exchange_strong(expected, NKikimrProto::ERROR, std::memory_order_relaxed)) {
+                releasedPages.swap(ReadyPages_);
             }
         }
-    }
 
-    const ui32 remaining = RemainingPages_.fetch_sub(1, std::memory_order_acq_rel);
-    Y_DEBUG_ABORT_UNLESS(remaining != 0);
-    if (remaining == 1 || HasFailed()) {
-        SendResult();
+        const ui32 remaining = RemainingPages_.fetch_sub(1, std::memory_order_acq_rel);
+        Y_DEBUG_ABORT_UNLESS(remaining != 0);
+        if (remaining == 1 || HasFailed()) {
+            result = TakeResult();
+        }
     }
+    SendResult(std::move(result));
 }
 
 void TRequestCompletion::Cancel(bool replyImmediately) noexcept {
-    TGuard<TMutex> guard(Mutex_);
-    Status_.store(NKikimrProto::RACE, std::memory_order_relaxed);
-    for (auto& page : ReadyPages_) {
-        page.Drop();
+    TVector<TSharedPageRef> releasedPages;
+    THolder<TEvResult> result;
+    {
+        TGuard<TMutex> guard(Mutex_);
+        Status_.store(NKikimrProto::RACE, std::memory_order_relaxed);
+        releasedPages.swap(ReadyPages_);
+        if (replyImmediately) {
+            result = TakeResult();
+        }
     }
-    if (replyImmediately) {
-        SendResult();
-    }
+    SendResult(std::move(result));
 }
 
 void TRequestCompletion::PostponeForResources() noexcept {
-    TGuard<TMutex> guard(Mutex_);
-    ResourcePressure_ = true;
-    Status_.store(NKikimrProto::RACE, std::memory_order_relaxed);
-    for (auto& page : ReadyPages_) {
-        page.Drop();
+    TVector<TSharedPageRef> releasedPages;
+    THolder<TEvResult> result;
+    {
+        TGuard<TMutex> guard(Mutex_);
+        ResourcePressure_ = true;
+        Status_.store(NKikimrProto::RACE, std::memory_order_relaxed);
+        releasedPages.swap(ReadyPages_);
+        result = TakeResult();
     }
-    SendResult();
+    SendResult(std::move(result));
 }
 
 void TRequestCompletion::NotifyResourcesReady() noexcept {
-    TGuard<TMutex> guard(Mutex_);
     auto* result =
         new TEvResult(PageCollection_, NKikimrProto::OK, Cookie_, ExecutorGeneration_, RequestId_, CoreRoute_);
     result->WaitPad = WaitPad_;
@@ -167,7 +175,6 @@ void TRequestCompletion::NotifyResourcesReady() noexcept {
 }
 
 void TRequestCompletion::NotifyWorkingSetTooLarge() noexcept {
-    TGuard<TMutex> guard(Mutex_);
     auto* result =
         new TEvResult(PageCollection_, NKikimrProto::ERROR, Cookie_, ExecutorGeneration_, RequestId_, CoreRoute_);
     result->WaitPad = WaitPad_;
@@ -175,9 +182,9 @@ void TRequestCompletion::NotifyWorkingSetTooLarge() noexcept {
     ActorSystem_->Send(ReplyTo_, result, 0, EventCookie_);
 }
 
-void TRequestCompletion::SendResult() noexcept {
+THolder<TEvResult> TRequestCompletion::TakeResult() noexcept {
     if (ResultSent_.exchange(true, std::memory_order_acq_rel)) {
-        return;
+        return {};
     }
     const TEvResult::EStatus status = Status_.load(std::memory_order_relaxed);
     auto result = MakeHolder<TEvResult>(PageCollection_, status, Cookie_, ExecutorGeneration_, RequestId_, CoreRoute_);
@@ -191,8 +198,15 @@ void TRequestCompletion::SendResult() noexcept {
             result->Pages.emplace_back(location.Offset, location.Size, std::move(ReadyPages_[index]));
         }
     }
+    return result;
+}
+
+void TRequestCompletion::SendResult(THolder<TEvResult> result) noexcept {
+    if (!result) {
+        return;
+    }
     if (Notify_) {
-        ActorSystem_->Send(Notify_, new TEvRequestAnswered(status, CompletionId_), 0, 0);
+        ActorSystem_->Send(Notify_, new TEvRequestAnswered(result->Status, CompletionId_), 0, 0);
     }
     ActorSystem_->Send(ReplyTo_, result.Release(), 0, EventCookie_);
 }
