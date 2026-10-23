@@ -5,6 +5,7 @@
 #include <ydb/core/testlib/actors/block_events.h>
 #include <ydb/core/testlib/actors/test_runtime.h>
 #include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
+#include <ydb/core/tablet_flat/test/libs/rows/layout.h>
 #include <ydb/core/testlib/actors/wait_events.h>
 #include <ydb/core/testlib/basics/appdata.h>
 #include <ydb/core/testlib/basics/helpers.h>
@@ -13,12 +14,14 @@
 
 #include <flat_sausagecache.h>
 #include <flat_executor_bootlogic.h>
+#include <flat_page_btree_index_writer.h>
 #include <shared_cache.h>
 #include <shared_cache_counters.h>
 #include <shared_cache_events.h>
 #include <shared_sausagecache.h>
 #include <shared_sausagecache_state.h>
 #include <atomic>
+#include <functional>
 #include <new>
 #include <thread>
 
@@ -3855,6 +3858,222 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         sharedCache.Provide(sharedCache.Collection1, { seed.Root }, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
         sharedCache.CheckFetches({});
+    }
+
+    enum class EIndexFetchLimit {
+        Handles,
+        Bytes,
+        QueuedShrink,
+        ByteAdmissionRace,
+        HandleAdmissionRace,
+    };
+
+    void CheckBoundedIndexFetch(EIndexFetchLimit limit) {
+        const bool handleLimit = limit == EIndexFetchLimit::Handles || limit == EIndexFetchLimit::HandleAdmissionRace;
+        const bool admissionRace =
+            limit == EIndexFetchLimit::ByteAdmissionRace || limit == EIndexFetchLimit::HandleAdmissionRace;
+        const ui64 pageSize = handleLimit ? 10 : 4096;
+        const ui64 pageBytes = pageSize + TSharedData::OverheadSize;
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        ui64 byteLimit = 8 * pageBytes;
+        if (handleLimit) {
+            byteLimit = 1_MB;
+        } else if (limit == EIndexFetchLimit::Bytes) {
+            byteLimit = 2 * pageSize + TSharedData::OverheadSize;
+        } else if (admissionRace) {
+            byteLimit = 2 * pageBytes + pageBytes / 2;
+        }
+        config.SetMemoryLimit(byteLimit);
+        config.SetAsyncQueueInFlyLimit(limit == EIndexFetchLimit::QueuedShrink ? 0 : 8_MB);
+        TSharedPageCacheMock sharedCache(config);
+        auto& cache = TSharedCache::Get();
+        const ui32 pageCount = limit == EIndexFetchLimit::Handles ? static_cast<ui32>(cache.TargetHandleCount() + 8)
+                                                                  : (limit == EIndexFetchLimit::Bytes ? 6 : 4);
+
+        struct TRacingIndexCollection final : TPageCollectionMock {
+            using TPageCollectionMock::TPageCollectionMock;
+
+            mutable ui32 LabelReads = 0;
+            mutable std::function<bool()> AfterPreflight;
+
+            const TLogoBlobID& Label() const noexcept override {
+                // Ignore nested eviction notifications between preflight and the next request-label read
+                if (AfterPreflight && ++LabelReads > 1) {
+                    auto consume = std::move(AfterPreflight);
+                    if (!consume()) {
+                        AfterPreflight = std::move(consume);
+                    }
+                }
+                return TPageCollectionMock::Label();
+            }
+        };
+
+        auto index = MakeIntrusive<TRacingIndexCollection>(1ul, pageCount + 1);
+        index->PageTypes = { EPage::Skip };
+        auto data = MakeIntrusive<TPageCollectionMock>(2ul, 1u);
+        data->PageTypes = { EPage::Skip };
+        sharedCache.Collection1 = index;
+        sharedCache.Collection2 = data;
+        sharedCache.Attach(sharedCache.Sender1, index, ECacheMode::Regular);
+
+        auto blocker = MakeIntrusiveConst<TPageCollectionMock>(3ul, 1u);
+        if (limit == EIndexFetchLimit::QueuedShrink) {
+            sharedCache.Request(sharedCache.Sender2, blocker, { _P(0) }, EPriority::Bkgr);
+            sharedCache.CheckFetches({ TFetch{ 10, blocker, { _P(0) } } });
+        }
+
+        NTable::NTest::TLayoutCook layout;
+        layout.Col(0, 0, NScheme::NTypeIds::Uint32).Key({ 0 });
+        NTable::NPage::TBtreeIndexNodeWriter<NTable::NPage::TBtreeIndexNode::TChildV2> writer(
+            new NTable::TPartScheme(layout.RowScheme()->Cols), {});
+        for (ui32 child = 1; child <= pageCount; ++child) {
+            const auto location = TPageLocation::FromPageIndex(child, pageSize, EPage::BTreeIndexV2, child + 1);
+            if (child > 1) {
+                const TCell key = TCell::Make(child);
+                writer.AddKey({ &key, 1 });
+            }
+            writer.AddChild({ location.Offset, location.Size, location.Crc32, 1, location.Size, 0, 0 });
+        }
+        auto body = writer.Finish();
+        if (limit == EIndexFetchLimit::ByteAdmissionRace) {
+            UNIT_ASSERT(body.size() + TSharedData::OverheadSize <= pageBytes / 2);
+        }
+        const auto rootLocation = TPageLocation::FromPageIndex(0, body.size(), EPage::BTreeIndexV2, 1);
+        auto root = cache.AdmitPage(index, rootLocation, std::move(body));
+        UNIT_ASSERT(root);
+        root.Drop();
+        sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
+
+        TEvAttach::TBtreeSeed seed;
+        seed.IndexCollectionId = index->Label();
+        seed.DataCollectionId = data->Label();
+        seed.Root = rootLocation;
+        seed.LevelCount = 2;
+        seed.QueueDataPages = false;
+        TSharedPageRef foreignPage;
+        TVector<TSharedCacheCollectionRef> foreignCollections;
+        bool consumedAfterPreflight = false;
+        ui32 restarts = 0;
+        TBlockEvents<TEvResult> results(sharedCache.Runtime, [&](const TEvResult::TPtr& event) {
+            if (event->Cookie == Max<ui64>() && event->Get()->Status == NKikimrProto::RACE) {
+                ++restarts;
+            }
+            return false;
+        });
+        if (admissionRace) {
+            const auto indexItem = cache.AdmitCollection(index).CacheItem();
+            const auto indexRefs = [&cache, indexItem] {
+                auto cacheOp = cache.BeginOperation();
+                return THandleState::FromRaw(cacheOp.Handles()[indexItem.Index()].State.load(std::memory_order_relaxed))
+                    .Refs();
+            };
+            const auto stableIndexRefs = indexRefs();
+            index->AfterPreflight = [&, indexRefs, stableIndexRefs] {
+                if (indexRefs() != stableIndexRefs) {
+                    return false;
+                }
+                consumedAfterPreflight = true;
+                if (handleLimit) {
+                    const auto first = TPageLocation::FromPageIndex(1, pageSize, EPage::BTreeIndexV2, 2);
+                    const auto second = TPageLocation::FromPageIndex(2, pageSize, EPage::BTreeIndexV2, 3);
+                    const TPageLocation missing[]{ first, second };
+                    const TSharedCacheHandleRequirement requirement{ seed.IndexCollectionId, missing };
+                    for (ui64 id = 100; cache.CanAdmitPageHandles({ &requirement, 1 }); ++id) {
+                        foreignCollections.push_back(
+                            cache.AdmitCollection(MakeIntrusiveConst<TPageCollectionMock>(id, 1u)));
+                    }
+                    const TSharedCacheHandleRequirement one{ seed.IndexCollectionId, { missing, 1 } };
+                    Y_ABORT_UNLESS(cache.CanAdmitPageHandles({ &one, 1 }));
+                } else {
+                    Y_ABORT_UNLESS(cache.CanAdmitWorkingSet(2 * pageBytes));
+                    auto foreign = MakeIntrusiveConst<TPageCollectionMock>(100ul, 1u);
+                    const auto location = TPageLocation::FromPageIndex(0, pageSize, EPage::DataPage, 1);
+                    foreignPage = cache.AdmitPage(foreign, location, TSharedData::Copy(TString(pageSize, 'p')));
+                    Y_ABORT_UNLESS(foreignPage);
+                }
+                return true;
+            };
+        }
+        Y_DEFER {
+            index->AfterPreflight = {};
+        };
+        sharedCache.Attach(sharedCache.Sender1, data, ECacheMode::TryKeepInMemory, { seed });
+        if (limit == EIndexFetchLimit::QueuedShrink) {
+            sharedCache.CheckFetches({});
+            sharedCache.SetLimit(0, 0, 2 * pageBytes);
+            sharedCache.Provide(blocker, { _P(0) }, ASYNC_QUEUE_COOKIE);
+            sharedCache.CheckResults({ TFetch{ 1, blocker, { _P(0) } } });
+        }
+
+        THashSet<TPageOffset> observed;
+        ui32 batches = 0;
+        while (observed.size() < pageCount) {
+            UNIT_ASSERT(++batches <= pageCount);
+            sharedCache.Runtime.WaitFor("bounded index fetch", [&] {
+                return !sharedCache.Fetches->empty();
+            }, TDuration::Seconds(5));
+            auto event = std::move(sharedCache.Fetches->front());
+            sharedCache.Fetches->pop_front();
+            const auto& fetch = *event->Get();
+            UNIT_ASSERT_VALUES_EQUAL(fetch.PageCollection->Label(), index->Label());
+            UNIT_ASSERT(fetch.Pages.size() <= cache.TargetHandleCount() - 3);
+            ui64 bytes = 0;
+            auto response = MakeHolder<NBlockIO::TEvData>(NKikimrProto::OK, index, fetch.Cookie);
+            for (const auto& location : fetch.Pages) {
+                UNIT_ASSERT(location.Offset.AsPageIndex() > 0 && location.Offset.AsPageIndex() <= pageCount);
+                UNIT_ASSERT(observed.insert(location.Offset).second);
+                bytes += location.Size + TSharedData::OverheadSize;
+                response->Pages.emplace_back(location.Offset, TSharedData::Copy(TString(location.Size, 'x')));
+            }
+            UNIT_ASSERT(bytes <= cache.CurrentLimit());
+            sharedCache.Send(event->GetRecipientRewrite(), response.Release(), ASYNC_QUEUE_COOKIE);
+        }
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({});
+        if (admissionRace) {
+            UNIT_ASSERT(consumedAfterPreflight);
+            UNIT_ASSERT(restarts > 0);
+        }
+    }
+
+    Y_UNIT_TEST(IndexWalkSplitsLevelsAtHandleCapacity) {
+        CheckBoundedIndexFetch(EIndexFetchLimit::Handles);
+    }
+    Y_UNIT_TEST(IndexWalkSplitsLevelsAtByteCapacityIncludingHeaders) {
+        CheckBoundedIndexFetch(EIndexFetchLimit::Bytes);
+    }
+    Y_UNIT_TEST(IndexWalkResplitsQueuedWindowAfterLimitShrinks) {
+        CheckBoundedIndexFetch(EIndexFetchLimit::QueuedShrink);
+    }
+    Y_UNIT_TEST(IndexWalkRestartsWhenBytesDisappearAfterPreflight) {
+        CheckBoundedIndexFetch(EIndexFetchLimit::ByteAdmissionRace);
+    }
+    Y_UNIT_TEST(IndexWalkRestartsWhenHandlesDisappearAfterPreflight) {
+        CheckBoundedIndexFetch(EIndexFetchLimit::HandleAdmissionRace);
+    }
+
+    Y_UNIT_TEST(DemandReadPromotesPageFromResourceWaitingBatch) {
+        TSharedPageCacheMock sharedCache;
+        sharedCache.SetLimit(0, 0, 2 * PAGE_TOTAL_SIZE);
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection2, { _P(0) });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection2, { _P(0) } } });
+        sharedCache.Provide(sharedCache.Collection2, { _P(0) });
+        auto held = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection2, { _P(0) } } });
+
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(1), _P(2) }, EPriority::Bkgr);
+        sharedCache.CheckFetches({});
+        sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, { _P(1) }, EPriority::Fast);
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(1) } } });
+        sharedCache.Provide(sharedCache.Collection1, { _P(1) }, NO_QUEUE_COOKIE);
+        auto demanded = sharedCache.CheckResults({ TFetch{ 3, sharedCache.Collection1, { _P(1) } } });
+        UNIT_ASSERT_VALUES_EQUAL(demanded.size(), 1);
+
+        held.clear();
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(2) } } });
+        sharedCache.Provide(sharedCache.Collection1, { _P(2) }, ASYNC_QUEUE_COOKIE);
+        sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { _P(1), _P(2) } } });
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({});
     }
 
     Y_UNIT_TEST(InMemory_FailedBtreeIndexFetch) {
