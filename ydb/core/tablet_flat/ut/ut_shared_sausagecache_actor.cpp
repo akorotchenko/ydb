@@ -3952,10 +3952,12 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             }
         };
 
-        auto index = MakeIntrusive<TRacingIndexCollection>(1ul, pageCount + 1);
-        index->PageTypes = { EPage::Skip };
+        auto indexCollection = MakeIntrusive<TRacingIndexCollection>(1ul, pageCount + 1);
+        indexCollection->PageTypes.assign(pageCount + 1, EPage::BTreeIndexV2);
+        indexCollection->MetaPagesOverride = 0;
+        TIntrusiveConstPtr<TRacingIndexCollection> index = std::move(indexCollection);
         auto data = MakeIntrusive<TPageCollectionMock>(2ul, 1u);
-        data->PageTypes = { EPage::Skip };
+        data->MetaPagesOverride = 0;
         sharedCache.Collection1 = index;
         sharedCache.Collection2 = data;
         sharedCache.Attach(sharedCache.Sender1, index, ECacheMode::Regular);
