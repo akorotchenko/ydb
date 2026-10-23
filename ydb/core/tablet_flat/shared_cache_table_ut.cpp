@@ -3001,6 +3001,122 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
     }
 
+    void CheckGrowthHandleNotification(bool laterBatch, bool armBeforePublication) {
+        struct TObservation {
+            TTestSharedCache* Cache = nullptr;
+            TCollectionCacheItem Claimed;
+            ui64 MinimumIndex = 0;
+            ui32 Notifications = 0;
+            bool Published = false;
+            bool Unlocked = false;
+        } observation;
+
+        const ui8 addressBits = laterBatch ? 9 : 5;
+        TFixture fixture(addressBits, 1, addressBits + 1);
+        TSharedCacheTestAccess::ShrinkHotToMinimum(*fixture.Cache);
+        TTransition growth;
+        TVector<TCollectionCacheItem> held;
+        Y_DEFER {
+            TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+            fixture.Cache->DisarmResourceWait();
+            if (observation.Claimed) {
+                TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, observation.Claimed);
+            }
+            for (const auto item : held) {
+                TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, item);
+            }
+        };
+        const auto fillHandles = [&] {
+            while (AvailableFreeHandles(*fixture.Cache) != 0) {
+                const auto item = AllocateCollection(
+                    *fixture.Cache, TSharedCacheKey::Collection(TLogoBlobID(221, 222, held.size() + 1)));
+                UNIT_ASSERT(item);
+                held.push_back(item);
+            }
+        };
+        fillHandles();
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        do {
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+        } while (growth.Phase() == ETransitionPhase::InitializeGrowth);
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, addressBits + 1));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        observation.MinimumIndex = fixture.Capacity.HandleCount();
+        if (laterBatch) {
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, growth));
+            UNIT_ASSERT(growth.Phase() == ETransitionPhase::AppendGrowth);
+            UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), SharedCacheTransitionWorkBatch);
+            fillHandles();
+            observation.MinimumIndex += SharedCacheTransitionWorkBatch;
+        }
+        observation.Cache = fixture.Cache.Get();
+        TTestTraits hooks{ &observation, [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                              if (point != ESharedCacheHookPoint::ResourcesAvailable) {
+                                  return;
+                              }
+                              auto& observation = *static_cast<TObservation*>(context);
+                              ++observation.Notifications;
+                              {
+                                  auto lock = TSharedCacheTestAccess::LockHotResize(*observation.Cache);
+                                  observation.Unlocked = static_cast<bool>(lock);
+                              }
+                              observation.Claimed = AllocateCollection(
+                                  *observation.Cache, TSharedCacheKey::Collection(TLogoBlobID(223, 224, 1)));
+                              observation.Published =
+                                  observation.Claimed && observation.Claimed.Index() >= observation.MinimumIndex;
+                          } };
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        if (armBeforePublication) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        TTransition idle;
+        UNIT_ASSERT(!TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, idle));
+        UNIT_ASSERT(!TSharedCacheTestAccess::AppendFreeHandles(*fixture.Cache, idle));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 0);
+        if (laterBatch) {
+            UNIT_ASSERT(TSharedCacheTestAccess::AppendFreeHandles(*fixture.Cache, growth));
+        } else {
+            UNIT_ASSERT(!TSharedCacheTestAccess::AppendFreeHandles(*fixture.Cache, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, growth));
+        }
+        UNIT_ASSERT(fixture.Cache->AdmissionGeneration() > generation);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? 1 : 0);
+        if (!armBeforePublication) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT(observation.Published);
+        UNIT_ASSERT(observation.Unlocked);
+        UNIT_ASSERT(growth.Phase() == ETransitionPhase::FinalDrain);
+        const ui64 afterPublication = fixture.Cache->AdmissionGeneration();
+        fixture.Cache->ArmResourceWait(afterPublication);
+        UNIT_ASSERT(!TSharedCacheTestAccess::AppendFreeHandles(*fixture.Cache, growth));
+        UNIT_ASSERT(!TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, growth));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), afterPublication);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+        fixture.Cache->DisarmResourceWait();
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, growth));
+    }
+
+    Y_UNIT_TEST(FirstGrowthBatchNotifiesAfterHandlePublication) {
+        for (bool armed : { false, true }) {
+            CheckGrowthHandleNotification(false, armed);
+        }
+    }
+
+    Y_UNIT_TEST(LaterGrowthBatchNotifiesAfterHandlePublication) {
+        for (bool armed : { false, true }) {
+            CheckGrowthHandleNotification(true, armed);
+        }
+    }
+
     Y_UNIT_TEST(ReviewR15DuplicateBatchNeedsOneHandle) {
         TFixture fixture;
         const TLogoBlobID id(83, 84, 124);
