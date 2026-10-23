@@ -284,7 +284,9 @@ namespace NKikimr::NSharedCache {
         }
 
     private:
-        void SendResult() noexcept;
+        // Caller holds Mutex_ once the completion is shared
+        THolder<TEvResult> TakeResult() noexcept;
+        void SendResult(THolder<TEvResult> result) noexcept;
 
     private:
         NActors::TActorSystem* const ActorSystem_;

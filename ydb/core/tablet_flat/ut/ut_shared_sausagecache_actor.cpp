@@ -18,6 +18,8 @@
 #include <shared_cache_events.h>
 #include <shared_sausagecache.h>
 #include <shared_sausagecache_state.h>
+#include <atomic>
+#include <new>
 #include <thread>
 
 namespace NKikimr::NSharedCache {
@@ -1780,6 +1782,112 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             UNIT_ASSERT_VALUES_EQUAL(event->Get()->Pages[index].Size, locations[index].Size);
             UNIT_ASSERT(event->Get()->Pages[index].Page);
         }
+    }
+
+    enum class ECompletionAction {
+        Fail,
+        Cancel,
+        CancelImmediately,
+        Postpone,
+    };
+
+    void CheckCompletionPageRelease(ECompletionAction action) {
+        TSharedPageCacheMock sharedCache;
+        auto& cache = TSharedCache::Get();
+        UNIT_ASSERT(cache.UpdateSoftLimitOverride(0));
+
+        struct TReleaseProbe final : TSharedData::IOwner {
+            using THeader = TSharedData::THeader;
+
+            TRequestCompletion* Completion = nullptr;
+            ui32 Releases = 0;
+
+            TSharedData Allocate(size_t size) {
+                char* raw = new char[sizeof(THeader) + size];
+                new (raw) THeader(this);
+                return TSharedData::AttachUnsafe(raw + sizeof(THeader), size);
+            }
+
+            void Deallocate(char* data) noexcept override {
+                if (Completion) {
+                    std::atomic<bool> returned = false;
+                    std::thread other([&] {
+                        Completion->Complete(2, {}, EPageFetchCompletion::Failed);
+                        returned.store(true, std::memory_order_release);
+                    });
+                    const TInstant deadline = TInstant::Now() + TDuration::Seconds(10);
+                    while (!returned.load(std::memory_order_acquire)) {
+                        Y_ABORT_UNLESS(TInstant::Now() < deadline,
+                            "Native page destruction must not hold the request-completion mutex");
+                        std::this_thread::yield();
+                    }
+                    other.join();
+                }
+                ++Releases;
+                char* raw = data - sizeof(THeader);
+                reinterpret_cast<THeader*>(raw)->~THeader();
+                delete[] raw;
+            }
+        } probe;
+
+        constexpr ui64 cookie = 93;
+        auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .PageCollection = sharedCache.Collection1,
+            .Pages = { _P(0), _P(1), _P(2) },
+            .Cookie = cookie,
+        });
+        probe.Completion = completion.Get();
+        Y_DEFER {
+            probe.Completion = nullptr;
+            completion->Cancel();
+        };
+        auto page = cache.AdmitPage(sharedCache.Collection1, _P(0), probe.Allocate(_P(0).Size));
+        UNIT_ASSERT(page);
+        completion->Complete(0, std::move(page), EPageFetchCompletion::Ready);
+        UNIT_ASSERT_VALUES_EQUAL(probe.Releases, 0);
+
+        switch (action) {
+            case ECompletionAction::Fail:
+                completion->Complete(1, {}, EPageFetchCompletion::Failed);
+                break;
+            case ECompletionAction::Cancel:
+                completion->Cancel();
+                break;
+            case ECompletionAction::CancelImmediately:
+                completion->Cancel(true);
+                break;
+            case ECompletionAction::Postpone:
+                completion->PostponeForResources();
+                break;
+        }
+        UNIT_ASSERT_VALUES_EQUAL(probe.Releases, 1);
+        if (action != ECompletionAction::Fail) {
+            completion->Complete(1, {}, EPageFetchCompletion::Failed);
+        }
+        sharedCache.Runtime.WaitFor("completion after releasing native pages", [&] {
+            return sharedCache.Results.size() == 1;
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Results.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(
+            sharedCache.Results.front()->Get()->ResourcePressure, action == ECompletionAction::Postpone);
+        const auto status = action == ECompletionAction::Fail ? NKikimrProto::ERROR : NKikimrProto::RACE;
+        sharedCache.CheckResults({ TFetch{ cookie, sharedCache.Collection1, {} } }, status);
+        sharedCache.CheckResults({});
+    }
+
+    Y_UNIT_TEST(RequestCompletionFailureReleasesPagesOutsideMutex) {
+        CheckCompletionPageRelease(ECompletionAction::Fail);
+    }
+    Y_UNIT_TEST(RequestCompletionCancelReleasesPagesOutsideMutex) {
+        CheckCompletionPageRelease(ECompletionAction::Cancel);
+    }
+    Y_UNIT_TEST(RequestCompletionImmediateCancelReleasesPagesOutsideMutex) {
+        CheckCompletionPageRelease(ECompletionAction::CancelImmediately);
+    }
+    Y_UNIT_TEST(RequestCompletionPostponeReleasesPagesOutsideMutex) {
+        CheckCompletionPageRelease(ECompletionAction::Postpone);
     }
 
     Y_UNIT_TEST(RequestPageWaiterPropagatesFailure) {
