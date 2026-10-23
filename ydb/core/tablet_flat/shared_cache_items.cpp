@@ -131,6 +131,12 @@ ui32 TCacheItems<TTraits>::TryAllocateHandle(TSpaceOperation& spaceOp) noexcept 
         if (const ui32 index = spaceOp.TryAllocateHandle()) {
             return index;
         }
+        if (spaceOp.ReclaimSpareHandle()) {
+            Cache_.NotifyResourcesAvailable();
+            if (const ui32 index = spaceOp.TryAllocateHandle()) {
+                return index;
+            }
+        }
         // Byte headroom does not guarantee a free handle when pages are much smaller than the expected size.
         // Reclaim Cold, or shrink Hot to feed Cold, before refusing the admission.
         const ui32 workLimit = static_cast<ui32>(Min<ui64>(spaceOp.HandleCount(), SharedCacheTransitionWorkBatch));
@@ -202,7 +208,9 @@ void TCacheItems<TTraits>::RefillSpareItem(TSpaceOperation& spaceOp) noexcept {
     handle.Key0.store(0, std::memory_order_relaxed);
     handle.Body.Fetch = nullptr;
     const TCacheItem cacheItem = TCacheItem::Make(state.Version(), index);
-    if (!spaceOp.TryStoreSpareItem(cacheItem)) {
+    if (spaceOp.TryStoreSpareItem(cacheItem)) {
+        Cache_.NotifyResourcesAvailable();
+    } else {
         DiscardCandidate(spaceOp, cacheItem, state.Kind(), 0);
     }
 }
@@ -253,7 +261,9 @@ void TCacheItems<TTraits>::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem
         state = state.WithState(EHandleState::Begin).WithFrequency(0).WithSticky(EStickyState::None);
         handle.State.store(state.Raw(), std::memory_order_release);
     }
-    if (!spaceOp.TryStoreSpareItem(cacheItem)) {
+    if (spaceOp.TryStoreSpareItem(cacheItem)) {
+        Cache_.NotifyResourcesAvailable();
+    } else {
         DiscardCandidate(spaceOp, cacheItem, state.Kind(), 0);
     }
 }

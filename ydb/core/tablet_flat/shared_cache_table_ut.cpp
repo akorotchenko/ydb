@@ -3117,6 +3117,294 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         }
     }
 
+    void RefillWorkerSpare(TTestSharedCache & cache, ui32 index) {
+        std::thread worker([&] {
+            Y_ABORT_UNLESS(!TlsCacheHazard);
+            TlsCacheHazard = &TCacheThreadTestAccess::Hazard(cache, index);
+            Y_DEFER {
+                TlsCacheHazard = nullptr;
+            };
+            auto cacheOp = cache.BeginOperation();
+            cacheOp.RefillSpareItem();
+        });
+        worker.join();
+    }
+
+    TVector<TCollectionCacheItem> AllocateAvailableHandleCandidates(TTestSharedCache & cache) {
+        TVector<TCollectionCacheItem> held;
+        const TSharedCacheHandleRequirement requirement{ TLogoBlobID(225, 226, 1), {} };
+        while (cache.CanAllocateHandles({ &requirement, 1 })) {
+            const auto item =
+                AllocateCollection(cache, TSharedCacheKey::Collection(TLogoBlobID(227, 228, held.size() + 1)));
+            UNIT_ASSERT(item);
+            held.push_back(item);
+        }
+        return held;
+    }
+
+    void CheckForeignSpareRecovery(bool controller) {
+        struct TObservation {
+            TTestSharedCache* Cache = nullptr;
+            ui32 Index = 0;
+            ui32 Notifications = 0;
+            bool Published = false;
+        } observation;
+
+        TFixture fixture(5, 2);
+        TSharedCacheTestAccess::ShrinkHotToMinimum(*fixture.Cache);
+        RefillWorkerSpare(*fixture.Cache, 0);
+        const auto spare = TCacheItem::FromRaw(TSharedCacheTestAccess::SpareItem(*fixture.Cache, 0));
+        UNIT_ASSERT(spare);
+        auto held = AllocateAvailableHandleCandidates(*fixture.Cache);
+        TCollectionCacheItem claimed;
+        Y_DEFER {
+            TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+            fixture.Cache->DisarmResourceWait();
+            if (claimed) {
+                TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, claimed);
+            }
+            for (const auto item : held) {
+                TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, item);
+            }
+        };
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::FreeCount(*fixture.Cache), 0);
+        UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), 1);
+        const TSharedCacheHandleRequirement requirement{ TLogoBlobID(229, 230, 1), {} };
+        UNIT_ASSERT(!fixture.Cache->CanAllocateHandles({ &requirement, 1 }));
+        observation.Cache = fixture.Cache.Get();
+        observation.Index = spare.Index();
+        TTestTraits hooks{ &observation,
+            [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                if (point == ESharedCacheHookPoint::ResourcesAvailable) {
+                    auto& observation = *static_cast<TObservation*>(context);
+                    ++observation.Notifications;
+                    observation.Published =
+                        TSharedCacheTestAccess::FreeCount(*observation.Cache) != 0 &&
+                        TSharedCacheTestAccess::HandleState(*observation.Cache, observation.Index).IsFree();
+                }
+            } };
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
+        fixture.Cache->ArmResourceWait(fixture.Cache->AdmissionGeneration());
+        if (controller) {
+            UNIT_ASSERT(fixture.Cache->ReclaimSpareHandle());
+            UNIT_ASSERT(fixture.Cache->CanAllocateHandles({ &requirement, 1 }));
+        }
+        claimed = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(requirement.CollectionId));
+        UNIT_ASSERT(claimed);
+        UNIT_ASSERT_VALUES_EQUAL(claimed.Index(), spare.Index());
+        UNIT_ASSERT_VALUES_EQUAL(claimed.Version(), spare.Version());
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::SpareItem(*fixture.Cache, 0), 0);
+        UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), 0);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT(observation.Published);
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        fixture.Cache->ArmResourceWait(generation);
+        UNIT_ASSERT(!fixture.Cache->ReclaimSpareHandle());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+    }
+
+    Y_UNIT_TEST(NativeHandlePressureReclaimsForeignSpare) {
+        CheckForeignSpareRecovery(false);
+    }
+
+    Y_UNIT_TEST(ControllerHandlePressureReclaimsForeignSpare) {
+        CheckForeignSpareRecovery(true);
+    }
+
+    Y_UNIT_TEST(NativeAllocationPreservesForeignSpareWithoutPressure) {
+        TFixture fixture(5, 2);
+        RefillWorkerSpare(*fixture.Cache, 0);
+        const ui64 spare = TSharedCacheTestAccess::SpareItem(*fixture.Cache, 0);
+        UNIT_ASSERT(spare);
+        const auto first = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(TLogoBlobID(231, 232, 1)));
+        const auto second = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(TLogoBlobID(231, 232, 2)));
+        UNIT_ASSERT(first && second);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::SpareItem(*fixture.Cache, 0), spare);
+        TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, first);
+        TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, second);
+    }
+
+    Y_UNIT_TEST(OwnerAndPressureRecoveryClaimSpareOnce) {
+        for (ui32 attempt = 0; attempt < 32; ++attempt) {
+            TFixture fixture(5, 2);
+            TSharedCacheTestAccess::ShrinkHotToMinimum(*fixture.Cache);
+            RefillWorkerSpare(*fixture.Cache, 0);
+            const auto spare = TCacheItem::FromRaw(TSharedCacheTestAccess::SpareItem(*fixture.Cache, 0));
+            UNIT_ASSERT(spare);
+            auto held = AllocateAvailableHandleCandidates(*fixture.Cache);
+            TCollectionCacheItem owner;
+            TCollectionCacheItem pressure;
+            Y_DEFER {
+                if (owner) {
+                    TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, owner);
+                }
+                if (pressure) {
+                    TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, pressure);
+                }
+                for (const auto item : held) {
+                    TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, item);
+                }
+            };
+            std::atomic<bool> start{ false };
+            std::thread worker([&] {
+                Y_ABORT_UNLESS(!TlsCacheHazard);
+                TlsCacheHazard = &TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+                Y_DEFER {
+                    TlsCacheHazard = nullptr;
+                };
+                while (!start.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                owner = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(TLogoBlobID(233, 234, 1)));
+            });
+            start.store(true, std::memory_order_release);
+            pressure = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(TLogoBlobID(233, 234, 2)));
+            worker.join();
+            UNIT_ASSERT(static_cast<bool>(owner) != static_cast<bool>(pressure));
+            UNIT_ASSERT_VALUES_EQUAL((owner ? owner : pressure).Index(), spare.Index());
+            UNIT_ASSERT_VALUES_EQUAL((owner ? owner : pressure).Version(), spare.Version());
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::SpareItem(*fixture.Cache, 0), 0);
+            UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), 0);
+        }
+    }
+
+    void CheckSparePublication(bool recycle, bool armBeforePublication) {
+        struct TObservation {
+            TTestSharedCache* Cache = nullptr;
+            ui32 Notifications = 0;
+            bool RearmedBeforeStore = false;
+            bool Published = false;
+        } observation;
+
+        TFixture fixture(5, 1);
+        TCollectionCacheItem candidate;
+        Y_DEFER {
+            TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+            fixture.Cache->DisarmResourceWait();
+            if (candidate) {
+                TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, candidate);
+            }
+        };
+        if (recycle) {
+            auto cacheOp = fixture.Cache->BeginOperation();
+            const auto item = cacheOp.Allocate();
+            UNIT_ASSERT(item);
+            cacheOp.Items().InitializeCollection(item, TLogoBlobID(235, 236, 1), 0);
+            candidate = TCollectionCacheItem::FromValidated(item);
+        }
+        observation.Cache = fixture.Cache.Get();
+        TTestTraits hooks{ &observation, [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                              if (point != ESharedCacheHookPoint::ResourcesAvailable) {
+                                  return;
+                              }
+                              auto& observation = *static_cast<TObservation*>(context);
+                              ++observation.Notifications;
+                              if (TSharedCacheTestAccess::SpareItem(*observation.Cache, 0) == 0) {
+                                  observation.RearmedBeforeStore = true;
+                                  observation.Cache->ArmResourceWait(observation.Cache->AdmissionGeneration());
+                              } else {
+                                  observation.Published = true;
+                              }
+                          } };
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        if (armBeforePublication) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        {
+            auto cacheOp = fixture.Cache->BeginOperation();
+            if (recycle) {
+                cacheOp.RecycleCandidate(candidate.CacheItem());
+                candidate = {};
+            } else {
+                cacheOp.RefillSpareItem();
+            }
+        }
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? (recycle ? 2 : 1) : 0);
+        if (!armBeforePublication) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        UNIT_ASSERT(observation.Published);
+        UNIT_ASSERT_VALUES_EQUAL(observation.RearmedBeforeStore, recycle && armBeforePublication);
+        const ui32 notifications = observation.Notifications;
+        const ui64 afterPublication = fixture.Cache->AdmissionGeneration();
+        fixture.Cache->ArmResourceWait(afterPublication);
+        {
+            auto cacheOp = fixture.Cache->BeginOperation();
+            cacheOp.RefillSpareItem();
+        }
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, notifications);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), afterPublication);
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+        fixture.Cache->DisarmResourceWait();
+        UNIT_ASSERT(fixture.Cache->ReclaimSpareHandle());
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::FreeCount(*fixture.Cache), fixture.Capacity.HandleCount() - 2);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+    }
+
+    Y_UNIT_TEST(SpareRefillNotifiesAfterPublication) {
+        for (bool armed : { false, true }) {
+            CheckSparePublication(false, armed);
+        }
+    }
+
+    Y_UNIT_TEST(SpareRecycleNotifiesAfterPublication) {
+        for (bool armed : { false, true }) {
+            CheckSparePublication(true, armed);
+        }
+    }
+
+    Y_UNIT_TEST(SpareRecoveryQuarantinesShrinkCutHandles) {
+        TFixture fixture(6, 2);
+        TSharedCacheTestAccess::ShrinkHotToMinimum(*fixture.Cache);
+        TSharedCacheCapacity target;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 2, target));
+        TVector<TCollectionCacheItem> held;
+        Y_DEFER {
+            for (const auto item : held) {
+                TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, item);
+            }
+        };
+        for (ui32 index = 0; index < target.HandleCount() - 2; ++index) {
+            const auto item =
+                AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(TLogoBlobID(237, 238, index + 1)));
+            UNIT_ASSERT(item);
+            UNIT_ASSERT(item.Index() < target.HandleCount());
+            held.push_back(item);
+        }
+        RefillWorkerSpare(*fixture.Cache, 0);
+        const std::array spares{ TCacheItem::FromRaw(TSharedCacheTestAccess::SpareItem(*fixture.Cache, 0)),
+            TCacheItem::FromRaw(TSharedCacheTestAccess::SpareItem(*fixture.Cache, 1)) };
+        for (const auto spare : spares) {
+            UNIT_ASSERT(spare && spare.Index() >= target.HandleCount());
+        }
+        TTransition shrink;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, target.AddressBits));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        {
+            auto cacheOp = fixture.Cache->BeginOperation();
+            UNIT_ASSERT_VALUES_EQUAL(cacheOp.SpaceOperation().TryAllocateHandle(), 0);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::FreeCount(*fixture.Cache), 0);
+        UNIT_ASSERT(fixture.Cache->ReclaimSpareHandle());
+        UNIT_ASSERT(fixture.Cache->ReclaimSpareHandle());
+        UNIT_ASSERT(!fixture.Cache->ReclaimSpareHandle());
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::FreeCount(*fixture.Cache), 0);
+        for (const auto spare : spares) {
+            UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, spare.Index()).IsFree());
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, shrink));
+    }
+
     Y_UNIT_TEST(ReviewR15DuplicateBatchNeedsOneHandle) {
         TFixture fixture;
         const TLogoBlobID id(83, 84, 124);
