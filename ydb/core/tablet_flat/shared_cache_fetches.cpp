@@ -178,6 +178,7 @@ void TCacheFetches<TTraits>::Finish(
     TPageFetchState::DrainWaiters(waiters, [page](TIntrusivePtr<TPageFetchWaiter> waiter) {
         waiter->Complete(TPageCacheItem::FromValidated(page), EPageFetchCompletion::Ready);
     });
+    Cache_.NotifyResourcesAvailable();
 }
 
 template <class TTraits>
