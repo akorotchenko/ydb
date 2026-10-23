@@ -687,7 +687,9 @@ bool TCacheCollections<TTraits>::MakePageSticky(TSpaceOperation& spaceOp, TCache
         Cache_.Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, bytes);
     }
 
-    return FinishStickyPromotion(spaceOp, pageItem, bytes);
+    const bool promoted = FinishStickyPromotion(spaceOp, pageItem, bytes);
+    Cache_.NotifyResourcesAvailable();
+    return promoted;
 }
 
 template <class TTraits>

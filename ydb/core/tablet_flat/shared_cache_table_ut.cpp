@@ -8503,6 +8503,250 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         CommitTransition(*fixture.Cache, growth);
     }
 
+    void CheckReadyPublicationNotification(bool armBeforeReady) {
+        TFixture fixture(6, 8, 7);
+        Y_DEFER {
+            fixture.Cache->DisarmResourceWait();
+        };
+        const auto collection = MakeCollectionCacheItem(251, 50051);
+        const ui32 splitBit = static_cast<ui32>(CurrentBucketCount(*fixture.Space));
+        const auto key = ReviewKeyForBucket(collection, (splitBit << 1) - 1, 0, 700000);
+        TTestSharedPageRef held;
+        auto waiter = MakeIntrusive<TAcquiringPageFetchWaiter>(*fixture.Cache, held);
+        TTestSharedPageRef hit;
+        TTestPageFetch fetch;
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, collection, MakePageLocation(key.Word(1)),
+                        EStickyState::None, waiter, hit, fetch) == ESharedCacheResultStatus::Inserted);
+        const auto page = fetch.CacheItem();
+        TTransition growth;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+
+        struct TObservation {
+            TSharedCacheGate Gate;
+            TTestSharedCache* Cache = nullptr;
+            TTestSharedPageRef* Held = nullptr;
+            TPageCacheItem Page;
+            ui32 Notifications = 0;
+            bool Published = false;
+            bool Activated = false;
+        } observation;
+
+        observation.Cache = fixture.Cache.Get();
+        observation.Held = &held;
+        observation.Page = page;
+        observation.Gate.Slots[0].Arm(ESharedCacheHookPoint::BeforeReadyStatePublication, page.CacheItem());
+        TTestTraits hooks{ &observation, [](void* context, ESharedCacheHookPoint point, TCacheItem item) noexcept {
+                              auto& observation = *static_cast<TObservation*>(context);
+                              TSharedCacheGate::Invoke(&observation.Gate, point, item);
+                              if (point == ESharedCacheHookPoint::ResourcesAvailable) {
+                                  ++observation.Notifications;
+                                  const auto state =
+                                      TSharedCacheTestAccess::HandleState(*observation.Cache, observation.Page.Index());
+                                  observation.Published = state.IsReady() && state.Refs() > 0 && *observation.Held &&
+                                                          observation.Held->CacheItem() == observation.Page;
+                                  observation.Activated =
+                                      TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*observation.Cache);
+                              }
+                          } };
+        TSharedCacheHookGuard hookGuard(*fixture.Cache, hooks);
+        bool ready = false;
+        TGateThread completer(observation.Gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazard);
+            TlsCacheHazard = &TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+            Y_DEFER {
+                TlsCacheHazard = nullptr;
+            };
+            ready = fetch.MakeReady(MakePageData(page.Index()));
+        });
+        observation.Gate.Slots[0].Wait();
+        const auto blocked = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+        UNIT_ASSERT(blocked.IsCompleting());
+        UNIT_ASSERT(!TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        if (armBeforeReady) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        observation.Gate.Slots[0].Release();
+        completer.Join();
+        UNIT_ASSERT(ready && waiter->Ready() && held);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeReady ? 1 : 0);
+        if (!armBeforeReady) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT(observation.Published && observation.Activated);
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+        fixture.Cache->DisarmResourceWait();
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        CommitTransition(*fixture.Cache, growth);
+    }
+
+    Y_UNIT_TEST(ReadyPublicationNotifiesBlockedSplitWithHeldResult) {
+        for (bool armed : { false, true }) {
+            CheckReadyPublicationNotification(armed);
+        }
+    }
+
+    void CheckStickyPublicationNotification(bool restore, bool armBeforePublication) {
+        TFixture fixture;
+        Y_DEFER {
+            fixture.Cache->DisarmResourceWait();
+        };
+        const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(253, 254, 255));
+        const auto collection = AllocateCollection(*fixture.Cache, collectionKey);
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+        auto metadata = TSharedCacheTestAccess::AcquireStructural(*fixture.Cache, collection.CacheItem());
+        UNIT_ASSERT(metadata);
+        const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 1));
+        TTestSharedPageRef held;
+        UNIT_ASSERT(fixture.Cache->AcquirePage(page, held));
+        const auto ordinary = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+        UNIT_ASSERT(ordinary.IsHot() && ordinary.IsStickyNoneField());
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Sticky));
+
+        struct TObservation {
+            TSharedCacheGate Gate;
+            TTestSharedCache* Cache = nullptr;
+            TPageCacheItem Page;
+            TCollectionCacheItem Collection;
+            bool Restore = false;
+            ui32 Notifications = 0;
+            bool Published = false;
+        } observation;
+
+        observation.Cache = fixture.Cache.Get();
+        observation.Page = page;
+        observation.Collection = collection;
+        observation.Restore = restore;
+        observation.Gate.Slots[0].Arm(restore ? ESharedCacheHookPoint::BeforeStickyPageListLink
+                                              : ESharedCacheHookPoint::AfterStickyPageLinked, page.CacheItem());
+        TTestTraits hooks{ &observation,
+            [](void* context, ESharedCacheHookPoint point, TCacheItem item) noexcept {
+                auto& observation = *static_cast<TObservation*>(context);
+                TSharedCacheGate::Invoke(&observation.Gate, point, item);
+                if (point == ESharedCacheHookPoint::ResourcesAvailable) {
+                    ++observation.Notifications;
+                    const auto state =
+                        TSharedCacheTestAccess::HandleState(*observation.Cache, observation.Page.Index());
+                    observation.Published =
+                        state.Refs() > 0 &&
+                        TSharedCacheTestAccess::HandleState(*observation.Cache, observation.Collection.Index()).Refs() >
+                            0;
+                    if (observation.Restore) {
+                        observation.Published &=
+                            state.IsHot() && state.IsStickyNoneField() && observation.Cache->StickyOwnedBytes() == 0 &&
+                            TSharedCacheTestAccess::NextInOwner(*observation.Cache, observation.Page.Index()) == 0;
+                    } else {
+                        observation.Published &= state.IsSticky() && state.IsStickyField() &&
+                                                 TSharedCacheTestAccess::StickyPageListHead(*observation.Cache,
+                                                     observation.Collection) == observation.Page.Index();
+                    }
+                }
+            } };
+        TSharedCacheHookGuard hookGuard(*fixture.Cache, hooks);
+        bool promoted = false;
+        TGateThread promoter(observation.Gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazard);
+            TlsCacheHazard = &TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+            Y_DEFER {
+                TlsCacheHazard = nullptr;
+            };
+            promoted = TSharedCacheTestAccess::MakePageSticky(*fixture.Cache, page);
+        });
+        observation.Gate.Slots[0].Wait();
+        if (restore) {
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::StickyPageListHead(*fixture.Cache, collection), 0);
+            UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+        }
+        const auto blocked = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+        UNIT_ASSERT(blocked.IsHot() && blocked.IsStickyField());
+        UNIT_ASSERT(!TSharedCacheTestAccess::RelocatePage(*fixture.Cache, page));
+        UNIT_ASSERT(!TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        if (armBeforePublication) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        observation.Gate.Slots[0].Release();
+        promoter.Join();
+        UNIT_ASSERT_VALUES_EQUAL(promoted, !restore);
+        UNIT_ASSERT(held && metadata);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? 1 : 0);
+        if (!armBeforePublication) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT(observation.Published);
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+        fixture.Cache->DisarmResourceWait();
+        if (!restore) {
+            UNIT_ASSERT(TSharedCacheTestAccess::UnstickyCutPages(*fixture.Cache, page, 0));
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::RelocatePage(*fixture.Cache, page));
+    }
+
+    Y_UNIT_TEST(StickyPromotionPublicationNotifiesWithHeldPageAndMetadata) {
+        for (bool armed : { false, true }) {
+            CheckStickyPublicationNotification(false, armed);
+        }
+    }
+
+    Y_UNIT_TEST(StickyPromotionRestorationNotifiesWithHeldPageAndMetadata) {
+        for (bool armed : { false, true }) {
+            CheckStickyPublicationNotification(true, armed);
+        }
+    }
+
+    void CheckStickyNoopNotification(bool pending) {
+        TFixture fixture;
+        Y_DEFER {
+            fixture.Cache->DisarmResourceWait();
+        };
+        const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(253, 254, 256));
+        const auto collection = AllocateCollection(*fixture.Cache, collectionKey);
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+        auto metadata = TSharedCacheTestAccess::AcquireStructural(*fixture.Cache, collection.CacheItem());
+        UNIT_ASSERT(metadata);
+        const auto key = TSharedCacheKey::Page(collection, 1);
+        const auto page = pending ? AllocatePage(*fixture.Cache, key, 4096) : InsertReadyPage(*fixture.Cache, key);
+        TTestSharedPageRef held;
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Sticky));
+        if (!pending) {
+            UNIT_ASSERT(fixture.Cache->AcquirePage(page, held));
+            UNIT_ASSERT(TSharedCacheTestAccess::MakePageSticky(*fixture.Cache, page));
+        }
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        fixture.Cache->ArmResourceWait(generation);
+        for (ui32 attempt = 0; attempt < 3; ++attempt) {
+            UNIT_ASSERT(pending ? TSharedCacheTestAccess::MakePendingPageSticky(*fixture.Cache, page)
+                                : TSharedCacheTestAccess::MakePageSticky(*fixture.Cache, page));
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        }
+        fixture.Cache->DisarmResourceWait();
+        if (pending) {
+            UNIT_ASSERT(fixture.Cache->MakeReady(page, MakePageData(page.Index())));
+        }
+    }
+
+    Y_UNIT_TEST(AlreadyStickyHitDoesNotNotify) {
+        CheckStickyNoopNotification(false);
+    }
+
+    Y_UNIT_TEST(PendingStickyHitDoesNotNotify) {
+        CheckStickyNoopNotification(true);
+    }
+
     void CheckMarkerReleaseNotification(bool grow, bool armBeforeRelease, bool finalRelease) {
         TFixture fixture(6, 8, grow ? 7 : 6);
         TTestSharedCacheItemRef firstHelper;
