@@ -8503,6 +8503,188 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         CommitTransition(*fixture.Cache, growth);
     }
 
+    void CheckMarkerReleaseNotification(bool grow, bool armBeforeRelease, bool finalRelease) {
+        TFixture fixture(6, 8, grow ? 7 : 6);
+        TTestSharedCacheItemRef firstHelper;
+        TTestSharedCacheItemRef secondHelper;
+
+        struct TObservation {
+            TTestSharedCache* Cache = nullptr;
+            TTestSharedCacheItemRef* LateHelper = nullptr;
+            TCacheItem Marker;
+            ui32 Notifications = 0;
+            bool FinalRelease = false;
+            bool CaptureLateHelper = false;
+            bool Published = true;
+            bool Reused = false;
+        } observation;
+
+        Y_DEFER {
+            TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+            fixture.Cache->DisarmResourceWait();
+        };
+        TTransition growth;
+        if (grow) {
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, grow ? 7 : 5));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishBucketSplit(*fixture.Cache));
+        if (!grow) {
+            UNIT_ASSERT(TSharedCacheTestAccess::CloseBucketSplit(*fixture.Cache));
+        }
+        const auto markerState = TSharedCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex);
+        observation.Cache = fixture.Cache.Get();
+        observation.LateHelper = &firstHelper;
+        observation.Marker = TCacheItem::Make(markerState.Version(), ResizeMarkerIndex);
+        observation.FinalRelease = finalRelease;
+        observation.CaptureLateHelper = finalRelease;
+        TTestTraits hooks{ &observation,
+            [](void* context, ESharedCacheHookPoint point, TCacheItem item) noexcept {
+                auto& observation = *static_cast<TObservation*>(context);
+                if (point == ESharedCacheHookPoint::AfterBucketSplitOwnerCheck && observation.CaptureLateHelper) {
+                    observation.CaptureLateHelper = false;
+                    *observation.LateHelper = TSharedCacheTestAccess::AcquireTombstoneHelper(*observation.Cache, item);
+                } else if (point == ESharedCacheHookPoint::ResourcesAvailable) {
+                    ++observation.Notifications;
+                    const auto state = TSharedCacheTestAccess::HandleState(*observation.Cache, ResizeMarkerIndex);
+                    if (observation.FinalRelease) {
+                        observation.Published &= state.IsFree() && state.Refs() == 0 &&
+                                                 state.Version() == AdvanceItemVersion(observation.Marker.Version());
+                        observation.Reused = TSharedCacheTestAccess::PrepareBucketSplit(*observation.Cache);
+                    } else {
+                        observation.Published &=
+                            state.IsTombstone() && state.Refs() == 1 && observation.Marker.Matches(state);
+                    }
+                }
+            } };
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
+        if (finalRelease) {
+            UNIT_ASSERT(TSharedCacheTestAccess::RemoveBucketSplit(*fixture.Cache));
+            UNIT_ASSERT(firstHelper);
+            AssertResizeMarker(*fixture.Cache, EHandleState::Tombstone);
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::BucketResizeState(*fixture.Space).Phase() == EBucketResizePhase::Prepared);
+            UNIT_ASSERT(!TSharedCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+        } else {
+            firstHelper = TSharedCacheTestAccess::AcquireStructural(*fixture.Cache, observation.Marker);
+            secondHelper = TSharedCacheTestAccess::AcquireStructural(*fixture.Cache, observation.Marker);
+            UNIT_ASSERT(firstHelper && secondHelper);
+            UNIT_ASSERT(!TSharedCacheTestAccess::RemoveBucketSplit(*fixture.Cache));
+            const auto blocked = TSharedCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex);
+            UNIT_ASSERT(blocked.IsTombstone());
+            UNIT_ASSERT_VALUES_EQUAL(blocked.Refs(), 3);
+        }
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        if (armBeforeRelease) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        firstHelper.Drop();
+        if (!finalRelease) {
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 0);
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex).Refs(), 2);
+            secondHelper.Drop();
+        }
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeRelease ? 1 : 0);
+        if (!armBeforeRelease) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT(observation.Published);
+        if (finalRelease) {
+            UNIT_ASSERT(observation.Reused);
+            const auto reused = TSharedCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex);
+            UNIT_ASSERT(reused.IsBucketSplit());
+            UNIT_ASSERT_VALUES_EQUAL(reused.Refs(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(reused.Version(), AdvanceItemVersion(observation.Marker.Version()));
+        }
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+        fixture.Cache->DisarmResourceWait();
+        if (!finalRelease) {
+            UNIT_ASSERT(TSharedCacheTestAccess::RemoveBucketSplit(*fixture.Cache));
+        }
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        if (grow) {
+            CommitTransition(*fixture.Cache, growth);
+        }
+    }
+
+    Y_UNIT_TEST(GrowthMarkerSoleOwnerReleaseNotifiesAdmissionWaiter) {
+        for (bool armed : { false, true }) {
+            CheckMarkerReleaseNotification(true, armed, false);
+        }
+    }
+
+    Y_UNIT_TEST(ShrinkMarkerSoleOwnerReleaseNotifiesAdmissionWaiter) {
+        for (bool armed : { false, true }) {
+            CheckMarkerReleaseNotification(false, armed, false);
+        }
+    }
+
+    Y_UNIT_TEST(GrowthRetiredMarkerReleaseNotifiesBeforeReuse) {
+        for (bool armed : { false, true }) {
+            CheckMarkerReleaseNotification(true, armed, true);
+        }
+    }
+
+    Y_UNIT_TEST(ShrinkRetiredMarkerReleaseNotifiesBeforeReuse) {
+        for (bool armed : { false, true }) {
+            CheckMarkerReleaseNotification(false, armed, true);
+        }
+    }
+
+    Y_UNIT_TEST(BucketSplitHelperReleaseDoesNotNotify) {
+        TFixture fixture;
+        Y_DEFER {
+            fixture.Cache->DisarmResourceWait();
+        };
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 5));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+        const auto state = TSharedCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex);
+        auto helper = TSharedCacheTestAccess::AcquireStructural(
+            *fixture.Cache, TCacheItem::Make(state.Version(), ResizeMarkerIndex));
+        UNIT_ASSERT(helper);
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        fixture.Cache->ArmResourceWait(generation);
+        helper.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        AssertResizeMarker(*fixture.Cache, EHandleState::BucketSplit);
+        fixture.Cache->DisarmResourceWait();
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+    }
+
+    Y_UNIT_TEST(OrdinaryTombstoneSoleOwnerReleaseDoesNotNotify) {
+        TFixture fixture;
+        Y_DEFER {
+            fixture.Cache->DisarmResourceWait();
+        };
+        const auto key = TSharedCacheKey::Page(MakeCollectionCacheItem(241, 242), 100);
+        const auto page = InsertReadyPage(*fixture.Cache, key);
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        auto cacheOp = fixture.Cache->BeginOperation();
+        TOperationItemRef<TTestTraits> held(cacheOp, cacheOp.TryAcquireStructural(page.CacheItem()));
+        UNIT_ASSERT(held);
+        TOperationItemRef<TTestTraits> owner(cacheOp);
+        auto expected = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+        UNIT_ASSERT(cacheOp.TryBeginErase(page.CacheItem(), expected, owner.Get()));
+        cacheOp.FinishErase(owner.CacheItem(), key);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 2);
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        fixture.Cache->ArmResourceWait(generation);
+        owner.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 1);
+        fixture.Cache->DisarmResourceWait();
+        held.Drop();
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsFree());
+    }
+
     void ReviewMarkerRetirementWaitsForHelper(bool grow, bool helperFirst) {
         TSharedCacheCapacity reserved;
         UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 8, reserved));
