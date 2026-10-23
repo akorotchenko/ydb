@@ -1999,6 +1999,63 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(pagesReleasedBeforeCollection);
     }
 
+    void CheckShutdownResourceNotification(bool sticky) {
+        ui32 notifications = 0;
+        TFixture fixture;
+        const TLogoBlobID id(37, 38, 40);
+        const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(collection);
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(
+            fixture.Cache->SetCollectionPagesCacheMode(collection, sticky ? ECacheMode::Sticky : ECacheMode::Regular));
+        UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(0));
+
+        TTestSharedPageRef held;
+        auto waiter = MakeIntrusive<TAcquiringPageFetchWaiter>(*fixture.Cache, held);
+        TTestSharedPageRef hit;
+        TTestPageFetch fetch;
+        UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsert(*fixture.Cache, collection, MakePageLocation(1),
+                        EStickyState::None, waiter, hit, fetch) == ESharedCacheResultStatus::Inserted);
+        const TPageCacheItem page = fetch.CacheItem();
+        auto data = MakePageData(page.Index());
+        auto payload = data;
+        UNIT_ASSERT(fetch.MakeReady(std::move(data)));
+        UNIT_ASSERT(held);
+        const THandleState resident = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+        UNIT_ASSERT(sticky ? resident.IsSticky() : resident.IsCold());
+        if (sticky) {
+            held.Drop();
+        }
+
+        TTestTraits hooks{ &notifications, [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                              if (point == ESharedCacheHookPoint::ResourcesAvailable) {
+                                  ++*static_cast<ui32*>(context);
+                              }
+                          } };
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
+        constexpr ui64 reservedBytes = 1;
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReserve(*fixture.Cache, reservedBytes));
+        fixture.Cache->ArmResourceWait(fixture.Cache->ResourceGeneration());
+        TSharedCacheTestAccess::ReleaseReservation(*fixture.Cache, reservedBytes);
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        UNIT_ASSERT(!payload.IsPrivate());
+
+        fixture.Cache->ArmResourceWait(fixture.Cache->ResourceGeneration());
+        TlsCacheHazard = nullptr;
+        held.Drop();
+        fixture.Cache.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        UNIT_ASSERT(payload.IsPrivate());
+    }
+
+    Y_UNIT_TEST(ShutdownDoesNotNotifyResourcesForStickyPages) {
+        CheckShutdownResourceNotification(true);
+    }
+    Y_UNIT_TEST(ShutdownDoesNotNotifyResourcesForHeldPages) {
+        CheckShutdownResourceNotification(false);
+    }
+
     Y_UNIT_TEST(ReviewR12UnboundFetchDestructionAbandonsWaiters) {
         for (bool dispatched : { false, true }) {
             std::atomic<ui32> completed = 0;

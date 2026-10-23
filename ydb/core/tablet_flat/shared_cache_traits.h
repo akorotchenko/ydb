@@ -10,6 +10,7 @@ class TActorSystem;
 namespace NKikimr::NSharedCache {
 
 enum class ESharedCacheHookPoint {
+    ResourcesAvailable, // No item payload; test traits observe a resource-waiter notification.
     BeforeKeepBytesPublished, // Payload is the collection whose contribution is being published.
     AfterPageBatchPrepared, // Payload is the collection after the batch presence checks.
     AfterPageCollectionStateChecked, // Collection, before InitializePage increments its owner count.
@@ -85,7 +86,9 @@ struct TTestTraits {
     void NotifyKeepPageEviction(
         const TLogoBlobID&, TCollectionCacheItem, ui64, NTable::NPage::TPageLocation) const noexcept {}
 
-    void NotifyResourcesAvailable() const noexcept {}
+    void NotifyResourcesAvailable() const noexcept {
+        Invoke(ESharedCacheHookPoint::ResourcesAvailable, {});
+    }
 
     void NotifyCollectionReleased(const TLogoBlobID&, TCollectionCacheItem) const noexcept {}
 
