@@ -1,6 +1,5 @@
 #include "shared_cache_eviction.h"
 #include "shared_cache.h"
-#include "shared_cache_items.h"
 
 #include <cmath>
 
@@ -138,8 +137,8 @@ bool TCacheEviction<TTraits>::GrowKeepCold() noexcept {
     ui64 limit = KeepColdLimit_.load(std::memory_order_relaxed);
     for (;;) {
         const ui64 budget = EvictableByteBudget();
-        const ui64 maximum = Min(
-            KeepColdMaxBytes_.load(std::memory_order_relaxed), budget - FractionCeil(budget, Cache_.Policy_.HotMin));
+        const ui64 maximum = Min(KeepColdMaxBytes_.load(std::memory_order_relaxed),
+            budget - FractionCeil(budget, 1.0 - Cache_.Policy_.KeepColdMaxShare));
         if (limit >= maximum) {
             return false;
         }
@@ -205,23 +204,13 @@ void TCacheEviction<TTraits>::RefreshEvictableByteBudget() noexcept {
 }
 
 template <class TTraits>
-ui32 TCacheEviction<TTraits>::MinimumHotSlots(const TSpaceOperation& spaceOp, bool underPressure) const noexcept {
-    const ui64 hotPages = Cache_.Memory_.Hot().Pages();
-    const ui64 hotBytes = Cache_.Memory_.Hot().Bytes();
-    const ui64 meanPageBytes =
-        hotPages ? Max<ui64>(1, hotBytes / hotPages)
-                 : TCacheItems<TTraits>::AccountedPageBytes(Cache_.Space_->ReservedConfiguration().ExpectedPageSize);
-    const ui64 hotMinBytes =
-        FractionCeil(EvictableByteBudget(), underPressure ? Cache_.Policy_.HotMinUnderPressure : Cache_.Policy_.HotMin);
-    const ui64 byteMinimumSlots = hotMinBytes / meanPageBytes + (hotMinBytes % meanPageBytes != 0);
-    return static_cast<ui32>(
-        Min<ui64>(spaceOp.View().HotSlotCount, Max<ui64>(Cache_.Policy_.MinHotSlotsUnderPressure, byteMinimumSlots)));
+ui32 TCacheEviction<TTraits>::MinimumHotSlots() const noexcept {
+    return Cache_.Policy_.MinHotSlots;
 }
 
 template <class TTraits>
-ui32 TCacheEviction<TTraits>::ShrinkHotTarget(
-    const TSpaceOperation& spaceOp, ui32 effectiveHotSlots, ui32 step, bool underPressure) const noexcept {
-    const ui32 minimum = MinimumHotSlots(spaceOp, underPressure);
+ui32 TCacheEviction<TTraits>::ShrinkHotTarget(ui32 effectiveHotSlots, ui32 step) const noexcept {
+    const ui32 minimum = MinimumHotSlots();
     if (effectiveHotSlots <= minimum) {
         return 0;
     }
@@ -320,17 +309,13 @@ bool TCacheEviction<TTraits>::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64
                                         (coldFreeBytes < coldTargetBytes || coldFreeHandles < coldTargetHandles));
             ui32 targetHotSlots = 0;
             // The caller's own requirement counts as already resident, so it lowers the cold plus free room.
-            // Referenced Cold and in-flight loads cannot be reclaimed yet. Under current-limit
-            // pressure, let Hot shrink further to compensate for their physical commitment.
-            const bool hotUnderPressure = enforceCurrentLimit && (Cache_.Memory_.ReservedBytes() != 0 ||
-                                                                     Cache_.Memory_.Cold().Bytes() > coldBytes);
-            const ui32 minimumHotSlots = MinimumHotSlots(hotSpaceOp, hotUnderPressure);
+            const ui32 minimumHotSlots = MinimumHotSlots();
             if (effectiveHotSlots < minimumHotSlots) {
                 targetHotSlots = minimumHotSlots;
             } else if (enforceCurrentLimit || forceShrinkHot || refillKeepCold ||
                        (pageUsage > softLimit && Cache_.Memory_.Hot().Bytes() > payloadBudget))
             {
-                targetHotSlots = ShrinkHotTarget(hotSpaceOp, effectiveHotSlots, hotResizeStep, hotUnderPressure);
+                targetHotSlots = ShrinkHotTarget(effectiveHotSlots, hotResizeStep);
                 if (targetHotSlots == 0) {
                     const bool needColdHandles =
                         coldFreeHandles < coldMinHandles ||
@@ -352,6 +337,7 @@ bool TCacheEviction<TTraits>::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64
             }
 
             if (targetHotSlots != 0 && Cache_.Space_->BeginHotResize(targetHotSlots, Cache_.HotResize_)) {
+                progress = true;
                 if (Cache_.HotResize_.Phase() == EHotResizePhase::Cut) {
                     progress = DrainHotResize(hotSpaceOp) || progress;
                 }
@@ -380,8 +366,8 @@ template bool TCacheEviction<TProdTraits>::ExceedsLimit(ui64, ui64, ui64) noexce
 template bool TCacheEviction<TProdTraits>::Reclaim(TSpaceOperation&, ui64) noexcept;
 template bool TCacheEviction<TProdTraits>::ReclaimToLimits(TSpaceOperation&, ui64, ui32, ui64) noexcept;
 template void TCacheEviction<TProdTraits>::RefreshEvictableByteBudget() noexcept;
-template ui32 TCacheEviction<TProdTraits>::MinimumHotSlots(const TSpaceOperation&, bool) const noexcept;
-template ui32 TCacheEviction<TProdTraits>::ShrinkHotTarget(const TSpaceOperation&, ui32, ui32, bool) const noexcept;
+template ui32 TCacheEviction<TProdTraits>::MinimumHotSlots() const noexcept;
+template ui32 TCacheEviction<TProdTraits>::ShrinkHotTarget(ui32, ui32) const noexcept;
 template ui32 TCacheEviction<TProdTraits>::GrowHotTarget(const TSpaceOperation&, ui32, ui32) const noexcept;
 template ui32 TCacheEviction<TProdTraits>::HotResizeStep(ui32) const noexcept;
 template bool TCacheEviction<TProdTraits>::DrainHotResize(TSpaceOperation&) noexcept;
@@ -398,8 +384,8 @@ template bool TCacheEviction<TTestTraits>::ExceedsLimit(ui64, ui64, ui64) noexce
 template bool TCacheEviction<TTestTraits>::Reclaim(TSpaceOperation&, ui64) noexcept;
 template bool TCacheEviction<TTestTraits>::ReclaimToLimits(TSpaceOperation&, ui64, ui32, ui64) noexcept;
 template void TCacheEviction<TTestTraits>::RefreshEvictableByteBudget() noexcept;
-template ui32 TCacheEviction<TTestTraits>::MinimumHotSlots(const TSpaceOperation&, bool) const noexcept;
-template ui32 TCacheEviction<TTestTraits>::ShrinkHotTarget(const TSpaceOperation&, ui32, ui32, bool) const noexcept;
+template ui32 TCacheEviction<TTestTraits>::MinimumHotSlots() const noexcept;
+template ui32 TCacheEviction<TTestTraits>::ShrinkHotTarget(ui32, ui32) const noexcept;
 template ui32 TCacheEviction<TTestTraits>::GrowHotTarget(const TSpaceOperation&, ui32, ui32) const noexcept;
 template ui32 TCacheEviction<TTestTraits>::HotResizeStep(ui32) const noexcept;
 template bool TCacheEviction<TTestTraits>::DrainHotResize(TSpaceOperation&) noexcept;

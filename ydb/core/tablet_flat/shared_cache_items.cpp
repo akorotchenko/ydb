@@ -133,20 +133,24 @@ ui32 TCacheItems<TTraits>::TryAllocateHandle(TSpaceOperation& spaceOp) noexcept 
         }
         // Byte headroom does not guarantee a free handle when pages are much smaller than the expected size.
         // Reclaim Cold, or shrink Hot to feed Cold, before refusing the admission.
-        for (ui32 attempt = 0; attempt < spaceOp.HandleCount(); ++attempt) {
-            if (!evictionOp.ReclaimCold()) {
-                const ui32 hotSlots = static_cast<ui32>(Cache_.Space_->EffectiveHotSlots());
-                evictionOp.EnforceCurrentLimit(0, true);
+        const ui32 workLimit = static_cast<ui32>(Min<ui64>(spaceOp.HandleCount(), SharedCacheTransitionWorkBatch));
+        for (ui32 attempt = 0; attempt < workLimit; ++attempt) {
+            bool progress = evictionOp.ReclaimCold();
+            if (!progress) {
+                progress = evictionOp.EnforceCurrentLimit(0, true);
                 // The caller's view may predate growth; drain with a fresh operation under the resize lock.
-                Cache_.DrainHotResize();
-                if (hotSlots == Cache_.Space_->EffectiveHotSlots() && !evictionOp.ReclaimCold()) {
-                    break;
-                }
+                progress = Cache_.DrainHotResize() || progress;
+                progress = evictionOp.ReclaimCold() || progress;
             }
             if (const ui32 index = spaceOp.TryAllocateHandle()) {
                 return index;
             }
+            if (!progress) {
+                return 0;
+            }
+            Cache_.InvokeHook(ESharedCacheHookPoint::AfterAdmissionReclaimStep, {});
         }
+        Cache_.NotifyResourcesAvailable();
         return 0;
     }
 

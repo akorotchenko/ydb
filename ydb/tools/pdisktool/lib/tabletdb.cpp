@@ -98,8 +98,13 @@ public:
             constexpr ui32 hazards = 1;
             Y_ENSURE(NSharedCache::TryCalculateSharedCacheCapacity(
                 cacheBytes, NSharedCache::TSharedCache::ExpectedPageSize, 0, hazards, capacity));
+            while (capacity.HotSlotCount() < NSharedCache::SharedCachePolicyFor<NSharedCache::TProdTraits>.MinHotSlots)
+            {
+                Y_ENSURE(NSharedCache::TryCalculateSharedCacheFootprint(static_cast<ui8>(capacity.AddressBits + 1),
+                    NSharedCache::TSharedCache::ExpectedPageSize, 0, hazards, capacity));
+            }
             auto core = NSharedCache::TSharedCache::Create(
-                NSharedCache::TSharedCacheSpace::Create(capacity, capacity, CacheThreads_), capacity.Limit);
+                NSharedCache::TSharedCacheSpace::Create(capacity, capacity, CacheThreads_), cacheBytes);
             Y_ENSURE(core);
             Y_ENSURE(core->UpdateSoftLimitOverride(0));
         } catch (...) {

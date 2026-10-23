@@ -313,16 +313,13 @@ public:
         });
     }
 
-    static ui32 MinimumHotSlots(TTestSharedCache& cache, bool underPressure = false) noexcept {
-        return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
-            return cache.Eviction_.MinimumHotSlots(spaceOp, underPressure);
-        });
+    static ui32 MinimumHotSlots(TTestSharedCache& cache) noexcept {
+        return cache.Eviction_.MinimumHotSlots();
     }
 
     static std::array<ui64, 4> HotPolicy(TTestSharedCache& cache, const TSpaceOperation& spaceOp) noexcept {
         const ui32 effective = static_cast<ui32>(spaceOp.EffectiveHotSlots());
-        return { effective, cache.Eviction_.MinimumHotSlots(spaceOp),
-            cache.Eviction_.ShrinkHotTarget(spaceOp, effective, 1, false),
+        return { effective, cache.Eviction_.MinimumHotSlots(), cache.Eviction_.ShrinkHotTarget(effective, 1),
             cache.Eviction_.GrowHotTarget(spaceOp, effective, 2) };
     }
 
@@ -4917,12 +4914,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                     for (ui64 bound : policy) {
                         UNIT_ASSERT(bound <= target.HotSlotCount());
                     }
+                    UNIT_ASSERT_VALUES_EQUAL(policy[1], 15);
+                    UNIT_ASSERT_VALUES_EQUAL(policy[1], oldPolicy[1]);
                     if (growing) {
-                        UNIT_ASSERT(policy[1] > oldPolicy[1]);
                         UNIT_ASSERT(policy[3] > oldPolicy[3]);
                         UNIT_ASSERT_VALUES_EQUAL(oldOp.EffectiveHotSlots(), oldOp.View().HotSlotCount);
-                    } else {
-                        UNIT_ASSERT(policy[1] < oldPolicy[1]);
                     }
                     for (ui64 bound : TSharedCacheTestAccess::HotPolicy(*fixture.Cache, oldOp)) {
                         UNIT_ASSERT(bound <= oldOp.View().HotSlotCount);
@@ -6063,6 +6059,109 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Cache->StaticBytes());
     }
+    Y_UNIT_TEST(AdmissionReclaimBudgetNotifiesWaiterArmedAtYield) {
+        struct TProgress {
+            TTestSharedCache* Cache = nullptr;
+            ui32 Steps = 0;
+            ui32 Notifications = 0;
+        } progress;
+
+        TFixture fixture(10);
+        const auto collection = MakeCollectionCacheItem(571, 572);
+        const ui32 bucketMask = static_cast<ui32>(CurrentBucketCount(*fixture.Space) - 1);
+        for (ui32 bucket = 0; bucket <= SharedCacheTransitionWorkBatch; ++bucket) {
+            const auto key = ReviewKeyForBucket(collection, bucketMask, bucket, 10000);
+            const auto page = InsertReadyPage(*fixture.Cache, key);
+            UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        }
+        const ui64 pageBytes = 4096 + NActors::TSharedData::OverheadSize;
+        const ui64 bytes = (SharedCacheTransitionWorkBatch + 1) * pageBytes;
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), bytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdPages(), SharedCacheTransitionWorkBatch + 1);
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(bytes));
+        progress.Cache = fixture.Cache.Get();
+        TTestTraits hooks{ &progress, [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                              auto& progress = *static_cast<TProgress*>(context);
+                              if (point == ESharedCacheHookPoint::AfterAdmissionReclaimStep) {
+                                  if (++progress.Steps == SharedCacheTransitionWorkBatch) {
+                                      progress.Cache->ArmResourceWait(progress.Cache->AdmissionGeneration());
+                                  }
+                              } else if (point == ESharedCacheHookPoint::ResourcesAvailable) {
+                                  ++progress.Notifications;
+                              }
+                          } };
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
+        UNIT_ASSERT(!TSharedCacheTestAccess::TryReserve(*fixture.Cache, bytes));
+        UNIT_ASSERT_VALUES_EQUAL(progress.Steps, SharedCacheTransitionWorkBatch);
+        UNIT_ASSERT_VALUES_EQUAL(progress.Notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), pageBytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReserve(*fixture.Cache, bytes));
+        TSharedCacheTestAccess::ReleaseReservation(*fixture.Cache, bytes);
+    }
+
+    Y_UNIT_TEST(AdmissionWithoutReclaimProgressRemainsQuiet) {
+        ui32 notifications = 0;
+        TFixture fixture(5);
+        UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(0));
+        TSharedCacheTestAccess::ShrinkHotToMinimum(*fixture.Cache);
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(1));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReserve(*fixture.Cache, 1));
+        TTestTraits hooks{ &notifications, [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                              if (point == ESharedCacheHookPoint::ResourcesAvailable) {
+                                  ++*static_cast<ui32*>(context);
+                              }
+                          } };
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        fixture.Cache->ArmResourceWait(generation);
+        UNIT_ASSERT(!TSharedCacheTestAccess::TryReserve(*fixture.Cache, 1));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 0);
+        fixture.Cache->DisarmResourceWait();
+        TSharedCacheTestAccess::ReleaseReservation(*fixture.Cache, 1);
+    }
+
+    Y_UNIT_TEST(HandleAdmissionContinuesFrequencyAgingAtFixedHotSize) {
+        TFixture fixture(5, 1);
+        const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(bytes));
+        TSharedCacheTestAccess::ShrinkHotToMinimum(*fixture.Cache);
+        const ui64 hotSlots = TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache);
+        const auto collection = MakeCollectionCacheItem(573, 574);
+        const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 0));
+        for (ui32 touch = 0; touch < 2; ++touch) {
+            TTestSharedPageRef held;
+            UNIT_ASSERT(fixture.Cache->Find(collection, 0, held) == ESharedCacheResultStatus::Hit);
+        }
+        for (ui32 index = 0; index < fixture.Capacity.HandleCount() - 3; ++index) {
+            const TLogoBlobID id(201, 202, index + 1);
+            const auto item = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+            UNIT_ASSERT(item);
+            UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, item, MakeCollection(id)));
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsHot());
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Frequency(), 2);
+        const auto admitted = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(TLogoBlobID(203, 204, 1)));
+        UNIT_ASSERT(admitted);
+        UNIT_ASSERT_VALUES_EQUAL(admitted.Index(), page.Index());
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), hotSlots);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
+        TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, admitted);
+    }
+
+    Y_UNIT_TEST(HotLayoutGrowthReportsMaintenanceProgress) {
+        TFixture fixture(8);
+        UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(0));
+        TSharedCacheTestAccess::ShrinkHotToMinimum(*fixture.Cache);
+        const ui64 before = TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::MinimumHotSlots(*fixture.Cache), before);
+        UNIT_ASSERT(fixture.Cache->EnforceCurrentLimit());
+        UNIT_ASSERT(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache) > before);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
+    }
+
     Y_UNIT_TEST(CurrentLimitReservation) {
         TFixture fixture;
         const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
@@ -6293,14 +6392,40 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(0));
         checkWatermarks();
     }
-    Y_UNIT_TEST(HotMinimumUsesSixtyPercentOfTheBudgetRemainingAfterSticky) {
+    Y_UNIT_TEST(ProductionHotMinimumFitsOneBoundedPass) {
+        constexpr ui32 hotSlots = SharedCachePolicyFor<TProdTraits>.MinHotSlots;
+        UNIT_ASSERT(hotSlots >= 64 && hotSlots <= 1024);
+        std::array<std::atomic<ui64>, hotSlots> slots{};
+        TS5FifoRings rings;
+        const TSpaceView view{
+            .HotSlots = slots.data(),
+            .HotSlotCount = hotSlots,
+            .Rings = &rings,
+        };
+        for (ui32 level = 0; level < 4; ++level) {
+            const auto hot = view.Hot(level);
+            UNIT_ASSERT(hot.Capacity > 0);
+            UNIT_ASSERT(hot.Capacity <= SharedCacheTransitionWorkBatch / 4);
+            hot.Slots[hot.Capacity - 1].store(level + 1, std::memory_order_relaxed);
+            ui32 found = 0;
+            const ui64 attempts = Min<ui64>(hot.Capacity, SharedCacheTransitionWorkBatch / 4);
+            for (ui64 attempt = 0; attempt < attempts; ++attempt) {
+                if (const ui64 item = hot.Pop()) {
+                    UNIT_ASSERT_VALUES_EQUAL(item, level + 1);
+                    ++found;
+                }
+            }
+            UNIT_ASSERT_VALUES_EQUAL(found, 1);
+        }
+    }
+
+    Y_UNIT_TEST(HotMinimumIsAbsoluteAcrossBudgetsAndStickyUsage) {
         TFixture fixture(8);
         const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
         const auto ordinary = MakeCollectionCacheItem(531, 532);
         InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(ordinary, 0));
         UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(100 * bytes));
-        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::MinimumHotSlots(*fixture.Cache), 60);
-        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::MinimumHotSlots(*fixture.Cache, true), 25);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::MinimumHotSlots(*fixture.Cache), 15);
         const TLogoBlobID id(95, 96, 121);
         const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
         UNIT_ASSERT(
@@ -6309,18 +6434,25 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, offset));
             UNIT_ASSERT(TSharedCacheTestAccess::MakePageSticky(*fixture.Cache, page));
         }
-        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::MinimumHotSlots(*fixture.Cache), 48);
-        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::MinimumHotSlots(*fixture.Cache, true), 20);
+        for (ui64 limit : { ui64{ 0 }, bytes, 100 * bytes, fixture.Cache->CurrentLimit() }) {
+            UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(limit));
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::MinimumHotSlots(*fixture.Cache), 15);
+        }
         TSharedCacheTestAccess::ShrinkHotToMinimum(*fixture.Cache);
-        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), 48);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), 15);
+        TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
+            for (ui32 level = 0; level < 4; ++level) {
+                UNIT_ASSERT(spaceOp.Hot(level).Capacity <= SharedCacheTransitionWorkBatch / 4);
+            }
+        });
     }
-    Y_UNIT_TEST(InFlightPressureLowersHotMinimumAndRecoveryRestoresIt) {
+    Y_UNIT_TEST(InFlightPressureKeepsAbsoluteHotMinimumAndRecoveryCanGrow) {
         TFixture fixture(8);
         const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
         InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(MakeCollectionCacheItem(537, 538), 0));
         UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(100 * bytes));
         TSharedCacheTestAccess::ShrinkHotToMinimum(*fixture.Cache);
-        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), 60);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), 15);
 
         const ui64 reservation = fixture.Cache->CurrentLimit() - fixture.Cache->PayloadUsage();
         UNIT_ASSERT(TSharedCacheTestAccess::TryReserve(*fixture.Cache, reservation));
@@ -6329,10 +6461,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 TSharedCacheTestAccess::EnforceWithOperation(*fixture.Cache, spaceOp, bytes + 1, false);
             }
         });
-        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), 25);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), 15);
         TSharedCacheTestAccess::ReleaseReservation(*fixture.Cache, reservation);
         fixture.Cache->EnforceCurrentLimit();
-        UNIT_ASSERT(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache) >= 60);
+        UNIT_ASSERT(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache) > 15);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::MinimumHotSlots(*fixture.Cache), 15);
     }
     Y_UNIT_TEST(BoundedHotAgingVisitsEveryLevelOfLargeRings) {
         TFixture fixture(10);
@@ -6449,10 +6582,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT_LE(usage, current);
             UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->RetainedBytes(), 0);
             UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsFree());
-            UNIT_ASSERT(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache) < hotSlots);
             if (atMinimum) {
                 UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache),
-                    TSharedCacheTestAccess::MinimumHotSlots(*fixture.Cache, true));
+                    TSharedCacheTestAccess::MinimumHotSlots(*fixture.Cache));
+            } else {
+                UNIT_ASSERT(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache) < hotSlots);
             }
         }
     }

@@ -156,8 +156,8 @@ public:
 
     ui64 KeepColdLimit() const noexcept {
         const ui64 budget = EvictableByteBudget();
-        // KeepCold uses the remainder after the normal Hot minimum (40% with HotMin = 60%).
-        const ui64 maximum = budget - FractionCeil(budget, Cache_.Policy_.HotMin);
+        // KeepCold has its own share of the evictable byte budget
+        const ui64 maximum = budget - FractionCeil(budget, 1.0 - Cache_.Policy_.KeepColdMaxShare);
         return Min(Min(KeepColdLimit_.load(std::memory_order_relaxed),
                        KeepColdMaxBytes_.load(std::memory_order_relaxed)), maximum);
     }
@@ -227,9 +227,8 @@ private:
     bool Reclaim(TSpaceOperation& spaceOp, ui64 bytes = 0) noexcept;
     bool ReclaimToLimits(TSpaceOperation& spaceOp, ui64 softLimit, ui32 step, ui64 bytes = 0) noexcept;
 
-    ui32 MinimumHotSlots(const TSpaceOperation& spaceOp, bool underPressure = false) const noexcept;
-    ui32 ShrinkHotTarget(
-        const TSpaceOperation& spaceOp, ui32 effectiveHotSlots, ui32 step, bool underPressure) const noexcept;
+    ui32 MinimumHotSlots() const noexcept;
+    ui32 ShrinkHotTarget(ui32 effectiveHotSlots, ui32 step) const noexcept;
     ui32 GrowHotTarget(const TSpaceOperation& spaceOp, ui32 effectiveHotSlots, ui32 step) const noexcept;
     ui32 HotResizeStep(ui32 effectiveHotSlots) const noexcept;
     bool DrainHotResize(TSpaceOperation& spaceOp) noexcept;
