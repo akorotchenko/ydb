@@ -2395,14 +2395,14 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         const TPageLocation location = _P(0);
         const TSharedCacheHandleRequirement requirement{ sharedCache.Collection1->Label(), { &location, 1 } };
         TVector<TSharedCacheCollectionRef> foreignCollections;
-        for (ui64 id = 100; cache.CanAdmitPageHandles({ &requirement, 1 }); ++id) {
+        for (ui64 id = 100; cache.CanAllocateHandles({ &requirement, 1 }); ++id) {
             UNIT_ASSERT(foreignCollections.size() < cache.TargetHandleCount());
             foreignCollections.push_back(cache.AdmitCollection(MakeIntrusiveConst<TPageCollectionMock>(id, 1u)));
         }
         for (const auto& foreign : foreignCollections) {
             UNIT_ASSERT(cache.DetachCollection(foreign.CacheItem()));
         }
-        UNIT_ASSERT(cache.CanAdmitWorkingSet(PAGE_TOTAL_SIZE));
+        UNIT_ASSERT(cache.CanReserve(PAGE_TOTAL_SIZE));
         ui32 notifications = 0;
         TVector<TEvResourcesAvailable::TPtr> blocked;
         auto observer = sharedCache.Runtime.AddObserver<TEvResourcesAvailable>([&](auto& event) {
@@ -4022,14 +4022,14 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
                     const auto second = TPageLocation::FromPageIndex(2, pageSize, EPage::BTreeIndexV2, 3);
                     const TPageLocation missing[]{ first, second };
                     const TSharedCacheHandleRequirement requirement{ seed.IndexCollectionId, missing };
-                    for (ui64 id = 100; cache.CanAdmitPageHandles({ &requirement, 1 }); ++id) {
+                    for (ui64 id = 100; cache.CanAllocateHandles({ &requirement, 1 }); ++id) {
                         foreignCollections.push_back(
                             cache.AdmitCollection(MakeIntrusiveConst<TPageCollectionMock>(id, 1u)));
                     }
                     const TSharedCacheHandleRequirement one{ seed.IndexCollectionId, { missing, 1 } };
-                    Y_ABORT_UNLESS(cache.CanAdmitPageHandles({ &one, 1 }));
+                    Y_ABORT_UNLESS(cache.CanAllocateHandles({ &one, 1 }));
                 } else {
-                    Y_ABORT_UNLESS(cache.CanAdmitWorkingSet(2 * pageBytes));
+                    Y_ABORT_UNLESS(cache.CanReserve(2 * pageBytes));
                     auto foreign = MakeIntrusiveConst<TPageCollectionMock>(100ul, 1u);
                     const auto location = TPageLocation::FromPageIndex(0, pageSize, EPage::DataPage, 1);
                     foreignPage = cache.AdmitPage(foreign, location, TSharedData::Copy(TString(pageSize, 'p')));

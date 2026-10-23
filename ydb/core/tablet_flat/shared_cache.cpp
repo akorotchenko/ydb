@@ -563,13 +563,13 @@ bool TSharedCache::TryReserveFetchBatch(TArrayRef<TPageFetchImpl<TTraits>> pages
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::CanAdmitWorkingSet(ui64 bytes) const noexcept {
+bool TSharedCache::CanReserve(ui64 bytes) const noexcept {
     const ui64 limit = CurrentLimit();
     return bytes == 0 || (bytes <= limit && Memory_.PayloadUsage() <= limit - bytes);
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::CanAdmitPageHandles(TArrayRef<const TSharedCacheHandleRequirement> requirements) noexcept {
+bool TSharedCache::CanAllocateHandles(TArrayRef<const TSharedCacheHandleRequirement> requirements) noexcept {
     auto cacheOp = BeginOperation();
     ui64 missing = 0;
     THashMap<TLogoBlobID, THashSet<ui64>> seen;

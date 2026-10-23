@@ -214,8 +214,8 @@ public:
     void ArmResourceWait(ui64 generation) noexcept;
     bool TryReserveFetchBatch(TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept;
     // Advisory read-only snapshots; actual admission must still acquire its resources
-    bool CanAdmitWorkingSet(ui64 bytes) const noexcept;
-    bool CanAdmitPageHandles(TArrayRef<const TSharedCacheHandleRequirement> requirements) noexcept;
+    bool CanReserve(ui64 bytes) const noexcept;
+    bool CanAllocateHandles(TArrayRef<const TSharedCacheHandleRequirement> requirements) noexcept;
     // Pressure-only check of request-held collection handles and distinct requested pages.
     bool WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheItem> retainedCollections,
         TArrayRef<const TSharedCacheHandleRequirement> requirements) noexcept;
