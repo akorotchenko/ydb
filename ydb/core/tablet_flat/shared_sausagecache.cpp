@@ -95,7 +95,6 @@ struct TQueuedRequest {
     NWilson::TTraceId TraceId;
     TDeque<TPageFetch> Pages;
     TCollectionCacheItem CollectionItem;
-    ui64 CompletionId = 0;
     TVector<ui32> AdmissionIndices;
     TVector<bool> Sticky;
     TVector<TIntrusivePtr<TRequestCompletion>> HandleRequirements;
@@ -200,9 +199,38 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         return {};
     }
 
+    size_t AllowedFetchPageCount(TArrayRef<const TPageLocation> locations, ui64& bytes) const {
+        const ui64 byteLimit = Cache->CurrentLimit();
+        const ui64 pageLimit = Cache->TargetHandleCount() - 3;
+        size_t count = 0;
+        bytes = 0;
+        // Keep the first page so an insufficient limit uses the normal resource-wait path
+        for (const auto& location : locations) {
+            const ui64 pageBytes = KeepPageBytes(location);
+            if (count && (count >= pageLimit || pageBytes > byteLimit - Min(byteLimit, bytes))) {
+                break;
+            }
+            bytes += pageBytes;
+            ++count;
+            if (bytes >= byteLimit) {
+                break;
+            }
+        }
+        return count;
+    }
+
     void FetchIndexLevel(
         TCollection& collection, TVector<TPageLocation>&& locations, const TLogoBlobID& walkCollectionId) override {
         Y_DEBUG_ABORT_UNLESS(collection.GetCacheMode() != ECacheMode::TryKeepInMemory);
+        ui64 bytes = 0;
+        locations.resize(AllowedFetchPageCount(locations, bytes));
+        if (locations.size() > 1) {
+            const TSharedCacheHandleRequirement requirement{ collection.Id(), locations };
+            // Independent residency can leave less room than the configured ceilings
+            if (!Cache->CanAdmitWorkingSet(bytes) || !Cache->CanAdmitPageHandles({ &requirement, 1 })) {
+                locations.resize(1);
+            }
+        }
         const ui64 requestId = NextWalkRequestId++;
         Y_ENSURE(WalkRequests.emplace(requestId, walkCollectionId).second);
         Walks.FetchStarted(walkCollectionId);
@@ -346,6 +374,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (Cache) {
             const ui64 hardLimit = GetTargetCacheHardLimitBytes();
             const ui64 currentLimit = GetTargetCacheCurrentLimitBytes();
+            const bool limitsChanged = hardLimit != Cache->HardLimit() || currentLimit != Cache->CurrentLimit();
             if (hardLimit < Cache->CurrentLimit()) {
                 Y_ENSURE(Cache->UpdateCurrentLimit(Min(currentLimit, hardLimit)));
             }
@@ -358,6 +387,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             UpdateSoftLimitOverride();
             UpdateKeepColdLimit();
             Counters.ActiveLimitBytes->Set(currentLimit);
+            if (limitsChanged) {
+                CancelOversizedWalkRequests();
+            }
         } else {
             Counters.ActiveLimitBytes->Set(GetTargetCacheCurrentLimitBytes());
         }
@@ -574,6 +606,40 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
     }
 
+    bool RestartBlockedWalk(TQueuedRequest& waiting) {
+        if (waiting.Completion->Locations().size() <= 1) {
+            return false;
+        }
+        auto request = Requests.find(waiting.Completion->CompletionId());
+        if (request == Requests.end() || request->second.Cancelled || !waiting.Completion->IsActive() ||
+            request->second.Sender != SelfId() || request->second.EventCookie != WalkResultCookie) {
+            return false;
+        }
+        request->second.Cancelled = true;
+        waiting.Completion->Cancel();
+        return true;
+    }
+
+    void CancelOversizedWalkRequests() {
+        bool cancelled = false;
+        for (auto& [_, request] : Requests) {
+            if (request.Cancelled || request.Sender != SelfId() || request.EventCookie != WalkResultCookie) {
+                continue;
+            }
+            ui64 bytes = 0;
+            if (AllowedFetchPageCount(request.Completion->Locations(), bytes) <
+                request.Completion->Locations().size()) {
+                request.Cancelled = true;
+                // Drain dispatched callbacks before the existing RACE reply restarts the walk
+                request.Completion->Cancel();
+                cancelled = true;
+            }
+        }
+        if (cancelled) {
+            PruneQueues();
+        }
+    }
+
     void CancelQueuedWalkRequests(const TLogoBlobID& walkCollectionId) {
         for (const auto& [requestId, collectionId] : WalkRequests) {
             if (collectionId != walkCollectionId) {
@@ -741,7 +807,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         auto admission = MakeHolder<TQueuedRequest>();
         admission->Sender = sender;
         admission->Completion = completion;
-        admission->CompletionId = completionId;
         admission->PageCollection = msg.PageCollection;
         admission->CollectionItem = owner ? owner->CacheItem : TCollectionCacheItem{};
         admission->Priority = msg.Priority;
@@ -755,7 +820,11 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             admission->Sticky.push_back(stickyRequest || (!msg.Sticky.empty() && msg.Sticky[index]));
         }
         if (!TryAdmitPages(*admission)) {
-            ResourceWaits.push_back(std::move(admission));
+            if (RestartBlockedWalk(*admission)) {
+                TryAdmitPages(*admission);
+            } else {
+                ResourceWaits.push_back(std::move(admission));
+            }
         }
         RetryResourceWaits();
         ActualizeCacheSizeLimit();
@@ -763,12 +832,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     }
 
     bool TryAdmitPages(TQueuedRequest& admission) {
-        if (admission.Completion->IsCancelled()) {
-            // No native waiter exists for these indices to send the cancellation reply.
-            admission.Completion->Cancel(true);
-            return true;
-        }
-        if (admission.Completion->HasFailed()) {
+        if (admission.Completion->IsCancelled() || admission.Completion->HasFailed()) {
+            // These indices have no native waiter; drain them before retiring the request
             for (const ui32 index : admission.AdmissionIndices) {
                 admission.Completion->Complete(index, {}, EPageFetchCompletion::Failed);
             }
@@ -787,11 +852,11 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 return false;
             }
             admission.CollectionItem = owner->CacheItem;
-            Requests.at(admission.CompletionId).CollectionTracked = true;
+            Requests.at(admission.Completion->CompletionId()).CollectionTracked = true;
             ++owner->GetActorState()->PendingRequests;
             RecordPendingInMemoryPages(*owner, admission.Completion->Locations());
         }
-        const auto& request = Requests.at(admission.CompletionId);
+        const auto& request = Requests.at(admission.Completion->CompletionId());
         const bool recordStats =
             request.EventCookie != KeepPreloadResultCookie && request.EventCookie != WalkResultCookie;
         const bool keepPages = owner->GetCacheMode() == ECacheMode::TryKeepInMemory;
@@ -871,8 +936,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
     }
 
-    void QueueFetch(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, TVector<TPageFetch>&& pages, NBlockIO::EPriority priority, const TActorId& sender,
-        NWilson::TTraceId traceId, TIntrusivePtr<TRequestCompletion> completion) {
+    void QueueFetch(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, TVector<TPageFetch>&& pages,
+        NBlockIO::EPriority priority, const TActorId& sender, NWilson::TTraceId traceId,
+        TIntrusivePtr<TRequestCompletion> completion) {
         auto waiting = MakeHolder<TQueuedRequest>();
         waiting->Sender = sender;
         waiting->Completion = completion;
@@ -890,7 +956,18 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             }
         }
         if (waiting->Pages) {
-            ResourceWaits.push_back(std::move(waiting));
+            if (RestartBlockedWalk(*waiting)) {
+                for (auto page = waiting->Pages.begin(); page != waiting->Pages.end();) {
+                    if (page->HasActiveWaiters()) {
+                        ++page;
+                    } else {
+                        page = waiting->Pages.erase(page);
+                    }
+                }
+            }
+            if (waiting->Pages) {
+                ResourceWaits.push_back(std::move(waiting));
+            }
         }
         if (!ready) {
             return;
@@ -980,7 +1057,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
         const ui64 generation = Cache->ResourceGeneration();
         const size_t count = ResourceWaits.size();
-        for (size_t index = 0; index < count; ++index) {
+        // Demand promotion during admission can remove another waiting entry
+        for (size_t index = 0; index < count && !ResourceWaits.empty(); ++index) {
             auto waiting = std::move(ResourceWaits.front());
             ResourceWaits.pop_front();
             if (waiting->WaitingTransaction) {
@@ -1000,6 +1078,10 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                     continue;
                 }
                 if (CanAdmitPages(*waiting) && TryAdmitPages(*waiting)) {
+                    continue;
+                }
+                if (RestartBlockedWalk(*waiting)) {
+                    TryAdmitPages(*waiting);
                     continue;
                 }
                 const auto& pad = waiting->Completion->WaitPad();
@@ -1425,6 +1507,23 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                         return page;
                     }
                 }
+            }
+        }
+        for (auto requestIt = ResourceWaits.begin(); requestIt != ResourceWaits.end(); ++requestIt) {
+            auto& request = **requestIt;
+            if (request.PageCollection->Label() != collectionId) {
+                continue;
+            }
+            for (auto pageIt = request.Pages.begin(); pageIt != request.Pages.end(); ++pageIt) {
+                if (pageIt->Location().Offset != offset) {
+                    continue;
+                }
+                TPageFetch page = std::move(*pageIt);
+                request.Pages.erase(pageIt);
+                if (request.Pages.empty() && request.AdmissionIndices.empty() && !request.WaitingTransaction) {
+                    ResourceWaits.erase(requestIt);
+                }
+                return page;
             }
         }
         return {};

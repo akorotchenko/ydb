@@ -279,6 +279,10 @@ namespace NKikimr::NSharedCache {
             return Locations_;
         }
 
+        ui64 CompletionId() const noexcept {
+            return CompletionId_;
+        }
+
         const TIntrusiveConstPtr<NPageCollection::IPageCollection>& PageCollection() const noexcept {
             return PageCollection_;
         }
