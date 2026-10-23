@@ -8503,6 +8503,121 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         CommitTransition(*fixture.Cache, growth);
     }
 
+    void CheckUnlinkNotification(bool chain, bool armBeforeUnlink) {
+        TFixture fixture(6, 8, 7);
+        Y_DEFER {
+            fixture.Cache->DisarmResourceWait();
+        };
+        const auto collection = MakeCollectionCacheItem(257, 50057);
+        const ui32 splitBit = static_cast<ui32>(CurrentBucketCount(*fixture.Space));
+        const ui32 mask = (splitBit << 1) - 1;
+        TVector<TSharedCacheKey> keys{ ReviewKeyForBucket(collection, mask, 0, 800000) };
+        if (chain) {
+            keys.push_back(ReviewKeyForBucket(collection, mask, 0, keys.front().Word(1) + 1, &keys.front()));
+        }
+        TVector<TPageCacheItem> pages;
+        TVector<TTestSharedPageRef> held;
+        for (const auto& key : keys) {
+            const auto page = InsertReadyPage(*fixture.Cache, key);
+            pages.push_back(page);
+            held.emplace_back();
+            UNIT_ASSERT(fixture.Cache->AcquirePage(page, held.back()));
+            UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        }
+        TTransition growth;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+
+        struct TObservation {
+            TTestSharedCache* Cache = nullptr;
+            TArrayRef<const TPageCacheItem> Pages;
+            ui64 Bytes = 0;
+            ui64 FreeCount = 0;
+            ui32 Notifications = 0;
+            bool Published = false;
+            bool Activated = false;
+        } observation;
+
+        observation.Cache = fixture.Cache.Get();
+        observation.Pages = TArrayRef<const TPageCacheItem>(pages.data(), pages.size());
+        observation.Bytes = fixture.Cache->PayloadUsage();
+        observation.FreeCount = TSharedCacheTestAccess::FreeCount(*fixture.Cache);
+        {
+            auto cacheOp = fixture.Cache->BeginOperation();
+            TOperationItemRef<TTestTraits> firstOwner(cacheOp);
+            TOperationItemRef<TTestTraits> secondOwner(cacheOp);
+            auto expected = TSharedCacheTestAccess::HandleState(*fixture.Cache, pages.front().Index());
+            UNIT_ASSERT(cacheOp.TryBeginErase(pages.front().CacheItem(), expected, firstOwner.Get()));
+            if (chain) {
+                expected = TSharedCacheTestAccess::HandleState(*fixture.Cache, pages.back().Index());
+                UNIT_ASSERT(cacheOp.TryBeginErase(pages.back().CacheItem(), expected, secondOwner.Get()));
+            }
+            UNIT_ASSERT(!TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+            TTestTraits hooks{ &observation,
+                [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                    if (point != ESharedCacheHookPoint::ResourcesAvailable) {
+                        return;
+                    }
+                    auto& observation = *static_cast<TObservation*>(context);
+                    ++observation.Notifications;
+                    observation.Published =
+                        observation.Cache->PayloadUsage() == observation.Bytes &&
+                        TSharedCacheTestAccess::FreeCount(*observation.Cache) == observation.FreeCount;
+                    for (const auto page : observation.Pages) {
+                        const auto state = TSharedCacheTestAccess::HandleState(*observation.Cache, page.Index());
+                        observation.Published &=
+                            state.IsTombstone() && state.Refs() == 2 && page.CacheItem().Matches(state);
+                    }
+                    observation.Activated = TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*observation.Cache);
+                } };
+            TSharedCacheHookGuard hookGuard(*fixture.Cache, hooks);
+            const ui64 generation = fixture.Cache->AdmissionGeneration();
+            if (armBeforeUnlink) {
+                fixture.Cache->ArmResourceWait(generation);
+            }
+            cacheOp.FinishErase(pages.back().CacheItem(), keys.back());
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeUnlink ? 1 : 0);
+            if (!armBeforeUnlink) {
+                fixture.Cache->ArmResourceWait(generation);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+            UNIT_ASSERT(observation.Published && observation.Activated);
+            const ui64 unlinkedGeneration = fixture.Cache->AdmissionGeneration();
+            fixture.Cache->ArmResourceWait(unlinkedGeneration);
+            for (ui32 index = 0; index < pages.size(); ++index) {
+                cacheOp.FinishErase(pages[index].CacheItem(), keys[index]);
+            }
+            firstOwner.Drop();
+            secondOwner.Drop();
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), unlinkedGeneration);
+            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+            for (ui32 index = 0; index < pages.size(); ++index) {
+                UNIT_ASSERT(held[index]);
+                UNIT_ASSERT_VALUES_EQUAL(
+                    TSharedCacheTestAccess::HandleState(*fixture.Cache, pages[index].Index()).Refs(), 1);
+            }
+            fixture.Cache->DisarmResourceWait();
+        }
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        CommitTransition(*fixture.Cache, growth);
+    }
+
+    Y_UNIT_TEST(LogicalUnlinkNotifiesWithHeldPayload) {
+        for (bool armed : { false, true }) {
+            CheckUnlinkNotification(false, armed);
+        }
+    }
+
+    Y_UNIT_TEST(TombstoneChainUnlinkNotifiesWithHeldPayloads) {
+        for (bool armed : { false, true }) {
+            CheckUnlinkNotification(true, armed);
+        }
+    }
+
     void CheckReadyPublicationNotification(bool armBeforeReady) {
         TFixture fixture(6, 8, 7);
         Y_DEFER {

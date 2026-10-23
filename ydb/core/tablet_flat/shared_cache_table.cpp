@@ -633,6 +633,7 @@ bool TSharedCacheTable::UnlinkTombstone(
                 }
                 current = next;
             }
+            Cache_.NotifyResourcesAvailable();
             return true;
         }
     }
