@@ -2386,6 +2386,50 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
     }
 
+    Y_UNIT_TEST(ResourceWaitWithNoFreeHandlesDoesNotWakeItself) {
+        TSharedPageCacheMock sharedCache;
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1);
+        auto& cache = TSharedCache::Get();
+        TSharedCacheCollectionRef collection;
+        UNIT_ASSERT(cache.Find(sharedCache.Collection1->Label(), collection) == ESharedCacheResultStatus::Hit);
+        const TPageLocation location = _P(0);
+        const TSharedCacheHandleRequirement requirement{ sharedCache.Collection1->Label(), { &location, 1 } };
+        TVector<TSharedCacheCollectionRef> foreignCollections;
+        for (ui64 id = 100; cache.CanAdmitPageHandles({ &requirement, 1 }); ++id) {
+            UNIT_ASSERT(foreignCollections.size() < cache.TargetHandleCount());
+            foreignCollections.push_back(cache.AdmitCollection(MakeIntrusiveConst<TPageCollectionMock>(id, 1u)));
+        }
+        for (const auto& foreign : foreignCollections) {
+            UNIT_ASSERT(cache.DetachCollection(foreign.CacheItem()));
+        }
+        UNIT_ASSERT(cache.CanAdmitWorkingSet(PAGE_TOTAL_SIZE));
+        ui32 notifications = 0;
+        TVector<TEvResourcesAvailable::TPtr> blocked;
+        auto observer = sharedCache.Runtime.AddObserver<TEvResourcesAvailable>([&](auto& event) {
+            if (++notifications > 1) {
+                blocked.push_back(std::move(event));
+            }
+        });
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { location });
+        sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 0);
+        UNIT_ASSERT(sharedCache.Fetches->empty());
+        UNIT_ASSERT(sharedCache.Results.empty());
+        const ui64 generation = cache.AdmissionGeneration();
+        sharedCache.Send(sharedCache.Sender1, new TEvResourcesAvailable);
+        sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        UNIT_ASSERT(blocked.empty());
+        UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), 0);
+        UNIT_ASSERT(sharedCache.Fetches->empty());
+        observer.Remove();
+        foreignCollections.clear();
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { location } } });
+        sharedCache.Provide(sharedCache.Collection1, { location });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { location } } });
+    }
+
     Y_UNIT_TEST(ResourceWaitSharedFetchPostponesPinnedTransactionOnce) {
         TSharedPageCacheMock sharedCache;
         sharedCache.SetLimit(3 * PAGE_TOTAL_SIZE, 0, 3 * PAGE_TOTAL_SIZE);

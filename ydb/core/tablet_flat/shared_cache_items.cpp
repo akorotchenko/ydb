@@ -298,10 +298,12 @@ void TCacheItems<TTraits>::DiscardCandidate(
     if (owner) {
         collectionsOp.DropOwnerReference(*owner);
     }
+    Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(index, desired.Version()));
     if (reservedBytes != 0) {
         Cache_.ReleaseReservation(reservedBytes, expected.IsPageKind() ? 1 : 0);
+    } else {
+        Cache_.NotifyResourcesAvailable();
     }
-    Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(index, desired.Version()));
 }
 
 template <class TTraits>

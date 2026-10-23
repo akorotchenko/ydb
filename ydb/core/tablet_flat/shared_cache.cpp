@@ -563,74 +563,44 @@ bool TSharedCache::TryReserveFetchBatch(TArrayRef<TPageFetchImpl<TTraits>> pages
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::CanAdmitWorkingSet(ui64 bytes) noexcept {
-    auto cacheOp = BeginOperation();
-    if (!cacheOp.TryReserve(bytes)) {
-        return false;
-    }
-    // A readiness check, not an allocation owned by the transaction. Its subsequent admissions
-    // still use TryReserve and may wait again if another requester consumes the released room.
-    ReleaseReservation(bytes);
-    return true;
+bool TSharedCache::CanAdmitWorkingSet(ui64 bytes) const noexcept {
+    const ui64 limit = CurrentLimit();
+    return bytes == 0 || (bytes <= limit && Memory_.PayloadUsage() <= limit - bytes);
 }
 
 SHARED_CACHE_TEMPLATE
 bool TSharedCache::CanAdmitPageHandles(TArrayRef<const TSharedCacheHandleRequirement> requirements) noexcept {
     auto cacheOp = BeginOperation();
-    TVector<TCacheItem> allocated;
-    Y_DEFER {
-        for (const TCacheItem item : allocated) {
+    ui64 missing = 0;
+    THashMap<TLogoBlobID, THashSet<ui64>> seen;
+    for (const auto& requirement : requirements) {
+        TCacheItem item;
+        TCollectionCacheItem collection;
+        if (cacheOp.Find(TSharedCacheKey::Collection(requirement.CollectionId), item) !=
+            ESharedCacheResultStatus::Miss) {
             const THandleState state =
-                THandleState::FromRaw(cacheOp.Handles()[item.Index()].State.load(std::memory_order_relaxed));
-            cacheOp.DiscardCandidate(item, state.Kind(), 0);
-        }
-    };
-    const auto countMissing = [&](ui64& count) {
-        count = 0;
-        THashMap<TLogoBlobID, THashSet<ui64>> seen;
-        for (const auto& requirement : requirements) {
-            TCacheItem item;
-            TCollectionCacheItem collection;
-            if (cacheOp.Find(TSharedCacheKey::Collection(requirement.CollectionId), item) !=
-                ESharedCacheResultStatus::Miss) {
-                const THandleState state =
-                    THandleState::FromRaw(cacheOp.Handles()[item.Index()].State.load(std::memory_order_acquire));
-                if (!item.Matches(state) || !state.IsCollectionKind() || !state.IsReady()) {
-                    return false;
-                }
-                collection = TCollectionCacheItem::FromValidated(item);
-            }
-            auto [it, first] = seen.try_emplace(requirement.CollectionId);
-            count += first && !collection;
-            for (const auto& location : requirement.Pages) {
-                const ui64 offset = static_cast<ui64>(location.Offset);
-                if (!it->second.insert(offset).second) {
-                    continue;
-                }
-                TCacheItem present;
-                count += !collection || cacheOp.Find(TSharedCacheKey::Page(collection, offset), present) ==
-                                            ESharedCacheResultStatus::Miss;
-            }
-        }
-        return true;
-    };
-    for (;;) {
-        ui64 missing = 0;
-        if (!countMissing(missing)) {
-            return false;
-        }
-        if (missing <= allocated.size()) {
-            return true;
-        }
-        while (allocated.size() < missing) {
-            const TCacheItem item = cacheOp.Allocate();
-            if (item.IsNull()) {
+                THandleState::FromRaw(cacheOp.Handles()[item.Index()].State.load(std::memory_order_acquire));
+            if (!item.Matches(state) || !state.IsCollectionKind() || !state.IsReady()) {
                 return false;
             }
-            allocated.push_back(item);
+            collection = TCollectionCacheItem::FromValidated(item);
         }
-        // Cooperative reclamation may have evicted another required page; include it before reporting readiness.
+        auto [it, first] = seen.try_emplace(requirement.CollectionId);
+        missing += first && !collection;
+        for (const auto& location : requirement.Pages) {
+            const ui64 offset = static_cast<ui64>(location.Offset);
+            if (!it->second.insert(offset).second) {
+                continue;
+            }
+            TCacheItem present;
+            missing += !collection || cacheOp.Find(TSharedCacheKey::Page(collection, offset), present) ==
+                                          ESharedCacheResultStatus::Miss;
+        }
     }
+    const auto& spaceOp = cacheOp.SpaceOperation();
+    const TCacheItem spare = TCacheItem::FromRaw(spaceOp.Hazard().SpareItem.load(std::memory_order_acquire));
+    const bool hasSpare = !spare.IsNull() && spare.Index() < spaceOp.AllocationLimit();
+    return missing <= spaceOp.View().Free().Count() + hasSpare;
 }
 
 SHARED_CACHE_TEMPLATE
@@ -1554,6 +1524,18 @@ SHARED_CACHE_TEMPLATE
 bool TSharedCache::ReclaimCold() noexcept {
     auto cacheOp = BeginOperation();
     return cacheOp.Eviction().ReclaimCold();
+}
+
+SHARED_CACHE_TEMPLATE
+bool TSharedCache::ReclaimForAdmission(ui64 bytes) noexcept {
+    auto cacheOp = BeginOperation();
+    bool progress = cacheOp.Eviction().ReclaimCold() || cacheOp.Eviction().ReclaimKeepCold();
+    if (!progress) {
+        progress = cacheOp.Eviction().EnforceCurrentLimit(bytes, true);
+        progress = DrainHotResize() || progress;
+        progress = cacheOp.Eviction().ReclaimCold() || progress;
+    }
+    return progress;
 }
 
 SHARED_CACHE_TEMPLATE
