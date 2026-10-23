@@ -2040,6 +2040,117 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         CheckHotResizeAdmissionNotification(false);
     }
 
+    enum class ECollectionPublication {
+        Ready,
+        Attach,
+        Detach,
+    };
+
+    void CheckCollectionAdmissionNotification(ECollectionPublication publication, bool armBeforePublication) {
+        struct TObservation {
+            TTestSharedCache* Cache = nullptr;
+            TCollectionCacheItem Item;
+            TLogoBlobID Id;
+            bool Attached = true;
+            ui32 Notifications = 0;
+            bool Published = true;
+        } observation;
+
+        TFixture fixture;
+        const TLogoBlobID id(205, 206, 1);
+        const TCollectionLocation location{ .Id = id, .BackingSize = 0 };
+        TCollectionCacheItem item;
+        TTestSharedCacheCollectionRef held;
+        UNIT_ASSERT(fixture.Cache->FindOrInsert(location, item, held) == ESharedCacheResultStatus::Inserted);
+        if (publication != ECollectionPublication::Ready) {
+            UNIT_ASSERT(fixture.Cache->MakeReady(item, MakeCollection(id)));
+            UNIT_ASSERT(fixture.Cache->Find(id, held) == ESharedCacheResultStatus::Hit);
+            if (publication == ECollectionPublication::Attach) {
+                UNIT_ASSERT(fixture.Cache->DetachCollection(item));
+            }
+        } else {
+            TCollectionCacheItem pending;
+            UNIT_ASSERT(fixture.Cache->FindOrInsert(location, pending, held) == ESharedCacheResultStatus::Pending);
+        }
+        observation.Cache = fixture.Cache.Get();
+        observation.Item = item;
+        observation.Id = id;
+        observation.Attached = publication != ECollectionPublication::Detach;
+        TTestTraits hooks{ &observation,
+            [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                if (point != ESharedCacheHookPoint::ResourcesAvailable) {
+                    return;
+                }
+                auto& observation = *static_cast<TObservation*>(context);
+                ++observation.Notifications;
+                const auto state = TSharedCacheTestAccess::HandleState(*observation.Cache, observation.Item.Index());
+                const bool stable =
+                    state.IsReady() && (observation.Attached ? state.IsStickyField() : state.IsStickyNoneField());
+                TTestSharedCacheCollectionRef found;
+                observation.Published &=
+                    stable && observation.Cache->Find(observation.Id, found) == ESharedCacheResultStatus::Hit &&
+                    found.CacheItem() == observation.Item;
+            } };
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        if (armBeforePublication) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        switch (publication) {
+            case ECollectionPublication::Ready:
+                UNIT_ASSERT(fixture.Cache->MakeReady(item, MakeCollection(id)));
+                break;
+            case ECollectionPublication::Attach: {
+                TCollectionCacheItem inserted;
+                TTestSharedCacheCollectionRef hit;
+                UNIT_ASSERT(fixture.Cache->FindOrInsert(location, inserted, hit) == ESharedCacheResultStatus::Hit);
+                break;
+            }
+            case ECollectionPublication::Detach:
+                UNIT_ASSERT(fixture.Cache->DetachCollection(item));
+                break;
+        }
+        UNIT_ASSERT(fixture.Cache->AdmissionGeneration() > generation);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? 1 : 0);
+        if (!armBeforePublication) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT(observation.Published);
+
+        const ui64 stableGeneration = fixture.Cache->AdmissionGeneration();
+        fixture.Cache->ArmResourceWait(stableGeneration);
+        if (publication == ECollectionPublication::Detach) {
+            UNIT_ASSERT(!fixture.Cache->DetachCollection(item));
+        } else {
+            TCollectionCacheItem inserted;
+            TTestSharedCacheCollectionRef hit;
+            UNIT_ASSERT(fixture.Cache->FindOrInsert(location, inserted, hit) == ESharedCacheResultStatus::Hit);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), stableGeneration);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        fixture.Cache->DisarmResourceWait();
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+    }
+
+    Y_UNIT_TEST(CollectionReadinessNotifiesAdmissionWaiter) {
+        for (bool armed : { false, true }) {
+            CheckCollectionAdmissionNotification(ECollectionPublication::Ready, armed);
+        }
+    }
+
+    Y_UNIT_TEST(CollectionAttachmentNotifiesAdmissionWaiter) {
+        for (bool armed : { false, true }) {
+            CheckCollectionAdmissionNotification(ECollectionPublication::Attach, armed);
+        }
+    }
+
+    Y_UNIT_TEST(CollectionDetachmentNotifiesAdmissionWaiter) {
+        for (bool armed : { false, true }) {
+            CheckCollectionAdmissionNotification(ECollectionPublication::Detach, armed);
+        }
+    }
+
     void CheckShutdownResourceNotification(bool sticky) {
         ui32 notifications = 0;
         TFixture fixture;
