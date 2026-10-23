@@ -1038,7 +1038,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         bool progress = true;
         for (ui32 step = 0;; ++step) {
             // Recheck both snapshots: reclamation can evict a required resident page
-            if (Cache->CanAllocateHandles(requirements) && Cache->CanReserve(bytes)) {
+            const bool handlesReady = Cache->CanAllocateHandles(requirements);
+            if (handlesReady && Cache->CanReserve(bytes)) {
                 return true;
             }
             if (!progress) {
@@ -1048,7 +1049,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 Send(SelfId(), new TEvResourcesAvailable);
                 return false;
             }
-            progress = Cache->ReclaimForAdmission(bytes);
+            progress = (!handlesReady && Cache->ReclaimSpareHandle()) || Cache->ReclaimForAdmission(bytes);
         }
     }
 

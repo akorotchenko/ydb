@@ -200,6 +200,7 @@ public:
         TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept;
 
     bool ReclaimCold() noexcept;
+    bool ReclaimSpareHandle() noexcept;
     bool ReclaimForAdmission(ui64 bytes) noexcept;
 
     bool UpdateCurrentLimit(ui64 limit) noexcept;

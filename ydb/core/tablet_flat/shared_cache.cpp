@@ -1527,6 +1527,16 @@ bool TSharedCache::ReclaimCold() noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
+bool TSharedCache::ReclaimSpareHandle() noexcept {
+    auto cacheOp = BeginOperation();
+    if (!cacheOp.SpaceOperation().ReclaimSpareHandle()) {
+        return false;
+    }
+    NotifyResourcesAvailable();
+    return true;
+}
+
+SHARED_CACHE_TEMPLATE
 bool TSharedCache::ReclaimForAdmission(ui64 bytes) noexcept {
     auto cacheOp = BeginOperation();
     bool progress = cacheOp.Eviction().ReclaimCold() || cacheOp.Eviction().ReclaimKeepCold();

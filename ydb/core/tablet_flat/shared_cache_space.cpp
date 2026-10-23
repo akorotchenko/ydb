@@ -281,6 +281,31 @@ ui32 TSpaceOperation::TryAllocateHandle() noexcept {
     return View().Space->TryAllocateHandleImpl<false>(*this, {});
 }
 
+bool TSpaceOperation::ReclaimSpareHandle() noexcept {
+    return View().Space->ReclaimSpareHandle(*this);
+}
+
+bool TSharedCacheSpace::ReclaimSpareHandle(TSpaceOperation& spaceOp) noexcept {
+    for (TSpaceHazard* hazard : Hazards_) {
+        ui64 raw = hazard->SpareItem.load(std::memory_order_acquire);
+        const TCacheItem cacheItem = TCacheItem::FromRaw(raw);
+        if (cacheItem.IsNull() || cacheItem.Index() >= spaceOp.AccessibleHandleCount()) {
+            continue;
+        }
+        if (!hazard->SpareItem.compare_exchange_strong(raw, 0, std::memory_order_acquire, std::memory_order_relaxed)) {
+            continue;
+        }
+        THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+        const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+        Y_DEBUG_ABORT_UNLESS(!cacheItem.IsFrozen() && cacheItem.Index() >= 2 && cacheItem.Matches(state) &&
+                             state.IsBegin() && state.Refs() == 0);
+        handle.State.store(state.WithState(EHandleState::Free).Raw(), std::memory_order_release);
+        Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(cacheItem.Index(), cacheItem.Version()));
+        return true;
+    }
+    return false;
+}
+
 template <bool WithHook>
 Y_FORCE_INLINE ui32 TSharedCacheSpace::TryAllocateHandleImpl(
     TSpaceOperation& spaceOp, TFreeExchangeHook hook) noexcept {

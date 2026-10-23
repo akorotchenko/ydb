@@ -637,6 +637,8 @@ public:
 
     ui32 TryAllocateHandle() noexcept;
 
+    bool ReclaimSpareHandle() noexcept;
+
     bool ReturnFreeHandle(ui32 index, ui32 version) noexcept;
 
     Y_FORCE_INLINE bool TryStoreSpareItem(TCacheItem cacheItem) noexcept {
@@ -993,6 +995,8 @@ private:
     bool TryReleaseTransitionWithHook(TTransition& transition, TReleaseHook hook) noexcept;
 
     bool AdvanceSpaceGeneration() noexcept;
+
+    bool ReclaimSpareHandle(TSpaceOperation& spaceOp) noexcept;
 
     template <bool WithHook>
     Y_FORCE_INLINE ui32 TryAllocateHandleImpl(TSpaceOperation& spaceOp, TFreeExchangeHook hook) noexcept;
