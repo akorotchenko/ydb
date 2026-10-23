@@ -281,6 +281,14 @@ ui32 TSpaceOperation::TryAllocateHandle() noexcept {
     return View().Space->TryAllocateHandleImpl<false>(*this, {});
 }
 
+void TSpaceOperation::NotifyHazardDrained(TSpaceHazard& hazard) noexcept {
+    Y_DEBUG_ABORT_UNLESS(hazard.Space);
+    const auto& notify = hazard.Space->HazardDrainNotify_;
+    if (notify.Function) {
+        notify.Function(notify.Context);
+    }
+}
+
 bool TSpaceOperation::ReclaimSpareHandle() noexcept {
     return View().Space->ReclaimSpareHandle(*this);
 }

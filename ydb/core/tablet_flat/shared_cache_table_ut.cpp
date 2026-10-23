@@ -3405,6 +3405,160 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, shrink));
     }
 
+    void CheckGuardDrainNotification(bool finalDrain, bool armBeforeDrain, bool nested) {
+        struct TObservation {
+            TTestSharedCache* Cache = nullptr;
+            TSpaceHazard* Hazard = nullptr;
+            ui64 PublishedGeneration = 0;
+            ui32 Notifications = 0;
+            bool Cleared = true;
+            bool CurrentView = true;
+        } observation;
+
+        TFixture fixture(5, 1, 6);
+        TTransition growth;
+        Y_DEFER {
+            TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+            fixture.Cache->DisarmResourceWait();
+        };
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        if (finalDrain) {
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, fixture.ReservedCapacity.AddressBits));
+            CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        }
+        observation.Cache = fixture.Cache.Get();
+        observation.Hazard = TlsCacheHazard;
+        TTestTraits hooks{ &observation, [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                              if (point != ESharedCacheHookPoint::ResourcesAvailable) {
+                                  return;
+                              }
+                              auto& observation = *static_cast<TObservation*>(context);
+                              ++observation.Notifications;
+                              observation.Cleared &= observation.Hazard->State.load(std::memory_order_acquire) == 0;
+                              auto cacheOp = observation.Cache->BeginOperation();
+                              observation.CurrentView &=
+                                  cacheOp.SpaceOperation().EntryGeneration() == observation.PublishedGeneration;
+                          } };
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
+        ui64 generation = 0;
+        {
+            auto original = fixture.Cache->BeginOperation();
+            auto moved = std::move(original);
+            if (finalDrain) {
+                UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, growth));
+            } else {
+                UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+            }
+            observation.PublishedGeneration = TSharedCacheTestAccess::CurrentSpaceState(*fixture.Space).Generation();
+            UNIT_ASSERT(moved.SpaceOperation().EntryGeneration() != observation.PublishedGeneration);
+            generation = fixture.Cache->AdmissionGeneration();
+            if (armBeforeDrain) {
+                fixture.Cache->ArmResourceWait(generation);
+            }
+            if (nested) {
+                auto inner = fixture.Cache->BeginOperation();
+                UNIT_ASSERT(!TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+                UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(observation.Hazard->State.load()), 2);
+            } else {
+                UNIT_ASSERT(!TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+            }
+            const ui64 state = observation.Hazard->State.load(std::memory_order_acquire);
+            UNIT_ASSERT(state & SpaceHazardDrainWaiter);
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(state), 1);
+            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 0);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(observation.Hazard->State.load(std::memory_order_acquire), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeDrain ? 1 : 0);
+        if (!armBeforeDrain) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT(observation.Cleared && observation.CurrentView);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+        fixture.Cache->DisarmResourceWait();
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        if (!finalDrain) {
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, fixture.ReservedCapacity.AddressBits));
+            CompleteBucketResize(*fixture.Cache, *fixture.Space);
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, growth));
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, growth));
+    }
+
+    Y_UNIT_TEST(MigrationGuardDrainNotifiesAdmissionWaiter) {
+        for (bool armed : { false, true }) {
+            CheckGuardDrainNotification(false, armed, false);
+        }
+    }
+
+    Y_UNIT_TEST(FinalGuardDrainNotifiesAdmissionWaiter) {
+        for (bool armed : { false, true }) {
+            CheckGuardDrainNotification(true, armed, false);
+        }
+    }
+
+    Y_UNIT_TEST(NestedMovedGuardDrainNotifiesOnlyAfterLastExit) {
+        for (bool finalDrain : { false, true }) {
+            CheckGuardDrainNotification(finalDrain, true, true);
+        }
+    }
+
+    void CheckQuietGuardExit(bool currentGeneration) {
+        ui32 notifications = 0;
+        TFixture fixture(5, 1, 6);
+        TTransition growth;
+        Y_DEFER {
+            TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+            fixture.Cache->DisarmResourceWait();
+        };
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        TTestTraits hooks{ &notifications, [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                              if (point == ESharedCacheHookPoint::ResourcesAvailable) {
+                                  ++*static_cast<ui32*>(context);
+                              }
+                          } };
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        fixture.Cache->ArmResourceWait(generation);
+        if (currentGeneration) {
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+            auto guard = fixture.Cache->BeginOperation();
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+            UNIT_ASSERT(!(TlsCacheHazard->State.load() & SpaceHazardDrainWaiter));
+        } else {
+            {
+                auto guard = fixture.Cache->BeginOperation();
+                UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+            }
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        }
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+        fixture.Cache->DisarmResourceWait();
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, fixture.ReservedCapacity.AddressBits));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        CommitTransition(*fixture.Cache, growth);
+    }
+
+    Y_UNIT_TEST(UnregisteredGuardExitDoesNotNotify) {
+        CheckQuietGuardExit(false);
+    }
+
+    Y_UNIT_TEST(CurrentGenerationGuardExitDoesNotNotify) {
+        CheckQuietGuardExit(true);
+    }
+
     Y_UNIT_TEST(ReviewR15DuplicateBatchNeedsOneHandle) {
         TFixture fixture;
         const TLogoBlobID id(83, 84, 124);

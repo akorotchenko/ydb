@@ -414,12 +414,14 @@ enum class EHotResizePhase {
     Cut,
 };
 
+struct TCacheNotify {
+    void* Context = nullptr;
+    void (*Function)(void*) noexcept = nullptr;
+};
+
 class THotResize {
 public:
-    struct TNotify {
-        void* Context = nullptr;
-        void (*Function)(void*) noexcept = nullptr;
-    };
+    using TNotify = TCacheNotify;
 
     THotResize() noexcept = default;
 
@@ -663,7 +665,7 @@ private:
             TSpaceState entryState = TSpaceState::FromRaw(spaceState.load(std::memory_order_acquire));
             ui64 hazardState = hazard.State.load(std::memory_order_relaxed);
             const ui32 activeCount = SpaceHazardActiveCount(hazardState);
-            Y_DEBUG_ABORT_UNLESS(activeCount != Max<ui32>());
+            Y_DEBUG_ABORT_UNLESS(activeCount != MaxSpaceHazardActiveCount);
 
             if (activeCount != 0) {
                 if (!hazard.State.compare_exchange_weak(
@@ -703,10 +705,15 @@ private:
             if (hazard.State.compare_exchange_weak(
                     state, desired, std::memory_order_release, std::memory_order_relaxed))
             {
+                if (Y_UNLIKELY(activeCount == 1 && (state & SpaceHazardDrainWaiter))) {
+                    NotifyHazardDrained(hazard);
+                }
                 return;
             }
         }
     }
+
+    static void NotifyHazardDrained(TSpaceHazard& hazard) noexcept;
 
     static constexpr ui64 PackHazardState(ui64 generation, ui32 activeCount) noexcept {
         return (generation << 32) | activeCount;
@@ -731,7 +738,7 @@ inline constexpr ui64 SpaceHazardGeneration(ui64 state) noexcept {
 }
 
 inline constexpr ui32 SpaceHazardActiveCount(ui64 state) noexcept {
-    return static_cast<ui32>(state);
+    return static_cast<ui32>(state) & MaxSpaceHazardActiveCount;
 }
 
 inline constexpr bool SpaceHazardIsActive(ui64 state) noexcept {
@@ -1061,6 +1068,7 @@ private:
     THolder<TS5FifoRings> S5FifoRings_;
     THolder<TFreeRingCursor> FreeRingCursor_;
     TVector<TSpaceHazard*> Hazards_;
+    TCacheNotify HazardDrainNotify_;
 
     ui32 HazardCount_ = 0;
     ui32 HazardSlotCount_ = 1;

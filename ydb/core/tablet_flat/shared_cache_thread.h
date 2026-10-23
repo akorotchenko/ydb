@@ -17,22 +17,20 @@ struct TTestTraits;
 template <class TTraits>
 class TSharedCacheImpl;
 
+inline constexpr ui64 SpaceHazardDrainWaiter = ui64{ 1 } << 31;
+inline constexpr ui32 MaxSpaceHazardActiveCount = static_cast<ui32>(SpaceHazardDrainWaiter - 1);
+
 struct alignas(64) TSpaceHazard {
-    std::atomic<ui64> State{ 0 }; // {generation:32, active-count:32}
+    std::atomic<ui64> State{ 0 }; // {generation:32, drain-waiter:1, active-count:31}
     std::atomic<ui64> SpareItem{ 0 };
     TSharedCacheImpl<TTestTraits>* TestCache = nullptr;
-#ifndef NDEBUG
     const TSharedCacheSpace* Space = nullptr;
-#endif
 };
 
-inline void SetHazardSpace(
-    [[maybe_unused]] TConstArrayRef<TSpaceHazard*> hazards, [[maybe_unused]] const TSharedCacheSpace* space) noexcept {
-#ifndef NDEBUG
+inline void SetHazardSpace(TConstArrayRef<TSpaceHazard*> hazards, const TSharedCacheSpace* space) noexcept {
     for (TSpaceHazard* hazard : hazards) {
         hazard->Space = space;
     }
-#endif
 }
 
 static_assert(sizeof(TSpaceHazard) == 64);
