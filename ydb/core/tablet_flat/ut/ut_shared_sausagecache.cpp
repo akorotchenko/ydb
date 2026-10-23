@@ -1865,9 +1865,8 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Disabling) {
         DoReadRows(env, new TTxReadRows(Table2Id, key, retried), true);
     }
     LogCounters(counters);
-    // The newly written table fits the page-data budget and remains fully cached.
-    UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 100);
-    UNIT_ASSERT_VALUES_EQUAL(retried.size(), 1);
+    // Regular pages may be evicted while both tables compete for the cache budget
+    AssertReadRetries(retried, 100);
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->ActiveInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));

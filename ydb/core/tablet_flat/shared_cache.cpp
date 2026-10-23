@@ -1469,7 +1469,7 @@ bool TSharedCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) 
                 return false;
             }
             ++reclamationAttempts;
-            InvokeHook(ESharedCacheHookPoint::AfterAdmissionReclaimStep, {});
+            InvokeHook(ESharedCacheHookPoint::AfterAdmissionReclaimStep, TCacheItem{});
             usage = Memory_.PayloadUsage();
             continue;
         }

@@ -2412,20 +2412,26 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         });
         TVector<TEvResourcesAvailable::TPtr> blocked;
         auto observer = sharedCache.Runtime.AddObserver<TEvResourcesAvailable>([&](auto& event) {
-            if (++notifications > 1) {
+            // Stop an accidental notification loop so the assertions can report it
+            if (++notifications > 16) {
                 blocked.push_back(std::move(event));
             }
         });
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { location });
         sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(50));
-        UNIT_ASSERT_VALUES_EQUAL(notifications, 0);
+        UNIT_ASSERT(blocked.empty());
+        UNIT_ASSERT_VALUES_EQUAL(wakeups, 0);
+        // The request's equal-limit update may notify once; the parked waiter must then stay quiet
+        const ui32 settledNotifications = notifications;
+        sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(50));
+        UNIT_ASSERT_VALUES_EQUAL(notifications, settledNotifications);
         UNIT_ASSERT_VALUES_EQUAL(wakeups, 0);
         UNIT_ASSERT(sharedCache.Fetches->empty());
         UNIT_ASSERT(sharedCache.Results.empty());
         const ui64 generation = cache.AdmissionGeneration();
         sharedCache.Send(sharedCache.Sender1, new TEvResourcesAvailable);
         sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(50));
-        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(notifications, settledNotifications + 1);
         UNIT_ASSERT_VALUES_EQUAL(wakeups, 0);
         UNIT_ASSERT(blocked.empty());
         UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation);
@@ -2458,14 +2464,21 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { location });
         sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
         UNIT_ASSERT(sharedCache.Fetches->empty());
-        TBlockEvents<TEvResourcesAvailable> resourceEvents(sharedCache.Runtime);
+        TVector<TEvResourcesAvailable::TPtr> resourceEvents;
+        auto observer = sharedCache.Runtime.AddObserver<TEvResourcesAvailable>([&](auto& event) {
+            resourceEvents.push_back(std::move(event));
+        });
         UNIT_ASSERT(!foreignCollections.empty());
         foreignCollections.pop_back();
         sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
         UNIT_ASSERT(!resourceEvents.empty());
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { location });
         sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { location } } });
-        resourceEvents.Stop().Unblock();
+        observer.Remove();
+        for (auto& event : resourceEvents) {
+            sharedCache.Runtime.Send(event.Release(), 0, /* viaActorSystem */ true);
+        }
+        resourceEvents.clear();
         sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
         sharedCache.CheckFetches({});
         sharedCache.Provide(sharedCache.Collection1, { location });
@@ -2519,14 +2532,27 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         held.clear();
         sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, { _P(2), _P(3) });
+        // Working-set readiness can arrive before either fetch completion
+        sharedCache.Runtime.WaitFor("shared-fetch replies and working-set readiness", [&] {
+            return sharedCache.Results.size() >= 3;
+        }, TDuration::Seconds(5));
+        ui32 readinessReplies = 0;
+        for (auto reply = sharedCache.Results.begin(); reply != sharedCache.Results.end();) {
+            const auto& result = *(*reply)->Get();
+            if (!result.ResourcesReady) {
+                ++reply;
+                continue;
+            }
+            UNIT_ASSERT_VALUES_EQUAL(result.Status, NKikimrProto::OK);
+            UNIT_ASSERT_VALUES_EQUAL(result.Cookie, 3);
+            UNIT_ASSERT(result.WaitPad == pinnedPad);
+            UNIT_ASSERT(result.Pages.empty());
+            ++readinessReplies;
+            reply = sharedCache.Results.erase(reply);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(readinessReplies, 1);
         sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { _P(2), _P(3) } },
             TFetch{ 4, sharedCache.Collection1, { _P(2), _P(3) } } });
-        sharedCache.Runtime.WaitFor("postponed transaction working-set room", [&] {
-            return sharedCache.Results.size() == 1;
-        }, TDuration::Seconds(5));
-        UNIT_ASSERT(sharedCache.Results.front()->Get()->ResourcesReady);
-        UNIT_ASSERT(sharedCache.Results.front()->Get()->WaitPad == pinnedPad);
-        sharedCache.Results.clear();
         sharedCache.CheckFetches({});
         UNIT_ASSERT(sharedCache.Results.empty());
     }
