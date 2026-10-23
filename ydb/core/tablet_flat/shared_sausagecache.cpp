@@ -227,7 +227,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (locations.size() > 1) {
             const TSharedCacheHandleRequirement requirement{ collection.Id(), locations };
             // Independent residency can leave less room than the configured ceilings
-            if (!Cache->CanAdmitWorkingSet(bytes) || !Cache->CanAdmitPageHandles({ &requirement, 1 })) {
+            if (!Cache->CanReserve(bytes) || !Cache->CanAllocateHandles({ &requirement, 1 })) {
                 locations.resize(1);
             }
         }
@@ -1038,7 +1038,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         bool progress = true;
         for (ui32 step = 0;; ++step) {
             // Recheck both snapshots: reclamation can evict a required resident page
-            if (Cache->CanAdmitPageHandles(requirements) && Cache->CanAdmitWorkingSet(bytes)) {
+            if (Cache->CanAllocateHandles(requirements) && Cache->CanReserve(bytes)) {
                 return true;
             }
             if (!progress) {

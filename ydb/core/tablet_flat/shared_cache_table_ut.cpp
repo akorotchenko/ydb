@@ -2752,7 +2752,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const std::array retained{ main.CacheItem(), foreign.CacheItem() };
         const ui64 before = fixture.Cache->PayloadUsage();
         UNIT_ASSERT(!fixture.Cache->WorkingSetExceedsCapacity({ &retained[0], 1 }, { &requirement, 1 }));
-        UNIT_ASSERT(!fixture.Cache->CanAdmitWorkingSet(pageBytes));
+        UNIT_ASSERT(!fixture.Cache->CanReserve(pageBytes));
         UNIT_ASSERT(!fixture.Cache->WorkingSetExceedsCapacity(retained, { &requirement, 1 }));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), before);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
@@ -2829,7 +2829,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                                   ++observation.Notifications;
                                   observation.Published &=
                                       observation.Cache->ReservedBytes() == 0 &&
-                                      observation.Cache->CanAdmitPageHandles({ &observation.Requirement, 1 });
+                                      observation.Cache->CanAllocateHandles({ &observation.Requirement, 1 });
                                   const auto candidate = AllocateCollection(*observation.Cache,
                                       TSharedCacheKey::Collection(observation.Requirement.CollectionId));
                                   observation.Published &= static_cast<bool>(candidate);
@@ -2914,8 +2914,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TSharedCacheHandleRequirement one{ id, {} };
         const TSharedCacheHandleRequirement two{ id, locations };
         for (ui32 attempt = 0; attempt < 3; ++attempt) {
-            UNIT_ASSERT(fixture.Cache->CanAdmitPageHandles({ &one, 1 }));
-            UNIT_ASSERT(!fixture.Cache->CanAdmitPageHandles({ &two, 1 }));
+            UNIT_ASSERT(fixture.Cache->CanAllocateHandles({ &one, 1 }));
+            UNIT_ASSERT(!fixture.Cache->CanAllocateHandles({ &two, 1 }));
             UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), 1);
             UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::FreeCount(*fixture.Cache), 0);
             UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::SpareItem(*fixture.Cache, 0), spare);
@@ -2950,10 +2950,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             fixture.Cache->DisarmResourceWait();
         };
         for (ui32 attempt = 0; attempt < 3; ++attempt) {
-            UNIT_ASSERT(fixture.Cache->CanAdmitWorkingSet(0));
-            UNIT_ASSERT(fixture.Cache->CanAdmitWorkingSet(bytes));
-            UNIT_ASSERT(!fixture.Cache->CanAdmitWorkingSet(bytes + 1));
-            UNIT_ASSERT(!fixture.Cache->CanAdmitWorkingSet(Max<ui64>()));
+            UNIT_ASSERT(fixture.Cache->CanReserve(0));
+            UNIT_ASSERT(fixture.Cache->CanReserve(bytes));
+            UNIT_ASSERT(!fixture.Cache->CanReserve(bytes + 1));
+            UNIT_ASSERT(!fixture.Cache->CanReserve(Max<ui64>()));
             UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), bytes);
             UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), overall);
             UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
@@ -2964,7 +2964,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT_VALUES_EQUAL(notifications, 0);
         }
         UNIT_ASSERT(fixture.Cache->ReclaimForAdmission(bytes + 1));
-        UNIT_ASSERT(fixture.Cache->CanAdmitWorkingSet(bytes + 1));
+        UNIT_ASSERT(fixture.Cache->CanReserve(bytes + 1));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedPages(), 0);
@@ -2989,10 +2989,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         }
         const TSharedCacheHandleRequirement requirement{ TLogoBlobID(219, 220, 1), {} };
         UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), 0);
-        UNIT_ASSERT(!fixture.Cache->CanAdmitPageHandles({ &requirement, 1 }));
+        UNIT_ASSERT(!fixture.Cache->CanAllocateHandles({ &requirement, 1 }));
         UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsHot());
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Frequency(), 2);
-        for (ui32 step = 0; !fixture.Cache->CanAdmitPageHandles({ &requirement, 1 }); ++step) {
+        for (ui32 step = 0; !fixture.Cache->CanAllocateHandles({ &requirement, 1 }); ++step) {
             UNIT_ASSERT(step < SharedCacheTransitionWorkBatch);
             UNIT_ASSERT(fixture.Cache->ReclaimForAdmission(0));
         }
@@ -3019,7 +3019,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const std::array locations{ MakePageLocation(1), MakePageLocation(2) };
         const TSharedCacheHandleRequirement requirement{ id, locations };
         const ui64 bytesBefore = fixture.Cache->PayloadUsage();
-        UNIT_ASSERT(!fixture.Cache->CanAdmitPageHandles({ &requirement, 1 }));
+        UNIT_ASSERT(!fixture.Cache->CanAllocateHandles({ &requirement, 1 }));
         UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), 1);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), bytesBefore);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
@@ -3035,7 +3035,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(requests[1].Status() == ESharedCacheResultStatus::Pending);
         UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), 0);
         const TSharedCacheHandleRequirement pending{ id, { &locations[0], 1 } };
-        UNIT_ASSERT(fixture.Cache->CanAdmitPageHandles({ &pending, 1 }));
+        UNIT_ASSERT(fixture.Cache->CanAllocateHandles({ &pending, 1 }));
         UNIT_ASSERT(requests[0].Fetch().MakeReady(MakePageData(1)));
         UNIT_ASSERT_VALUES_EQUAL(ready.load(), 2);
         UNIT_ASSERT_VALUES_EQUAL(completed.load(), 2);
