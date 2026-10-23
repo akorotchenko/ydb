@@ -1055,7 +1055,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             }
             return;
         }
-        const ui64 generation = Cache->ResourceGeneration();
+        const ui64 generation = Cache->AdmissionGeneration();
         const size_t count = ResourceWaits.size();
         // Demand promotion during admission can remove another waiting entry
         for (size_t index = 0; index < count && !ResourceWaits.empty(); ++index) {
