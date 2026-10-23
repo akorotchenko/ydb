@@ -91,6 +91,13 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
     , Eviction_(*this)
     , Capacity_(*this)
     , Fetches_(*this)
+    , HotResize_({
+          .Context = this,
+          .Function =
+              [](void* context) noexcept {
+                  static_cast<TSharedCache*>(context)->NotifyResourcesAvailable();
+              },
+      })
 {
     if constexpr (std::is_same_v<TTraits, TTestTraits>) {
         for (TSpaceHazard* hazard : Space_->Hazards_) {

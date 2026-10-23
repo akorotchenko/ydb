@@ -1999,6 +1999,50 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(pagesReleasedBeforeCollection);
     }
 
+    void CheckHotResizeAdmissionNotification(bool armBeforeUnlock) {
+        ui32 notifications = 0;
+        TFixture fixture;
+        TTestTraits hooks{ &notifications, [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                              if (point == ESharedCacheHookPoint::ResourcesAvailable) {
+                                  ++*static_cast<ui32*>(context);
+                              }
+                          } };
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        auto owner = TSharedCacheTestAccess::LockHotResize(*fixture.Cache);
+        UNIT_ASSERT(owner);
+        UNIT_ASSERT(!TSharedCacheTestAccess::LockHotResize(*fixture.Cache));
+        UNIT_ASSERT(!TSharedCacheTestAccess::LockHotResize(*fixture.Cache));
+        if (armBeforeUnlock) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 0);
+        owner = {};
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT_VALUES_EQUAL(notifications, armBeforeUnlock ? 1 : 0);
+        if (!armBeforeUnlock) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+
+        fixture.Cache->ArmResourceWait(fixture.Cache->AdmissionGeneration());
+        {
+            auto uncontended = TSharedCacheTestAccess::LockHotResize(*fixture.Cache);
+            UNIT_ASSERT(uncontended);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        fixture.Cache->DisarmResourceWait();
+    }
+
+    Y_UNIT_TEST(HotResizeUnlockNotifiesArmedAdmissionWaiter) {
+        CheckHotResizeAdmissionNotification(true);
+    }
+
+    Y_UNIT_TEST(HotResizeUnlockBeforeAdmissionArmDoesNotLoseWakeup) {
+        CheckHotResizeAdmissionNotification(false);
+    }
+
     void CheckShutdownResourceNotification(bool sticky) {
         ui32 notifications = 0;
         TFixture fixture;
