@@ -797,14 +797,14 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         }
         UNIT_ASSERT(core->Find(sharedCache.Collection1->Label(), collection) == ESharedCacheResultStatus::Hit);
         collection.Drop();
-        UNIT_ASSERT(!core->DeleteCollection(item)); // The surviving owner's registry attachment is still active.
+        UNIT_ASSERT(!core->EraseCollection(item)); // The surviving owner's registry attachment is still active.
 
         if (unregister) {
             sharedCache.Unregister(sharedCache.Sender2);
         } else {
             sharedCache.Detach(sharedCache.Sender2, sharedCache.Collection1);
         }
-        UNIT_ASSERT(core->DeleteCollection(item));
+        UNIT_ASSERT(core->EraseCollection(item));
         // No owner ref was leaked by the repeated attach or released twice by duplicate cleanup.
         UNIT_ASSERT_VALUES_EQUAL(core->Collections(), 0);
     }
@@ -1250,7 +1250,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
                     ++reclaimed;
                 }
             });
-            UNIT_ASSERT(core.DeleteCollection(item));
+            UNIT_ASSERT(core.EraseCollection(item));
             UNIT_ASSERT_VALUES_EQUAL(core.Collections(), 1); // The held metadata ref still protects its payload.
             collection.Drop();
             sharedCache.Runtime.WaitFor("saved collection reclaimed", [&] {
@@ -1636,7 +1636,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Detach(sharedCache.Sender1, sharedCache.Collection1);
         auto* core = &NSharedCache::TSharedCache::Get();
         {
-            UNIT_ASSERT(core->DeleteCollection(oldItem));
+            UNIT_ASSERT(core->EraseCollection(oldItem));
         }
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory, {}, true);
         sharedCache.Runtime.WaitFor("new core attach", [&] {

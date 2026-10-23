@@ -11,6 +11,7 @@
 #include "shared_cache_table.h"
 
 #include <util/generic/function_ref.h>
+#include <util/generic/size_literals.h>
 
 #include <new>
 #include <type_traits>
@@ -138,7 +139,7 @@ class TCompactedPageWaiter;
 template <class TTraits = TProdTraits>
 class TSharedCacheImpl : public TThrRefBase, private TTraits {
 public:
-    static constexpr ui64 ExpectedPageSize = 7 * 1024;
+    static constexpr ui64 ExpectedPageSize = 7_KB;
 
     static TIntrusivePtr<TSharedCacheImpl> Create(
         THolder<TSharedCacheSpace> space, ui64 hardLimit, TTraits traits = {});
@@ -178,7 +179,7 @@ public:
 
     bool DetachCollection(TCollectionCacheItem collection) noexcept;
 
-    bool DeleteCollection(TCollectionCacheItem collection) noexcept;
+    bool EraseCollection(TCollectionCacheItem collection) noexcept;
 
     bool SetCollectionPagesCacheMode(TCollectionCacheItem collection, ECacheMode mode) noexcept;
     bool SetCollectionSkipBTreeIndexV1Shadow(TCollectionCacheItem collection, bool skip) noexcept;
@@ -202,7 +203,7 @@ public:
 
     bool UpdateCurrentLimit(ui64 limit) noexcept;
     // Max<ui64>() restores the calculated default; zero is an explicit target.
-    bool UpdateSoftLimit(ui64 limit) noexcept;
+    bool UpdateSoftLimitOverride(ui64 limit) noexcept;
     bool UpdateHardLimit(ui64 limit) noexcept;
 
     ui64 ResourceGeneration() const noexcept {
@@ -513,8 +514,7 @@ private:
     void DiscardCandidate(TCacheItem cacheItem, EItemKind kind) noexcept;
 
     bool DetachCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
-    bool DeleteCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept;
-    bool DeleteCollection(TCollectionRegistry* registry, TCollectionCacheItem collection) noexcept;
+    bool EraseCollection(TCollectionRegistry* registry, TCollectionCacheItem collection) noexcept;
 
     bool IsPageSticky(TPageCacheItem page) const noexcept;
     TSharedPageRefImpl<TTraits> AcquireMorePageRef(TCacheItem item) noexcept;

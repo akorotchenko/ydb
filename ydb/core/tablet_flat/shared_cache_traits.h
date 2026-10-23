@@ -13,6 +13,7 @@ enum class ESharedCacheHookPoint {
     BeforeKeepBytesPublished, // Payload is the collection whose contribution is being published.
     AfterPageBatchPrepared, // Payload is the collection after the batch presence checks.
     AfterPageCollectionStateChecked, // Collection, before InitializePage increments its owner count.
+    BeforeInsertOwnerAcquire, // Payload is the insertion predecessor, before acquiring its structural ref.
     AfterInsertPositionFound, // Payload is the link owner, before candidate preparation or publication.
     BeforeTableLinkCas, // Payload is the link owner, may be null.
     AfterTableLinkCas, // Payload is the link owner, may be null.
@@ -42,6 +43,7 @@ enum class ESharedCacheHookPoint {
     AfterStickyPageListDetached, // Payload is the owning collection while the detached list is private.
     AfterStickyPageListHeadPublished, // Payload is the owning collection after its retained list is published.
     AfterFetchWaiterSubscribed, // Payload is the pending page while the subscriber still owns its structural ref.
+    AfterFetchCompletingClaim, // Payload is the page after the last pending releaser claims exclusive finalization.
     BeforeCollectionHotPublished, // Payload is the collection before insertion into a Hot ring.
     BeforePageReplacementRetry, // Source, while a held-page reader waits for its forwarder.
     BeforePageReplacementLinkCas, // Source, after preparing the successor but before freezing the forwarder.

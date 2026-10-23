@@ -76,8 +76,8 @@ public:
             return Collections_.Detach(SpaceOp_, registry, item);
         }
 
-        bool Delete(TCollectionRegistry* expectedRegistry, TCacheItem item) noexcept {
-            return Collections_.Delete(SpaceOp_, expectedRegistry, item);
+        bool Erase(TCollectionRegistry* expectedRegistry, TCacheItem item) noexcept {
+            return Collections_.Erase(SpaceOp_, expectedRegistry, item);
         }
 
         bool MoveRegistry(TCollectionRegistry& source, TCollectionRegistry& destination, TCacheItem item) noexcept {
@@ -182,7 +182,7 @@ private:
 
     bool TryClaimDeletion(TSpaceOperation& spaceOp, TCollectionRegistry* expectedRegistry, TCacheItem item,
         THandleState& sourceState, TSharedCacheItemRefImpl<TTraits>& owner) noexcept;
-    bool Delete(TSpaceOperation& spaceOp, TCollectionRegistry* expectedRegistry, TCacheItem item) noexcept;
+    bool Erase(TSpaceOperation& spaceOp, TCollectionRegistry* expectedRegistry, TCacheItem item) noexcept;
     bool MoveRegistry(TSpaceOperation& spaceOp, TCollectionRegistry& source, TCollectionRegistry& destination,
         TCacheItem item) noexcept;
 

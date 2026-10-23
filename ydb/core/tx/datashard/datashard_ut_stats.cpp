@@ -579,7 +579,7 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
         const ui64 savedLimit = cache.CurrentLimit();
         Y_DEFER {
             cache.UpdateCurrentLimit(savedLimit);
-            cache.UpdateSoftLimit(Max<ui64>());
+            cache.UpdateSoftLimitOverride(Max<ui64>());
         };
         // Keep the actor's limit stable while the test exercises one-page admission.
         TBlockEvents<NMemory::TEvConsumerLimit> allocations(runtime, [&](const auto& event) {

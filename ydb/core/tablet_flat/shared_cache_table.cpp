@@ -375,6 +375,7 @@ Y_FORCE_INLINE ESharedCacheResultStatus TSharedCacheTable::FindOrInsert(TSpaceOp
 
         TOperationItemRef ownerRef(spaceOp);
         if (!orderedLink.Owner.IsNull()) {
+            Cache_.InvokeHook(ESharedCacheHookPoint::BeforeInsertOwnerAcquire, orderedLink.Owner);
             ownerRef.Get() = TryAcquire(spaceOp, orderedLink.Owner);
             if (!ownerRef) {
                 continue;
