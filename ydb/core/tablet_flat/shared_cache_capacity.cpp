@@ -40,6 +40,7 @@ bool TCacheCapacity<TTraits>::TryDrainTransition(TTransition& transition) noexce
 
 template <class TTraits>
 bool TCacheCapacity<TTraits>::PublishFinalView(TTransition& transition) noexcept {
+    bool published = false;
     if (auto hotResizeGuard = Cache_.HotResize_.TryLock()) {
         if (Cache_.HotResize_.Phase() == EHotResizePhase::Cut) {
             auto spaceOp = Cache_.Space_->BeginOperation();
@@ -48,14 +49,21 @@ bool TCacheCapacity<TTraits>::PublishFinalView(TTransition& transition) noexcept
         if (Cache_.HotResize_.Phase() != EHotResizePhase::Idle) {
             return false;
         }
-        return Cache_.Space_->PublishFinalView(transition);
+        published = Cache_.Space_->PublishFinalView(transition);
     }
-    return false;
+    if (published && transition.TargetConfiguration().HandleCount() > transition.OldConfiguration().HandleCount()) {
+        Cache_.NotifyResourcesAvailable();
+    }
+    return published;
 }
 
 template <class TTraits>
 bool TCacheCapacity<TTraits>::AppendFreeHandles(TTransition& transition) noexcept {
-    return Cache_.Space_->AppendFreeHandles(transition);
+    if (!Cache_.Space_->AppendFreeHandles(transition)) {
+        return false;
+    }
+    Cache_.NotifyResourcesAvailable();
+    return true;
 }
 
 template <class TTraits>
