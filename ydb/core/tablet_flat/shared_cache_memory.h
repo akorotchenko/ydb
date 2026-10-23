@@ -336,13 +336,13 @@ public:
         UpdateAggregate(KeepActivePageBytes_, previous, current);
     }
 
-    ui64 ResourceGeneration() const noexcept {
-        return ResourceGeneration_.load(std::memory_order_acquire);
+    ui64 AdmissionGeneration() const noexcept {
+        return AdmissionGeneration_.load(std::memory_order_acquire);
     }
 
     // The caller notifies its resource waiter when either operation returns true
     bool NotifyResourcesAvailable() noexcept {
-        ResourceGeneration_.fetch_add(1, std::memory_order_release);
+        AdmissionGeneration_.fetch_add(1, std::memory_order_release);
         return ResourceWaitArmed_.exchange(false, std::memory_order_acq_rel);
     }
 
@@ -350,7 +350,7 @@ public:
         // Acquire the notifier's last exchange even when it has already cleared the flag.
         // This makes its preceding generation update visible and closes the store/load lost-wake race.
         ResourceWaitArmed_.exchange(true, std::memory_order_acq_rel);
-        return ResourceGeneration() != generation && ResourceWaitArmed_.exchange(false, std::memory_order_acq_rel);
+        return AdmissionGeneration() != generation && ResourceWaitArmed_.exchange(false, std::memory_order_acq_rel);
     }
 
     void DisarmResourceWait() noexcept {
@@ -464,7 +464,7 @@ private: // Data members
     std::atomic<ui64> SoftLimit_{ 0 };
     std::atomic<ui64> HardLimit_{ 0 };
     ui64 ReservationLimit_ = 0;
-    std::atomic<ui64> ResourceGeneration_{ 0 };
+    std::atomic<ui64> AdmissionGeneration_{ 0 };
     std::atomic<bool> ResourceWaitArmed_{ false };
 };
 

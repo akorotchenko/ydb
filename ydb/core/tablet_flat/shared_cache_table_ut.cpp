@@ -2036,12 +2036,12 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TSharedCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
         constexpr ui64 reservedBytes = 1;
         UNIT_ASSERT(TSharedCacheTestAccess::TryReserve(*fixture.Cache, reservedBytes));
-        fixture.Cache->ArmResourceWait(fixture.Cache->ResourceGeneration());
+        fixture.Cache->ArmResourceWait(fixture.Cache->AdmissionGeneration());
         TSharedCacheTestAccess::ReleaseReservation(*fixture.Cache, reservedBytes);
         UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
         UNIT_ASSERT(!payload.IsPrivate());
 
-        fixture.Cache->ArmResourceWait(fixture.Cache->ResourceGeneration());
+        fixture.Cache->ArmResourceWait(fixture.Cache->AdmissionGeneration());
         TlsCacheHazard = nullptr;
         held.Drop();
         fixture.Cache.Drop();
@@ -2790,9 +2790,9 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyOwnedBytes(), bytes);
         UNIT_ASSERT(!fetch.Dispatch());
         UNIT_ASSERT(!fetch.TryReserveMemory());
-        const ui64 generation = fixture.Cache->ResourceGeneration();
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
         TSharedCacheTestAccess::ReleaseReservation(*fixture.Cache, bytes);
-        UNIT_ASSERT(fixture.Cache->ResourceGeneration() > generation);
+        UNIT_ASSERT(fixture.Cache->AdmissionGeneration() > generation);
         UNIT_ASSERT(fetch.TryReserveMemory());
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), bytes);
         UNIT_ASSERT(fetch.TryReserveMemory());

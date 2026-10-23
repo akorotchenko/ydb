@@ -206,8 +206,8 @@ public:
     bool UpdateSoftLimitOverride(ui64 limit) noexcept;
     bool UpdateHardLimit(ui64 limit) noexcept;
 
-    ui64 ResourceGeneration() const noexcept {
-        return Memory_.ResourceGeneration();
+    ui64 AdmissionGeneration() const noexcept {
+        return Memory_.AdmissionGeneration();
     }
 
     void ArmResourceWait(ui64 generation) noexcept;
