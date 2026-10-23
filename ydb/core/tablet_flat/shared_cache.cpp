@@ -305,6 +305,8 @@ void TSharedCacheCollectionRef::Drop() noexcept {
 
 SHARED_CACHE_TEMPLATE
 TSharedCache::~TSharedCacheImpl() {
+    // The actor system may already be destroyed when terminal sweeping releases payloads
+    Memory_.DisarmResourceWait();
     const TSpaceView& space = Space_->SpaceView(Space_->CurrentSpaceState());
     // Release every page payload and pending fetch before destroying collection metadata.
     for (ui64 index = 2; index < space.HandleCount; ++index) {
