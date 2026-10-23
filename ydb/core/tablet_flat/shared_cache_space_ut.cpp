@@ -172,6 +172,66 @@ void CompleteFinalDrain(TSharedCacheSpace& space, TTransition& transition) {
 }
 
 Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
+    Y_UNIT_TEST(HotResizeCoalescesContendedUnlockNotification) {
+        ui32 notifications = 0;
+        THotResize resize({
+            .Context = &notifications,
+            .Function = [](void* context) noexcept {
+                ++*static_cast<ui32*>(context);
+            },
+        });
+        {
+            auto owner = resize.TryLock();
+            UNIT_ASSERT(owner);
+            bool contended = false;
+            std::thread worker([&] {
+                contended = !resize.TryLock() && !resize.TryLock();
+            });
+            worker.join();
+            UNIT_ASSERT(contended);
+            UNIT_ASSERT_VALUES_EQUAL(notifications, 0);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        {
+            auto owner = resize.TryLock();
+            UNIT_ASSERT(owner);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+    }
+
+    Y_UNIT_TEST(HotResizeMovedGuardNotifiesAfterUnlock) {
+        struct TNotification {
+            THotResize* Resize = nullptr;
+            ui32 Count = 0;
+            bool Acquired = false;
+        } notification;
+
+        THotResize resize({
+            .Context = &notification,
+            .Function = [](void* context) noexcept {
+                auto& notification = *static_cast<TNotification*>(context);
+                ++notification.Count;
+                auto owner = notification.Resize->TryLock();
+                notification.Acquired = bool(owner);
+            },
+        });
+        notification.Resize = &resize;
+        THotResize::TGuard owner;
+        {
+            auto first = resize.TryLock();
+            UNIT_ASSERT(first);
+            UNIT_ASSERT(!resize.TryLock());
+            auto second = std::move(first);
+            UNIT_ASSERT(!first);
+            owner = std::move(second);
+            UNIT_ASSERT(!second);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(notification.Count, 0);
+        owner = {};
+        UNIT_ASSERT_VALUES_EQUAL(notification.Count, 1);
+        UNIT_ASSERT(notification.Acquired);
+    }
+
     Y_UNIT_TEST(SpaceStatePacking) {
         constexpr TSpaceState state = TSpaceState::Make(Max<ui32>(), MaxSharedCacheAddressBits);
         static_assert(state.Generation() == Max<ui32>());

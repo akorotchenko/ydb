@@ -416,6 +416,17 @@ enum class EHotResizePhase {
 
 class THotResize {
 public:
+    struct TNotify {
+        void* Context = nullptr;
+        void (*Function)(void*) noexcept = nullptr;
+    };
+
+    THotResize() noexcept = default;
+
+    explicit THotResize(TNotify notify) noexcept
+        : Notify_(notify)
+    {}
+
     EHotResizePhase Phase() const noexcept {
         return Phase_;
     }
@@ -458,9 +469,8 @@ public:
 
     private:
         void Reset() noexcept {
-            if (Resize_) {
-                Resize_->Unlock();
-                Resize_ = nullptr;
+            if (auto* resize = std::exchange(Resize_, nullptr)) {
+                resize->Unlock();
             }
         }
 
@@ -474,12 +484,22 @@ public:
 
 private:
     bool TryAcquire() noexcept {
-        bool expected = false;
-        return Locked_.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed);
+        ui8 state = 0;
+        for (;;) {
+            const bool acquired = !(state & Locked);
+            const ui8 desired = acquired ? Locked : state | NotifyOnUnlock;
+            if (State_.compare_exchange_weak(state, desired, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                return acquired;
+            }
+        }
     }
 
     void Unlock() noexcept {
-        Locked_.store(false, std::memory_order_release);
+        const ui8 state = State_.exchange(0, std::memory_order_release);
+        Y_DEBUG_ABORT_UNLESS(state & Locked);
+        if ((state & NotifyOnUnlock) && Notify_.Function) {
+            Notify_.Function(Notify_.Context);
+        }
     }
 
     friend class TSharedCacheSpace;
@@ -491,7 +511,11 @@ private:
     }
 
 private:
-    std::atomic<bool> Locked_{ false };
+    // Lock ownership and a coalesced admission retry share one atomic word
+    static constexpr ui8 Locked = 1;
+    static constexpr ui8 NotifyOnUnlock = 2;
+    std::atomic<ui8> State_{ 0 };
+    TNotify Notify_;
     EHotResizePhase Phase_ = EHotResizePhase::Idle;
     ui64 OldEffectiveHotSlots_ = 0;
     ui64 NextCutSlot_ = 0;
