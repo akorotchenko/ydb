@@ -1014,13 +1014,15 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
     }
 
-    bool CanAdmitPages(const TQueuedRequest& waiting) {
+    bool PrepareAdmission(const TQueuedRequest& waiting) {
         TVector<TSharedCacheHandleRequirement> requirements;
         TVector<TPageLocation> locations;
+        ui64 bytes = 0;
         if (waiting.WaitingTransaction) {
-            const auto& pages = waiting.Completion->WaitPad()->WorkingSetPages;
-            requirements.reserve(pages.size() + waiting.HandleRequirements.size());
-            for (const auto& [collectionId, locations] : pages) {
+            const auto& pad = waiting.Completion->WaitPad();
+            bytes = pad->WorkingSetBytes;
+            requirements.reserve(pad->WorkingSetPages.size() + waiting.HandleRequirements.size());
+            for (const auto& [collectionId, locations] : pad->WorkingSetPages) {
                 requirements.push_back({ collectionId, locations });
             }
             for (const auto& completion : waiting.HandleRequirements) {
@@ -1033,7 +1035,21 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             }
             requirements.push_back({ waiting.PageCollection->Label(), locations });
         }
-        return Cache->CanAdmitPageHandles(requirements);
+        bool progress = true;
+        for (ui32 step = 0;; ++step) {
+            // Recheck both snapshots: reclamation can evict a required resident page
+            if (Cache->CanAdmitPageHandles(requirements) && Cache->CanAdmitWorkingSet(bytes)) {
+                return true;
+            }
+            if (!progress) {
+                return false;
+            }
+            if (step == SharedCacheTransitionWorkBatch) {
+                Send(SelfId(), new TEvResourcesAvailable);
+                return false;
+            }
+            progress = Cache->ReclaimForAdmission(bytes);
+        }
     }
 
     bool WorkingSetTooLarge(const TQueuedRequest& waiting) {
@@ -1062,8 +1078,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             auto waiting = std::move(ResourceWaits.front());
             ResourceWaits.pop_front();
             if (waiting->WaitingTransaction) {
-                if (CanAdmitPages(*waiting) &&
-                    Cache->CanAdmitWorkingSet(waiting->Completion->WaitPad()->WorkingSetBytes)) {
+                if (PrepareAdmission(*waiting)) {
                     waiting->Completion->NotifyResourcesReady();
                 } else if (WorkingSetTooLarge(*waiting)) {
                     waiting->Completion->NotifyWorkingSetTooLarge();
@@ -1077,7 +1092,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                     TryAdmitPages(*waiting);
                     continue;
                 }
-                if (CanAdmitPages(*waiting) && TryAdmitPages(*waiting)) {
+                if (PrepareAdmission(*waiting) && TryAdmitPages(*waiting)) {
                     continue;
                 }
                 if (RestartBlockedWalk(*waiting)) {
