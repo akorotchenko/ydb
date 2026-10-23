@@ -24,7 +24,6 @@ namespace NKikimr::NSharedCache {
         DoGCManual = 2,
         DoLimitMaintenance = 3,
         ContinueBTreeWalk = 4,
-        RetryResources = 5,
     };
 
     enum EEv {

@@ -583,6 +583,7 @@ template <class TTraits>
 class TSharedCacheImpl<TTraits>::TOperationView {
 public: // Cache table operations
     using TInsertPosition = typename TSharedCacheTableImpl<TTraits>::TInsertPosition;
+    using EResizeStep = typename TSharedCacheTableImpl<TTraits>::EResizeStep;
     using EAcquireStatus = typename TSharedCacheImpl<TTraits>::EAcquireStatus;
 
     Y_FORCE_INLINE TSpaceOperation& SpaceOperation() const noexcept {
@@ -819,23 +820,23 @@ public: // Cache helpers
     }
 
 public: // Resizing
-    Y_FORCE_INLINE bool PrepareBucketSplit() noexcept {
+    Y_FORCE_INLINE EResizeStep PrepareBucketSplit() noexcept {
         return Cache_.Table_.PrepareBucketSplit(SpaceOp_);
     }
 
-    Y_FORCE_INLINE bool ActivateBucketSplitOrMerge() noexcept {
+    Y_FORCE_INLINE EResizeStep ActivateBucketSplitOrMerge() noexcept {
         return Cache_.Table_.ActivateBucketSplitOrMerge(SpaceOp_);
     }
 
-    Y_FORCE_INLINE bool PublishBucketSplit() noexcept {
+    Y_FORCE_INLINE EResizeStep PublishBucketSplit() noexcept {
         return Cache_.Table_.PublishBucketSplit(SpaceOp_);
     }
 
-    Y_FORCE_INLINE bool CloseBucketSplit() noexcept {
+    Y_FORCE_INLINE EResizeStep CloseBucketSplit() noexcept {
         return Cache_.Table_.CloseBucketSplit(SpaceOp_);
     }
 
-    Y_FORCE_INLINE bool RemoveBucketSplit() noexcept {
+    Y_FORCE_INLINE EResizeStep RemoveBucketSplit() noexcept {
         return Cache_.Table_.RemoveBucketSplit(SpaceOp_);
     }
 

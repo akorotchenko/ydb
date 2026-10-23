@@ -18,6 +18,7 @@
 namespace NKikimr::NSharedCache {
 
 using TTestSharedCache = TSharedCacheImpl<TTestTraits>;
+using EResizeStep = TSharedCacheTableImpl<TTestTraits>::EResizeStep;
 using TTestSharedCacheItemRef = TSharedCacheItemRefImpl<TTestTraits>;
 using TTestSharedPageRef = TSharedPageRefImpl<TTestTraits>;
 using TTestSharedCacheCollectionRef = TSharedCacheCollectionRefImpl<TTestTraits>;
@@ -495,29 +496,41 @@ public:
         return cache.Space_->BeginBucketResize(newAddressBits);
     }
 
-    static bool PrepareBucketSplit(TTestSharedCache& cache) {
+    static EResizeStep PrepareBucketSplitStep(TTestSharedCache& cache) {
         auto spaceOp = cache.BeginOperation();
         return cache.Table_.PrepareBucketSplit(spaceOp);
     }
 
-    static bool ActivateBucketSplitOrMerge(TTestSharedCache& cache) {
+    static bool PrepareBucketSplit(TTestSharedCache& cache) {
+        return PrepareBucketSplitStep(cache) == EResizeStep::Complete;
+    }
+
+    static EResizeStep ActivateBucketSplitStep(TTestSharedCache& cache) {
         auto spaceOp = cache.BeginOperation();
         return cache.Table_.ActivateBucketSplitOrMerge(spaceOp);
     }
 
+    static bool ActivateBucketSplitOrMerge(TTestSharedCache& cache) {
+        return ActivateBucketSplitStep(cache) == EResizeStep::Complete;
+    }
+
     static bool PublishBucketSplit(TTestSharedCache& cache) {
         auto spaceOp = cache.BeginOperation();
-        return cache.Table_.PublishBucketSplit(spaceOp);
+        return cache.Table_.PublishBucketSplit(spaceOp) == EResizeStep::Complete;
     }
 
     static bool CloseBucketSplit(TTestSharedCache& cache) {
         auto spaceOp = cache.BeginOperation();
-        return cache.Table_.CloseBucketSplit(spaceOp);
+        return cache.Table_.CloseBucketSplit(spaceOp) == EResizeStep::Complete;
+    }
+
+    static EResizeStep RemoveBucketSplitStep(TTestSharedCache& cache) {
+        auto operation = cache.BeginOperation();
+        return cache.Table_.RemoveBucketSplit(operation);
     }
 
     static bool RemoveBucketSplit(TTestSharedCache& cache) {
-        auto operation = cache.BeginOperation();
-        return cache.Table_.RemoveBucketSplit(operation);
+        return RemoveBucketSplitStep(cache) == EResizeStep::Complete;
     }
 
     static bool FinishBucketResize(TTestSharedCache& cache) {
@@ -8503,6 +8516,89 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         CommitTransition(*fixture.Cache, growth);
     }
 
+    void CheckResizeInterference(bool remove) {
+        TFixture fixture(6, 8, 7);
+        const auto collection = MakeCollectionCacheItem(259, 50059);
+        const ui32 splitBit = static_cast<ui32>(CurrentBucketCount(*fixture.Space));
+        const ui32 mask = (splitBit << 1) - 1;
+        const auto firstKey = ReviewKeyForBucket(collection, mask, 0, 900000);
+        const auto nextKey = ReviewKeyForBucket(collection, mask, 0, firstKey.Word(1) + 1, &firstKey);
+        const auto first = InsertReadyPage(*fixture.Cache, firstKey);
+        TTestSharedPageRef held;
+        UNIT_ASSERT(fixture.Cache->AcquirePage(first, held));
+        auto candidates = AllocateAvailableHandleCandidates(*fixture.Cache);
+        Y_DEFER {
+            for (const auto item : candidates) {
+                TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, item);
+            }
+        };
+        UNIT_ASSERT(!candidates.empty());
+        TSharedCacheTestAccess::DiscardCandidate(*fixture.Cache, candidates.back());
+        candidates.pop_back();
+        UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), 1);
+        TTransition growth;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+        if (remove) {
+            UNIT_ASSERT(TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishBucketSplit(*fixture.Cache));
+        }
+        const auto before = TSharedCacheTestAccess::BucketResizeState(*fixture.Space);
+        TSharedCacheGate gate;
+        gate.Slots[0].Arm(
+            remove ? ESharedCacheHookPoint::BeforeTableLinkCas : ESharedCacheHookPoint::AfterGrowthBucketPublished,
+            remove ? first.CacheItem() : TCacheItem{});
+        TSharedCacheHookGuard hookGuard(*fixture.Cache, gate.Hooks);
+        bool moreWork = false;
+        TGateThread resizer(gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazard);
+            TlsCacheHazard = &TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+            Y_DEFER {
+                TlsCacheHazard = nullptr;
+            };
+            moreWork = TSharedCacheTestAccess::AdvanceBucketResize(*fixture.Cache);
+        });
+        gate.Slots[0].Wait();
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        TPageCacheItem inserted;
+        TTestSharedPageRef hit;
+        UNIT_ASSERT(FindOrInsertPage(*fixture.Cache, collection, MakePageLocation(nextKey.Word(1)), EStickyState::None,
+                        inserted, hit) == ESharedCacheResultStatus::Inserted);
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, inserted.Index()).IsPending());
+        UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        gate.Slots[0].Release();
+        resizer.Join();
+        UNIT_ASSERT(moreWork);
+        const auto after = TSharedCacheTestAccess::BucketResizeState(*fixture.Space);
+        UNIT_ASSERT(after.Phase() == before.Phase());
+        UNIT_ASSERT_VALUES_EQUAL(after.Cursor(), before.Cursor());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        CommitTransition(*fixture.Cache, growth);
+        UNIT_ASSERT(fixture.Cache->MakeReady(inserted, MakePageData(inserted.Index())));
+    }
+
+    Y_UNIT_TEST(GrowthSplitInterferenceKeepsMaintenanceRunnable) {
+        CheckResizeInterference(false);
+    }
+
+    Y_UNIT_TEST(MarkerRemovalInterferenceKeepsMaintenanceRunnable) {
+        CheckResizeInterference(true);
+    }
+
+    Y_UNIT_TEST(WrongPhaseResizeStepsRemainBlocked) {
+        TFixture fixture;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareBucketSplitStep(*fixture.Cache) == EResizeStep::Blocked);
+        UNIT_ASSERT(TSharedCacheTestAccess::ActivateBucketSplitStep(*fixture.Cache) == EResizeStep::Blocked);
+        UNIT_ASSERT(TSharedCacheTestAccess::RemoveBucketSplitStep(*fixture.Cache) == EResizeStep::Blocked);
+        UNIT_ASSERT(!TSharedCacheTestAccess::AdvanceBucketResize(*fixture.Cache));
+    }
+
     void CheckUnlinkNotification(bool chain, bool armBeforeUnlink) {
         TFixture fixture(6, 8, 7);
         Y_DEFER {
@@ -8555,7 +8651,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 expected = TSharedCacheTestAccess::HandleState(*fixture.Cache, pages.back().Index());
                 UNIT_ASSERT(cacheOp.TryBeginErase(pages.back().CacheItem(), expected, secondOwner.Get()));
             }
-            UNIT_ASSERT(!TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+            UNIT_ASSERT(TSharedCacheTestAccess::ActivateBucketSplitStep(*fixture.Cache) == EResizeStep::Blocked);
             TTestTraits hooks{ &observation,
                 [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
                     if (point != ESharedCacheHookPoint::ResourcesAvailable) {
@@ -8680,7 +8776,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         observation.Gate.Slots[0].Wait();
         const auto blocked = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
         UNIT_ASSERT(blocked.IsCompleting());
-        UNIT_ASSERT(!TSharedCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::ActivateBucketSplitStep(*fixture.Cache) == EResizeStep::Blocked);
         const ui64 generation = fixture.Cache->AdmissionGeneration();
         if (armBeforeReady) {
             fixture.Cache->ArmResourceWait(generation);
@@ -8927,12 +9023,12 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             AssertResizeMarker(*fixture.Cache, EHandleState::Tombstone);
             UNIT_ASSERT(
                 TSharedCacheTestAccess::BucketResizeState(*fixture.Space).Phase() == EBucketResizePhase::Prepared);
-            UNIT_ASSERT(!TSharedCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareBucketSplitStep(*fixture.Cache) == EResizeStep::Blocked);
         } else {
             firstHelper = TSharedCacheTestAccess::AcquireStructural(*fixture.Cache, observation.Marker);
             secondHelper = TSharedCacheTestAccess::AcquireStructural(*fixture.Cache, observation.Marker);
             UNIT_ASSERT(firstHelper && secondHelper);
-            UNIT_ASSERT(!TSharedCacheTestAccess::RemoveBucketSplit(*fixture.Cache));
+            UNIT_ASSERT(TSharedCacheTestAccess::RemoveBucketSplitStep(*fixture.Cache) == EResizeStep::Blocked);
             const auto blocked = TSharedCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex);
             UNIT_ASSERT(blocked.IsTombstone());
             UNIT_ASSERT_VALUES_EQUAL(blocked.Refs(), 3);
@@ -9192,7 +9288,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         AssertPageHit(*fixture.Cache, keys[1], inserted);
         gate.Slots[0].Release();
         firstActivator.Join();
-        UNIT_ASSERT(!firstActivation);
+        UNIT_ASSERT(firstActivation);
+        UNIT_ASSERT(TSharedCacheTestAccess::BucketResizeState(*fixture.Space).Phase() == EBucketResizePhase::Prepared);
 
         bool activated = false;
         TGateThread activator(gate, [&] {
