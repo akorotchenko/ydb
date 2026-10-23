@@ -232,6 +232,15 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT(notification.Acquired);
     }
 
+    Y_UNIT_TEST(HazardWaiterPreservesGenerationAndActiveCount) {
+        constexpr ui64 state = (ui64(Max<ui32>()) << 32) | SpaceHazardDrainWaiter | MaxSpaceHazardActiveCount;
+        static_assert(SpaceHazardGeneration(state) == Max<ui32>());
+        static_assert(SpaceHazardActiveCount(state) == MaxSpaceHazardActiveCount);
+        static_assert(SpaceHazardIsActive(state));
+        static_assert(SpaceHazardIsDrained(state, Max<ui32>()));
+        static_assert(!SpaceHazardIsDrained(state, Max<ui32>() - 1));
+    }
+
     Y_UNIT_TEST(SpaceStatePacking) {
         constexpr TSpaceState state = TSpaceState::Make(Max<ui32>(), MaxSharedCacheAddressBits);
         static_assert(state.Generation() == Max<ui32>());

@@ -99,6 +99,12 @@ TSharedCache::TSharedCacheImpl(THolder<TSharedCacheSpace> space, ui64 hardLimit,
               },
       })
 {
+    Space_->HazardDrainNotify_ = {
+        .Context = this,
+        .Function = [](void* context) noexcept {
+            static_cast<TSharedCache*>(context)->NotifyResourcesAvailable();
+        },
+    };
     if constexpr (std::is_same_v<TTraits, TTestTraits>) {
         for (TSpaceHazard* hazard : Space_->Hazards_) {
             hazard->TestCache = this;
