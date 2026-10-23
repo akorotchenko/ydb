@@ -10,6 +10,7 @@ class TActorSystem;
 namespace NKikimr::NSharedCache {
 
 enum class ESharedCacheHookPoint {
+    AfterAdmissionReclaimStep, // No payload; a successful admission reclamation step has completed.
     ResourcesAvailable, // No item payload; test traits observe a resource-waiter notification.
     BeforeKeepBytesPublished, // Payload is the collection whose contribution is being published.
     AfterPageBatchPrepared, // Payload is the collection after the batch presence checks.
@@ -108,11 +109,9 @@ struct TSharedCachePolicy {
     ui64 MinCurrentLimitGap = 0; // An absolute floor would drain the payload of a small cache on pressure.
     double ColdMin = 0.20;
     double Grow = 0.30;
-    double HotMin = 0.60;
-    double HotMinUnderPressure = 0.25;
+    double KeepColdMaxShare = 0.40;
     double ResizeStep = 0.05;
-    ui32 MinHotSlots = 25;
-    ui32 MinHotSlotsUnderPressure = 15;
+    ui32 MinHotSlots = 128;
     ui32 MinResizeStep = 256;
 };
 
@@ -122,7 +121,7 @@ inline constexpr TSharedCachePolicy SharedCachePolicyFor{};
 template <>
 inline constexpr TSharedCachePolicy SharedCachePolicyFor<TTestTraits>{
     .MinCurrentLimitGap = 0,
-    .MinHotSlots = 15,
+    .MinHotSlots = 15, // Scaled geometry for small native fixtures
     .MinResizeStep = 1,
 };
 

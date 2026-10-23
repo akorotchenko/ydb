@@ -114,14 +114,11 @@ TIntrusivePtr<TSharedCache> TSharedCache::Create(THolder<TSharedCacheSpace> spac
         return {};
     }
     Y_DEBUG_ABORT_UNLESS(Policy_.CurrentLimitGap >= 0.0 && Policy_.CurrentLimitGap < 1.0 && Policy_.ColdMin >= 0.0 &&
-                         Policy_.ColdMin < Policy_.Grow && Policy_.Grow <= 1.0 && Policy_.HotMin > 0.0 &&
-                         Policy_.HotMin < 1.0 && Policy_.HotMinUnderPressure > 0.0 &&
-                         Policy_.HotMinUnderPressure <= Policy_.HotMin && Policy_.ResizeStep > 0.0 &&
-                         Policy_.ResizeStep <= 1.0 && Policy_.MinHotSlots > 0 &&
-                         Policy_.MinHotSlotsUnderPressure <= Policy_.MinHotSlots && Policy_.MinResizeStep > 0 &&
+                         Policy_.ColdMin < Policy_.Grow && Policy_.Grow <= 1.0 && Policy_.KeepColdMaxShare > 0.0 &&
+                         Policy_.KeepColdMaxShare < 1.0 && Policy_.ResizeStep > 0.0 && Policy_.ResizeStep <= 1.0 &&
+                         Policy_.MinHotSlots > 0 && Policy_.MinResizeStep > 0 &&
                          Policy_.MinHotSlots <= space->CurrentConfiguration().HotSlotCount() &&
-                         SharedCacheHotLayoutIsValid(Policy_.MinHotSlots) &&
-                         SharedCacheHotLayoutIsValid(Policy_.MinHotSlotsUnderPressure));
+                         SharedCacheHotLayoutIsValid(Policy_.MinHotSlots));
     TIntrusivePtr<TSharedCache> cache(new TSharedCache(std::move(space), hardLimit, std::move(traits)));
     if (!TTraits::InstallCache(cache.Get())) {
         return {};
@@ -1487,11 +1484,17 @@ bool TSharedCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) 
             Eviction_.MarkSoftLimitPressure();
             // Aging/resizing can make progress without freeing bytes. Bound cooperative work so
             // concurrent activity cannot keep a requester here instead of putting it on the wait path.
-            if (reclamationAttempts++ < SharedCacheTransitionWorkBatch && cacheOp.Eviction().Reclaim(bytes)) {
-                usage = Memory_.PayloadUsage();
-                continue;
+            if (reclamationAttempts == SharedCacheTransitionWorkBatch) {
+                NotifyResourcesAvailable();
+                return false;
             }
-            return false;
+            if (!cacheOp.Eviction().Reclaim(bytes)) {
+                return false;
+            }
+            ++reclamationAttempts;
+            InvokeHook(ESharedCacheHookPoint::AfterAdmissionReclaimStep, {});
+            usage = Memory_.PayloadUsage();
+            continue;
         }
         if (Memory_.TryReserve(usage, bytes, pages)) {
             return true;
