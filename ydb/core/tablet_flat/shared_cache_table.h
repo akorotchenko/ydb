@@ -110,12 +110,18 @@ public: // Cache table operations
     void FinishErase(TSpaceOperation& spaceOp, TCacheItem cacheItem, const TSharedCacheKey& key) noexcept;
 
 public: // Resizing
-    // Resize steps may return false after partial progress; recheck the phase and cursor before retrying.
-    bool PrepareBucketSplit(TSpaceOperation& spaceOp) noexcept;
-    bool ActivateBucketSplitOrMerge(TSpaceOperation& spaceOp) noexcept;
-    bool PublishBucketSplit(TSpaceOperation& spaceOp) noexcept;
-    bool CloseBucketSplit(TSpaceOperation& spaceOp) noexcept;
-    bool RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept;
+    // Retry keeps bounded maintenance running; Blocked waits for a producer
+    enum class EResizeStep : ui8 {
+        Blocked,
+        Retry,
+        Complete,
+    };
+
+    EResizeStep PrepareBucketSplit(TSpaceOperation& spaceOp) noexcept;
+    EResizeStep ActivateBucketSplitOrMerge(TSpaceOperation& spaceOp) noexcept;
+    EResizeStep PublishBucketSplit(TSpaceOperation& spaceOp) noexcept;
+    EResizeStep CloseBucketSplit(TSpaceOperation& spaceOp) noexcept;
+    EResizeStep RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept;
 
     void PublishPageReplacement(
         TCacheItem source, TCacheItem replacement, const TSharedCacheKey& key, TSpaceOperation& spaceOp) noexcept;
@@ -185,11 +191,14 @@ private: // Table helpers
         TSpaceState& spaceState, TBucketRoute& route, const TOrderedLink& link) const noexcept;
 
 private: // Resize helpers
-    bool FindSplitBoundary(
+    EResizeStep FindSplitBoundary(
         const TSpaceOperation& spaceOp, ui32 bucket, ui32 splitBit, bool suffix, TOrderedLink& result) noexcept;
 
-    bool ActivateBucketSplit(TSpaceOperation& spaceOp, const TBucketResizeState& resize, TCacheItem marker) noexcept;
-    bool ActivateBucketMerge(TSpaceOperation& spaceOp, const TBucketResizeState& resize, TCacheItem marker) noexcept;
+    EResizeStep ResizeOwnerResult(const TSpaceOperation& spaceOp, TCacheItem owner) const noexcept;
+    EResizeStep ActivateBucketSplit(
+        TSpaceOperation& spaceOp, const TBucketResizeState& resize, TCacheItem marker) noexcept;
+    EResizeStep ActivateBucketMerge(
+        TSpaceOperation& spaceOp, const TBucketResizeState& resize, TCacheItem marker) noexcept;
 
     bool PrepareSplitMarker(const TSpaceOperation& spaceOp, TCacheItem suffix) noexcept;
     bool TransitionSplitMarkerToTombstone(const TSpaceOperation& spaceOp, TCacheItem marker) noexcept;

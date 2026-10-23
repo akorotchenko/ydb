@@ -195,6 +195,7 @@ EShrinkCutStatus TCacheCapacity<TTraits>::ReclaimShrinkCut() noexcept {
 
 template <class TTraits>
 bool TCacheCapacity<TTraits>::AdvanceBucketResize() noexcept {
+    using EResizeStep = typename TSharedCacheTableImpl<TTraits>::EResizeStep;
     const TSpaceState spaceState = Cache_.Space_->CurrentSpaceState();
     if (!spaceState.Resizing()) {
         return false;
@@ -203,15 +204,19 @@ bool TCacheCapacity<TTraits>::AdvanceBucketResize() noexcept {
     const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
     auto spaceOp = Cache_.Space_->BeginOperation();
     switch (resize.Phase()) {
-        case EBucketResizePhase::Prepared:
-            return Cache_.Table_.PrepareBucketSplit(spaceOp) && Cache_.Table_.ActivateBucketSplitOrMerge(spaceOp);
+        case EBucketResizePhase::Prepared: {
+            const auto step = Cache_.Table_.PrepareBucketSplit(spaceOp);
+            return step == EResizeStep::Complete
+                       ? Cache_.Table_.ActivateBucketSplitOrMerge(spaceOp) != EResizeStep::Blocked
+                       : step == EResizeStep::Retry;
+        }
 
         case EBucketResizePhase::Activated:
-            return Cache_.Table_.PublishBucketSplit(spaceOp);
+            return Cache_.Table_.PublishBucketSplit(spaceOp) != EResizeStep::Blocked;
 
         case EBucketResizePhase::CursorPublished:
             if (resize.Direction() == EBucketResize::Shrinking) {
-                return Cache_.Table_.CloseBucketSplit(spaceOp);
+                return Cache_.Table_.CloseBucketSplit(spaceOp) != EResizeStep::Blocked;
             }
             break;
 
@@ -222,8 +227,9 @@ bool TCacheCapacity<TTraits>::AdvanceBucketResize() noexcept {
             return false;
     }
 
-    if (!Cache_.Table_.RemoveBucketSplit(spaceOp)) {
-        return false;
+    const auto step = Cache_.Table_.RemoveBucketSplit(spaceOp);
+    if (step != EResizeStep::Complete) {
+        return step == EResizeStep::Retry;
     }
     return resize.Cursor() != resize.PairCount() || Cache_.Space_->FinishBucketResize();
 }

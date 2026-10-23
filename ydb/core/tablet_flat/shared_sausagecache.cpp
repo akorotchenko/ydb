@@ -138,7 +138,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     THashMap<ui64, TRequest> Requests;
     ui64 NextRequestId = 1;
     TDeque<THolder<TQueuedRequest>> ResourceWaits;
-    bool ResourceRetryScheduled = false;
     TRequestQueue AsyncRequests{EBlockIOFetchTypeCookie::AsyncQueue};
     TRequestQueue ScanRequests{EBlockIOFetchTypeCookie::ScanQueue};
 
@@ -1148,12 +1147,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         } else {
             // Arm after observing the generation before reservation attempts; a concurrent release wakes us.
             Cache->ArmResourceWait(generation);
-            // Also retry maintenance contention, which need not change resource counters.
-            if (!ResourceRetryScheduled) {
-                ResourceRetryScheduled = true;
-                Schedule(
-                    TDuration::MilliSeconds(10), new TKikimrEvents::TEvWakeup(ui64(EWakeupTag::RetryResources)));
-            }
         }
     }
 
@@ -1441,28 +1434,25 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     void Wakeup(TKikimrEvents::TEvWakeup::TPtr& ev, const TActorContext& ctx) {
         auto tag = static_cast<EWakeupTag>(ev->Get()->Tag);
-        if (tag != EWakeupTag::ContinueBTreeWalk && tag != EWakeupTag::RetryResources) {
+        if (tag != EWakeupTag::ContinueBTreeWalk) {
             LOG_INFO_S(ctx, NKikimrServices::TABLET_SAUSAGECACHE, "Wakeup " << tag);
         }
 
         switch (tag) {
-        case EWakeupTag::DoGCScheduled:
+            case EWakeupTag::DoGCScheduled:
+                // Periodic GC also retries OS mapping release and background capacity work
                 KeepPreloadRetryBlocked.clear();
                 ScheduleGC();
-            break;
-        case EWakeupTag::DoGCManual:
-            break;
-        case EWakeupTag::DoLimitMaintenance:
+                break;
+            case EWakeupTag::DoGCManual:
+                break;
+            case EWakeupTag::DoLimitMaintenance:
                 LimitMaintenanceScheduled = false;
-            ActualizeCacheSizeLimit();
+                ActualizeCacheSizeLimit();
                 break;
-            case EWakeupTag::RetryResources:
-                ResourceRetryScheduled = false;
-                RetryResourceWaits();
+            case EWakeupTag::ContinueBTreeWalk:
+                WalkContinuationScheduled = false;
                 break;
-        case EWakeupTag::ContinueBTreeWalk:
-            WalkContinuationScheduled = false;
-            break;
         }
 
         // DoGC will be called at the end of StateFunc
