@@ -491,17 +491,12 @@ bool TSharedCache::DetachCollection(TCollectionRegistry& registry, TCollectionCa
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::DeleteCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept {
-    return DeleteCollection(&registry, collection);
+bool TSharedCache::EraseCollection(TCollectionCacheItem collection) noexcept {
+    return EraseCollection(nullptr, collection);
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::DeleteCollection(TCollectionCacheItem collection) noexcept {
-    return DeleteCollection(nullptr, collection);
-}
-
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::DeleteCollection(TCollectionRegistry* registry, TCollectionCacheItem collection) noexcept {
+bool TSharedCache::EraseCollection(TCollectionRegistry* registry, TCollectionCacheItem collection) noexcept {
     auto cacheOp = BeginOperation();
     TOperationItemRef collectionRef(cacheOp, cacheOp.TryAcquireStructural(collection.CacheItem()));
     if (!collectionRef) {
@@ -511,7 +506,7 @@ bool TSharedCache::DeleteCollection(TCollectionRegistry* registry, TCollectionCa
     if (!value || !cacheOp.Collections().SetPagesCacheMode(*value, ECacheMode::Regular)) {
         return false;
     }
-    return cacheOp.Collections().Delete(registry, collection.CacheItem());
+    return cacheOp.Collections().Erase(registry, collection.CacheItem());
 }
 
 SHARED_CACHE_TEMPLATE
@@ -1432,7 +1427,7 @@ bool TSharedCache::UpdateCurrentLimit(ui64 limit) noexcept {
 }
 
 SHARED_CACHE_TEMPLATE
-bool TSharedCache::UpdateSoftLimit(ui64 limit) noexcept {
+bool TSharedCache::UpdateSoftLimitOverride(ui64 limit) noexcept {
     Memory_.SetSoftLimitOverride(limit);
     RefreshSoftLimit();
     return true;

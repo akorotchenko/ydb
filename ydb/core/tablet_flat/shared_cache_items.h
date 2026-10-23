@@ -146,8 +146,8 @@ private:
         ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
         for (;;) {
             const THandleState expected = THandleState::FromRaw(expectedRaw);
-            if (!cacheItem.Matches(expected) || expected.IsFree() || expected.IsReplacing() || expected.IsReplaced() ||
-                expected.IsTombstone())
+            if (!cacheItem.Matches(expected) || expected.IsFree() || expected.IsCompleting() ||
+                expected.IsReplacing() || expected.IsReplaced() || expected.IsTombstone())
             {
                 return {};
             }

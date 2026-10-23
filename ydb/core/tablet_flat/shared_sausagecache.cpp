@@ -237,11 +237,11 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         return ControllerCurrentBytes ? Min(ControllerCurrentBytes, maximum) : maximum;
     }
 
-    void UpdateSoftLimit() {
+    void UpdateSoftLimitOverride() {
         if (HasControllerAllocation) {
-            Y_ENSURE(Cache->UpdateSoftLimit(MemLimitBytes));
+            Y_ENSURE(Cache->UpdateSoftLimitOverride(MemLimitBytes));
         } else {
-            Y_ENSURE(Cache->UpdateSoftLimit(Max<ui64>()));
+            Y_ENSURE(Cache->UpdateSoftLimitOverride(Max<ui64>()));
         }
     }
 
@@ -284,7 +284,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         Cache = TSharedCache::Create(std::move(space), targetLimit, std::move(traits));
         if (Cache) {
             Y_ENSURE(Cache->UpdateCurrentLimit(GetTargetCacheCurrentLimitBytes()));
-            UpdateSoftLimit();
+            UpdateSoftLimitOverride();
         }
         return bool(Cache);
     }
@@ -355,7 +355,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                                                                                       << Cache->ReservationLimit());
             }
             Y_ENSURE(Cache->UpdateCurrentLimit(currentLimit));
-            UpdateSoftLimit();
+            UpdateSoftLimitOverride();
             UpdateKeepColdLimit();
             Counters.ActiveLimitBytes->Set(currentLimit);
         } else {

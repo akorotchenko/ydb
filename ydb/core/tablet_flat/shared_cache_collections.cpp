@@ -594,6 +594,7 @@ void TCacheCollections<TTraits>::UnlinkPendingStickyPage(TSpaceOperation& spaceO
         Y_DEBUG_ABORT_UNLESS(pageItem.Matches(state) && (state.IsPending() || state.IsCompleting()));
         const ECacheMode mode = collection->CacheMode_.load(std::memory_order_acquire);
         ui32 current = collection->StickyPageListHead.exchange(0, std::memory_order_acq_rel);
+        Cache_.InvokeHook(ESharedCacheHookPoint::AfterStickyPageListDetached, collection->CacheItem.CacheItem());
         ui32 retainedHead = 0;
         ui32 retainedTail = 0;
         bool found = false;
@@ -938,7 +939,7 @@ bool TCacheCollections<TTraits>::TryClaimDeletion(TSpaceOperation& spaceOp, TCol
 }
 
 template <class TTraits>
-bool TCacheCollections<TTraits>::Delete(
+bool TCacheCollections<TTraits>::Erase(
     TSpaceOperation& spaceOp, TCollectionRegistry* expectedRegistry, TCacheItem collectionItem) noexcept {
     TOperationItemRef<TTraits> deletionOwner(spaceOp);
     THandleState sourceState;

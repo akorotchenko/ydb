@@ -80,6 +80,12 @@ void TCacheFetches<TTraits>::Release(TOperationItemRef<TTraits>& owner, TPageFet
         const THandleState expected = THandleState::FromRaw(expectedRaw);
         Y_DEBUG_ABORT_UNLESS(MatchesPendingFetch(handle, expected, cacheItem, fetch) && expected.Refs() > 0);
         const bool finish = expected.Refs() == 1 && fetch.Completion() != EPageFetchCompletion::Pending;
+        if (finish && expected.IsStickyField() && fetch.Completion() == EPageFetchCompletion::Failed) {
+            // List owners may need this pending predecessor while withdrawing Sticky siblings
+            Cache_.Collections_.BindOperation(spaceOp).UnlinkPendingStickyPage(cacheItem);
+            expectedRaw = handle.State.load(std::memory_order_relaxed);
+            continue;
+        }
         const THandleState desired =
             finish ? expected.WithState(EHandleState::Completing).WithFrequency(0) : expected.DecrementRefs();
         const std::memory_order successOrder = finish ? std::memory_order_acq_rel : std::memory_order_release;
@@ -87,6 +93,7 @@ void TCacheFetches<TTraits>::Release(TOperationItemRef<TTraits>& owner, TPageFet
             continue;
         }
         if (finish) {
+            Cache_.InvokeHook(ESharedCacheHookPoint::AfterFetchCompletingClaim, cacheItem);
             Finish(owner, fetch, !expected.IsWaitingForMemory());
         } else {
             // The CAS above already decremented this ref.
@@ -112,10 +119,7 @@ void TCacheFetches<TTraits>::FinishFailed(TOperationItemRef<TTraits>& finalizerR
     THandleState completing = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
     Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(completing) && completing.IsCompleting() && completing.Refs() == 1 &&
                          handle.Body.Fetch == &fetch);
-    if (completing.IsStickyField()) {
-        Cache_.Collections_.BindOperation(spaceOp).UnlinkPendingStickyPage(cacheItem);
-        completing = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    }
+    Y_DEBUG_ABORT_UNLESS(completing.IsStickyNoneField());
     DeletePendingFetch(handle);
     new (&handle.Body.PageBuffer) NActors::TSharedData::TBuffer();
     if (reserved) {

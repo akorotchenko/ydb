@@ -101,7 +101,7 @@ public:
             auto core = NSharedCache::TSharedCache::Create(
                 NSharedCache::TSharedCacheSpace::Create(capacity, capacity, CacheThreads_), capacity.Limit);
             Y_ENSURE(core);
-            Y_ENSURE(core->UpdateSoftLimit(0));
+            Y_ENSURE(core->UpdateSoftLimitOverride(0));
         } catch (...) {
             TlsActivationContext = nullptr;
             NSharedCache::TlsCacheHazard = nullptr;

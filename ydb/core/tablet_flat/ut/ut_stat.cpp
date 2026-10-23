@@ -232,9 +232,9 @@ Y_UNIT_TEST_SUITE_F(BuildStatsPageLifetime, ::NKikimr::NTable::NTest::TTableCach
         const ui64 savedLimit = cache.CurrentLimit();
         Y_DEFER {
             cache.UpdateCurrentLimit(savedLimit);
-            cache.UpdateSoftLimit(Max<ui64>());
+            cache.UpdateSoftLimitOverride(Max<ui64>());
         };
-        UNIT_ASSERT(cache.UpdateSoftLimit(0));
+        UNIT_ASSERT(cache.UpdateSoftLimitOverride(0));
         const ui64 frontierBudget = mixed ? indexBytes + collection->Total() * TSharedData::OverheadSize
                                           : (4 * part->IndexPages.GetBTree({}).LevelCount() + 4) * pageBudget;
         UNIT_ASSERT(cache.UpdateCurrentLimit(frontierBudget));

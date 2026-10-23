@@ -899,7 +899,7 @@ Y_UNIT_TEST_SUITE(TPDiskToolRestoreTablet) {
         UNIT_ASSERT_C(boot.Run(history), Complaints(issues));
         auto& cache = NSharedCache::TSharedCache::Get();
         const ui64 handles = cache.PhysicalHandleCount();
-        UNIT_ASSERT(cache.UpdateSoftLimit(1));
+        UNIT_ASSERT(cache.UpdateSoftLimitOverride(1));
         auto& db = boot.Database();
         db.Begin(NTable::TTxStamp(Max<ui32>(), 0), boot.Pages());
         const TVector<NTable::TTag> tags{ 1, 2 };
