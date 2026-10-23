@@ -158,7 +158,7 @@ ui32 TCacheItems<TTraits>::TryAllocateHandle(TSpaceOperation& spaceOp) noexcept 
             if (!progress) {
                 return 0;
             }
-            Cache_.InvokeHook(ESharedCacheHookPoint::AfterAdmissionReclaimStep, {});
+            Cache_.InvokeHook(ESharedCacheHookPoint::AfterAdmissionReclaimStep, TCacheItem{});
         }
         Cache_.NotifyResourcesAvailable();
         return 0;
