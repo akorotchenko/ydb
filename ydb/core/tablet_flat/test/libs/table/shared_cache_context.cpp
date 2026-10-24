@@ -5,16 +5,26 @@
 
 namespace NKikimr::NTable::NTest {
 
-TTableCacheContext::TTableCacheContext() {
+namespace {
+    NSharedCache::TSharedCacheCapacity DefaultCapacity() {
+        NSharedCache::TSharedCacheCapacity capacity;
+        Y_ENSURE(NSharedCache::TryCalculateSharedCacheCapacity(
+            128_MB, NSharedCache::TSharedCache::ExpectedPageSize, 0, NActors::MaxWorkers, capacity));
+        return capacity;
+    }
+} // namespace
+
+TTableCacheContext::TTableCacheContext()
+    : TTableCacheContext(DefaultCapacity())
+{}
+
+TTableCacheContext::TTableCacheContext(const NSharedCache::TSharedCacheCapacity& capacity) {
     Y_ABORT_UNLESS(!NActors::TlsActivationContext && !NSharedCache::TlsCacheHazard);
     Context_ = MakeHolder<TActorSystemStub>();
-    NSharedCache::TSharedCacheCapacity capacity;
     constexpr ui32 hazards = NActors::MaxWorkers;
     Threads_ = MakeHolder<NSharedCache::TCacheThreadSubSystem>(hazards);
     NSharedCache::TlsCacheHazard = &Threads_->Hazard();
     try {
-        Y_ENSURE(NSharedCache::TryCalculateSharedCacheCapacity(
-            128_MB, NSharedCache::TSharedCache::ExpectedPageSize, 0, hazards, capacity));
         auto cache = NSharedCache::TSharedCache::Create(
             NSharedCache::TSharedCacheSpace::Create(capacity, capacity, *Threads_), capacity.Limit);
         Y_ENSURE(cache);

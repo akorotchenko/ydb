@@ -21,17 +21,7 @@ public:
         ui64 MissPages = 0;
         ui64 MissBytes = 0;
 
-        void AddAdmission(ESharedCacheResultStatus status, ui64 bytes) noexcept {
-            ++RequestedPages;
-            RequestedBytes += bytes;
-            if (status == ESharedCacheResultStatus::Hit) {
-                ++HitPages;
-                HitBytes += bytes;
-                return;
-            }
-            ++MissPages;
-            MissBytes += bytes;
-        }
+        void AddAdmission(ESharedCacheResultStatus status, ui64 bytes) noexcept;
     };
 
     TStats Stats() const noexcept {
@@ -45,14 +35,7 @@ public:
         };
     }
 
-    void AddStats(const TStats& stats) noexcept {
-        RequestedPages_.fetch_add(stats.RequestedPages, std::memory_order_relaxed);
-        RequestedBytes_.fetch_add(stats.RequestedBytes, std::memory_order_relaxed);
-        HitPages_.fetch_add(stats.HitPages, std::memory_order_relaxed);
-        HitBytes_.fetch_add(stats.HitBytes, std::memory_order_relaxed);
-        MissPages_.fetch_add(stats.MissPages, std::memory_order_relaxed);
-        MissBytes_.fetch_add(stats.MissBytes, std::memory_order_relaxed);
-    }
+    void AddStats(const TStats& stats) noexcept;
 
     // State transitions can overtake category accounting, temporarily making these estimates negative.
     class TCategoryUsage {
@@ -81,17 +64,9 @@ public:
             Bytes_.fetch_sub(bytes, std::memory_order_relaxed);
         }
 
-        void AddPage(EItemKind kind) noexcept {
-            if (kind == EItemKind::Page) {
-                Pages_.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
+        void AddPage(EItemKind kind) noexcept;
 
-        void RemovePage(EItemKind kind) noexcept {
-            if (kind == EItemKind::Page) {
-                Pages_.fetch_sub(1, std::memory_order_relaxed);
-            }
-        }
+        void RemovePage(EItemKind kind) noexcept;
 
         void TransferBytesTo(TCategoryUsage& destination, ui64 bytes) noexcept {
             const i64 estimatedBytes = static_cast<i64>(bytes);
@@ -99,20 +74,20 @@ public:
             Bytes_.fetch_sub(estimatedBytes, std::memory_order_relaxed);
         }
 
-        void TransferPageTo(TCategoryUsage& destination, EItemKind kind) noexcept {
-            if (kind != EItemKind::Page) {
-                return;
-            }
-            destination.Pages_.fetch_add(1, std::memory_order_relaxed);
-            Pages_.fetch_sub(1, std::memory_order_relaxed);
-        }
+        void TransferPageTo(TCategoryUsage& destination, EItemKind kind) noexcept;
 
     private:
         std::atomic<i64> Bytes_{ 0 };
         std::atomic<i64> Pages_{ 0 };
     };
 
-    TCacheMemory(ui64 staticBytes, ui64 initialLimit, ui64 reservationLimit) noexcept;
+    Y_FORCE_INLINE TCacheMemory(ui64 staticBytes, ui64 initialLimit, ui64 reservationLimit) noexcept
+        : StaticBytes_(staticBytes)
+        , OverallUsage_(staticBytes)
+        , CurrentLimit_(initialLimit)
+        , HardLimit_(initialLimit)
+        , ReservationLimit_(reservationLimit)
+    {}
 
     TCategoryUsage& Hot() noexcept {
         return Hot_;
@@ -216,18 +191,7 @@ public:
         return KeepColdOwnedBytes_.load(std::memory_order_relaxed);
     }
 
-    bool TryAddRetainedBytes(ui64 bytes) noexcept {
-        ui64 retained = RetainedBytes_.load(std::memory_order_relaxed);
-        for (;;) {
-            if (retained + bytes > SoftLimit()) {
-                return false;
-            }
-            if (RetainedBytes_.compare_exchange_weak(
-                    retained, retained + bytes, std::memory_order_relaxed, std::memory_order_relaxed)) {
-                return true;
-            }
-        }
-    }
+    bool TryAddRetainedBytes(ui64 bytes) noexcept;
 
     void AddRetainedBytes(ui64 bytes) noexcept {
         RetainedBytes_.fetch_add(bytes, std::memory_order_relaxed);
@@ -242,11 +206,7 @@ public:
     }
 
     // Sticky ownership counts page payloads; collection records contribute only to the resident-state estimates.
-    void ReleaseStickyOwnedBytes(EItemKind kind, ui64 bytes) noexcept {
-        if (kind == EItemKind::Page) {
-            SubtractExactBytes(StickyOwnedBytes_, bytes);
-        }
-    }
+    void ReleaseStickyOwnedBytes(EItemKind kind, ui64 bytes) noexcept;
 
     void AddKeepColdOwnedBytes(ui64 bytes) noexcept {
         KeepColdOwnedBytes_.fetch_add(bytes, std::memory_order_relaxed);
@@ -265,20 +225,7 @@ public:
     }
 
     // Returns true when the transition makes the item reclaimable.
-    bool UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept {
-        const auto reclaimable = [](THandleState state) {
-            return state.IsCold() && state.IsStickyNoneField() && state.Refs() == 0;
-        };
-        const bool wasReclaimable = reclaimable(before);
-        const bool isReclaimable = reclaimable(after);
-        if (wasReclaimable == isReclaimable) {
-            return false;
-        }
-        const i64 bytes = static_cast<i64>(payloadBytes);
-        ColdReclaimableBytes_.fetch_add(isReclaimable ? bytes : -bytes, std::memory_order_relaxed);
-        ColdReclaimableItems_.fetch_add(isReclaimable ? 1 : -1, std::memory_order_relaxed);
-        return isReclaimable;
-    }
+    bool UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept;
 
     void AddColdItem() noexcept {
         ColdItems_.fetch_add(1, std::memory_order_relaxed);
@@ -346,39 +293,16 @@ public:
         return ResourceWaitArmed_.exchange(false, std::memory_order_acq_rel);
     }
 
-    bool ArmResourceWait(ui64 generation) noexcept {
-        // Acquire the notifier's last exchange even when it has already cleared the flag.
-        // This makes its preceding generation update visible and closes the store/load lost-wake race.
-        ResourceWaitArmed_.exchange(true, std::memory_order_acq_rel);
-        return AdmissionGeneration() != generation && ResourceWaitArmed_.exchange(false, std::memory_order_acq_rel);
-    }
+    bool ArmResourceWait(ui64 generation) noexcept;
 
     void DisarmResourceWait() noexcept {
         ResourceWaitArmed_.store(false, std::memory_order_release);
     }
 
     // The caller checks its current limit against usage before each attempt.
-    bool TryReserve(ui64& usage, ui64 bytes, ui64 pages) noexcept {
-        if (PageUsage_.compare_exchange_weak(
-                usage, usage + bytes, std::memory_order_relaxed, std::memory_order_relaxed)) {
-            OverallUsage_.fetch_add(bytes, std::memory_order_relaxed);
-            ReservedBytes_.fetch_add(bytes, std::memory_order_relaxed);
-            ReservedPages_.fetch_add(pages, std::memory_order_relaxed);
-            return true;
-        }
-        return false;
-    }
+    bool TryReserve(ui64& usage, ui64 bytes, ui64 pages) noexcept;
 
-    void AccountWritten(ui64 bytes, ui64 pages) noexcept {
-        if (bytes == 0 && pages == 0) {
-            return;
-        }
-        // The writer already owns these buffers; transfer their charge before publishing native page items.
-        PageUsage_.fetch_add(bytes, std::memory_order_relaxed);
-        OverallUsage_.fetch_add(bytes, std::memory_order_relaxed);
-        ReservedBytes_.fetch_add(bytes, std::memory_order_relaxed);
-        ReservedPages_.fetch_add(pages, std::memory_order_relaxed);
-    }
+    void AccountWritten(ui64 bytes, ui64 pages) noexcept;
 
     void ReleaseReservation(ui64 bytes, ui64 pages) noexcept {
         SubtractExactBytes(ReservedBytes_, bytes);
@@ -403,27 +327,25 @@ public:
         SubtractExactBytes(ResidentBytes_, bytes);
     }
 
-    void ReleasePayloadCharge(ui64 bytes, EItemKind kind) noexcept {
-        SubtractExactBytes(OverallUsage_, bytes);
-        if (kind == EItemKind::Page) {
-            SubtractExactBytes(PageUsage_, bytes);
-        }
+    void ReleasePayloadCharge(ui64 bytes, EItemKind kind) noexcept;
+
+    Y_FORCE_INLINE void PrepareStaticResize(ui64 bytes) noexcept {
+        Y_DEBUG_ABORT_UNLESS(StaticDeltaBytes_.load(std::memory_order_relaxed) == 0);
+        StaticDeltaBytes_.fetch_add(bytes, std::memory_order_relaxed);
+        OverallUsage_.fetch_add(bytes, std::memory_order_relaxed);
     }
 
-    void PrepareStaticResize(ui64 bytes) noexcept;
-    void CancelStaticResize(ui64 bytes) noexcept;
+    Y_FORCE_INLINE void CancelStaticResize(ui64 bytes) noexcept {
+        SubtractExactBytes(StaticDeltaBytes_, bytes);
+        SubtractExactBytes(OverallUsage_, bytes);
+    }
+
     void CommitStaticResize(ui64 oldStaticBytes, ui64 targetStaticBytes) noexcept;
 
 private:
     static ui64 CalculateSoftLimit(ui64 currentLimit, double gapFraction, ui64 minimumGap) noexcept;
 
-    static void UpdateAggregate(std::atomic<ui64>& total, ui64 previous, ui64 current) noexcept {
-        if (current > previous) {
-            total.fetch_add(current - previous, std::memory_order_relaxed);
-        } else if (current < previous) {
-            SubtractExactBytes(total, previous - current);
-        }
-    }
+    static void UpdateAggregate(std::atomic<ui64>& total, ui64 previous, ui64 current) noexcept;
 
     static void SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept {
         const ui64 previous = counter.fetch_sub(bytes, std::memory_order_relaxed);
@@ -467,5 +389,125 @@ private: // Data members
     std::atomic<ui64> AdmissionGeneration_{ 0 };
     std::atomic<bool> ResourceWaitArmed_{ false };
 };
+
+// Inline implementations
+
+inline void TCacheMemory::AddStats(const TStats& stats) noexcept {
+    RequestedPages_.fetch_add(stats.RequestedPages, std::memory_order_relaxed);
+    RequestedBytes_.fetch_add(stats.RequestedBytes, std::memory_order_relaxed);
+    HitPages_.fetch_add(stats.HitPages, std::memory_order_relaxed);
+    HitBytes_.fetch_add(stats.HitBytes, std::memory_order_relaxed);
+    MissPages_.fetch_add(stats.MissPages, std::memory_order_relaxed);
+    MissBytes_.fetch_add(stats.MissBytes, std::memory_order_relaxed);
+}
+
+inline bool TCacheMemory::TryAddRetainedBytes(ui64 bytes) noexcept {
+    ui64 retained = RetainedBytes_.load(std::memory_order_relaxed);
+    for (;;) {
+        if (retained + bytes > SoftLimit()) {
+            return false;
+        }
+        if (RetainedBytes_.compare_exchange_weak(
+                retained, retained + bytes, std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+}
+
+inline void TCacheMemory::ReleaseStickyOwnedBytes(EItemKind kind, ui64 bytes) noexcept {
+    if (kind == EItemKind::Page) {
+        SubtractExactBytes(StickyOwnedBytes_, bytes);
+    }
+}
+
+inline bool TCacheMemory::UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept {
+    const auto reclaimable = [](THandleState state) {
+        return state.IsCold() && state.IsStickyNoneField() && state.Refs() == 0;
+    };
+    const bool wasReclaimable = reclaimable(before);
+    const bool isReclaimable = reclaimable(after);
+    if (wasReclaimable == isReclaimable) {
+        return false;
+    }
+    const i64 bytes = static_cast<i64>(payloadBytes);
+    ColdReclaimableBytes_.fetch_add(isReclaimable ? bytes : -bytes, std::memory_order_relaxed);
+    ColdReclaimableItems_.fetch_add(isReclaimable ? 1 : -1, std::memory_order_relaxed);
+    return isReclaimable;
+}
+
+inline bool TCacheMemory::ArmResourceWait(ui64 generation) noexcept {
+    // Acquire the notifier's last exchange even when it has already cleared the flag.
+    // This makes its preceding generation update visible and closes the store/load lost-wake race.
+    ResourceWaitArmed_.exchange(true, std::memory_order_acq_rel);
+    return AdmissionGeneration() != generation && ResourceWaitArmed_.exchange(false, std::memory_order_acq_rel);
+}
+
+inline bool TCacheMemory::TryReserve(ui64& usage, ui64 bytes, ui64 pages) noexcept {
+    if (PageUsage_.compare_exchange_weak(usage, usage + bytes, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        OverallUsage_.fetch_add(bytes, std::memory_order_relaxed);
+        ReservedBytes_.fetch_add(bytes, std::memory_order_relaxed);
+        ReservedPages_.fetch_add(pages, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+inline void TCacheMemory::AccountWritten(ui64 bytes, ui64 pages) noexcept {
+    if (bytes == 0 && pages == 0) {
+        return;
+    }
+    // The writer already owns these buffers; transfer their charge before publishing native page items.
+    PageUsage_.fetch_add(bytes, std::memory_order_relaxed);
+    OverallUsage_.fetch_add(bytes, std::memory_order_relaxed);
+    ReservedBytes_.fetch_add(bytes, std::memory_order_relaxed);
+    ReservedPages_.fetch_add(pages, std::memory_order_relaxed);
+}
+
+inline void TCacheMemory::ReleasePayloadCharge(ui64 bytes, EItemKind kind) noexcept {
+    SubtractExactBytes(OverallUsage_, bytes);
+    if (kind == EItemKind::Page) {
+        SubtractExactBytes(PageUsage_, bytes);
+    }
+}
+
+inline void TCacheMemory::UpdateAggregate(std::atomic<ui64>& total, ui64 previous, ui64 current) noexcept {
+    if (current > previous) {
+        total.fetch_add(current - previous, std::memory_order_relaxed);
+    } else if (current < previous) {
+        SubtractExactBytes(total, previous - current);
+    }
+}
+
+inline void TCacheMemory::TStats::AddAdmission(ESharedCacheResultStatus status, ui64 bytes) noexcept {
+    ++RequestedPages;
+    RequestedBytes += bytes;
+    if (status == ESharedCacheResultStatus::Hit) {
+        ++HitPages;
+        HitBytes += bytes;
+        return;
+    }
+    ++MissPages;
+    MissBytes += bytes;
+}
+
+inline void TCacheMemory::TCategoryUsage::AddPage(EItemKind kind) noexcept {
+    if (kind == EItemKind::Page) {
+        Pages_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void TCacheMemory::TCategoryUsage::RemovePage(EItemKind kind) noexcept {
+    if (kind == EItemKind::Page) {
+        Pages_.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
+inline void TCacheMemory::TCategoryUsage::TransferPageTo(TCategoryUsage& destination, EItemKind kind) noexcept {
+    if (kind != EItemKind::Page) {
+        return;
+    }
+    destination.Pages_.fetch_add(1, std::memory_order_relaxed);
+    Pages_.fetch_sub(1, std::memory_order_relaxed);
+}
 
 } // namespace NKikimr::NSharedCache

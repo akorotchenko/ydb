@@ -10,25 +10,6 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
-TCollection* TCacheCollections<TTraits>::PageCollection(TSpaceOperation& spaceOp, const THandle& page) noexcept {
-    return PageCollection(
-        spaceOp, TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(page.Key0.load(std::memory_order_relaxed))));
-}
-
-template <class TTraits>
-TCollection* TCacheCollections<TTraits>::PageCollection(TSpaceOperation& spaceOp, TCollectionCacheItem item) noexcept {
-    if (item.Index() >= spaceOp.AccessibleHandleCount()) {
-        return nullptr;
-    }
-    THandle& collection = spaceOp.Handles()[item.Index()];
-    const THandleState state = THandleState::FromRaw(collection.State.load(std::memory_order_acquire));
-    if (!item.Matches(state) || !collection.Body.Collection) {
-        return nullptr;
-    }
-    return collection.Body.Collection;
-}
-
-template <class TTraits>
 void TCacheCollections<TTraits>::PublishKeepPageBytes(TCollection& owner) noexcept {
     constexpr ui32 Publishing = 1;
     constexpr ui32 Changed = 2;
@@ -87,24 +68,6 @@ void TCacheCollections<TTraits>::AddActivePageBytes(TCollection& owner, NTable::
         owner.BTreeIndexV1ActiveBytes_.fetch_add(bytes, std::memory_order_relaxed);
     }
     PublishKeepPageBytes(owner);
-}
-
-template <class TTraits>
-void TCacheCollections<TTraits>::SetSkipBTreeIndexV1Shadow(TCollection& owner, bool skip) noexcept {
-    owner.PageCollection()->SetSkipBTreeIndexV1Shadow(skip);
-    PublishKeepPageBytes(owner);
-}
-
-template <class TTraits>
-void TCacheCollections<TTraits>::SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept {
-    const ui64 previous = counter.fetch_sub(bytes, std::memory_order_relaxed);
-    Y_ABORT_UNLESS(previous >= bytes);
-}
-
-template <class TTraits>
-void TCacheCollections<TTraits>::AcknowledgeBytes(TCollection& owner) noexcept {
-    // Clear before the actor samples bytes, so a racing update can schedule the next notification.
-    owner.BytesNotificationPending_.store(false, std::memory_order_release);
 }
 
 template <class TTraits>
@@ -176,14 +139,6 @@ bool TCacheCollections<TTraits>::Unlink(TSpaceOperation& spaceOp, TCollectionReg
 }
 
 template <class TTraits>
-void TCacheCollections<TTraits>::Unlink(
-    TCollectionRegistry& registry, TOperationItemRef<TTraits>& collectionRef) noexcept {
-    const bool unlinked =
-        Unlink(collectionRef.SpaceOperation(), registry, collectionRef.CacheItem(), EHandleState::Tombstone);
-    Y_DEBUG_ABORT_UNLESS(unlinked);
-}
-
-template <class TTraits>
 bool TCacheCollections<TTraits>::Unlink(
     TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collectionItem) noexcept {
     TOperationItemRef<TTraits> collectionRef(spaceOp, Items(spaceOp).TryAcquireStructural(collectionItem));
@@ -218,18 +173,6 @@ void TCacheCollections<TTraits>::ForEach(
         callback(*handle.Body.Collection);
         current = next;
     }
-}
-
-template <class TTraits>
-void TCacheCollections<TTraits>::AddReference(TCollection& owner) noexcept {
-    owner.References.fetch_add(1, std::memory_order_relaxed);
-}
-
-template <class TTraits>
-bool TCacheCollections<TTraits>::DropReference(TCollection& owner) noexcept {
-    const ui64 previous = owner.References.fetch_sub(1, std::memory_order_relaxed);
-    Y_ABORT_UNLESS(previous != 0);
-    return previous == 1;
 }
 
 template <class TTraits>
@@ -891,17 +834,6 @@ bool TCacheCollections<TTraits>::Detach(
     }
     Cache_.NotifyResourcesAvailable();
     return true;
-}
-
-template <class TTraits>
-bool TCacheCollections<TTraits>::IsUnregisteredAndUnreferenced(const TCollection& collection) noexcept {
-    return !collection.Registry_.load(std::memory_order_acquire) &&
-           collection.References.load(std::memory_order_acquire) == 0;
-}
-
-template <class TTraits>
-bool TCacheCollections<TTraits>::WantsStickyPage(const TCollection& collection) noexcept {
-    return collection.CacheMode_.load(std::memory_order_acquire) == ECacheMode::Sticky;
 }
 
 template <class TTraits>

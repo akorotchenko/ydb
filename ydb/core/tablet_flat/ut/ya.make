@@ -26,13 +26,11 @@ SRCS(
     flat_test_db.cpp
     flat_test_db_helpers.h
     shared_cache_btree_walk_ut.cpp
-    shared_cache_s3fifo_ut.cpp
     shared_cache_cyclic_buffer_ut.cpp
     shared_cache_item_ut.cpp
     shared_cache_space_ut.cpp
     shared_cache_table_ut.cpp
     shared_cache_thread_ut.cpp
-    shared_cache_tiered_ut.cpp
     ut_btree_index_nodes.cpp
     ut_btree_index_iter_charge.cpp
     ut_self.cpp

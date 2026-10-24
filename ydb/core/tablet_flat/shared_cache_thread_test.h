@@ -70,24 +70,29 @@ public:
     }
 
     template <class TRuntime>
-    static void Setup(TRuntime& runtime) {
-        auto previous = std::move(runtime.SetupNodeSubSystems);
-        const ui32 count = runtime.IsRealThreads() ? 1 : NActors::MaxWorkers;
-        const bool applicationThread = !runtime.IsRealThreads() && runtime.GetNodeCount() == 1;
-        runtime.SetupNodeSubSystems = [count, applicationThread, previous = std::move(previous)](
-                                          ui32 node, NActors::TActorSystemSetup* setup) {
-            if (previous) {
-                previous(node, setup);
-            }
-            if (!NActors::GetSubSystem<TCacheThreadSubSystem>(setup->SubSystems)) {
-                auto threads = std::make_unique<TCacheThreadSubSystem>(count);
-                setup->RegisterSubSystem(std::move(threads));
-            }
-            if (applicationThread && !NActors::GetSubSystem<TApplicationThreadSubSystem>(setup->SubSystems)) {
-                setup->RegisterSubSystem(std::make_unique<TApplicationThreadSubSystem>());
-            }
-        };
-    }
+    static void Setup(TRuntime& runtime);
 };
+
+// Inline implementations
+
+template <class TRuntime>
+inline void TCacheThreadTestAccess::Setup(TRuntime& runtime) {
+    auto previous = std::move(runtime.SetupNodeSubSystems);
+    const ui32 count = runtime.IsRealThreads() ? 1 : NActors::MaxWorkers;
+    const bool applicationThread = !runtime.IsRealThreads() && runtime.GetNodeCount() == 1;
+    runtime.SetupNodeSubSystems = [count, applicationThread, previous = std::move(previous)](
+                                      ui32 node, NActors::TActorSystemSetup* setup) {
+        if (previous) {
+            previous(node, setup);
+        }
+        if (!NActors::GetSubSystem<TCacheThreadSubSystem>(setup->SubSystems)) {
+            auto threads = std::make_unique<TCacheThreadSubSystem>(count);
+            setup->RegisterSubSystem(std::move(threads));
+        }
+        if (applicationThread && !NActors::GetSubSystem<TApplicationThreadSubSystem>(setup->SubSystems)) {
+            setup->RegisterSubSystem(std::make_unique<TApplicationThreadSubSystem>());
+        }
+    };
+}
 
 } // namespace NKikimr::NSharedCache

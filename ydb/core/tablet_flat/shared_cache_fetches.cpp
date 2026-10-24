@@ -10,13 +10,6 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
-bool TCacheFetches<TTraits>::MatchesPendingFetch(
-    const THandle& handle, THandleState state, TCacheItem cacheItem, const TPageFetchState& fetch) noexcept {
-    return cacheItem.Matches(state) && state.IsPageKind() && state.IsPending() && handle.Body.Fetch == &fetch &&
-           fetch.Page().CacheItem() == cacheItem;
-}
-
-template <class TTraits>
 TIntrusivePtr<TPageFetchState> TCacheFetches<TTraits>::TryAcquire(
     TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept {
     if (Cache_.Items_.BindOperation(spaceOp).TryAcquire(page.CacheItem(), true, owner.Get()) !=
@@ -100,13 +93,6 @@ void TCacheFetches<TTraits>::Release(TOperationItemRef<TTraits>& owner, TPageFet
             owner.Disarm();
         }
         return;
-    }
-}
-
-template <class TTraits>
-void TCacheFetches<TTraits>::DeletePendingFetch(THandle& handle) noexcept {
-    if (TPageFetchState* fetch = std::exchange(handle.Body.Fetch, nullptr)) {
-        fetch->UnRef();
     }
 }
 
@@ -273,137 +259,7 @@ bool TCacheFetches<TTraits>::Dispatch(TSpaceOperation& spaceOp, TCacheItem cache
     }
 }
 
-template <class TTraits>
-TPageFetchImpl<TTraits>::TPageFetchImpl(TPageFetchState* fetch) noexcept
-    : FetchState_(fetch)
-{
-    Y_DEBUG_ABORT_UNLESS(FetchState_ && FetchState_->Page());
-}
-
-template <class TTraits>
-TPageFetchImpl<TTraits>::TPageFetchImpl(TPageFetchImpl<TTraits>&& other) noexcept
-    : FetchState_(std::move(other.FetchState_))
-{}
-
-template <class TTraits>
-TPageFetchImpl<TTraits>& TPageFetchImpl<TTraits>::operator=(TPageFetchImpl<TTraits>&& other) noexcept {
-    if (this != &other) {
-        FailReady();
-        FetchState_ = std::move(other.FetchState_);
-    }
-    return *this;
-}
-
-template <class TTraits>
-TPageFetchImpl<TTraits>::~TPageFetchImpl() {
-    FailReady();
-}
-
-template <class TTraits>
-TPageCacheItem TPageFetchImpl<TTraits>::CacheItem() const noexcept {
-    Y_DEBUG_ABORT_UNLESS(FetchState_);
-    return FetchState_->Page();
-}
-
-template <class TTraits>
-NTable::NPage::TPageLocation TPageFetchImpl<TTraits>::Location() const noexcept {
-    Y_DEBUG_ABORT_UNLESS(FetchState_);
-    TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
-    auto spaceOp = cache.BeginOperation();
-    const TCacheItem cacheItem = FetchState_->Page().CacheItem();
-    Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
-    const THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    Y_DEBUG_ABORT_UNLESS(
-        cacheItem.Matches(state) && state.IsPageKind() && state.IsPending() && handle.Body.Fetch == FetchState_.Get());
-    return {
-        NTable::NPage::TPageOffset::FromRaw(handle.Key1.load(std::memory_order_relaxed)),
-        handle.Key2OrSize.load(std::memory_order_relaxed),
-        handle.Metadata.Page.Type,
-        handle.Metadata.Page.Crc32,
-    };
-}
-
-template <class TTraits>
-ui64 TPageFetchImpl<TTraits>::Size() const noexcept {
-    return Location().Size;
-}
-
-template <class TTraits>
-bool TPageFetchImpl<TTraits>::HasActiveWaiters() const noexcept {
-    return FetchState_ && FetchState_->HasActiveWaiters();
-}
-
-template <class TTraits>
-void TPageFetchImpl<TTraits>::ForEachActiveWaiter(TFunctionRef<void(const TPageFetchWaiter&)> visitor) const noexcept {
-    if (FetchState_) {
-        FetchState_->ForEachActiveWaiter(visitor);
-    }
-}
-
-template <class TTraits>
-bool TPageFetchImpl<TTraits>::TryReserveMemory() noexcept {
-    if (!FetchState_) {
-        return false;
-    }
-    TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
-    auto cacheOp = cache.BeginOperation();
-    return cacheOp.Fetches().ReserveMemory(FetchState_->Page().CacheItem(), *FetchState_);
-}
-
-template <class TTraits>
-bool TPageFetchImpl<TTraits>::Dispatch() noexcept {
-    if (!FetchState_) {
-        return false;
-    }
-    TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
-    auto cacheOp = cache.BeginOperation();
-    return cacheOp.Fetches().Dispatch(FetchState_->Page().CacheItem(), *FetchState_);
-}
-
-template <class TTraits>
-bool TPageFetchImpl<TTraits>::MakeReady(NActors::TSharedData&& data) noexcept {
-    if (!FetchState_) {
-        return false;
-    }
-    TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
-    bool ready;
-    {
-        auto cacheOp = cache.BeginOperation();
-        // The fetch owns the insertion ref represented by FetchState_, without storing a second item identity.
-        TOperationItemRef<TTraits> owner(cacheOp, FetchState_->Page().CacheItem());
-        ready = cacheOp.Fetches().Complete(owner, *FetchState_, std::move(data));
-    }
-    FetchState_.Drop();
-    return ready;
-}
-
-template <class TTraits>
-bool TPageFetchImpl<TTraits>::FailReady() noexcept {
-    if (!FetchState_) {
-        return false;
-    }
-    TSharedCacheImpl<TTraits>* cache = TSharedCacheImpl<TTraits>::TryGet();
-    if (!cache) {
-        // Missing actor context is terminal shutdown, as for native item references.
-        FetchState_->AbandonWaiters();
-        FetchState_.Drop();
-        return false;
-    }
-    bool failed;
-    {
-        auto cacheOp = cache->BeginOperation();
-        TOperationItemRef<TTraits> owner(cacheOp, FetchState_->Page().CacheItem());
-        failed = cacheOp.Fetches().Fail(owner, *FetchState_);
-    }
-    FetchState_.Drop();
-    return failed;
-}
-
 template class TCacheFetches<TProdTraits>;
 template class TCacheFetches<TTestTraits>;
-
-template class TPageFetchImpl<TProdTraits>;
-template class TPageFetchImpl<TTestTraits>;
 
 } // namespace NKikimr::NSharedCache

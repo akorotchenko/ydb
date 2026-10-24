@@ -476,7 +476,7 @@ Y_UNIT_TEST(Limits_Config) {
     UNIT_ASSERT_VALUES_EQUAL(counters->ConfigLimitBytes->Val(), 1);
 }
 
-Y_UNIT_TEST(S3FIFO) {
+Y_UNIT_TEST(S5FIFO) {
     TMyEnvBase env;
     env->SetLogPriority(NKikimrServices::TABLET_SAUSAGECACHE, NActors::NLog::PRI_TRACE);
     env->SetLogPriority(NKikimrServices::TABLET_EXECUTOR, NActors::NLog::PRI_TRACE);

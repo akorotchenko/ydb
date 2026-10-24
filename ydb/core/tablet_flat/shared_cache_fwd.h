@@ -12,6 +12,19 @@ enum class ESharedCacheResultStatus {
 struct TProdTraits;
 template <class TTraits>
 class TSharedCacheImpl;
+
+template <class TTraits>
+class TCacheOperation;
+template <class TTraits>
+class TCacheOperationView;
+template <class TTraits>
+class TCacheItemsOperation;
+template <class TTraits>
+class TCacheCollectionsOperation;
+template <class TTraits>
+class TCacheEvictionOperation;
+template <class TTraits>
+class TCacheFetchesOperation;
 using TSharedCache = TSharedCacheImpl<TProdTraits>;
 
 template <class TTraits>

@@ -91,8 +91,7 @@ class TCacheBTreeWalkController {
 public:
     explicit TCacheBTreeWalkController(ICacheBTreeWalkHost& host)
         : Host(host)
-    {
-    }
+    {}
 
     void UpdateSeeds(TCollection& collection, const TActorId& owner, TVector<TEvAttach::TBtreeSeed> seeds,
         bool replayStickyWalk = false);
@@ -107,15 +106,36 @@ public:
     void IndexPagesChanged(const TLogoBlobID& collectionId);
     void FinishReady();
     void FinishFetch(const TLogoBlobID& walkCollectionId);
-    void FetchStarted(const TLogoBlobID& walkCollectionId);
-    void InvalidateRun(const TLogoBlobID& walkCollectionId);
+
+    Y_FORCE_INLINE void FetchStarted(const TLogoBlobID& walkCollectionId) {
+        auto* collection = Host.FindCollection(walkCollectionId);
+        Y_ENSURE(collection && State(collection->Id()).Run &&
+                 State(collection->Id()).Run->State != EWalkRunState::Cancelled);
+        ++State(collection->Id()).Run->FetchesInFlight;
+    }
+
+    Y_FORCE_INLINE void InvalidateRun(const TLogoBlobID& walkCollectionId) {
+        auto* collection = Host.FindCollection(walkCollectionId);
+        Y_ENSURE(collection);
+        InvalidateWalkRun(*collection);
+    }
+
     void InvalidateDataCollection(const TLogoBlobID& collectionId);
     void InvalidateIndexCollection(const TLogoBlobID& collectionId);
     void DropForIndexCollection(const TLogoBlobID& indexCollectionId);
     void RestartForIndexCollection(const TLogoBlobID& indexCollectionId);
     void DropIndexOnlyWalks(const TLogoBlobID& indexCollectionId);
-    bool IsIdle(const TLogoBlobID& collectionId) const;
-    void EraseCollection(const TLogoBlobID& collectionId);
+
+    Y_FORCE_INLINE bool IsIdle(const TLogoBlobID& collectionId) const {
+        const auto* state = States.FindPtr(collectionId);
+        // Keep the collection alive while its index association exists, or WalkCollectionsByIndex would dangle.
+        return !state || (!state->Run && !state->IndexCollectionId);
+    }
+
+    Y_FORCE_INLINE void EraseCollection(const TLogoBlobID& collectionId) {
+        Y_DEBUG_ABORT_UNLESS(IsIdle(collectionId));
+        States.erase(collectionId);
+    }
 
 private:
     enum class EBatchResult {
@@ -123,15 +143,34 @@ private:
         Queued,
     };
 
-    TWalkCollectionState& State(const TLogoBlobID& collectionId);
+    Y_FORCE_INLINE TWalkCollectionState& State(const TLogoBlobID& collectionId) {
+        return States[collectionId];
+    }
+
     void UpdateWalkIndex(TCollection& collection);
-    TVector<TLogoBlobID> GetWalkCollections(const TLogoBlobID& indexCollectionId) const;
+
+    Y_FORCE_INLINE TVector<TLogoBlobID> GetWalkCollections(const TLogoBlobID& indexCollectionId) const {
+        if (const auto* walkCollections = WalkCollectionsByIndex.FindPtr(indexCollectionId)) {
+            return *walkCollections;
+        }
+        return {};
+    }
+
     void StartWalkRun(TCollection& collection);
     void FinishWalkRun(TCollection& collection);
     bool FinishWalkRunIfDrained(TCollection& collection);
     void CancelWalkRun(TCollection& collection);
-    void RestartWalkRun(TCollection& collection);
-    void InvalidateWalkRun(TCollection& collection);
+
+    Y_FORCE_INLINE void RestartWalkRun(TCollection& collection) {
+        State(collection.Id()).ControllerState = EWalkControllerState::Pending;
+        CancelWalkRun(collection);
+    }
+
+    Y_FORCE_INLINE void InvalidateWalkRun(TCollection& collection) {
+        State(collection.Id()).ControllerState = EWalkControllerState::Blocked;
+        CancelWalkRun(collection);
+    }
+
     bool QueueInMemoryPages(TCollection& collection, TArrayRef<const TPageLocation> locations);
     void AdvanceWalk(TCacheBTreeWalk& walk, const TLogoBlobID& walkCollectionId);
     void HandOverIndexLevel(TCacheBTreeWalk& walk, TArrayRef<const NTable::NPage::TPageLocation> locations, ui32 level);

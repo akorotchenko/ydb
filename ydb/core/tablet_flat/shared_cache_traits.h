@@ -78,11 +78,7 @@ struct TTestTraits {
     // The TCacheItem argument follows the payload rules documented on ESharedCacheHookPoint.
     void (*Function)(void*, ESharedCacheHookPoint, TCacheItem) noexcept = nullptr;
 
-    void Invoke(ESharedCacheHookPoint point, TCacheItem cacheItem) const noexcept {
-        if (Function) {
-            Function(Context, point, cacheItem);
-        }
-    }
+    void Invoke(ESharedCacheHookPoint point, TCacheItem cacheItem) const noexcept;
 
     void NotifyKeepPageEviction(
         const TLogoBlobID&, TCollectionCacheItem, ui64, NTable::NPage::TPageLocation) const noexcept {}
@@ -124,5 +120,13 @@ inline constexpr TSharedCachePolicy SharedCachePolicyFor<TTestTraits>{
     .MinHotSlots = 15, // Scaled geometry for small native fixtures
     .MinResizeStep = 1,
 };
+
+// Inline implementations
+
+inline void TTestTraits::Invoke(ESharedCacheHookPoint point, TCacheItem cacheItem) const noexcept {
+    if (Function) {
+        Function(Context, point, cacheItem);
+    }
+}
 
 } // namespace NKikimr::NSharedCache

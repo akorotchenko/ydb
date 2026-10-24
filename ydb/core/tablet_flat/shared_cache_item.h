@@ -511,43 +511,16 @@ public:
         : Page_(page)
     {}
 
-    ~TPageFetchState() {
-        CloseWaiters([this](TIntrusivePtr<TPageFetchWaiter> waiter) {
-            waiter->Complete(Page_, EPageFetchCompletion::Failed);
-        });
-    }
+    ~TPageFetchState();
 
     TPageCacheItem Page() const noexcept {
         return Page_;
     }
 
-    bool Subscribe(TIntrusivePtr<TPageFetchWaiter> waiter) noexcept {
-        Y_DEBUG_ABORT_UNLESS(waiter);
-        TPageFetchWaiter* raw = waiter.Get();
-        raw->Ref();
-        TPageFetchWaiter* head = Waiters_.load(std::memory_order_acquire);
-        for (;;) {
-            if (head == Sealed) {
-                raw->UnRef();
-                return false;
-            }
-            raw->Next_.store(head, std::memory_order_relaxed);
-            if (Waiters_.compare_exchange_weak(head, raw, std::memory_order_release, std::memory_order_acquire))
-            {
-                return true;
-            }
-        }
-    }
+    bool Subscribe(TIntrusivePtr<TPageFetchWaiter> waiter) noexcept;
 
     template <class TConsumer>
-    bool CloseWaiters(TConsumer&& consumer) noexcept {
-        TPageFetchWaiter* head = DetachWaiters();
-        if (head == Sealed) {
-            return false;
-        }
-        DrainWaiters(head, std::forward<TConsumer>(consumer));
-        return true;
-    }
+    bool CloseWaiters(TConsumer&& consumer) noexcept;
 
     bool Closed() const noexcept {
         return Waiters_.load(std::memory_order_acquire) == Sealed;
@@ -566,37 +539,12 @@ private:
     template <class>
     friend class TSharedCacheImpl;
 
-    void AbandonWaiters() noexcept {
-        CloseWaiters([](TIntrusivePtr<TPageFetchWaiter>) {
-        });
-    }
+    void AbandonWaiters() noexcept;
 
-    bool HasActiveWaiters() const noexcept {
-        // The move-only fetch owner holds a pending item ref, preventing waiter-list closure and reclamation.
-        // Subscribers only prepend nodes; existing links remain unchanged until that owner releases its ref.
-        TPageFetchWaiter* waiter = Waiters_.load(std::memory_order_acquire);
-        Y_DEBUG_ABORT_UNLESS(waiter != Sealed);
-        while (waiter) {
-            if (waiter->IsActive()) {
-                return true;
-            }
-            waiter = waiter->Next_.load(std::memory_order_relaxed);
-        }
-        return false;
-    }
+    bool HasActiveWaiters() const noexcept;
 
     template <class TVisitor>
-    void ForEachActiveWaiter(TVisitor&& visitor) const noexcept {
-        // The fetch owner keeps this list alive even when a visitor cancels a request.
-        TPageFetchWaiter* waiter = Waiters_.load(std::memory_order_acquire);
-        Y_DEBUG_ABORT_UNLESS(waiter != Sealed);
-        while (waiter) {
-            if (waiter->IsActive()) {
-                visitor(*waiter);
-            }
-            waiter = waiter->Next_.load(std::memory_order_relaxed);
-        }
-    }
+    void ForEachActiveWaiter(TVisitor&& visitor) const noexcept;
 
     void SetReady(NActors::TSharedData&& data) noexcept {
         Y_DEBUG_ABORT_UNLESS(data && Completion_.load(std::memory_order_relaxed) == EPageFetchCompletion::Pending);
@@ -623,15 +571,7 @@ private:
     }
 
     template <class TConsumer>
-    static void DrainWaiters(TPageFetchWaiter* head, TConsumer&& consumer) noexcept {
-        Y_DEBUG_ABORT_UNLESS(head != Sealed);
-        while (head) {
-            TPageFetchWaiter* next = head->Next_.load(std::memory_order_relaxed);
-            head->Next_.store(nullptr, std::memory_order_relaxed);
-            consumer(TIntrusivePtr<TPageFetchWaiter>(head, TIntrusivePtr<TPageFetchWaiter>::TNoIncrement{}));
-            head = next;
-        }
-    }
+    static void DrainWaiters(TPageFetchWaiter* head, TConsumer&& consumer) noexcept;
 
     inline static TPageFetchWaiter* const Sealed = reinterpret_cast<TPageFetchWaiter*>(~uintptr_t{ 0 });
 
@@ -707,5 +647,84 @@ static_assert(offsetof(THandle, Body) == 40);
 static_assert(offsetof(THandle, Metadata) == 48);
 static_assert(offsetof(THandle, ColdVersion) == 56);
 static_assert(offsetof(THandle, NextInOwner) == 60);
+
+// Inline implementations
+
+inline TPageFetchState::~TPageFetchState() {
+    CloseWaiters([this](TIntrusivePtr<TPageFetchWaiter> waiter) {
+        waiter->Complete(Page_, EPageFetchCompletion::Failed);
+    });
+}
+
+inline bool TPageFetchState::Subscribe(TIntrusivePtr<TPageFetchWaiter> waiter) noexcept {
+    Y_DEBUG_ABORT_UNLESS(waiter);
+    TPageFetchWaiter* raw = waiter.Get();
+    raw->Ref();
+    TPageFetchWaiter* head = Waiters_.load(std::memory_order_acquire);
+    for (;;) {
+        if (head == Sealed) {
+            raw->UnRef();
+            return false;
+        }
+        raw->Next_.store(head, std::memory_order_relaxed);
+        if (Waiters_.compare_exchange_weak(head, raw, std::memory_order_release, std::memory_order_acquire))
+        {
+            return true;
+        }
+    }
+}
+
+template <class TConsumer>
+inline bool TPageFetchState::CloseWaiters(TConsumer&& consumer) noexcept {
+    TPageFetchWaiter* head = DetachWaiters();
+    if (head == Sealed) {
+        return false;
+    }
+    DrainWaiters(head, std::forward<TConsumer>(consumer));
+    return true;
+}
+
+inline void TPageFetchState::AbandonWaiters() noexcept {
+    CloseWaiters([](TIntrusivePtr<TPageFetchWaiter>) {
+    });
+}
+
+inline bool TPageFetchState::HasActiveWaiters() const noexcept {
+    // The move-only fetch owner holds a pending item ref, preventing waiter-list closure and reclamation.
+    // Subscribers only prepend nodes; existing links remain unchanged until that owner releases its ref.
+    TPageFetchWaiter* waiter = Waiters_.load(std::memory_order_acquire);
+    Y_DEBUG_ABORT_UNLESS(waiter != Sealed);
+    while (waiter) {
+        if (waiter->IsActive()) {
+            return true;
+        }
+        waiter = waiter->Next_.load(std::memory_order_relaxed);
+    }
+    return false;
+}
+
+template <class TVisitor>
+inline void TPageFetchState::ForEachActiveWaiter(TVisitor&& visitor) const noexcept {
+    // The fetch owner keeps this list alive even when a visitor cancels a request.
+    TPageFetchWaiter* waiter = Waiters_.load(std::memory_order_acquire);
+    Y_DEBUG_ABORT_UNLESS(waiter != Sealed);
+    while (waiter) {
+        if (waiter->IsActive()) {
+            visitor(*waiter);
+        }
+        waiter = waiter->Next_.load(std::memory_order_relaxed);
+    }
+}
+
+template <class TConsumer>
+inline void TPageFetchState::DrainWaiters(TPageFetchWaiter* head, TConsumer&& consumer) noexcept {
+    Y_DEBUG_ABORT_UNLESS(head != Sealed);
+    while (head) {
+        TPageFetchWaiter* next = head->Next_.load(std::memory_order_relaxed);
+        head->Next_.store(nullptr, std::memory_order_relaxed);
+        consumer(TIntrusivePtr<TPageFetchWaiter>(head, TIntrusivePtr<TPageFetchWaiter>::TNoIncrement{}));
+        head = next;
+    }
+}
 
 } // namespace NKikimr::NSharedCache

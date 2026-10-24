@@ -1,13 +1,11 @@
 #pragma once
 
 #include "defs.h"
-#include <ydb/core/protos/shared_cache.pb.h>
 
 namespace NKikimr::NSharedCache {
 
 struct TSharedPageCacheCounters final : public TAtomicRefCount<TSharedPageCacheCounters> {
     using TCounterPtr = ::NMonitoring::TDynamicCounters::TCounterPtr;
-    using TReplacementPolicy = NKikimrSharedCache::TReplacementPolicy;
 
     const TIntrusivePtr<::NMonitoring::TDynamicCounters> Counters;
 
@@ -33,7 +31,6 @@ struct TSharedPageCacheCounters final : public TAtomicRefCount<TSharedPageCacheC
     const TCounterPtr ActiveInMemoryBytes;
     const TCounterPtr EvictedPages;
     const TCounterPtr EvictedBytes;
-    const TCounterPtr S3FIFOEvictOps;
 
     // page collection counters:
     const TCounterPtr PageCollections;

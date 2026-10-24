@@ -4,18 +4,6 @@
 
 namespace NKikimr::NSharedCache {
 
-TCollection::TCollection(
-    TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, TCollectionCacheItem cacheItem) noexcept
-    : CacheItem(cacheItem)
-    , PageCollection_(std::move(pageCollection))
-{
-    Y_DEBUG_ABORT_UNLESS(PageCollection_);
-}
-
-TCollection::~TCollection() {
-    ResetActorState();
-}
-
 void TCollection::SetSkipBTreeIndexV1Shadow(bool skip) {
     auto& cache = TSharedCache::Get();
     cache.Collections_.SetSkipBTreeIndexV1Shadow(*this, skip);

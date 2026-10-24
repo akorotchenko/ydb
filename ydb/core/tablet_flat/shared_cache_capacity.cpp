@@ -4,12 +4,6 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
-void TCacheCapacity<TTraits>::SetTarget(const TSharedCacheCapacity& target) noexcept {
-    Target_ = target;
-    TargetHandleCount_.store(target.HandleCount(), std::memory_order_relaxed);
-}
-
-template <class TTraits>
 bool TCacheCapacity<TTraits>::PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept {
     const ui64 currentStaticBytes = Cache_.Space_->CurrentConfiguration().StaticBytes;
     const ui64 staticDeltaBytes = target.StaticBytes > currentStaticBytes ? target.StaticBytes - currentStaticBytes : 0;
@@ -23,19 +17,6 @@ bool TCacheCapacity<TTraits>::PrepareTransition(const TSharedCacheCapacity& targ
         Cache_.Memory_.CancelStaticResize(staticDeltaBytes);
     }
     return false;
-}
-
-template <class TTraits>
-bool TCacheCapacity<TTraits>::PublishMigrationView(TTransition& transition) noexcept {
-    if (auto hotResizeGuard = Cache_.HotResize_.TryLock()) {
-        return Cache_.Space_->PublishMigrationView(transition);
-    }
-    return false;
-}
-
-template <class TTraits>
-bool TCacheCapacity<TTraits>::TryDrainTransition(TTransition& transition) noexcept {
-    return Cache_.Space_->TryDrainTransition(transition);
 }
 
 template <class TTraits>
@@ -105,11 +86,6 @@ bool TCacheCapacity<TTraits>::FinalDrain(TTransition& transition) noexcept {
         [&](ui64 raw) noexcept {
             evictionOp.RouteKeepCold(TColdCacheItem::FromRaw(raw));
         });
-}
-
-template <class TTraits>
-bool TCacheCapacity<TTraits>::TryReleaseTransition(TTransition& transition) noexcept {
-    return Cache_.Space_->TryReleaseTransition(transition);
 }
 
 template <class TTraits>
