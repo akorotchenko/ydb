@@ -4,6 +4,7 @@
 #include "shared_cache_item.h"
 
 #include <util/generic/noncopyable.h>
+#include <util/system/compiler.h>
 
 #include <utility>
 
@@ -24,9 +25,16 @@ public:
     TSharedCacheItemRefImpl() noexcept = default;
     TSharedCacheItemRefImpl(const TSharedCacheItemRefImpl&) = delete;
     TSharedCacheItemRefImpl& operator=(const TSharedCacheItemRefImpl&) = delete;
-    TSharedCacheItemRefImpl(TSharedCacheItemRefImpl&& other) noexcept;
-    TSharedCacheItemRefImpl& operator=(TSharedCacheItemRefImpl&& other) noexcept;
-    ~TSharedCacheItemRefImpl();
+
+    Y_FORCE_INLINE TSharedCacheItemRefImpl(TSharedCacheItemRefImpl&& other) noexcept
+        : CacheItem_(other.Take())
+    {}
+
+    Y_FORCE_INLINE TSharedCacheItemRefImpl& operator=(TSharedCacheItemRefImpl&& other) noexcept;
+
+    Y_FORCE_INLINE ~TSharedCacheItemRefImpl() {
+        Drop();
+    }
 
     explicit operator bool() const noexcept {
         return !CacheItem_.IsNull();
@@ -44,7 +52,7 @@ public:
         return CacheItem_;
     }
 
-    void Drop() noexcept;
+    Y_FORCE_INLINE void Drop() noexcept;
 
 private:
     friend class TSharedCacheTableImpl<TTraits>;
@@ -54,11 +62,33 @@ private:
     friend class TSharedCacheCollectionRefImpl<TTraits>;
     friend class TOperationItemRef<TTraits>;
 
-    explicit TSharedCacheItemRefImpl(TCacheItem cacheItem) noexcept;
+    Y_FORCE_INLINE explicit TSharedCacheItemRefImpl(TCacheItem cacheItem) noexcept
+        : CacheItem_(cacheItem)
+    {}
 
-    TCacheItem Take() noexcept;
-    void Disarm() noexcept;
-    void Drop(TSpaceOperation& spaceOp) noexcept;
+    Y_FORCE_INLINE TCacheItem Take() noexcept {
+        return std::exchange(CacheItem_, {});
+    }
+
+    Y_FORCE_INLINE void Disarm() noexcept {
+        Y_DEBUG_ABORT_UNLESS(!CacheItem_.IsNull());
+        CacheItem_ = {};
+    }
+
+    Y_FORCE_INLINE void Drop(TSpaceOperation& spaceOp) noexcept;
+
+    static Y_FORCE_INLINE void Release(TCacheItem item) noexcept {
+        // A missing resolver is the explicit terminal-shutdown abandonment path
+        if (TSharedCacheImpl<TTraits>* cache = TSharedCacheImpl<TTraits>::TryGet()) {
+            auto cacheOp = cache->BeginOperation();
+            cacheOp.Release(item);
+        }
+    }
+
+    static Y_FORCE_INLINE void Release(TSpaceOperation& spaceOp, TCacheItem item) noexcept {
+        auto cacheOp = TSharedCacheImpl<TTraits>::Get().BindOperation(spaceOp);
+        cacheOp.Release(item);
+    }
 
 private:
     TCacheItem CacheItem_;
@@ -67,16 +97,16 @@ private:
 template <class TTraits>
 class TOperationItemRef {
 public:
-    explicit TOperationItemRef(TSpaceOperation& spaceOp) noexcept
+    Y_FORCE_INLINE explicit TOperationItemRef(TSpaceOperation& spaceOp) noexcept
         : SpaceOp_(spaceOp)
     {}
 
-    TOperationItemRef(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept
+    Y_FORCE_INLINE TOperationItemRef(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept
         : SpaceOp_(spaceOp)
         , Ref_(cacheItem)
     {}
 
-    TOperationItemRef(TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) noexcept
+    Y_FORCE_INLINE TOperationItemRef(TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) noexcept
         : SpaceOp_(spaceOp)
         , Ref_(std::move(ref))
     {}
@@ -86,35 +116,35 @@ public:
     TOperationItemRef(TOperationItemRef&&) = delete;
     TOperationItemRef& operator=(TOperationItemRef&&) = delete;
 
-    ~TOperationItemRef() {
+    Y_FORCE_INLINE ~TOperationItemRef() {
         Ref_.Drop(SpaceOp_);
     }
 
-    explicit operator bool() const noexcept {
+    Y_FORCE_INLINE explicit operator bool() const noexcept {
         return bool(Ref_);
     }
 
-    TCacheItem CacheItem() const noexcept {
+    Y_FORCE_INLINE TCacheItem CacheItem() const noexcept {
         return Ref_.CacheItem();
     }
 
-    TSharedCacheItemRefImpl<TTraits>& Get() noexcept {
+    Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits>& Get() noexcept {
         return Ref_;
     }
 
-    TSharedCacheItemRefImpl<TTraits> Take() noexcept {
+    Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> Take() noexcept {
         return std::move(Ref_);
     }
 
-    void Drop() noexcept {
+    Y_FORCE_INLINE void Drop() noexcept {
         Ref_.Drop(SpaceOp_);
     }
 
-    TSpaceOperation& SpaceOperation() const noexcept {
+    Y_FORCE_INLINE TSpaceOperation& SpaceOperation() const noexcept {
         return SpaceOp_;
     }
 
-    void Disarm() noexcept {
+    Y_FORCE_INLINE void Disarm() noexcept {
         Ref_.Disarm();
     }
 
@@ -127,33 +157,102 @@ template <class TTraits = TProdTraits>
 class TSharedPageRefImpl : private TMoveOnly {
 public:
     TSharedPageRefImpl() noexcept = default;
-    TSharedPageRefImpl(TSharedPageRefImpl&& other) noexcept;
-    TSharedPageRefImpl& operator=(TSharedPageRefImpl&& other) noexcept;
+
+    Y_FORCE_INLINE TSharedPageRefImpl(TSharedPageRefImpl&& other) noexcept
+        : Ref_(std::move(other.Ref_))
+    {}
+
+    Y_FORCE_INLINE TSharedPageRefImpl& operator=(TSharedPageRefImpl&& other) noexcept;
 
     explicit operator bool() const noexcept {
         return bool(Ref_);
     }
 
-    TPageCacheItem CacheItem() const noexcept;
-    const char* data() const noexcept;
-    size_t size() const noexcept;
-    NActors::TSharedData BuildSharedData() const noexcept;
+    Y_FORCE_INLINE TPageCacheItem CacheItem() const noexcept {
+        Y_DEBUG_ABORT_UNLESS(Ref_);
+        return TPageCacheItem::FromValidated(Ref_.CacheItem_);
+    }
+
+    Y_FORCE_INLINE const char* data() const noexcept {
+        return WithHandle([](const THandle& handle) {
+            return handle.Body.PageBuffer.data();
+        });
+    }
+
+    Y_FORCE_INLINE size_t size() const noexcept {
+        if (!Ref_) {
+            return 0;
+        }
+        return WithHandle([](const THandle& handle) {
+            return handle.Key2OrSize.load(std::memory_order_relaxed);
+        });
+    }
+
+    Y_FORCE_INLINE NActors::TSharedData BuildSharedData() const noexcept {
+        return WithHandle([](const THandle& handle) {
+            return handle.Body.PageBuffer.Share(handle.Key2OrSize.load(std::memory_order_relaxed));
+        });
+    }
     // Construct an independent owner only when moving or borrowing cannot preserve the required lifetime.
-    TSharedPageRefImpl Acquire() const& noexcept;
-    NTable::NPage::TPageOffset GetOffset() const noexcept;
-    NTable::NPage::TPageLocation GetLocation() const noexcept;
-    TLogoBlobID GetCollectionId() const noexcept;
-    NTable::NPage::EPage GetType() const noexcept;
-    bool IsSticky() const noexcept;
-    void Drop() noexcept;
+    Y_FORCE_INLINE TSharedPageRefImpl Acquire() const& noexcept {
+        if (!Ref_) {
+            return {};
+        }
+        TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+        return cache.AcquireMorePageRef(Ref_.CacheItem());
+    }
+
+    Y_FORCE_INLINE NTable::NPage::TPageOffset GetOffset() const noexcept {
+        return WithHandle([](const THandle& handle) {
+            return NTable::NPage::TPageOffset::FromRaw(handle.Key1.load(std::memory_order_relaxed));
+        });
+    }
+
+    Y_FORCE_INLINE NTable::NPage::TPageLocation GetLocation() const noexcept {
+        return WithHandle([](const THandle& handle) {
+            return NTable::NPage::TPageLocation(
+                NTable::NPage::TPageOffset::FromRaw(handle.Key1.load(std::memory_order_relaxed)),
+                handle.Key2OrSize.load(std::memory_order_relaxed), handle.Metadata.Page.Type,
+                handle.Metadata.Page.Crc32);
+        });
+    }
+
+    Y_FORCE_INLINE TLogoBlobID GetCollectionId() const noexcept {
+        TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+        auto cacheOp = cache.BeginOperation();
+        const THandle& page = cacheOp.Handles()[CacheItem().Index()];
+        return cacheOp.Collections().PageCollection(page)->Id();
+    }
+
+    Y_FORCE_INLINE NTable::NPage::EPage GetType() const noexcept {
+        return WithHandle([](const THandle& handle) {
+            return handle.Metadata.Page.Type;
+        });
+    }
+
+    Y_FORCE_INLINE bool IsSticky() const noexcept {
+        if (!Ref_) {
+            return false;
+        }
+        TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+        return cache.IsPageSticky(CacheItem());
+    }
+
+    Y_FORCE_INLINE void Drop() noexcept {
+        Ref_.Drop();
+    }
 
 private:
     friend class TCacheItems<TTraits>;
 
-    explicit TSharedPageRefImpl(TSharedCacheItemRefImpl<TTraits>&& ref) noexcept;
+    Y_FORCE_INLINE explicit TSharedPageRefImpl(TSharedCacheItemRefImpl<TTraits>&& ref) noexcept
+        : Ref_(std::move(ref))
+    {
+        Y_DEBUG_ABORT_UNLESS(Ref_);
+    }
 
     template <class TCallback>
-    decltype(auto) WithHandle(TCallback&& callback) const noexcept;
+    Y_FORCE_INLINE decltype(auto) WithHandle(TCallback&& callback) const noexcept;
 
 private:
     TSharedCacheItemRefImpl<TTraits> Ref_;
@@ -163,17 +262,33 @@ template <class TTraits = TProdTraits>
 class TSharedCacheCollectionRefImpl : private TMoveOnly {
 public:
     TSharedCacheCollectionRefImpl() noexcept = default;
-    TSharedCacheCollectionRefImpl(TSharedCacheCollectionRefImpl&& other) noexcept;
-    TSharedCacheCollectionRefImpl& operator=(TSharedCacheCollectionRefImpl&& other) noexcept;
+
+    Y_FORCE_INLINE TSharedCacheCollectionRefImpl(TSharedCacheCollectionRefImpl&& other) noexcept
+        : Ref_(std::move(other.Ref_))
+    {}
+
+    Y_FORCE_INLINE TSharedCacheCollectionRefImpl& operator=(TSharedCacheCollectionRefImpl&& other) noexcept;
 
     explicit operator bool() const noexcept {
         return bool(Ref_);
     }
 
-    TCollectionCacheItem CacheItem() const noexcept;
-    TCollection& GetCollection() const noexcept;
-    TSharedCacheCollectionRefImpl Acquire() const& noexcept;
-    bool IsSoleReference() const noexcept;
+    Y_FORCE_INLINE TCollectionCacheItem CacheItem() const noexcept {
+        Y_DEBUG_ABORT_UNLESS(Ref_);
+        return TCollectionCacheItem::FromValidated(Ref_.CacheItem_);
+    }
+
+    Y_FORCE_INLINE TCollection& GetCollection() const noexcept;
+
+    Y_FORCE_INLINE TSharedCacheCollectionRefImpl Acquire() const& noexcept {
+        if (!Ref_) {
+            return {};
+        }
+        TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+        return cache.AcquireMoreCollectionRef(Ref_.CacheItem());
+    }
+
+    Y_FORCE_INLINE bool IsSoleReference() const noexcept;
 
     TCollection* Get() const noexcept {
         return Ref_ ? &GetCollection() : nullptr;
@@ -187,15 +302,106 @@ public:
         return GetCollection();
     }
 
-    void Drop() noexcept;
+    Y_FORCE_INLINE void Drop() noexcept {
+        Ref_.Drop();
+    }
 
 private:
     friend class TCacheItems<TTraits>;
 
-    explicit TSharedCacheCollectionRefImpl(TSharedCacheItemRefImpl<TTraits>&& ref) noexcept;
+    Y_FORCE_INLINE explicit TSharedCacheCollectionRefImpl(TSharedCacheItemRefImpl<TTraits>&& ref) noexcept
+        : Ref_(std::move(ref))
+    {
+        Y_DEBUG_ABORT_UNLESS(Ref_);
+    }
 
 private:
     TSharedCacheItemRefImpl<TTraits> Ref_;
 };
+
+// Inline implementations
+
+template <class TTraits>
+Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits>& TSharedCacheItemRefImpl<TTraits>::operator=(
+    TSharedCacheItemRefImpl&& other) noexcept {
+    if (this != &other) {
+        Drop();
+        CacheItem_ = other.Take();
+    }
+    return *this;
+}
+
+template <class TTraits>
+Y_FORCE_INLINE void TSharedCacheItemRefImpl<TTraits>::Drop() noexcept {
+    const TCacheItem item = Take();
+    if (!item.IsNull()) {
+        Release(item);
+    }
+}
+
+template <class TTraits>
+Y_FORCE_INLINE void TSharedCacheItemRefImpl<TTraits>::Drop(TSpaceOperation& spaceOp) noexcept {
+    const TCacheItem item = Take();
+    if (!item.IsNull()) {
+        Release(spaceOp, item);
+    }
+}
+
+template <class TTraits>
+Y_FORCE_INLINE TSharedPageRefImpl<TTraits>& TSharedPageRefImpl<TTraits>::operator=(
+    TSharedPageRefImpl&& other) noexcept {
+    if (this != &other) {
+        Drop();
+        Ref_ = std::move(other.Ref_);
+    }
+    return *this;
+}
+
+template <class TTraits>
+template <class TCallback>
+Y_FORCE_INLINE decltype(auto) TSharedPageRefImpl<TTraits>::WithHandle(TCallback&& callback) const noexcept {
+    Y_DEBUG_ABORT_UNLESS(Ref_);
+    TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+    auto spaceOp = cache.BeginOperation();
+    const TCacheItem item = Ref_.CacheItem();
+    const THandle& handle = spaceOp.Handles()[item.Index()];
+    Y_DEBUG_ABORT_UNLESS([&] {
+        const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+        return item.Matches(state) && state.IsPageKind() && state.Refs() != 0;
+    }());
+    return std::forward<TCallback>(callback)(handle);
+}
+
+template <class TTraits>
+Y_FORCE_INLINE TSharedCacheCollectionRefImpl<TTraits>& TSharedCacheCollectionRefImpl<TTraits>::operator=(
+    TSharedCacheCollectionRefImpl<TTraits>&& other) noexcept {
+    if (this != &other) {
+        Drop();
+        Ref_ = std::move(other.Ref_);
+    }
+    return *this;
+}
+
+template <class TTraits>
+Y_FORCE_INLINE TCollection& TSharedCacheCollectionRefImpl<TTraits>::GetCollection() const noexcept {
+    Y_DEBUG_ABORT_UNLESS(Ref_);
+    TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+    auto spaceOp = cache.BeginOperation();
+    const THandle& handle = spaceOp.Handles()[Ref_.Index()];
+    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+    Y_DEBUG_ABORT_UNLESS(Ref_.CacheItem().Matches(state) && state.IsCollectionKind() && state.Refs() != 0);
+    return *handle.Body.Collection;
+}
+
+template <class TTraits>
+Y_FORCE_INLINE bool TSharedCacheCollectionRefImpl<TTraits>::IsSoleReference() const noexcept {
+    Y_DEBUG_ABORT_UNLESS(Ref_);
+    auto& cache = TSharedCacheImpl<TTraits>::Get();
+    auto spaceOp = cache.BeginOperation();
+    const THandleState state =
+        THandleState::FromRaw(spaceOp.Handles()[Ref_.Index()].State.load(std::memory_order_acquire));
+    Y_DEBUG_ABORT_UNLESS(Ref_.CacheItem().Matches(state) && state.IsCollectionKind() && state.Refs() != 0);
+    return state.Refs() == 1;
+}
 
 } // namespace NKikimr::NSharedCache

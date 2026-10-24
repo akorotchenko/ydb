@@ -14,24 +14,10 @@ public:
     bool Prepare(size_t targetSize, void*& pointer) noexcept;
 
     template <class T>
-    bool Allocate(size_t currentSize, size_t reservedSize, T*& pointer) noexcept {
-        void* data;
-        if (!Allocate(currentSize, reservedSize, data)) {
-            return false;
-        }
-        pointer = static_cast<T*>(data);
-        return true;
-    }
+    bool Allocate(size_t currentSize, size_t reservedSize, T*& pointer) noexcept;
 
     template <class T>
-    bool Prepare(size_t targetSize, T*& pointer) noexcept {
-        void* data;
-        if (!Prepare(targetSize, data)) {
-            return false;
-        }
-        pointer = static_cast<T*>(data);
-        return true;
-    }
+    bool Prepare(size_t targetSize, T*& pointer) noexcept;
 
     void Cancel(void* pointer, size_t targetSize) noexcept;
     void Publish(void* pointer, size_t size) noexcept;
@@ -47,5 +33,27 @@ private:
     class TImpl;
     THolder<TImpl> Impl_;
 };
+
+// Inline implementations
+
+template <class T>
+inline bool TSharedCacheMapping::Allocate(size_t currentSize, size_t reservedSize, T*& pointer) noexcept {
+    void* data;
+    if (!Allocate(currentSize, reservedSize, data)) {
+        return false;
+    }
+    pointer = static_cast<T*>(data);
+    return true;
+}
+
+template <class T>
+inline bool TSharedCacheMapping::Prepare(size_t targetSize, T*& pointer) noexcept {
+    void* data;
+    if (!Prepare(targetSize, data)) {
+        return false;
+    }
+    pointer = static_cast<T*>(data);
+    return true;
+}
 
 } // namespace NKikimr::NSharedCache

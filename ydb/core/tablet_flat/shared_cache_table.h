@@ -12,6 +12,9 @@
 
 namespace NKikimr::NSharedCache {
 
+ui32 HashPageKey(TCollectionCacheItem collection, ui64 offset) noexcept;
+ui32 HashCollectionKey(const TLogoBlobID& id) noexcept;
+
 class TSharedCacheKey {
 public:
     static constexpr TSharedCacheKey Page(TCollectionCacheItem collection, ui64 offset) noexcept {
@@ -43,7 +46,11 @@ public:
         return Words_[index];
     }
 
-    ui32 Hash() const noexcept;
+    Y_FORCE_INLINE ui32 Hash() const noexcept {
+        return Kind_ == EItemKind::Page
+                   ? HashPageKey(TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(Words_[0])), Words_[1])
+                   : HashCollectionKey(TLogoBlobID(Words_.data()));
+    }
 
     friend constexpr bool operator==(const TSharedCacheKey&, const TSharedCacheKey&) noexcept = default;
 
@@ -57,9 +64,6 @@ private:
     EItemKind Kind_;
     std::array<ui64, 3> Words_;
 };
-
-ui32 HashPageKey(TCollectionCacheItem collection, ui64 offset) noexcept;
-ui32 HashCollectionKey(const TLogoBlobID& id) noexcept;
 
 int CompareSharedCacheKeys(
     const TSharedCacheKey& left, ui32 leftHash, const TSharedCacheKey& right, ui32 rightHash) noexcept;

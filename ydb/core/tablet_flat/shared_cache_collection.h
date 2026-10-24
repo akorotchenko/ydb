@@ -50,12 +50,20 @@ struct TCollectionActorState;
 
 class TCollection {
 public:
-    explicit TCollection(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection,
-        TCollectionCacheItem cacheItem = {}) noexcept;
+    Y_FORCE_INLINE explicit TCollection(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection,
+        TCollectionCacheItem cacheItem = {}) noexcept
+        : CacheItem(cacheItem)
+        , PageCollection_(std::move(pageCollection))
+    {
+        Y_DEBUG_ABORT_UNLESS(PageCollection_);
+    }
 
     TCollection(const TCollection&) = delete;
     TCollection& operator=(const TCollection&) = delete;
-    ~TCollection();
+
+    Y_FORCE_INLINE ~TCollection() {
+        ResetActorState();
+    }
 
     const TLogoBlobID& Id() const noexcept {
         return PageCollection_->Label();

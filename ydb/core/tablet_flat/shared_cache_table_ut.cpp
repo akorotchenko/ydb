@@ -11105,6 +11105,87 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         UNIT_ASSERT(fixture.Cache->ReclaimCold());
     }
+
+    Y_UNIT_TEST(MixedSizeAndModeChurnPreservesDataAndAccounting) {
+        TFixture fixture(7);
+        std::array<TCollectionCacheItem, 2> collections;
+        std::array<TTestSharedCacheCollectionRef, 2> owners;
+        for (ui32 index = 0; index < collections.size(); ++index) {
+            const TLogoBlobID id(96, 108, index + 1);
+            UNIT_ASSERT(TSharedCacheTestAccess::FindOrInsertUnregistered(*fixture.Cache, { .Id = id },
+                            collections[index], owners[index]) == ESharedCacheResultStatus::Inserted);
+            UNIT_ASSERT(
+                TSharedCacheTestAccess::MakeReadyUnregistered(*fixture.Cache, collections[index], MakeCollection(id)));
+            UNIT_ASSERT(fixture.Cache->Find(id, owners[index]) == ESharedCacheResultStatus::Hit);
+        }
+
+        const ui64 initialLimit = fixture.Cache->CurrentLimit();
+        UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(initialLimit / 4));
+        std::array<bool, 256> seen{};
+        ui64 random = 0x4c464341434845;
+        ui32 hits = 0;
+        ui32 reloads = 0;
+        for (ui32 step = 0; step < 10000; ++step) {
+            if (step % 256 == 0) {
+                const ui32 phase = step / 256;
+                UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(phase % 2 ? initialLimit / 2 : initialLimit));
+                for (ui32 index = 0; index < collections.size(); ++index) {
+                    UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(
+                        collections[index], (phase + index) % 2 ? ECacheMode::TryKeepInMemory : ECacheMode::Regular));
+                }
+            }
+
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            const ui32 pageId = random % seen.size();
+            const ui64 size = 1_KB << ((pageId >> 1) & 3);
+            TPageCacheItem page;
+            TTestSharedPageRef ref;
+            ESharedCacheResultStatus status = ESharedCacheResultStatus::Miss;
+            for (ui32 attempt = 0; attempt < 256; ++attempt) {
+                status = FindOrInsertPage(*fixture.Cache, collections[pageId % collections.size()],
+                    MakePageLocation(pageId, size), EStickyState::None, page, ref);
+                if (status != ESharedCacheResultStatus::Miss) {
+                    break;
+                }
+                fixture.Cache->EnforceCurrentLimit();
+            }
+            if (status == ESharedCacheResultStatus::Hit) {
+                ++hits;
+                UNIT_ASSERT_VALUES_EQUAL(ref.size(), size);
+                UNIT_ASSERT_VALUES_EQUAL(static_cast<ui8>(ref.data()[0]), static_cast<ui8>(pageId));
+            } else {
+                UNIT_ASSERT(status == ESharedCacheResultStatus::Inserted);
+                reloads += seen[pageId];
+                UNIT_ASSERT(fixture.Cache->MakeReady(page, MakePageData(pageId, size)));
+                seen[pageId] = true;
+            }
+            ref.Drop();
+
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedPages(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), fixture.Cache->ResidentBytes());
+            UNIT_ASSERT_VALUES_EQUAL(
+                fixture.Cache->ResidentBytes(), fixture.Cache->HotBytes() + fixture.Cache->ColdBytes() +
+                                                    fixture.Cache->KeepColdBytes() + fixture.Cache->StickyBytes());
+        }
+        UNIT_ASSERT(hits > 0);
+        UNIT_ASSERT(reloads > 0);
+
+        for (auto collection : collections) {
+            UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+        }
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(1));
+        for (ui32 attempt = 0; attempt < 4096 && fixture.Cache->ResidentBytes() != 0; ++attempt) {
+            fixture.Cache->EnforceCurrentLimit();
+        }
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ResidentBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedPages(), 0);
+    }
+
     Y_UNIT_TEST(PageAndCollectionShareTable) {
         TFixture fixture;
         const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(1, 2, 3));

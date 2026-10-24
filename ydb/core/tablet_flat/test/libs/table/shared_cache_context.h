@@ -12,11 +12,16 @@ namespace NKikimr {
 struct TActorSystemStub;
 }
 
+namespace NKikimr::NSharedCache {
+struct TSharedCacheCapacity;
+}
+
 namespace NKikimr::NTable::NTest {
 
 class TTableCacheContext {
 public:
     TTableCacheContext();
+    explicit TTableCacheContext(const NSharedCache::TSharedCacheCapacity& capacity);
     ~TTableCacheContext();
 
     NActors::TActorSystem& ActorSystem() const noexcept;

@@ -97,11 +97,6 @@ bool TCacheEviction<TTraits>::MatchesKeepColdEntry(TSpaceOperation& spaceOp, TCo
 }
 
 template <class TTraits>
-bool TCacheEviction<TTraits>::IsKeepColdQueued(const THandle& handle) noexcept {
-    return (handle.ColdVersion.load(std::memory_order_acquire) & KeepColdQueuedMask) != 0;
-}
-
-template <class TTraits>
 void TCacheEviction<TTraits>::RouteKeepCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
     if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen()) {
         return;
@@ -234,14 +229,6 @@ TCacheItem TCacheEviction<TTraits>::PutHot(TSpaceOperation& spaceOp, EHotLevel l
         }
     }
     return TCacheItem::FromRaw(exchange.Previous);
-}
-
-template <class TTraits>
-void TCacheEviction<TTraits>::RouteHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept {
-    const TCacheItem displaced = PutHot(spaceOp, level, cacheItem);
-    if (!displaced.IsNull()) {
-        ProcessHot(spaceOp, level, displaced);
-    }
 }
 
 template <class TTraits>

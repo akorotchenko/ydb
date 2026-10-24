@@ -9,21 +9,6 @@
 
 namespace NKikimr::NSharedCache {
 
-TWalkCollectionState& TCacheBTreeWalkController::State(const TLogoBlobID& collectionId) {
-    return States[collectionId];
-}
-
-bool TCacheBTreeWalkController::IsIdle(const TLogoBlobID& collectionId) const {
-    const auto* state = States.FindPtr(collectionId);
-    // Keep the collection alive while its index association exists, or WalkCollectionsByIndex would dangle.
-    return !state || (!state->Run && !state->IndexCollectionId);
-}
-
-void TCacheBTreeWalkController::EraseCollection(const TLogoBlobID& collectionId) {
-    Y_DEBUG_ABORT_UNLESS(IsIdle(collectionId));
-    States.erase(collectionId);
-}
-
 void TCacheBTreeWalkController::UpdateWalkIndex(TCollection& collection) {
     TLogoBlobID indexCollectionId;
     // Check every owner; production owners have at most two seeds (current and historic).
@@ -57,13 +42,6 @@ void TCacheBTreeWalkController::UpdateWalkIndex(TCollection& collection) {
     }
 
     State(collection.Id()).IndexCollectionId = indexCollectionId;
-}
-
-TVector<TLogoBlobID> TCacheBTreeWalkController::GetWalkCollections(const TLogoBlobID& indexCollectionId) const {
-    if (const auto* walkCollections = WalkCollectionsByIndex.FindPtr(indexCollectionId)) {
-        return *walkCollections;
-    }
-    return {};
 }
 
 void TCacheBTreeWalkController::StartWalkRun(TCollection& collection) {
@@ -172,16 +150,6 @@ void TCacheBTreeWalkController::UpdateSeeds(TCollection& collection, const TActo
     CancelWalkRun(collection);
 }
 
-void TCacheBTreeWalkController::RestartWalkRun(TCollection& collection) {
-    State(collection.Id()).ControllerState = EWalkControllerState::Pending;
-    CancelWalkRun(collection);
-}
-
-void TCacheBTreeWalkController::InvalidateWalkRun(TCollection& collection) {
-    State(collection.Id()).ControllerState = EWalkControllerState::Blocked;
-    CancelWalkRun(collection);
-}
-
 void TCacheBTreeWalkController::FinishFetch(const TLogoBlobID& walkCollectionId) {
     if (!walkCollectionId) {
         return;
@@ -195,18 +163,6 @@ void TCacheBTreeWalkController::FinishFetch(const TLogoBlobID& walkCollectionId)
     --run.FetchesInFlight;
 
     FinishWalkRunIfDrained(*collection);
-}
-
-void TCacheBTreeWalkController::FetchStarted(const TLogoBlobID& walkCollectionId) {
-    auto* collection = Host.FindCollection(walkCollectionId);
-    Y_ENSURE(collection && State(collection->Id()).Run && State(collection->Id()).Run->State != EWalkRunState::Cancelled);
-    ++State(collection->Id()).Run->FetchesInFlight;
-}
-
-void TCacheBTreeWalkController::InvalidateRun(const TLogoBlobID& walkCollectionId) {
-    auto* collection = Host.FindCollection(walkCollectionId);
-    Y_ENSURE(collection);
-    InvalidateWalkRun(*collection);
 }
 
 void TCacheBTreeWalkController::InvalidateDataCollection(const TLogoBlobID& collectionId) {

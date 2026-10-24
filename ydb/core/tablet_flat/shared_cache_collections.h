@@ -18,131 +18,54 @@ class TOperationItemRef;
 template <class TTraits>
 class TCacheCollections {
 public:
-    class TOperation {
-    public:
-        TCollection* PageCollection(const THandle& page) noexcept {
-            return Collections_.PageCollection(SpaceOp_, page);
-        }
-
-        TCollection* PageCollection(TCollectionCacheItem item) noexcept {
-            return Collections_.PageCollection(SpaceOp_, item);
-        }
-
-        void DropOwnerReference(TCollection& owner) noexcept {
-            Collections_.DropOwnerReference(SpaceOp_, owner);
-        }
-
-        void DropPageItemRef(THandle& page) noexcept {
-            Collections_.DropPageItemRef(SpaceOp_, page);
-        }
-
-        void PublishCollectionForReclaim(TCacheItem item) noexcept {
-            Collections_.PublishCollectionForReclaim(SpaceOp_, item);
-        }
-
-        TSharedCacheItemRefImpl<TTraits> AcquireSticky(TCollectionCacheItem item, TCollection*& value) noexcept {
-            return Collections_.AcquireSticky(SpaceOp_, item, value);
-        }
-
-        void DrainStickyPages(TCollection& collection) noexcept {
-            Collections_.DrainStickyPages(SpaceOp_, collection);
-        }
-
-        void MergeRetainedStickyPages(TCollection& collection, ui32 retainedHead, ui32 retainedTail) noexcept {
-            Collections_.MergeRetainedStickyPages(SpaceOp_, collection, retainedHead, retainedTail);
-        }
-
-        bool LinkStickyPage(TCacheItem item, TSharedCacheItemRefImpl<TTraits>& collectionRef) noexcept {
-            return Collections_.LinkStickyPage(SpaceOp_, item, collectionRef);
-        }
-
-        void UnlinkPendingStickyPage(TCacheItem item) noexcept {
-            Collections_.UnlinkPendingStickyPage(SpaceOp_, item);
-        }
-
-        bool MakePageSticky(TCacheItem item) noexcept {
-            return Collections_.MakePageSticky(SpaceOp_, item);
-        }
-
-        bool UnstickyCutPages(TCacheItem item, ui64 allocationLimit) noexcept {
-            return Collections_.UnstickyCutPages(SpaceOp_, item, allocationLimit);
-        }
-
-        bool SetPagesCacheMode(TCollection& collection, ECacheMode mode) noexcept {
-            return Collections_.SetPagesCacheMode(SpaceOp_, collection, mode);
-        }
-
-        bool Detach(TCollectionRegistry& registry, TCacheItem item) noexcept {
-            return Collections_.Detach(SpaceOp_, registry, item);
-        }
-
-        bool Erase(TCollectionRegistry* expectedRegistry, TCacheItem item) noexcept {
-            return Collections_.Erase(SpaceOp_, expectedRegistry, item);
-        }
-
-        bool MoveRegistry(TCollectionRegistry& source, TCollectionRegistry& destination, TCacheItem item) noexcept {
-            return Collections_.MoveRegistry(SpaceOp_, source, destination, item);
-        }
-
-        bool Attach(TCollectionRegistry& registry, TCacheItem item) noexcept {
-            return Collections_.Attach(SpaceOp_, registry, item);
-        }
-
-        bool Link(TCollectionRegistry& registry, TCacheItem item) noexcept {
-            return Collections_.Link(SpaceOp_, registry, item);
-        }
-
-        bool Unlink(TCollectionRegistry& registry, TCacheItem item, EHandleState expectedState) noexcept {
-            return Collections_.Unlink(SpaceOp_, registry, item, expectedState);
-        }
-
-        bool Unlink(TCollectionRegistry& registry, TCacheItem item) noexcept {
-            return Collections_.Unlink(SpaceOp_, registry, item);
-        }
-
-        void Unlink(TCollectionRegistry& registry, TOperationItemRef<TTraits>& owner) noexcept {
-            Collections_.Unlink(registry, owner);
-        }
-
-        void ForEach(TFunctionRef<void(TCollection&)> callback) noexcept {
-            Collections_.ForEach(SpaceOp_, *Collections_.CollectionRegistry_, callback);
-        }
-
-    private:
-        friend class TCacheCollections;
-
-        TOperation(TCacheCollections& collections, TSpaceOperation& spaceOp) noexcept
-            : Collections_(collections)
-            , SpaceOp_(spaceOp)
-        {}
-
-    private:
-        TCacheCollections& Collections_;
-        TSpaceOperation& SpaceOp_;
-    };
+    using TOperation = TCacheCollectionsOperation<TTraits>;
 
     explicit TCacheCollections(TSharedCacheImpl<TTraits>& cache) noexcept
         : Cache_(cache)
     {}
 
-    TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
-        return { *this, spaceOp };
+    Y_FORCE_INLINE TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
+        return { Cache_, spaceOp };
     }
 
     void AddResidentPageBytes(TCollection& owner, NTable::NPage::EPage type, i64 bytes) noexcept;
     void AddActivePageBytes(TCollection& owner, NTable::NPage::EPage type, i64 bytes) noexcept;
     void PublishKeepPageBytes(TCollection& owner) noexcept;
-    void SetSkipBTreeIndexV1Shadow(TCollection& owner, bool skip) noexcept;
-    void AcknowledgeBytes(TCollection& owner) noexcept;
-    static void AddReference(TCollection& owner) noexcept;
-    static bool DropReference(TCollection& owner) noexcept;
-    static bool WantsStickyPage(const TCollection& collection) noexcept;
-    static bool IsUnregisteredAndUnreferenced(const TCollection& collection) noexcept;
+
+    Y_FORCE_INLINE void SetSkipBTreeIndexV1Shadow(TCollection& owner, bool skip) noexcept {
+        owner.PageCollection()->SetSkipBTreeIndexV1Shadow(skip);
+        PublishKeepPageBytes(owner);
+    }
+
+    Y_FORCE_INLINE void AcknowledgeBytes(TCollection& owner) noexcept {
+        // Clear before the actor samples bytes, so a racing update can schedule the next notification.
+        owner.BytesNotificationPending_.store(false, std::memory_order_release);
+    }
+
+    static Y_FORCE_INLINE void AddReference(TCollection& owner) noexcept {
+        owner.References.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    static Y_FORCE_INLINE bool DropReference(TCollection& owner) noexcept {
+        const ui64 previous = owner.References.fetch_sub(1, std::memory_order_relaxed);
+        Y_ABORT_UNLESS(previous != 0);
+        return previous == 1;
+    }
+
+    static Y_FORCE_INLINE bool WantsStickyPage(const TCollection& collection) noexcept {
+        return collection.CacheMode_.load(std::memory_order_acquire) == ECacheMode::Sticky;
+    }
+
+    static Y_FORCE_INLINE bool IsUnregisteredAndUnreferenced(const TCollection& collection) noexcept {
+        return !collection.Registry_.load(std::memory_order_acquire) &&
+               collection.References.load(std::memory_order_acquire) == 0;
+    }
 
 private:
+    friend class TCacheCollectionsOperation<TTraits>;
     friend class TSharedCacheImpl<TTraits>;
 
-    typename TCacheItems<TTraits>::TOperation Items(TSpaceOperation& spaceOp) const noexcept {
+    Y_FORCE_INLINE typename TCacheItems<TTraits>::TOperation Items(TSpaceOperation& spaceOp) const noexcept {
         return Cache_.Items_.BindOperation(spaceOp);
     }
 
@@ -150,9 +73,27 @@ private:
         return *CollectionRegistry_;
     }
 
-    static TCollection* PageCollection(TSpaceOperation& spaceOp, const THandle& page) noexcept;
-    static TCollection* PageCollection(TSpaceOperation& spaceOp, TCollectionCacheItem item) noexcept;
-    static void SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept;
+    static Y_FORCE_INLINE TCollection* PageCollection(TSpaceOperation& spaceOp, const THandle& page) noexcept {
+        return PageCollection(spaceOp,
+            TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(page.Key0.load(std::memory_order_relaxed))));
+    }
+
+    static Y_FORCE_INLINE TCollection* PageCollection(TSpaceOperation& spaceOp, TCollectionCacheItem item) noexcept {
+        if (item.Index() >= spaceOp.AccessibleHandleCount()) {
+            return nullptr;
+        }
+        THandle& collection = spaceOp.Handles()[item.Index()];
+        const THandleState state = THandleState::FromRaw(collection.State.load(std::memory_order_acquire));
+        if (!item.Matches(state) || !collection.Body.Collection) {
+            return nullptr;
+        }
+        return collection.Body.Collection;
+    }
+
+    static Y_FORCE_INLINE void SubtractExactBytes(std::atomic<ui64>& counter, ui64 bytes) noexcept {
+        const ui64 previous = counter.fetch_sub(bytes, std::memory_order_relaxed);
+        Y_ABORT_UNLESS(previous >= bytes);
+    }
 
     void DropOwnerReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept;
     void DropPageItemRef(TSpaceOperation& spaceOp, THandle& page) noexcept;
@@ -195,13 +136,128 @@ private:
     bool Unlink(
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item, EHandleState expectedState) noexcept;
     bool Unlink(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item) noexcept;
-    void Unlink(TCollectionRegistry& registry, TOperationItemRef<TTraits>& owner) noexcept;
+
+    Y_FORCE_INLINE void Unlink(TCollectionRegistry& registry, TOperationItemRef<TTraits>& owner) noexcept {
+        const bool unlinked = Unlink(owner.SpaceOperation(), registry, owner.CacheItem(), EHandleState::Tombstone);
+        Y_DEBUG_ABORT_UNLESS(unlinked);
+    }
+
     void ForEach(
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, TFunctionRef<void(TCollection&)> callback) noexcept;
 
 private:
     TSharedCacheImpl<TTraits>& Cache_;
     TIntrusivePtr<TCollectionRegistry> CollectionRegistry_ = new TCollectionRegistry;
+};
+
+// Leave operation constructors implicitly instantiated
+template <class TTraits>
+class TCacheCollectionsOperation {
+public:
+    Y_FORCE_INLINE TCollection* PageCollection(const THandle& page) noexcept {
+        return Cache_.Collections_.PageCollection(SpaceOp_, page);
+    }
+
+    Y_FORCE_INLINE TCollection* PageCollection(TCollectionCacheItem item) noexcept {
+        return Cache_.Collections_.PageCollection(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE void DropOwnerReference(TCollection& owner) noexcept {
+        Cache_.Collections_.DropOwnerReference(SpaceOp_, owner);
+    }
+
+    Y_FORCE_INLINE void DropPageItemRef(THandle& page) noexcept {
+        Cache_.Collections_.DropPageItemRef(SpaceOp_, page);
+    }
+
+    Y_FORCE_INLINE void PublishCollectionForReclaim(TCacheItem item) noexcept {
+        Cache_.Collections_.PublishCollectionForReclaim(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> AcquireSticky(
+        TCollectionCacheItem item, TCollection*& value) noexcept {
+        return Cache_.Collections_.AcquireSticky(SpaceOp_, item, value);
+    }
+
+    Y_FORCE_INLINE void DrainStickyPages(TCollection& collection) noexcept {
+        Cache_.Collections_.DrainStickyPages(SpaceOp_, collection);
+    }
+
+    Y_FORCE_INLINE void MergeRetainedStickyPages(
+        TCollection& collection, ui32 retainedHead, ui32 retainedTail) noexcept {
+        Cache_.Collections_.MergeRetainedStickyPages(SpaceOp_, collection, retainedHead, retainedTail);
+    }
+
+    Y_FORCE_INLINE bool LinkStickyPage(TCacheItem item, TSharedCacheItemRefImpl<TTraits>& collectionRef) noexcept {
+        return Cache_.Collections_.LinkStickyPage(SpaceOp_, item, collectionRef);
+    }
+
+    Y_FORCE_INLINE void UnlinkPendingStickyPage(TCacheItem item) noexcept {
+        Cache_.Collections_.UnlinkPendingStickyPage(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE bool MakePageSticky(TCacheItem item) noexcept {
+        return Cache_.Collections_.MakePageSticky(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE bool UnstickyCutPages(TCacheItem item, ui64 allocationLimit) noexcept {
+        return Cache_.Collections_.UnstickyCutPages(SpaceOp_, item, allocationLimit);
+    }
+
+    Y_FORCE_INLINE bool SetPagesCacheMode(TCollection& collection, ECacheMode mode) noexcept {
+        return Cache_.Collections_.SetPagesCacheMode(SpaceOp_, collection, mode);
+    }
+
+    Y_FORCE_INLINE bool Detach(TCollectionRegistry& registry, TCacheItem item) noexcept {
+        return Cache_.Collections_.Detach(SpaceOp_, registry, item);
+    }
+
+    Y_FORCE_INLINE bool Erase(TCollectionRegistry* expectedRegistry, TCacheItem item) noexcept {
+        return Cache_.Collections_.Erase(SpaceOp_, expectedRegistry, item);
+    }
+
+    Y_FORCE_INLINE bool MoveRegistry(
+        TCollectionRegistry& source, TCollectionRegistry& destination, TCacheItem item) noexcept {
+        return Cache_.Collections_.MoveRegistry(SpaceOp_, source, destination, item);
+    }
+
+    Y_FORCE_INLINE bool Attach(TCollectionRegistry& registry, TCacheItem item) noexcept {
+        return Cache_.Collections_.Attach(SpaceOp_, registry, item);
+    }
+
+    Y_FORCE_INLINE bool Link(TCollectionRegistry& registry, TCacheItem item) noexcept {
+        return Cache_.Collections_.Link(SpaceOp_, registry, item);
+    }
+
+    Y_FORCE_INLINE bool Unlink(TCollectionRegistry& registry, TCacheItem item, EHandleState expectedState) noexcept {
+        return Cache_.Collections_.Unlink(SpaceOp_, registry, item, expectedState);
+    }
+
+    Y_FORCE_INLINE bool Unlink(TCollectionRegistry& registry, TCacheItem item) noexcept {
+        return Cache_.Collections_.Unlink(SpaceOp_, registry, item);
+    }
+
+    Y_FORCE_INLINE void Unlink(TCollectionRegistry& registry, TOperationItemRef<TTraits>& owner) noexcept {
+        Cache_.Collections_.Unlink(registry, owner);
+    }
+
+    Y_FORCE_INLINE void ForEach(TFunctionRef<void(TCollection&)> callback) noexcept {
+        Cache_.Collections_.ForEach(SpaceOp_, *Cache_.Collections_.CollectionRegistry_, callback);
+    }
+
+private:
+    friend class TCacheCollections<TTraits>;
+    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheOperationView<TTraits>;
+
+    Y_FORCE_INLINE TCacheCollectionsOperation(TSharedCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
+        : Cache_(cache)
+        , SpaceOp_(spaceOp)
+    {}
+
+private:
+    TSharedCacheImpl<TTraits>& Cache_;
+    TSpaceOperation& SpaceOp_;
 };
 
 } // namespace NKikimr::NSharedCache

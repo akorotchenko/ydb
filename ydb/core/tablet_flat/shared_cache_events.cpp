@@ -54,16 +54,6 @@ public:
 };
 
 TSharedPageRef TEvSaveCompactedPages::AddPage(
-    TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
-    return AddPage(cachePages, std::move(page), sticky, TSharedCache::EPageAdmission::Bounded);
-}
-
-TSharedPageRef TEvSaveCompactedPages::AddWrittenPage(
-    TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
-    return AddPage(cachePages, std::move(page), sticky, TSharedCache::EPageAdmission::Written);
-}
-
-TSharedPageRef TEvSaveCompactedPages::AddPage(
     TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky, TSharedCache::EPageAdmission admission) {
     if (!CacheItem) {
         auto collection = cachePages.AdmitCollection(PageCollection);
@@ -209,17 +199,6 @@ void TRequestCompletion::SendResult(THolder<TEvResult> result) noexcept {
         ActorSystem_->Send(Notify_, new TEvRequestAnswered(result->Status, CompletionId_), 0, 0);
     }
     ActorSystem_->Send(ReplyTo_, result.Release(), 0, EventCookie_);
-}
-
-TRequestPageWaiter::TRequestPageWaiter(TIntrusivePtr<TRequestCompletion> completion, ui32 index) noexcept
-    : Completion_(std::move(completion))
-    , Index_(index)
-{
-    Y_DEBUG_ABORT_UNLESS(Completion_);
-}
-
-bool TRequestPageWaiter::IsActive() const noexcept {
-    return Completion_->IsActive();
 }
 
 void TRequestPageWaiter::Complete(TPageCacheItem page, EPageFetchCompletion completion) noexcept {

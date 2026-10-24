@@ -50,20 +50,9 @@ public:
         return PopExchange(slots, capacity).Previous;
     }
 
-    Y_FORCE_INLINE TRingExchangeResult Push(std::atomic<ui64>* slots, ui64 capacity, ui64 value) noexcept {
-        Y_DEBUG_ABORT_UNLESS(value != 0);
-        Y_DEBUG_ABORT_UNLESS(slots && capacity != 0);
-        const ui64 position = Tail_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
-        std::atomic<ui64>* slot = &slots[Map(position, capacity)];
-        return { slot, slot->exchange(value, std::memory_order_acq_rel) };
-    }
+    Y_FORCE_INLINE TRingExchangeResult Push(std::atomic<ui64>* slots, ui64 capacity, ui64 value) noexcept;
 
-    Y_FORCE_INLINE TRingExchangeResult PopExchange(std::atomic<ui64>* slots, ui64 capacity) noexcept {
-        Y_DEBUG_ABORT_UNLESS(slots && capacity != 0);
-        const ui64 position = Head_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
-        std::atomic<ui64>* slot = &slots[Map(position, capacity)];
-        return { slot, slot->exchange(0, std::memory_order_acquire) };
-    }
+    Y_FORCE_INLINE TRingExchangeResult PopExchange(std::atomic<ui64>* slots, ui64 capacity) noexcept;
 
     template <class TOnReserved>
     ui64 PopWithHook(std::atomic<ui64>* slots, ui64 capacity, TOnReserved&& onReserved) noexcept(
@@ -74,29 +63,11 @@ public:
 private:
     template <bool WithHook, class TOnReserved>
     Y_FORCE_INLINE TRingExchangeResult PutAndPopImpl(std::atomic<ui64>* slots, ui64 capacity, ui64 value,
-        TOnReserved&& onReserved) noexcept(noexcept(std::forward<TOnReserved>(onReserved)())) {
-        Y_DEBUG_ABORT_UNLESS(value != 0);
-        Y_DEBUG_ABORT_UNLESS(slots && capacity != 0);
-
-        const ui64 position = Tail_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
-        Head_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
-        if constexpr (WithHook) {
-            std::forward<TOnReserved>(onReserved)();
-        }
-        std::atomic<ui64>* slot = &slots[Map(position, capacity)];
-        return { slot, slot->exchange(value, std::memory_order_acq_rel) };
-    }
+        TOnReserved&& onReserved) noexcept(noexcept(std::forward<TOnReserved>(onReserved)()));
 
     template <bool WithHook, class TOnReserved>
     Y_FORCE_INLINE ui64 PopImpl(std::atomic<ui64>* slots, ui64 capacity, TOnReserved&& onReserved) noexcept(
-        noexcept(std::forward<TOnReserved>(onReserved)())) {
-        Y_DEBUG_ABORT_UNLESS(slots && capacity != 0);
-        const ui64 position = Head_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
-        if constexpr (WithHook) {
-            std::forward<TOnReserved>(onReserved)();
-        }
-        return slots[Map(position, capacity)].exchange(0, std::memory_order_acquire);
-    }
+        noexcept(std::forward<TOnReserved>(onReserved)()));
 
     static ui32 Map(ui64 position, ui64 capacity) noexcept {
         return static_cast<ui32>(position % capacity);
@@ -168,47 +139,15 @@ public:
 
     template <class TOnExchange>
     Y_FORCE_INLINE TRingExchangeResult Pop(std::atomic<ui64>* slots, ui64 capacity, TOnExchange&& onExchange) noexcept(
-        noexcept(std::forward<TOnExchange>(onExchange)())) {
-        if (Count() == 0) {
-            return {};
-        }
-        const TRingExchangeResult result = Cursor_.PopExchange(slots, capacity);
-        std::forward<TOnExchange>(onExchange)();
-        if (result.Previous != 0) {
-            RemoveOne();
-        }
-        return result;
-    }
+        noexcept(std::forward<TOnExchange>(onExchange)()));
 
     template <class TOnExchange>
     Y_FORCE_INLINE TRingExchangeResult Push(std::atomic<ui64>* slots, ui64 capacity, ui64 value,
-        TOnExchange&& onExchange) noexcept(noexcept(std::forward<TOnExchange>(onExchange)())) {
-        Count_.fetch_add(1, std::memory_order_relaxed);
-        const TRingExchangeResult result = Cursor_.Push(slots, capacity, value);
-        std::forward<TOnExchange>(onExchange)();
-        if (result.Previous != 0) {
-            RemoveOne();
-        }
-        return result;
-    }
+        TOnExchange&& onExchange) noexcept(noexcept(std::forward<TOnExchange>(onExchange)()));
 
-    Y_FORCE_INLINE ui64 Clear(std::atomic<ui64>* slot) noexcept {
-        Y_DEBUG_ABORT_UNLESS(slot);
-        const ui64 previous = slot->exchange(0, std::memory_order_acquire);
-        if (previous != 0) {
-            RemoveOne();
-        }
-        return previous;
-    }
+    Y_FORCE_INLINE ui64 Clear(std::atomic<ui64>* slot) noexcept;
 
-    Y_FORCE_INLINE bool ClearSafe(std::atomic<ui64>* slot, ui64 expected) noexcept {
-        Y_DEBUG_ABORT_UNLESS(slot && expected != 0);
-        if (!slot->compare_exchange_strong(expected, 0, std::memory_order_acquire, std::memory_order_relaxed)) {
-            return false;
-        }
-        RemoveOne();
-        return true;
-    }
+    Y_FORCE_INLINE bool ClearSafe(std::atomic<ui64>* slot, ui64 expected) noexcept;
 
 private:
     Y_FORCE_INLINE void RemoveOne() noexcept {
@@ -250,5 +189,92 @@ struct TFreeRingView {
         return Cursor->Push(Slots, Capacity, value);
     }
 };
+
+// Inline implementations
+
+Y_FORCE_INLINE TRingExchangeResult TRingCursor::Push(std::atomic<ui64>* slots, ui64 capacity, ui64 value) noexcept {
+    Y_DEBUG_ABORT_UNLESS(value != 0);
+    Y_DEBUG_ABORT_UNLESS(slots && capacity != 0);
+    const ui64 position = Tail_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
+    std::atomic<ui64>* slot = &slots[Map(position, capacity)];
+    return { slot, slot->exchange(value, std::memory_order_acq_rel) };
+}
+
+Y_FORCE_INLINE TRingExchangeResult TRingCursor::PopExchange(std::atomic<ui64>* slots, ui64 capacity) noexcept {
+    Y_DEBUG_ABORT_UNLESS(slots && capacity != 0);
+    const ui64 position = Head_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
+    std::atomic<ui64>* slot = &slots[Map(position, capacity)];
+    return { slot, slot->exchange(0, std::memory_order_acquire) };
+}
+
+template <bool WithHook, class TOnReserved>
+Y_FORCE_INLINE TRingExchangeResult TRingCursor::PutAndPopImpl(std::atomic<ui64>* slots, ui64 capacity, ui64 value,
+    TOnReserved&& onReserved) noexcept(noexcept(std::forward<TOnReserved>(onReserved)())) {
+    Y_DEBUG_ABORT_UNLESS(value != 0);
+    Y_DEBUG_ABORT_UNLESS(slots && capacity != 0);
+
+    const ui64 position = Tail_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
+    Head_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
+    if constexpr (WithHook) {
+        std::forward<TOnReserved>(onReserved)();
+    }
+    std::atomic<ui64>* slot = &slots[Map(position, capacity)];
+    return { slot, slot->exchange(value, std::memory_order_acq_rel) };
+}
+
+template <bool WithHook, class TOnReserved>
+Y_FORCE_INLINE ui64 TRingCursor::PopImpl(std::atomic<ui64>* slots, ui64 capacity, TOnReserved&& onReserved) noexcept(
+    noexcept(std::forward<TOnReserved>(onReserved)())) {
+    Y_DEBUG_ABORT_UNLESS(slots && capacity != 0);
+    const ui64 position = Head_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
+    if constexpr (WithHook) {
+        std::forward<TOnReserved>(onReserved)();
+    }
+    return slots[Map(position, capacity)].exchange(0, std::memory_order_acquire);
+}
+
+template <class TOnExchange>
+Y_FORCE_INLINE TRingExchangeResult TFreeRingCursor::Pop(std::atomic<ui64>* slots, ui64 capacity,
+    TOnExchange&& onExchange) noexcept(noexcept(std::forward<TOnExchange>(onExchange)())) {
+    if (Count() == 0) {
+        return {};
+    }
+    const TRingExchangeResult result = Cursor_.PopExchange(slots, capacity);
+    std::forward<TOnExchange>(onExchange)();
+    if (result.Previous != 0) {
+        RemoveOne();
+    }
+    return result;
+}
+
+template <class TOnExchange>
+Y_FORCE_INLINE TRingExchangeResult TFreeRingCursor::Push(std::atomic<ui64>* slots, ui64 capacity, ui64 value,
+    TOnExchange&& onExchange) noexcept(noexcept(std::forward<TOnExchange>(onExchange)())) {
+    Count_.fetch_add(1, std::memory_order_relaxed);
+    const TRingExchangeResult result = Cursor_.Push(slots, capacity, value);
+    std::forward<TOnExchange>(onExchange)();
+    if (result.Previous != 0) {
+        RemoveOne();
+    }
+    return result;
+}
+
+Y_FORCE_INLINE ui64 TFreeRingCursor::Clear(std::atomic<ui64>* slot) noexcept {
+    Y_DEBUG_ABORT_UNLESS(slot);
+    const ui64 previous = slot->exchange(0, std::memory_order_acquire);
+    if (previous != 0) {
+        RemoveOne();
+    }
+    return previous;
+}
+
+Y_FORCE_INLINE bool TFreeRingCursor::ClearSafe(std::atomic<ui64>* slot, ui64 expected) noexcept {
+    Y_DEBUG_ABORT_UNLESS(slot && expected != 0);
+    if (!slot->compare_exchange_strong(expected, 0, std::memory_order_acquire, std::memory_order_relaxed)) {
+        return false;
+    }
+    RemoveOne();
+    return true;
+}
 
 } // namespace NKikimr::NSharedCache

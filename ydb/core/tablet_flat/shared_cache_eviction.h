@@ -23,127 +23,14 @@ enum class EHotLevel : ui32 {
 template <class TTraits>
 class TCacheEviction {
 public:
-    class TOperation {
-    public:
-        // KeepCold routing
-        bool WantsKeepCold(const THandle& page) noexcept {
-            return Eviction_.WantsKeepCold(SpaceOp_, page);
-        }
-
-        bool TryReleaseColdPageToKeepCold(TCacheItem item, ui64& expectedRaw) noexcept {
-            return Eviction_.TryReleaseColdPageToKeepCold(SpaceOp_, item, expectedRaw);
-        }
-
-        bool DemoteKeepCold(TColdCacheItem item, TPageCacheItem expectedPage = {}) noexcept {
-            return Eviction_.DemoteKeepCold(SpaceOp_, item, expectedPage);
-        }
-
-        void WithdrawKeepColdEntry(TColdCacheItem item) noexcept {
-            Eviction_.WithdrawKeepColdEntry(SpaceOp_, item);
-        }
-
-        bool MatchesKeepColdEntry(TColdCacheItem item) noexcept {
-            return Eviction_.MatchesKeepColdEntry(SpaceOp_, item);
-        }
-
-        void RouteKeepCold(TColdCacheItem item) noexcept {
-            Eviction_.RouteKeepCold(SpaceOp_, item);
-        }
-
-        void ReleaseKeepColdRef(TOperationItemRef<TTraits>& itemRef, ui32 initialColdVersion) noexcept {
-            Eviction_.ReleaseKeepColdRef(SpaceOp_, itemRef, initialColdVersion);
-        }
-
-        // Hot routing and eviction
-        void RouteHot(EHotLevel level, TCacheItem item) noexcept {
-            Eviction_.RouteHot(SpaceOp_, level, item);
-        }
-
-        void ProcessHot(EHotLevel level, TCacheItem item) noexcept {
-            Eviction_.ProcessHot(SpaceOp_, level, item);
-        }
-
-        bool EvictFromHot(ui32 index) noexcept {
-            return Eviction_.EvictFromHot(SpaceOp_, index);
-        }
-
-        bool EvictFromHot(TCacheItem item) noexcept {
-            return Eviction_.EvictFromHot(SpaceOp_, item);
-        }
-
-        bool PromoteCold(TCacheItem item, bool force = false) noexcept {
-            return Eviction_.PromoteCold(SpaceOp_, item, force);
-        }
-
-        bool ProcessHotAtMinimum() noexcept {
-            return Eviction_.ProcessHotAtMinimum(SpaceOp_);
-        }
-
-        // Cold routing and reclamation
-        void CompleteColdPageRelease(TOperationItemRef<TTraits>& ownerRef) noexcept {
-            Eviction_.CompleteColdPageRelease(ownerRef);
-        }
-
-        bool EraseCold(TColdCacheItem item) noexcept {
-            return Eviction_.EraseCold(SpaceOp_, item);
-        }
-
-        void RouteCold(TColdCacheItem item) noexcept {
-            Eviction_.RouteCold(SpaceOp_, item);
-        }
-
-        bool ReclaimCold() noexcept {
-            return Eviction_.ReclaimCold(SpaceOp_);
-        }
-
-        bool ReclaimKeepCold() noexcept {
-            return Eviction_.ReclaimKeepCold(SpaceOp_);
-        }
-
-        // Policy resizing and maintenance
-        bool TrimKeepCold() noexcept {
-            return Eviction_.TrimKeepCold(SpaceOp_);
-        }
-
-        bool ShrinkKeepCold() noexcept {
-            return Eviction_.ShrinkKeepCold(SpaceOp_);
-        }
-
-        bool Reclaim(ui64 bytes = 0) noexcept {
-            return Eviction_.Reclaim(SpaceOp_, bytes);
-        }
-
-        bool ReclaimToLimits(ui64 softLimit, ui32 step, ui64 bytes = 0) noexcept {
-            return Eviction_.ReclaimToLimits(SpaceOp_, softLimit, step, bytes);
-        }
-
-        bool EnforceCurrentLimit(ui64 bytes = 0, bool forceShrinkHot = false) noexcept {
-            return Eviction_.EnforceCurrentLimit(SpaceOp_, bytes, forceShrinkHot);
-        }
-
-        bool DrainHotResize() noexcept {
-            return Eviction_.DrainHotResize(SpaceOp_);
-        }
-
-    private:
-        friend class TCacheEviction;
-
-        TOperation(TCacheEviction& eviction, TSpaceOperation& spaceOp) noexcept
-            : Eviction_(eviction)
-            , SpaceOp_(spaceOp)
-        {}
-
-    private:
-        TCacheEviction& Eviction_;
-        TSpaceOperation& SpaceOp_;
-    };
+    using TOperation = TCacheEvictionOperation<TTraits>;
 
     explicit TCacheEviction(TSharedCacheImpl<TTraits>& cache) noexcept
         : Cache_(cache)
     {}
 
-    TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
-        return { *this, spaceOp };
+    Y_FORCE_INLINE TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
+        return { Cache_, spaceOp };
     }
 
     // Policy resizing and maintenance
@@ -175,13 +62,20 @@ public:
     void RefreshEvictableByteBudget() noexcept;
 
     bool GrowKeepCold() noexcept;
-    void ScheduleKeepColdSweep(ui64 slots) noexcept;
+
+    Y_FORCE_INLINE void ScheduleKeepColdSweep(ui64 slots) noexcept {
+        KeepColdSweepRemaining_.store(slots, std::memory_order_release);
+    }
+
     bool SweepKeepCold() noexcept;
 
     // Routing state
-    static bool IsKeepColdQueued(const THandle& handle) noexcept;
+    static Y_FORCE_INLINE bool IsKeepColdQueued(const THandle& handle) noexcept {
+        return (handle.ColdVersion.load(std::memory_order_acquire) & KeepColdQueuedMask) != 0;
+    }
 
 private:
+    friend class TCacheEvictionOperation<TTraits>;
     friend class TSharedCacheTestAccess;
 
     // KeepCold routing
@@ -197,7 +91,14 @@ private:
 
     // Hot routing and eviction
     TCacheItem PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
-    void RouteHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
+
+    Y_FORCE_INLINE void RouteHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept {
+        const TCacheItem displaced = PutHot(spaceOp, level, item);
+        if (!displaced.IsNull()) {
+            ProcessHot(spaceOp, level, displaced);
+        }
+    }
+
     static Y_FORCE_INLINE bool TakeHotFrequency(
         THandle& handle, TCacheItem item, THandleState& state, ui8& frequency) noexcept;
     Y_FORCE_INLINE void CompleteHotEviction(TSpaceOperation& spaceOp, THandle& handle, THandleState coldState,
@@ -220,14 +121,20 @@ private:
     bool TrimKeepCold(TSpaceOperation& spaceOp) noexcept;
     bool ShrinkKeepCold(TSpaceOperation& spaceOp) noexcept;
     static ui64 FractionCeil(ui64 value, double fraction) noexcept;
-    static bool ExceedsLimit(ui64 usage, ui64 limit, ui64 bytes) noexcept;
+
+    static Y_FORCE_INLINE bool ExceedsLimit(ui64 usage, ui64 limit, ui64 bytes) noexcept {
+        return usage + bytes > limit;
+    }
 
     // Cooperative reclamation: takes a cold entry and, when cold is empty, lets EnforceCurrentLimit move the
     // hot/cold boundary so that the coldest hot entries become reclaimable.
     bool Reclaim(TSpaceOperation& spaceOp, ui64 bytes = 0) noexcept;
     bool ReclaimToLimits(TSpaceOperation& spaceOp, ui64 softLimit, ui32 step, ui64 bytes = 0) noexcept;
 
-    ui32 MinimumHotSlots() const noexcept;
+    Y_FORCE_INLINE ui32 MinimumHotSlots() const noexcept {
+        return Cache_.Policy_.MinHotSlots;
+    }
+
     ui32 ShrinkHotTarget(ui32 effectiveHotSlots, ui32 step) const noexcept;
     ui32 GrowHotTarget(const TSpaceOperation& spaceOp, ui32 effectiveHotSlots, ui32 step) const noexcept;
     ui32 HotResizeStep(ui32 effectiveHotSlots) const noexcept;
@@ -250,6 +157,125 @@ private:
     std::atomic<ui64> KeepColdTrimScanRemaining_{ 0 };
     std::atomic<bool> KeepColdTrimActive_{ false };
     std::atomic<ui64> KeepColdSweepRemaining_{ 0 };
+};
+
+// Leave operation constructors implicitly instantiated
+template <class TTraits>
+class TCacheEvictionOperation {
+public:
+    // KeepCold routing
+    Y_FORCE_INLINE bool WantsKeepCold(const THandle& page) noexcept {
+        return Cache_.Eviction_.WantsKeepCold(SpaceOp_, page);
+    }
+
+    Y_FORCE_INLINE bool TryReleaseColdPageToKeepCold(TCacheItem item, ui64& expectedRaw) noexcept {
+        return Cache_.Eviction_.TryReleaseColdPageToKeepCold(SpaceOp_, item, expectedRaw);
+    }
+
+    Y_FORCE_INLINE bool DemoteKeepCold(TColdCacheItem item, TPageCacheItem expectedPage = {}) noexcept {
+        return Cache_.Eviction_.DemoteKeepCold(SpaceOp_, item, expectedPage);
+    }
+
+    Y_FORCE_INLINE void WithdrawKeepColdEntry(TColdCacheItem item) noexcept {
+        Cache_.Eviction_.WithdrawKeepColdEntry(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE bool MatchesKeepColdEntry(TColdCacheItem item) noexcept {
+        return Cache_.Eviction_.MatchesKeepColdEntry(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE void RouteKeepCold(TColdCacheItem item) noexcept {
+        Cache_.Eviction_.RouteKeepCold(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE void ReleaseKeepColdRef(TOperationItemRef<TTraits>& itemRef, ui32 initialColdVersion) noexcept {
+        Cache_.Eviction_.ReleaseKeepColdRef(SpaceOp_, itemRef, initialColdVersion);
+    }
+
+    // Hot routing and eviction
+    Y_FORCE_INLINE void RouteHot(EHotLevel level, TCacheItem item) noexcept {
+        Cache_.Eviction_.RouteHot(SpaceOp_, level, item);
+    }
+
+    Y_FORCE_INLINE void ProcessHot(EHotLevel level, TCacheItem item) noexcept {
+        Cache_.Eviction_.ProcessHot(SpaceOp_, level, item);
+    }
+
+    Y_FORCE_INLINE bool EvictFromHot(ui32 index) noexcept {
+        return Cache_.Eviction_.EvictFromHot(SpaceOp_, index);
+    }
+
+    Y_FORCE_INLINE bool EvictFromHot(TCacheItem item) noexcept {
+        return Cache_.Eviction_.EvictFromHot(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE bool PromoteCold(TCacheItem item, bool force = false) noexcept {
+        return Cache_.Eviction_.PromoteCold(SpaceOp_, item, force);
+    }
+
+    Y_FORCE_INLINE bool ProcessHotAtMinimum() noexcept {
+        return Cache_.Eviction_.ProcessHotAtMinimum(SpaceOp_);
+    }
+
+    // Cold routing and reclamation
+    Y_FORCE_INLINE void CompleteColdPageRelease(TOperationItemRef<TTraits>& ownerRef) noexcept {
+        Cache_.Eviction_.CompleteColdPageRelease(ownerRef);
+    }
+
+    Y_FORCE_INLINE bool EraseCold(TColdCacheItem item) noexcept {
+        return Cache_.Eviction_.EraseCold(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE void RouteCold(TColdCacheItem item) noexcept {
+        Cache_.Eviction_.RouteCold(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE bool ReclaimCold() noexcept {
+        return Cache_.Eviction_.ReclaimCold(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE bool ReclaimKeepCold() noexcept {
+        return Cache_.Eviction_.ReclaimKeepCold(SpaceOp_);
+    }
+
+    // Policy resizing and maintenance
+    Y_FORCE_INLINE bool TrimKeepCold() noexcept {
+        return Cache_.Eviction_.TrimKeepCold(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE bool ShrinkKeepCold() noexcept {
+        return Cache_.Eviction_.ShrinkKeepCold(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE bool Reclaim(ui64 bytes = 0) noexcept {
+        return Cache_.Eviction_.Reclaim(SpaceOp_, bytes);
+    }
+
+    Y_FORCE_INLINE bool ReclaimToLimits(ui64 softLimit, ui32 step, ui64 bytes = 0) noexcept {
+        return Cache_.Eviction_.ReclaimToLimits(SpaceOp_, softLimit, step, bytes);
+    }
+
+    Y_FORCE_INLINE bool EnforceCurrentLimit(ui64 bytes = 0, bool forceShrinkHot = false) noexcept {
+        return Cache_.Eviction_.EnforceCurrentLimit(SpaceOp_, bytes, forceShrinkHot);
+    }
+
+    Y_FORCE_INLINE bool DrainHotResize() noexcept {
+        return Cache_.Eviction_.DrainHotResize(SpaceOp_);
+    }
+
+private:
+    friend class TCacheEviction<TTraits>;
+    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheOperationView<TTraits>;
+
+    Y_FORCE_INLINE TCacheEvictionOperation(TSharedCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
+        : Cache_(cache)
+        , SpaceOp_(spaceOp)
+    {}
+
+private:
+    TSharedCacheImpl<TTraits>& Cache_;
+    TSpaceOperation& SpaceOp_;
 };
 
 } // namespace NKikimr::NSharedCache

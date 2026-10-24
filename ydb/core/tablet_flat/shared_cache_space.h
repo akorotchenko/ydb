@@ -131,13 +131,7 @@ public:
         return static_cast<ui32>(Raw_ >> CursorShift);
     }
 
-    constexpr ui32 SplitBit() const noexcept {
-        if (!*this) {
-            return 0;
-        }
-        const ui8 bits = Direction() == EBucketResize::Growing ? OldAddressBits() : NewAddressBits();
-        return ui32{ 1 } << bits;
-    }
+    constexpr ui32 SplitBit() const noexcept;
 
     constexpr ui32 PairCount() const noexcept {
         return SplitBit();
@@ -205,26 +199,7 @@ struct TSpaceView {
         return Min(effective, HotSlotCount);
     }
 
-    Y_FORCE_INLINE TRingView Hot(ui32 level) const noexcept {
-        Y_DEBUG_ABORT_UNLESS(Rings && level < 4);
-        const ui64 hotSlotCount = EffectiveHotSlotCount();
-        const ui64 l3Size = hotSlotCount / 15;
-        const ui64 l2Size = (hotSlotCount * 2) / 15;
-        const ui64 l1Size = (hotSlotCount * 5) / 15;
-        const ui64 sizes[4] = {
-            hotSlotCount - l3Size - l2Size - l1Size,
-            l1Size,
-            l2Size,
-            l3Size,
-        };
-        const ui64 offsets[4] = {
-            l3Size + l2Size + l1Size,
-            l3Size + l2Size,
-            l3Size,
-            0,
-        };
-        return { &Rings->Hot(level), HotSlots + offsets[level], sizes[level] };
-    }
+    Y_FORCE_INLINE TRingView Hot(ui32 level) const noexcept;
 
     Y_FORCE_INLINE TRingView Cold() const noexcept {
         Y_DEBUG_ABORT_UNLESS(Rings);
@@ -241,20 +216,7 @@ struct TSpaceView {
         return { FreeCursor, FreeSlots, HandleCount };
     }
 
-    void CopyMappings(const TSpaceView& source) noexcept {
-        Handles = source.Handles;
-        Buckets = source.Buckets;
-        HotSlots = source.HotSlots;
-        ColdSlots = source.ColdSlots;
-        KeepColdSlots = source.KeepColdSlots;
-        FreeSlots = source.FreeSlots;
-        HandlesBytes = source.HandlesBytes;
-        BucketsBytes = source.BucketsBytes;
-        HotSlotBytes = source.HotSlotBytes;
-        ColdSlotBytes = source.ColdSlotBytes;
-        KeepColdSlotBytes = source.KeepColdSlotBytes;
-        FreeSlotBytes = source.FreeSlotBytes;
-    }
+    void CopyMappings(const TSpaceView& source) noexcept;
 };
 
 enum class ETransitionPhase {
@@ -314,20 +276,7 @@ private:
     template <class TTraits>
     friend class TCacheCapacity;
 
-    void Reset() noexcept {
-        Phase_ = ETransitionPhase::Idle;
-        Generation_ = 0;
-        OldConfiguration_ = {};
-        TargetConfiguration_ = {};
-        ResizeDeltaBits_ = 0;
-        ReleaseStage_ = ESpaceMap::Done;
-        NextHazardIndex_ = 0;
-        NextWorkIndex_ = 0;
-        FinalDrainStage_ = ESpaceMap::Done;
-        CutBlocked_ = false;
-        PreparedView_.Reset();
-        OldView_.Reset();
-    }
+    void Reset() noexcept;
 
 private:
     ETransitionPhase Phase_ = ETransitionPhase::Idle;
@@ -449,14 +398,7 @@ public:
             other.Resize_ = nullptr;
         }
 
-        TGuard& operator=(TGuard&& other) noexcept {
-            if (this != &other) {
-                Reset();
-                Resize_ = other.Resize_;
-                other.Resize_ = nullptr;
-            }
-            return *this;
-        }
+        TGuard& operator=(TGuard&& other) noexcept;
 
         TGuard(const TGuard&) = delete;
         TGuard& operator=(const TGuard&) = delete;
@@ -470,11 +412,7 @@ public:
         }
 
     private:
-        void Reset() noexcept {
-            if (auto* resize = std::exchange(Resize_, nullptr)) {
-                resize->Unlock();
-            }
-        }
+        void Reset() noexcept;
 
     private:
         THotResize* Resize_ = nullptr;
@@ -485,24 +423,9 @@ public:
     }
 
 private:
-    bool TryAcquire() noexcept {
-        ui8 state = 0;
-        for (;;) {
-            const bool acquired = !(state & Locked);
-            const ui8 desired = acquired ? Locked : state | NotifyOnUnlock;
-            if (State_.compare_exchange_weak(state, desired, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-                return acquired;
-            }
-        }
-    }
+    bool TryAcquire() noexcept;
 
-    void Unlock() noexcept {
-        const ui8 state = State_.exchange(0, std::memory_order_release);
-        Y_DEBUG_ABORT_UNLESS(state & Locked);
-        if ((state & NotifyOnUnlock) && Notify_.Function) {
-            Notify_.Function(Notify_.Context);
-        }
-    }
+    void Unlock() noexcept;
 
     friend class TSharedCacheSpace;
 
@@ -539,17 +462,13 @@ public:
     TSpaceOperation& operator=(const TSpaceOperation&) = delete;
     TSpaceOperation& operator=(TSpaceOperation&&) = delete;
 
-    TSpaceOperation(TSpaceOperation&& other) noexcept
+    Y_FORCE_INLINE TSpaceOperation(TSpaceOperation&& other) noexcept
         : Hazard_(std::exchange(other.Hazard_, nullptr))
         , EntryState_(other.EntryState_)
         , View_(other.View_)
     {}
 
-    ~TSpaceOperation() {
-        if (Hazard_) {
-            LeaveHazard(*Hazard_);
-        }
-    }
+    Y_FORCE_INLINE ~TSpaceOperation();
 
     static Y_FORCE_INLINE TSpaceOperation Begin(
         std::atomic<ui64>& spaceState, TSpaceHazard& hazard, const std::array<TSpaceView, 2>& views) noexcept {
@@ -560,25 +479,24 @@ public:
     template <class TAfterIncrement>
     static Y_FORCE_INLINE TSpaceOperation BeginWithHook(std::atomic<ui64>& spaceState, TSpaceHazard& hazard,
         const std::array<TSpaceView, 2>& views,
-        TAfterIncrement&& afterIncrement) noexcept(noexcept(std::forward<TAfterIncrement>(afterIncrement)()))
-    {
+        TAfterIncrement&& afterIncrement) noexcept(noexcept(std::forward<TAfterIncrement>(afterIncrement)())) {
         return BeginImpl<true>(spaceState, hazard, views, std::forward<TAfterIncrement>(afterIncrement));
     }
 
-    ui64 EntryGeneration() const noexcept {
+    Y_FORCE_INLINE ui64 EntryGeneration() const noexcept {
         return EntryState_.Generation();
     }
 
-    TSpaceState EntrySpaceState() const noexcept {
+    Y_FORCE_INLINE TSpaceState EntrySpaceState() const noexcept {
         return EntryState_;
     }
 
-    TSpaceHazard& Hazard() const noexcept {
+    Y_FORCE_INLINE TSpaceHazard& Hazard() const noexcept {
         Y_DEBUG_ABORT_UNLESS(Hazard_);
         return *Hazard_;
     }
 
-    const TSpaceView& View() const noexcept {
+    Y_FORCE_INLINE const TSpaceView& View() const noexcept {
         return *View_;
     }
 
@@ -643,83 +561,24 @@ public:
 
     bool ReturnFreeHandle(ui32 index, ui32 version) noexcept;
 
-    Y_FORCE_INLINE bool TryStoreSpareItem(TCacheItem cacheItem) noexcept {
-        Y_DEBUG_ABORT_UNLESS(!cacheItem.IsNull() && !cacheItem.IsFrozen() && cacheItem.Index() >= 2 &&
-                             cacheItem.Index() < AccessibleHandleCount());
-        const THandle& handle = Handles()[cacheItem.Index()];
-        const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-        Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(state) && state.IsBegin() && state.Refs() == 0);
-
-        ui64 expected = 0;
-        return Hazard().SpareItem.compare_exchange_strong(
-            expected, cacheItem.Raw(), std::memory_order_release, std::memory_order_relaxed);
-    }
+    Y_FORCE_INLINE bool TryStoreSpareItem(TCacheItem cacheItem) noexcept;
 
 private:
     template <bool WithHook, class TAfterIncrement>
     static Y_FORCE_INLINE TSpaceOperation BeginImpl(std::atomic<ui64>& spaceState, TSpaceHazard& hazard,
         const std::array<TSpaceView, 2>& views,
-        TAfterIncrement&& afterIncrement) noexcept(noexcept(std::forward<TAfterIncrement>(afterIncrement)()))
-    {
-        for (;;) {
-            TSpaceState entryState = TSpaceState::FromRaw(spaceState.load(std::memory_order_acquire));
-            ui64 hazardState = hazard.State.load(std::memory_order_relaxed);
-            const ui32 activeCount = SpaceHazardActiveCount(hazardState);
-            Y_DEBUG_ABORT_UNLESS(activeCount != MaxSpaceHazardActiveCount);
+        TAfterIncrement&& afterIncrement) noexcept(noexcept(std::forward<TAfterIncrement>(afterIncrement)()));
 
-            if (activeCount != 0) {
-                if (!hazard.State.compare_exchange_weak(
-                        hazardState, hazardState + 1, std::memory_order_acq_rel, std::memory_order_relaxed))
-                {
-                    continue;
-                }
-                return TSpaceOperation(hazard, entryState, views);
-            }
-
-            Y_DEBUG_ABORT_UNLESS(hazardState == 0);
-            const ui32 generation = entryState.Generation();
-            if (!hazard.State.compare_exchange_weak(hazardState, PackHazardState(generation, activeCount + 1),
-                    std::memory_order_acq_rel, std::memory_order_relaxed))
-            {
-                continue;
-            }
-            if constexpr (WithHook) {
-                std::forward<TAfterIncrement>(afterIncrement)();
-            }
-            entryState = TSpaceState::FromRaw(spaceState.load(std::memory_order_acquire));
-            if (entryState.Generation() != generation) {
-                LeaveHazard(hazard);
-                continue;
-            }
-
-            return TSpaceOperation(hazard, entryState, views);
-        }
-    }
-
-    static Y_FORCE_INLINE void LeaveHazard(TSpaceHazard& hazard) noexcept {
-        ui64 state = hazard.State.load(std::memory_order_relaxed);
-        for (;;) {
-            const ui32 activeCount = SpaceHazardActiveCount(state);
-            Y_DEBUG_ABORT_UNLESS(activeCount != 0);
-            const ui64 desired = activeCount == 1 ? 0 : state - 1;
-            if (hazard.State.compare_exchange_weak(
-                    state, desired, std::memory_order_release, std::memory_order_relaxed))
-            {
-                if (Y_UNLIKELY(activeCount == 1 && (state & SpaceHazardDrainWaiter))) {
-                    NotifyHazardDrained(hazard);
-                }
-                return;
-            }
-        }
-    }
+    static Y_FORCE_INLINE void LeaveHazard(TSpaceHazard& hazard) noexcept;
 
     static void NotifyHazardDrained(TSpaceHazard& hazard) noexcept;
 
-    static constexpr ui64 PackHazardState(ui64 generation, ui32 activeCount) noexcept {
+    static Y_FORCE_INLINE constexpr ui64 PackHazardState(ui64 generation, ui32 activeCount) noexcept {
         return (generation << 32) | activeCount;
     }
 
-    TSpaceOperation(TSpaceHazard& hazard, TSpaceState entryState, const std::array<TSpaceView, 2>& views) noexcept
+    Y_FORCE_INLINE TSpaceOperation(
+        TSpaceHazard& hazard, TSpaceState entryState, const std::array<TSpaceView, 2>& views) noexcept
         : Hazard_(&hazard)
         , EntryState_(entryState)
         , View_(&views[entryState.Generation() & 1])
@@ -775,26 +634,7 @@ public:
         return TBucketResizeState::FromRaw(BucketResizeState_.load(std::memory_order_acquire));
     }
 
-    Y_FORCE_INLINE bool RefreshBucketRoute(TSpaceState& spaceState, TBucketResizeState& resizeState) const noexcept {
-        const TSpaceState currentSpaceState = CurrentSpaceState();
-        if (!currentSpaceState.Resizing()) {
-            const bool unchanged = currentSpaceState == spaceState;
-            spaceState = currentSpaceState;
-            if (!unchanged) {
-                resizeState = {};
-            }
-            return unchanged;
-        }
-
-        const TBucketResizeState currentResizeState = BucketResizeState();
-        if (currentSpaceState == spaceState && currentResizeState == resizeState)
-        {
-            return true;
-        }
-        spaceState = currentSpaceState;
-        resizeState = currentResizeState;
-        return false;
-    }
+    Y_FORCE_INLINE bool RefreshBucketRoute(TSpaceState& spaceState, TBucketResizeState& resizeState) const noexcept;
 
     Y_FORCE_INLINE TSpaceState CurrentSpaceState() const noexcept {
         return TSpaceState::FromRaw(SpaceState_.load(std::memory_order_acquire));
@@ -836,106 +676,7 @@ public:
 
     template <class THotRouter, class TColdRouter, class TKeepColdRouter>
     bool FinalDrain(TTransition& transition, THotRouter&& hotRouter, TColdRouter&& coldRouter,
-        TKeepColdRouter&& keepColdRouter) noexcept {
-        if (transition.Phase_ != ETransitionPhase::FinalDrain || transition.NextHazardIndex_ != HazardSlotCount_ ||
-            transition.Generation_ != CurrentSpaceState().Generation() || !transition.OldView_)
-        {
-            return false;
-        }
-
-        ui32 remainingSlots = SharedCacheTransitionWorkBatch;
-        const ui64 oldHotSlotCount = transition.OldConfiguration_.HotSlotCount();
-        const ui64 oldHandleCount = transition.OldConfiguration_.HandleCount();
-        const ui64 oldColdSlotCount = transition.OldConfiguration_.ColdSlotCount();
-        const ui64 oldKeepColdSlotCount = transition.OldConfiguration_.KeepColdSlotCount();
-        const ui64 targetHandleCount = transition.TargetConfiguration_.HandleCount();
-        const ui64 targetColdSlotCount = transition.TargetConfiguration_.ColdSlotCount();
-        const ui64 targetKeepColdSlotCount = transition.TargetConfiguration_.KeepColdSlotCount();
-        while (remainingSlots != 0 && transition.FinalDrainStage_ != ESpaceMap::Done) {
-            switch (transition.FinalDrainStage_) {
-                case ESpaceMap::Hot:
-                    while (remainingSlots != 0 && transition.NextWorkIndex_ < oldHotSlotCount) {
-                        const ui64 slot = transition.NextWorkIndex_++;
-                        const ui64 raw = transition.OldView_->HotSlots[slot].exchange(0, std::memory_order_acquire);
-                        if (raw != 0) {
-                            hotRouter(HotLevelForSlot(slot, oldHotSlotCount), raw);
-                        }
-                        --remainingSlots;
-                    }
-                    if (transition.NextWorkIndex_ == oldHotSlotCount) {
-                        transition.FinalDrainStage_ = ESpaceMap::Cold;
-                        transition.NextWorkIndex_ = targetColdSlotCount;
-                    }
-                    break;
-
-                case ESpaceMap::Cold:
-                    while (remainingSlots != 0 && transition.NextWorkIndex_ < oldColdSlotCount) {
-                        const ui64 raw = transition.OldView_->ColdSlots[transition.NextWorkIndex_++].exchange(
-                            0, std::memory_order_acquire);
-                        if (raw != 0) {
-                            coldRouter(raw);
-                        }
-                        --remainingSlots;
-                    }
-                    if (transition.NextWorkIndex_ == oldColdSlotCount) {
-                        transition.FinalDrainStage_ = ESpaceMap::KeepCold;
-                        transition.NextWorkIndex_ = targetKeepColdSlotCount;
-                    }
-                    break;
-
-                case ESpaceMap::KeepCold:
-                    while (remainingSlots != 0 && transition.NextWorkIndex_ < oldKeepColdSlotCount) {
-                        const ui64 raw = transition.OldView_->KeepColdSlots[transition.NextWorkIndex_++].exchange(
-                            0, std::memory_order_acquire);
-                        if (raw != 0) {
-                            keepColdRouter(raw);
-                        }
-                        --remainingSlots;
-                    }
-                    if (transition.NextWorkIndex_ == oldKeepColdSlotCount) {
-                        transition.FinalDrainStage_ = ESpaceMap::Free;
-                        transition.NextWorkIndex_ = 0;
-                    }
-                    break;
-
-                case ESpaceMap::Free: {
-                    const ui64 cutCount = oldHandleCount - targetHandleCount;
-                    const TSpaceView& view = SpaceView(CurrentSpaceState());
-                    while (remainingSlots != 0 && transition.NextWorkIndex_ < oldHandleCount) {
-                        const ui64 workIndex = transition.NextWorkIndex_++;
-                        if (workIndex < cutCount) {
-                            const ui64 slot = targetHandleCount + workIndex;
-                            RouteFreeWord(view, FreeRingCursor_->Clear(&transition.OldView_->FreeSlots[slot]));
-                        } else {
-                            std::atomic<ui64>* currentSlot = &view.FreeSlots[workIndex - cutCount];
-                            ui64 raw = currentSlot->load(std::memory_order_relaxed);
-                            while (raw != 0 && !IsCurrentFreeWord(view, raw)) {
-                                if (FreeRingCursor_->ClearSafe(currentSlot, raw)) {
-                                    break;
-                                }
-                                raw = currentSlot->load(std::memory_order_relaxed);
-                            }
-                        }
-                        --remainingSlots;
-                    }
-                    if (transition.NextWorkIndex_ == oldHandleCount) {
-                        transition.FinalDrainStage_ = ESpaceMap::Done;
-                        transition.NextWorkIndex_ = 0;
-                    }
-                    break;
-                }
-
-                case ESpaceMap::Handles:
-                case ESpaceMap::Buckets:
-                case ESpaceMap::Done:
-                    Y_ABORT("Invalid shared-cache final-drain stage");
-            }
-        }
-        if (transition.FinalDrainStage_ == ESpaceMap::Done) {
-            transition.Phase_ = ETransitionPhase::Release;
-        }
-        return true;
-    }
+        TKeepColdRouter&& keepColdRouter) noexcept;
 
     bool PublishFinalView(TTransition& transition) noexcept;
 
@@ -947,14 +688,7 @@ public:
 
     bool AbandonTransition(TTransition& transition) noexcept;
 
-    Y_FORCE_INLINE bool RefreshSpaceState(TSpaceState& spaceState) const noexcept {
-        const TSpaceState current = CurrentSpaceState();
-        if (current == spaceState) {
-            return true;
-        }
-        spaceState = current;
-        return false;
-    }
+    Y_FORCE_INLINE bool RefreshSpaceState(TSpaceState& spaceState) const noexcept;
 
 private:
     friend class TCacheThreadTestAccess;
@@ -968,11 +702,7 @@ private:
         void* Context = nullptr;
         void (*Function)(void*) noexcept = nullptr;
 
-        void Run() const noexcept {
-            if (Function) {
-                Function(Context);
-            }
-        }
+        void Run() const noexcept;
     };
 
     struct TPublishMigrationViewHook {
@@ -1079,5 +809,315 @@ private:
     std::atomic<ui64> EffectiveHotSlots_{ 0 };
     std::atomic<ui64> BucketResizeState_{ 0 };
 };
+
+// Inline implementations
+
+inline THotResize::TGuard& THotResize::TGuard::operator=(TGuard&& other) noexcept {
+    if (this != &other) {
+        Reset();
+        Resize_ = other.Resize_;
+        other.Resize_ = nullptr;
+    }
+    return *this;
+}
+
+inline void THotResize::TGuard::Reset() noexcept {
+    if (auto* resize = std::exchange(Resize_, nullptr)) {
+        resize->Unlock();
+    }
+}
+
+inline bool THotResize::TryAcquire() noexcept {
+    ui8 state = 0;
+    for (;;) {
+        const bool acquired = !(state & Locked);
+        const ui8 desired = acquired ? Locked : state | NotifyOnUnlock;
+        if (State_.compare_exchange_weak(state, desired, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            return acquired;
+        }
+    }
+}
+
+inline void THotResize::Unlock() noexcept {
+    const ui8 state = State_.exchange(0, std::memory_order_release);
+    Y_DEBUG_ABORT_UNLESS(state & Locked);
+    if ((state & NotifyOnUnlock) && Notify_.Function) {
+        Notify_.Function(Notify_.Context);
+    }
+}
+
+Y_FORCE_INLINE TSpaceOperation::~TSpaceOperation() {
+    if (Hazard_) {
+        LeaveHazard(*Hazard_);
+    }
+}
+
+Y_FORCE_INLINE bool TSpaceOperation::TryStoreSpareItem(TCacheItem cacheItem) noexcept {
+    Y_DEBUG_ABORT_UNLESS(!cacheItem.IsNull() && !cacheItem.IsFrozen() && cacheItem.Index() >= 2 &&
+                         cacheItem.Index() < AccessibleHandleCount());
+    const THandle& handle = Handles()[cacheItem.Index()];
+    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+    Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(state) && state.IsBegin() && state.Refs() == 0);
+
+    ui64 expected = 0;
+    return Hazard().SpareItem.compare_exchange_strong(
+        expected, cacheItem.Raw(), std::memory_order_release, std::memory_order_relaxed);
+}
+
+template <bool WithHook, class TAfterIncrement>
+Y_FORCE_INLINE TSpaceOperation TSpaceOperation::BeginImpl(std::atomic<ui64>& spaceState, TSpaceHazard& hazard,
+    const std::array<TSpaceView, 2>& views,
+    TAfterIncrement&& afterIncrement) noexcept(noexcept(std::forward<TAfterIncrement>(afterIncrement)())) {
+    for (;;) {
+        TSpaceState entryState = TSpaceState::FromRaw(spaceState.load(std::memory_order_acquire));
+        ui64 hazardState = hazard.State.load(std::memory_order_relaxed);
+        const ui32 activeCount = SpaceHazardActiveCount(hazardState);
+        Y_DEBUG_ABORT_UNLESS(activeCount != MaxSpaceHazardActiveCount);
+
+        if (activeCount != 0) {
+            if (!hazard.State.compare_exchange_weak(
+                    hazardState, hazardState + 1, std::memory_order_acq_rel, std::memory_order_relaxed))
+            {
+                continue;
+            }
+            return TSpaceOperation(hazard, entryState, views);
+        }
+
+        Y_DEBUG_ABORT_UNLESS(hazardState == 0);
+        const ui32 generation = entryState.Generation();
+        if (!hazard.State.compare_exchange_weak(hazardState, PackHazardState(generation, activeCount + 1),
+                std::memory_order_acq_rel, std::memory_order_relaxed))
+        {
+            continue;
+        }
+        if constexpr (WithHook) {
+            std::forward<TAfterIncrement>(afterIncrement)();
+        }
+        entryState = TSpaceState::FromRaw(spaceState.load(std::memory_order_acquire));
+        if (entryState.Generation() != generation) {
+            LeaveHazard(hazard);
+            continue;
+        }
+
+        return TSpaceOperation(hazard, entryState, views);
+    }
+}
+
+Y_FORCE_INLINE void TSpaceOperation::LeaveHazard(TSpaceHazard& hazard) noexcept {
+    ui64 state = hazard.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const ui32 activeCount = SpaceHazardActiveCount(state);
+        Y_DEBUG_ABORT_UNLESS(activeCount != 0);
+        const ui64 desired = activeCount == 1 ? 0 : state - 1;
+        if (hazard.State.compare_exchange_weak(state, desired, std::memory_order_release, std::memory_order_relaxed))
+        {
+            if (Y_UNLIKELY(activeCount == 1 && (state & SpaceHazardDrainWaiter))) {
+                NotifyHazardDrained(hazard);
+            }
+            return;
+        }
+    }
+}
+
+inline void TSharedCacheSpace::TFreeExchangeHook::Run() const noexcept {
+    if (Function) {
+        Function(Context);
+    }
+}
+
+Y_FORCE_INLINE bool TSharedCacheSpace::RefreshBucketRoute(
+    TSpaceState& spaceState, TBucketResizeState& resizeState) const noexcept {
+    const TSpaceState currentSpaceState = CurrentSpaceState();
+    if (!currentSpaceState.Resizing()) {
+        const bool unchanged = currentSpaceState == spaceState;
+        spaceState = currentSpaceState;
+        if (!unchanged) {
+            resizeState = {};
+        }
+        return unchanged;
+    }
+
+    const TBucketResizeState currentResizeState = BucketResizeState();
+    if (currentSpaceState == spaceState && currentResizeState == resizeState)
+    {
+        return true;
+    }
+    spaceState = currentSpaceState;
+    resizeState = currentResizeState;
+    return false;
+}
+
+template <class THotRouter, class TColdRouter, class TKeepColdRouter>
+inline bool TSharedCacheSpace::FinalDrain(TTransition& transition, THotRouter&& hotRouter, TColdRouter&& coldRouter,
+    TKeepColdRouter&& keepColdRouter) noexcept {
+    if (transition.Phase_ != ETransitionPhase::FinalDrain || transition.NextHazardIndex_ != HazardSlotCount_ ||
+        transition.Generation_ != CurrentSpaceState().Generation() || !transition.OldView_)
+    {
+        return false;
+    }
+
+    ui32 remainingSlots = SharedCacheTransitionWorkBatch;
+    const ui64 oldHotSlotCount = transition.OldConfiguration_.HotSlotCount();
+    const ui64 oldHandleCount = transition.OldConfiguration_.HandleCount();
+    const ui64 oldColdSlotCount = transition.OldConfiguration_.ColdSlotCount();
+    const ui64 oldKeepColdSlotCount = transition.OldConfiguration_.KeepColdSlotCount();
+    const ui64 targetHandleCount = transition.TargetConfiguration_.HandleCount();
+    const ui64 targetColdSlotCount = transition.TargetConfiguration_.ColdSlotCount();
+    const ui64 targetKeepColdSlotCount = transition.TargetConfiguration_.KeepColdSlotCount();
+    while (remainingSlots != 0 && transition.FinalDrainStage_ != ESpaceMap::Done) {
+        switch (transition.FinalDrainStage_) {
+            case ESpaceMap::Hot:
+                while (remainingSlots != 0 && transition.NextWorkIndex_ < oldHotSlotCount) {
+                    const ui64 slot = transition.NextWorkIndex_++;
+                    const ui64 raw = transition.OldView_->HotSlots[slot].exchange(0, std::memory_order_acquire);
+                    if (raw != 0) {
+                        hotRouter(HotLevelForSlot(slot, oldHotSlotCount), raw);
+                    }
+                    --remainingSlots;
+                }
+                if (transition.NextWorkIndex_ == oldHotSlotCount) {
+                    transition.FinalDrainStage_ = ESpaceMap::Cold;
+                    transition.NextWorkIndex_ = targetColdSlotCount;
+                }
+                break;
+
+            case ESpaceMap::Cold:
+                while (remainingSlots != 0 && transition.NextWorkIndex_ < oldColdSlotCount) {
+                    const ui64 raw = transition.OldView_->ColdSlots[transition.NextWorkIndex_++].exchange(
+                        0, std::memory_order_acquire);
+                    if (raw != 0) {
+                        coldRouter(raw);
+                    }
+                    --remainingSlots;
+                }
+                if (transition.NextWorkIndex_ == oldColdSlotCount) {
+                    transition.FinalDrainStage_ = ESpaceMap::KeepCold;
+                    transition.NextWorkIndex_ = targetKeepColdSlotCount;
+                }
+                break;
+
+            case ESpaceMap::KeepCold:
+                while (remainingSlots != 0 && transition.NextWorkIndex_ < oldKeepColdSlotCount) {
+                    const ui64 raw = transition.OldView_->KeepColdSlots[transition.NextWorkIndex_++].exchange(
+                        0, std::memory_order_acquire);
+                    if (raw != 0) {
+                        keepColdRouter(raw);
+                    }
+                    --remainingSlots;
+                }
+                if (transition.NextWorkIndex_ == oldKeepColdSlotCount) {
+                    transition.FinalDrainStage_ = ESpaceMap::Free;
+                    transition.NextWorkIndex_ = 0;
+                }
+                break;
+
+            case ESpaceMap::Free: {
+                const ui64 cutCount = oldHandleCount - targetHandleCount;
+                const TSpaceView& view = SpaceView(CurrentSpaceState());
+                while (remainingSlots != 0 && transition.NextWorkIndex_ < oldHandleCount) {
+                    const ui64 workIndex = transition.NextWorkIndex_++;
+                    if (workIndex < cutCount) {
+                        const ui64 slot = targetHandleCount + workIndex;
+                        RouteFreeWord(view, FreeRingCursor_->Clear(&transition.OldView_->FreeSlots[slot]));
+                    } else {
+                        std::atomic<ui64>* currentSlot = &view.FreeSlots[workIndex - cutCount];
+                        ui64 raw = currentSlot->load(std::memory_order_relaxed);
+                        while (raw != 0 && !IsCurrentFreeWord(view, raw)) {
+                            if (FreeRingCursor_->ClearSafe(currentSlot, raw)) {
+                                break;
+                            }
+                            raw = currentSlot->load(std::memory_order_relaxed);
+                        }
+                    }
+                    --remainingSlots;
+                }
+                if (transition.NextWorkIndex_ == oldHandleCount) {
+                    transition.FinalDrainStage_ = ESpaceMap::Done;
+                    transition.NextWorkIndex_ = 0;
+                }
+                break;
+            }
+
+            case ESpaceMap::Handles:
+            case ESpaceMap::Buckets:
+            case ESpaceMap::Done:
+                Y_ABORT("Invalid shared-cache final-drain stage");
+        }
+    }
+    if (transition.FinalDrainStage_ == ESpaceMap::Done) {
+        transition.Phase_ = ETransitionPhase::Release;
+    }
+    return true;
+}
+
+Y_FORCE_INLINE bool TSharedCacheSpace::RefreshSpaceState(TSpaceState& spaceState) const noexcept {
+    const TSpaceState current = CurrentSpaceState();
+    if (current == spaceState) {
+        return true;
+    }
+    spaceState = current;
+    return false;
+}
+
+// Inline implementations
+
+constexpr ui32 TBucketResizeState::SplitBit() const noexcept {
+    if (!*this) {
+        return 0;
+    }
+    const ui8 bits = Direction() == EBucketResize::Growing ? OldAddressBits() : NewAddressBits();
+    return ui32{ 1 } << bits;
+}
+
+Y_FORCE_INLINE TRingView TSpaceView::Hot(ui32 level) const noexcept {
+    Y_DEBUG_ABORT_UNLESS(Rings && level < 4);
+    const ui64 hotSlotCount = EffectiveHotSlotCount();
+    const ui64 l3Size = hotSlotCount / 15;
+    const ui64 l2Size = (hotSlotCount * 2) / 15;
+    const ui64 l1Size = (hotSlotCount * 5) / 15;
+    const ui64 sizes[4] = {
+        hotSlotCount - l3Size - l2Size - l1Size,
+        l1Size,
+        l2Size,
+        l3Size,
+    };
+    const ui64 offsets[4] = {
+        l3Size + l2Size + l1Size,
+        l3Size + l2Size,
+        l3Size,
+        0,
+    };
+    return { &Rings->Hot(level), HotSlots + offsets[level], sizes[level] };
+}
+
+inline void TSpaceView::CopyMappings(const TSpaceView& source) noexcept {
+    Handles = source.Handles;
+    Buckets = source.Buckets;
+    HotSlots = source.HotSlots;
+    ColdSlots = source.ColdSlots;
+    KeepColdSlots = source.KeepColdSlots;
+    FreeSlots = source.FreeSlots;
+    HandlesBytes = source.HandlesBytes;
+    BucketsBytes = source.BucketsBytes;
+    HotSlotBytes = source.HotSlotBytes;
+    ColdSlotBytes = source.ColdSlotBytes;
+    KeepColdSlotBytes = source.KeepColdSlotBytes;
+    FreeSlotBytes = source.FreeSlotBytes;
+}
+
+inline void TTransition::Reset() noexcept {
+    Phase_ = ETransitionPhase::Idle;
+    Generation_ = 0;
+    OldConfiguration_ = {};
+    TargetConfiguration_ = {};
+    ResizeDeltaBits_ = 0;
+    ReleaseStage_ = ESpaceMap::Done;
+    NextHazardIndex_ = 0;
+    NextWorkIndex_ = 0;
+    FinalDrainStage_ = ESpaceMap::Done;
+    CutBlocked_ = false;
+    PreparedView_.Reset();
+    OldView_.Reset();
+}
 
 } // namespace NKikimr::NSharedCache

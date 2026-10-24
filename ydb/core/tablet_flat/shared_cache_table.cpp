@@ -54,12 +54,6 @@ ui32 HashCollectionKey(const TLogoBlobID& id) noexcept {
     return FinishHash(HashCombine(hash, words[2]));
 }
 
-ui32 TSharedCacheKey::Hash() const noexcept {
-    return Kind_ == EItemKind::Page
-               ? HashPageKey(TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(Words_[0])), Words_[1])
-               : HashCollectionKey(TLogoBlobID(Words_.data()));
-}
-
 int CompareSharedCacheKeys(
     const TSharedCacheKey& left, ui32 leftHash, const TSharedCacheKey& right, ui32 rightHash) noexcept {
     const ui32 leftOrder = ReverseBits(leftHash);
@@ -90,62 +84,6 @@ TSharedCacheKey LoadSharedCacheKey(const THandle& handle, EItemKind kind) noexce
     const ui64 word1 = handle.Key1.load(std::memory_order_relaxed);
     const ui64 word2 = handle.Key2OrSize.load(std::memory_order_relaxed);
     return TSharedCacheKey::FromWords(kind, word0, word1, word2);
-}
-
-SHARED_CACHE_TEMPLATE
-TSharedCacheItemRef::TSharedCacheItemRefImpl(TCacheItem cacheItem) noexcept
-    : CacheItem_(cacheItem)
-{}
-
-SHARED_CACHE_TEMPLATE
-TSharedCacheItemRef::TSharedCacheItemRefImpl(TSharedCacheItemRef&& other) noexcept
-    : CacheItem_(std::exchange(other.CacheItem_, {}))
-{}
-
-SHARED_CACHE_TEMPLATE
-TSharedCacheItemRef& TSharedCacheItemRef::operator=(TSharedCacheItemRef&& other) noexcept {
-    if (this != &other) {
-        Drop();
-        CacheItem_ = std::exchange(other.CacheItem_, {});
-    }
-    return *this;
-}
-
-SHARED_CACHE_TEMPLATE
-TSharedCacheItemRef::~TSharedCacheItemRefImpl() {
-    Drop();
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCacheItemRef::Drop() noexcept {
-    const TCacheItem cacheItem = Take();
-    if (!cacheItem.IsNull()) {
-        // A missing resolver is the explicit terminal-shutdown abandonment path.
-        if (TSharedCache* cache = TSharedCache::TryGet()) {
-            auto cacheOp = cache->BeginOperation();
-            cacheOp.Release(cacheItem);
-        }
-    }
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCacheItemRef::Drop(TSpaceOperation& spaceOp) noexcept {
-    const TCacheItem cacheItem = Take();
-    if (!cacheItem.IsNull()) {
-        auto cacheOp = TSharedCache::Get().BindOperation(spaceOp);
-        cacheOp.Release(cacheItem);
-    }
-}
-
-SHARED_CACHE_TEMPLATE
-TCacheItem TSharedCacheItemRef::Take() noexcept {
-    return std::exchange(CacheItem_, {});
-}
-
-SHARED_CACHE_TEMPLATE
-void TSharedCacheItemRef::Disarm() noexcept {
-    Y_DEBUG_ABORT_UNLESS(!CacheItem_.IsNull());
-    CacheItem_ = {};
 }
 
 SHARED_CACHE_TEMPLATE
@@ -340,6 +278,25 @@ Y_FORCE_INLINE ESharedCacheResultStatus TSharedCacheTable::FindOrInsert(TSpaceOp
     static constexpr ETombstoneMode Mode = Insert ? ETombstoneMode::Help : ETombstoneMode::Traverse;
     const ui32 hash = key.Hash();
     TSpaceState spaceState = spaceOp.EntrySpaceState();
+    if constexpr (!Insert) {
+        // Exact page-head hits do not need the ordered-key comparison
+        if (key.IsPageKind() && !spaceState.Resizing()) {
+            const ui32 bucket = hash & spaceState.BucketMask();
+            const TCacheItem head = TCacheItem::FromRaw(spaceOp.Buckets()[bucket].load(std::memory_order_acquire));
+            if (!head.IsFrozen() && spaceOp.Contains(head)) {
+                const THandle& handle = spaceOp.Handles()[head.Index()];
+                const TCacheItem next = TCacheItem::FromRaw(handle.Next.load(std::memory_order_acquire));
+                const ui64 collection = handle.Key0.load(std::memory_order_relaxed);
+                const ui64 offset = handle.Key1.load(std::memory_order_relaxed);
+                const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+                if (head.Matches(state) && state.IsPageKind() && state.IsReady() && !next.IsFrozen() &&
+                    collection == key.Word(0) && offset == key.Word(1)) {
+                    cacheItem = head;
+                    return ESharedCacheResultStatus::Hit;
+                }
+            }
+        }
+    }
     for (;;) {
         TBucketRoute route = SelectBucket(hash, spaceState);
         TOrderedLink orderedLink;
@@ -763,9 +720,7 @@ void TSharedCacheTable::FinishErase(
 #undef TSharedCache
 #undef SHARED_CACHE_TEMPLATE
 
-template class TSharedCacheItemRefImpl<TProdTraits>;
 template class TSharedCacheTableImpl<TProdTraits>;
-template class TSharedCacheItemRefImpl<TTestTraits>;
 template class TSharedCacheTableImpl<TTestTraits>;
 
 } // namespace NKikimr::NSharedCache

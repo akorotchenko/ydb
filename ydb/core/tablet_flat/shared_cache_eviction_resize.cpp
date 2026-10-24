@@ -32,11 +32,6 @@ bool TCacheEviction<TTraits>::UpdateKeepColdLimit(ui64 limit) noexcept {
 }
 
 template <class TTraits>
-void TCacheEviction<TTraits>::ScheduleKeepColdSweep(ui64 slots) noexcept {
-    KeepColdSweepRemaining_.store(slots, std::memory_order_release);
-}
-
-template <class TTraits>
 bool TCacheEviction<TTraits>::SweepKeepCold() noexcept {
     ui64 remaining = KeepColdSweepRemaining_.load(std::memory_order_acquire);
     while (remaining != 0) {
@@ -152,11 +147,6 @@ bool TCacheEviction<TTraits>::GrowKeepCold() noexcept {
 }
 
 template <class TTraits>
-bool TCacheEviction<TTraits>::ExceedsLimit(ui64 usage, ui64 limit, ui64 bytes) noexcept {
-    return usage + bytes > limit;
-}
-
-template <class TTraits>
 bool TCacheEviction<TTraits>::Reclaim(TSpaceOperation& spaceOp, ui64 bytes) noexcept {
     if (ReclaimCold(spaceOp) || ReclaimKeepCold(spaceOp)) {
         return true;
@@ -201,11 +191,6 @@ void TCacheEviction<TTraits>::RefreshEvictableByteBudget() noexcept {
     ColdTargetBytes_.store(
         FractionCeil(budget, (Cache_.Policy_.ColdMin + Cache_.Policy_.Grow) / 2), std::memory_order_relaxed);
     ColdGrowBytes_.store(FractionCeil(budget, Cache_.Policy_.Grow), std::memory_order_relaxed);
-}
-
-template <class TTraits>
-ui32 TCacheEviction<TTraits>::MinimumHotSlots() const noexcept {
-    return Cache_.Policy_.MinHotSlots;
 }
 
 template <class TTraits>
@@ -357,16 +342,13 @@ bool TCacheEviction<TTraits>::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64
 // Moved methods are instantiated here for both trait variants
 template ui64 TCacheEviction<TProdTraits>::FractionCeil(ui64, double) noexcept;
 template bool TCacheEviction<TProdTraits>::UpdateKeepColdLimit(ui64) noexcept;
-template void TCacheEviction<TProdTraits>::ScheduleKeepColdSweep(ui64) noexcept;
 template bool TCacheEviction<TProdTraits>::SweepKeepCold() noexcept;
 template bool TCacheEviction<TProdTraits>::TrimKeepCold(TSpaceOperation&) noexcept;
 template bool TCacheEviction<TProdTraits>::ShrinkKeepCold(TSpaceOperation&) noexcept;
 template bool TCacheEviction<TProdTraits>::GrowKeepCold() noexcept;
-template bool TCacheEviction<TProdTraits>::ExceedsLimit(ui64, ui64, ui64) noexcept;
 template bool TCacheEviction<TProdTraits>::Reclaim(TSpaceOperation&, ui64) noexcept;
 template bool TCacheEviction<TProdTraits>::ReclaimToLimits(TSpaceOperation&, ui64, ui32, ui64) noexcept;
 template void TCacheEviction<TProdTraits>::RefreshEvictableByteBudget() noexcept;
-template ui32 TCacheEviction<TProdTraits>::MinimumHotSlots() const noexcept;
 template ui32 TCacheEviction<TProdTraits>::ShrinkHotTarget(ui32, ui32) const noexcept;
 template ui32 TCacheEviction<TProdTraits>::GrowHotTarget(const TSpaceOperation&, ui32, ui32) const noexcept;
 template ui32 TCacheEviction<TProdTraits>::HotResizeStep(ui32) const noexcept;
@@ -375,16 +357,13 @@ template bool TCacheEviction<TProdTraits>::EnforceCurrentLimit(TSpaceOperation&,
 
 template ui64 TCacheEviction<TTestTraits>::FractionCeil(ui64, double) noexcept;
 template bool TCacheEviction<TTestTraits>::UpdateKeepColdLimit(ui64) noexcept;
-template void TCacheEviction<TTestTraits>::ScheduleKeepColdSweep(ui64) noexcept;
 template bool TCacheEviction<TTestTraits>::SweepKeepCold() noexcept;
 template bool TCacheEviction<TTestTraits>::TrimKeepCold(TSpaceOperation&) noexcept;
 template bool TCacheEviction<TTestTraits>::ShrinkKeepCold(TSpaceOperation&) noexcept;
 template bool TCacheEviction<TTestTraits>::GrowKeepCold() noexcept;
-template bool TCacheEviction<TTestTraits>::ExceedsLimit(ui64, ui64, ui64) noexcept;
 template bool TCacheEviction<TTestTraits>::Reclaim(TSpaceOperation&, ui64) noexcept;
 template bool TCacheEviction<TTestTraits>::ReclaimToLimits(TSpaceOperation&, ui64, ui32, ui64) noexcept;
 template void TCacheEviction<TTestTraits>::RefreshEvictableByteBudget() noexcept;
-template ui32 TCacheEviction<TTestTraits>::MinimumHotSlots() const noexcept;
 template ui32 TCacheEviction<TTestTraits>::ShrinkHotTarget(ui32, ui32) const noexcept;
 template ui32 TCacheEviction<TTestTraits>::GrowHotTarget(const TSpaceOperation&, ui32, ui32) const noexcept;
 template ui32 TCacheEviction<TTestTraits>::HotResizeStep(ui32) const noexcept;

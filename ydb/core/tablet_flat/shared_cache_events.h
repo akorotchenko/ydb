@@ -81,7 +81,7 @@ namespace NKikimr::NSharedCache {
     struct TEvSync : public TEventLocal<TEvSync, EvTouch> {
         THashMap<TLogoBlobID, THashSet<TPageOffset>> Pages;
 
-        TEvSync(THashMap<TLogoBlobID, THashSet<TPageOffset>> &&pages)
+        TEvSync(THashMap<TLogoBlobID, THashSet<TPageOffset>>&& pages)
             : Pages(std::move(pages))
         {}
     };
@@ -119,8 +119,7 @@ namespace NKikimr::NSharedCache {
             , CacheMode(cacheMode)
             , BtreeSeeds(std::move(btreeSeeds))
             , ReplayStickyWalk(replayStickyWalk)
-        {
-        }
+        {}
 
         TEvAttach(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, ECacheMode cacheMode)
             : PageCollection(std::move(pageCollection))
@@ -135,8 +134,7 @@ namespace NKikimr::NSharedCache {
         TEvAttached(const TLogoBlobID& pageCollectionId, TCollectionCacheItem cacheItem)
             : PageCollectionId(pageCollectionId)
             , CacheItem(cacheItem)
-        {
-        }
+        {}
     };
 
     // Note: compacted pages do not have an owner yet
@@ -147,13 +145,19 @@ namespace NKikimr::NSharedCache {
         TVector<TPageLocation> Pages;
         TCollectionCacheItem CacheItem;
 
-        TSharedPageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky);
-        TSharedPageRef AddWrittenPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky);
+        Y_FORCE_INLINE TSharedPageRef AddPage(
+            TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
+            return AddPage(cachePages, std::move(page), sticky, TSharedCache::EPageAdmission::Bounded);
+        }
+
+        Y_FORCE_INLINE TSharedPageRef AddWrittenPage(
+            TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
+            return AddPage(cachePages, std::move(page), sticky, TSharedCache::EPageAdmission::Written);
+        }
 
         TEvSaveCompactedPages(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection)
             : PageCollection(std::move(pageCollection))
-        {
-        }
+        {}
 
     private:
         TSharedPageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky,
@@ -161,12 +165,13 @@ namespace NKikimr::NSharedCache {
     };
 
     struct TEvRequest : public TEventLocal<TEvRequest, EvRequest> {
-        TEvRequest(EPriority priority, TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, TVector<TPageLocation> pages, ui64 cookie = 0)
+        TEvRequest(EPriority priority, TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection,
+            TVector<TPageLocation> pages, ui64 cookie = 0)
             : Priority(priority)
             , PageCollection(std::move(pageCollection))
             , Pages(std::move(pages))
             , Cookie(cookie)
-        { }
+        {}
 
         const EPriority Priority;
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
@@ -188,31 +193,22 @@ namespace NKikimr::NSharedCache {
             , ExecutorGeneration(executorGeneration)
             , RequestId(requestId)
             , CoreRoute(coreRoute)
-        { }
+        {}
 
-        void Describe(IOutputStream &out) const
-        {
-            out
-                << "TEvResult{" << Pages.size() << " pages"
-                << " " << PageCollection->Label()
-                << " " << (Status == NKikimrProto::OK ? "ok" : "fail")
-                << " " << NKikimrProto::EReplyStatus_Name(Status) << "}";
+        void Describe(IOutputStream& out) const {
+            out << "TEvResult{" << Pages.size() << " pages"
+                << " " << PageCollection->Label() << " " << (Status == NKikimrProto::OK ? "ok" : "fail") << " "
+                << NKikimrProto::EReplyStatus_Name(Status) << "}";
         }
 
-        ui64 Bytes() const
-        {
-            return
-                std::accumulate(Pages.begin(), Pages.end(), ui64(0),
-                    [](ui64 bytes, const TLoaded& loaded)
-                        { return bytes + loaded.Size; });
-        }
+        ui64 Bytes() const;
 
         struct TLoaded {
             TLoaded(NTable::NPage::TPageOffset offset, size_t size, TSharedPageRef page)
                 : Offset(offset)
                 , Size(size)
                 , Page(std::move(page))
-            { }
+            {}
 
             NTable::NPage::TPageOffset Offset;
             size_t Size;
@@ -318,8 +314,7 @@ namespace NKikimr::NSharedCache {
         explicit TEvRequestAnswered(ui64 status, ui64 completionId = 0) noexcept
             : Status(status)
             , CompletionId(completionId)
-        {
-        }
+        {}
 
         const ui64 Status;
         const ui64 CompletionId;
@@ -332,8 +327,7 @@ namespace NKikimr::NSharedCache {
         TEvCollectionBytesChanged(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem)
             : CollectionId(collectionId)
             , CacheItem(cacheItem)
-        {
-        }
+        {}
     };
 
     // Page items drained, or the collection metadata was reclaimed; recheck this generation.
@@ -344,8 +338,7 @@ namespace NKikimr::NSharedCache {
         TEvCollectionReleased(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem)
             : CollectionId(collectionId)
             , CacheItem(cacheItem)
-        {
-        }
+        {}
     };
 
     struct TEvKeepPageEvicted : public TEventLocal<TEvKeepPageEvicted, EvKeepPageEvicted> {
@@ -368,7 +361,7 @@ namespace NKikimr::NSharedCache {
             : Cookie(cookie)
             , Bytes(bytes)
             , Pages(pages)
-        { }
+        {}
 
         const ui64 Cookie; // queue type
         const ui64 Bytes; // fetch cookie, the requested size
@@ -377,9 +370,16 @@ namespace NKikimr::NSharedCache {
 
     class TRequestPageWaiter final : public TPageFetchWaiter {
     public:
-        TRequestPageWaiter(TIntrusivePtr<TRequestCompletion> completion, ui32 index) noexcept;
+        Y_FORCE_INLINE TRequestPageWaiter(TIntrusivePtr<TRequestCompletion> completion, ui32 index) noexcept
+            : Completion_(std::move(completion))
+            , Index_(index)
+        {
+            Y_DEBUG_ABORT_UNLESS(Completion_);
+        }
 
-        bool IsActive() const noexcept override;
+        Y_FORCE_INLINE bool IsActive() const noexcept override {
+            return Completion_->IsActive();
+        }
 
         const TRequestCompletion& GetCompletion() const noexcept {
             return *Completion_;
@@ -391,6 +391,17 @@ namespace NKikimr::NSharedCache {
         TIntrusivePtr<TRequestCompletion> Completion_;
         const ui32 Index_;
     };
+
+    // Inline implementations
+
+    inline ui64 TEvResult::Bytes() const {
+        return std::accumulate(Pages.begin(), Pages.end(), ui64(0),
+            [](ui64 bytes, const TLoaded& loaded)
+            {
+                return bytes + loaded.Size;
+            });
+    }
+
 } // namespace NKikimr::NSharedCache
 
 template<> inline

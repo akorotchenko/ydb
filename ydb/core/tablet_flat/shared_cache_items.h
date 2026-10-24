@@ -17,97 +17,7 @@ public:
         Ready,
     };
 
-    class TOperation {
-    public:
-        // Structural protection
-        TSharedCacheItemRefImpl<TTraits> TryAcquireStructural(TCacheItem item) noexcept {
-            return Items_.TryAcquireItemRef(SpaceOp_, item);
-        }
-
-        // Reference acquisition
-        Y_FORCE_INLINE EAcquireStatus TryAcquire(
-            TCacheItem cacheItem, bool allowPending, TSharedCacheItemRefImpl<TTraits>& ref) noexcept {
-            return Items_.TryAcquire(SpaceOp_, cacheItem, allowPending, ref);
-        }
-
-        TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TCacheItem item) noexcept {
-            return Items_.TryAcquireHotItemRef(SpaceOp_, item);
-        }
-
-        TSharedCacheItemRefImpl<TTraits> AcquireMorePageRef(TCacheItem item) noexcept {
-            return Items_.AcquireMorePageRef(SpaceOp_, item);
-        }
-
-        TSharedCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TCacheItem item) noexcept {
-            return Items_.AcquireMoreCollectionRef(SpaceOp_, item);
-        }
-
-        // Reference construction
-        TSharedPageRefImpl<TTraits> BuildPageRef(TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {
-            return Items_.BuildPageRef(SpaceOp_, std::move(ref));
-        }
-
-        TSharedCacheCollectionRefImpl<TTraits> BuildCollectionRef(
-            TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {
-            return Items_.BuildCollectionRef(SpaceOp_, std::move(ref));
-        }
-
-        // Reference release
-        Y_FORCE_INLINE TCollection* ReleaseItem(TCacheItem cacheItem, bool allowKeepCold) noexcept {
-            return Items_.ReleaseItem(SpaceOp_, cacheItem, allowKeepCold);
-        }
-
-        // Allocation
-        ui32 TryAllocateHandle() noexcept {
-            return Items_.TryAllocateHandle(SpaceOp_);
-        }
-
-        TCacheItem Allocate() noexcept {
-            return Items_.Allocate(SpaceOp_);
-        }
-
-        TCacheItem TryAllocateReservedItem(ui64 bytes, ui64 pages) noexcept {
-            return Items_.TryAllocateReservedItem(SpaceOp_, bytes, pages);
-        }
-
-        // Spare handles
-        void RefillSpareItem() noexcept {
-            Items_.RefillSpareItem(SpaceOp_);
-        }
-
-        // Candidate cleanup
-        void RecycleCandidate(TCacheItem cacheItem) noexcept {
-            Items_.RecycleCandidate(SpaceOp_, cacheItem);
-        }
-
-        void DiscardCandidate(TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes) noexcept {
-            Items_.DiscardCandidate(SpaceOp_, cacheItem, kind, reservedBytes);
-        }
-
-        // Handle initialization
-        void InitializePage(TCacheItem cacheItem, TCollectionCacheItem collection, ui64 offset, ui64 size,
-            NTable::NPage::EPage type, ui32 crc32, EStickyState sticky, bool reserved,
-            bool collectionOwnerHeld) noexcept {
-            Items_.InitializePage(
-                SpaceOp_, cacheItem, collection, offset, size, type, crc32, sticky, reserved, collectionOwnerHeld);
-        }
-
-        void InitializeCollection(TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept {
-            Items_.InitializeCollection(SpaceOp_, cacheItem, id, bytes);
-        }
-
-    private:
-        friend class TCacheItems;
-
-        TOperation(TCacheItems& items, TSpaceOperation& spaceOp) noexcept
-            : Items_(items)
-            , SpaceOp_(spaceOp)
-        {}
-
-    private:
-        TCacheItems& Items_;
-        TSpaceOperation& SpaceOp_;
-    };
+    using TOperation = TCacheItemsOperation<TTraits>;
 
     // Payload sizes
     static ui64 PayloadBytes(const THandle& handle, EItemKind kind) noexcept {
@@ -119,7 +29,7 @@ public:
     }
 
     static ui64 AccountedPageBytes(ui64 size) noexcept {
-        Y_ABORT_UNLESS(size <= Max<ui64>() - NActors::TSharedData::OverheadSize);
+        Y_DEBUG_ABORT_UNLESS(size <= Max<ui64>() - NActors::TSharedData::OverheadSize);
         return size + NActors::TSharedData::OverheadSize;
     }
 
@@ -127,41 +37,17 @@ public:
         : Cache_(cache)
     {}
 
-    TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
-        return { *this, spaceOp };
+    Y_FORCE_INLINE TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
+        return { Cache_, spaceOp };
     }
 
     // Payload destruction
     void DeletePayload(THandle& handle, EItemKind kind, EHandleState state, TCollection* owner = nullptr) noexcept;
 
 private:
+    friend class TCacheItemsOperation<TTraits>;
     // Structural reference acquisition
-    TSharedCacheItemRefImpl<TTraits> TryAcquireItemRef(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
-        if (!spaceOp.Contains(cacheItem) || cacheItem.IsFrozen())
-        {
-            return {};
-        }
-
-        THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-        ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-        for (;;) {
-            const THandleState expected = THandleState::FromRaw(expectedRaw);
-            if (!cacheItem.Matches(expected) || expected.IsFree() || expected.IsCompleting() ||
-                expected.IsReplacing() || expected.IsReplaced() || expected.IsTombstone())
-            {
-                return {};
-            }
-
-            Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
-            const THandleState desired = expected.IncrementRefs();
-            if (handle.State.compare_exchange_weak(
-                    expectedRaw, desired.Raw(), std::memory_order_relaxed, std::memory_order_relaxed))
-            {
-                Cache_.UpdateColdReclaimable(PayloadBytes(handle, expected.Kind()), expected, desired);
-                return TSharedCacheItemRefImpl<TTraits>(cacheItem);
-            }
-        }
-    }
+    TSharedCacheItemRefImpl<TTraits> TryAcquireItemRef(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
     // Reference acquisition
     Y_FORCE_INLINE EAcquireStatus TryAcquire(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending,
@@ -208,6 +94,135 @@ private:
     TSharedCacheImpl<TTraits>& Cache_;
 };
 
+// Leave operation constructors implicitly instantiated
+template <class TTraits>
+class TCacheItemsOperation {
+public:
+    using EAcquireStatus = typename TCacheItems<TTraits>::EAcquireStatus;
+
+    // Structural protection
+    Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> TryAcquireStructural(TCacheItem item) noexcept {
+        return Cache_.Items_.TryAcquireItemRef(SpaceOp_, item);
+    }
+
+    // Reference acquisition
+    Y_FORCE_INLINE EAcquireStatus TryAcquire(
+        TCacheItem cacheItem, bool allowPending, TSharedCacheItemRefImpl<TTraits>& ref) noexcept {
+        return Cache_.Items_.TryAcquire(SpaceOp_, cacheItem, allowPending, ref);
+    }
+
+    Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TCacheItem item) noexcept {
+        return Cache_.Items_.TryAcquireHotItemRef(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> AcquireMorePageRef(TCacheItem item) noexcept {
+        return Cache_.Items_.AcquireMorePageRef(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TCacheItem item) noexcept {
+        return Cache_.Items_.AcquireMoreCollectionRef(SpaceOp_, item);
+    }
+
+    // Reference construction
+    Y_FORCE_INLINE TSharedPageRefImpl<TTraits> BuildPageRef(TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {
+        return Cache_.Items_.BuildPageRef(SpaceOp_, std::move(ref));
+    }
+
+    Y_FORCE_INLINE TSharedCacheCollectionRefImpl<TTraits> BuildCollectionRef(
+        TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {
+        return Cache_.Items_.BuildCollectionRef(SpaceOp_, std::move(ref));
+    }
+
+    // Reference release
+    Y_FORCE_INLINE TCollection* ReleaseItem(TCacheItem cacheItem, bool allowKeepCold) noexcept {
+        return Cache_.Items_.ReleaseItem(SpaceOp_, cacheItem, allowKeepCold);
+    }
+
+    // Allocation
+    Y_FORCE_INLINE ui32 TryAllocateHandle() noexcept {
+        return Cache_.Items_.TryAllocateHandle(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE TCacheItem Allocate() noexcept {
+        return Cache_.Items_.Allocate(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE TCacheItem TryAllocateReservedItem(ui64 bytes, ui64 pages) noexcept {
+        return Cache_.Items_.TryAllocateReservedItem(SpaceOp_, bytes, pages);
+    }
+
+    // Spare handles
+    Y_FORCE_INLINE void RefillSpareItem() noexcept {
+        Cache_.Items_.RefillSpareItem(SpaceOp_);
+    }
+
+    // Candidate cleanup
+    Y_FORCE_INLINE void RecycleCandidate(TCacheItem cacheItem) noexcept {
+        Cache_.Items_.RecycleCandidate(SpaceOp_, cacheItem);
+    }
+
+    Y_FORCE_INLINE void DiscardCandidate(TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes) noexcept {
+        Cache_.Items_.DiscardCandidate(SpaceOp_, cacheItem, kind, reservedBytes);
+    }
+
+    // Handle initialization
+    Y_FORCE_INLINE void InitializePage(TCacheItem cacheItem, TCollectionCacheItem collection, ui64 offset, ui64 size,
+        NTable::NPage::EPage type, ui32 crc32, EStickyState sticky, bool reserved, bool collectionOwnerHeld) noexcept {
+        Cache_.Items_.InitializePage(
+            SpaceOp_, cacheItem, collection, offset, size, type, crc32, sticky, reserved, collectionOwnerHeld);
+    }
+
+    Y_FORCE_INLINE void InitializeCollection(TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept {
+        Cache_.Items_.InitializeCollection(SpaceOp_, cacheItem, id, bytes);
+    }
+
+private:
+    friend class TCacheItems<TTraits>;
+    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheOperationView<TTraits>;
+
+    Y_FORCE_INLINE TCacheItemsOperation(TSharedCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
+        : Cache_(cache)
+        , SpaceOp_(spaceOp)
+    {}
+
+private:
+    TSharedCacheImpl<TTraits>& Cache_;
+    TSpaceOperation& SpaceOp_;
+};
+
+// Reference construction
+template <class TTraits>
+TSharedPageRefImpl<TTraits> TCacheItems<TTraits>::BuildPageRef(
+    const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {
+    Y_DEBUG_ABORT_UNLESS(ref);
+    const TCacheItem cacheItem = ref.CacheItem_;
+    Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
+    const THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    Y_DEBUG_ABORT_UNLESS([&] {
+        const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+        return cacheItem.Matches(state) && state.IsPageKind() &&
+               (state.IsReady() || state.IsReplacing() || state.IsReplaced() || state.IsTombstone()) &&
+               state.Refs() > 0 && handle.Body.PageBuffer.data();
+    }());
+    return TSharedPageRefImpl<TTraits>(std::move(ref));
+}
+
+template <class TTraits>
+TSharedCacheCollectionRefImpl<TTraits> TCacheItems<TTraits>::BuildCollectionRef(
+    const TSpaceOperation& spaceOp, TSharedCacheItemRefImpl<TTraits>&& ref) const noexcept {
+    const TCacheItem cacheItem = ref.CacheItem_;
+    Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
+    const THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    Y_DEBUG_ABORT_UNLESS([&] {
+        const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
+        return cacheItem.Matches(state) && state.IsCollectionKind() &&
+               (state.IsSticky() || state.IsHot() || state.IsCold() || state.IsTombstone()) && state.Refs() > 0 &&
+               handle.Body.Collection;
+    }());
+    return TSharedCacheCollectionRefImpl<TTraits>(std::move(ref));
+}
+
 // Reference acquisition
 template <class TTraits>
 Y_FORCE_INLINE typename TCacheItems<TTraits>::EAcquireStatus TCacheItems<TTraits>::TryAcquire(
@@ -249,7 +264,9 @@ Y_FORCE_INLINE typename TCacheItems<TTraits>::EAcquireStatus TCacheItems<TTraits
         {
             continue;
         }
-        Cache_.UpdateColdReclaimable(PayloadBytes(handle, expected.Kind()), expected, desired);
+        if (expected.IsCold()) {
+            Cache_.UpdateColdReclaimable(PayloadBytes(handle, expected.Kind()), expected, desired);
+        }
         if (expected.IsKeepCold()) {
             Cache_.AdvanceColdMembership(handle);
             const ui64 bytes = PageBytes(handle);
@@ -369,6 +386,37 @@ Y_FORCE_INLINE bool TCacheItems<TTraits>::TryReleaseItemRef(
         return true;
     }
     return false;
+}
+
+// Inline implementations
+
+template <class TTraits>
+inline TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::TryAcquireItemRef(
+    TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
+    if (!spaceOp.Contains(cacheItem) || cacheItem.IsFrozen())
+    {
+        return {};
+    }
+
+    THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        if (!cacheItem.Matches(expected) || expected.IsFree() || expected.IsCompleting() || expected.IsReplacing() ||
+            expected.IsReplaced() || expected.IsTombstone())
+        {
+            return {};
+        }
+
+        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
+        const THandleState desired = expected.IncrementRefs();
+        if (handle.State.compare_exchange_weak(
+                expectedRaw, desired.Raw(), std::memory_order_relaxed, std::memory_order_relaxed))
+        {
+            Cache_.UpdateColdReclaimable(PayloadBytes(handle, expected.Kind()), expected, desired);
+            return TSharedCacheItemRefImpl<TTraits>(cacheItem);
+        }
+    }
 }
 
 } // namespace NKikimr::NSharedCache

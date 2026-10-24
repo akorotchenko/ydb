@@ -21,7 +21,11 @@ public:
         , Target_(cache.Space_->CurrentConfiguration())
     {}
 
-    void SetTarget(const TSharedCacheCapacity& target) noexcept;
+    Y_FORCE_INLINE void SetTarget(const TSharedCacheCapacity& target) noexcept {
+        Target_ = target;
+        TargetHandleCount_.store(target.HandleCount(), std::memory_order_relaxed);
+    }
+
     bool StartTransition() noexcept;
     bool RunMaintenance() noexcept;
 
@@ -39,12 +43,26 @@ private:
 
     // Capacity transitions
     bool PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept;
-    bool PublishMigrationView(TTransition& transition) noexcept;
-    bool TryDrainTransition(TTransition& transition) noexcept;
+
+    Y_FORCE_INLINE bool PublishMigrationView(TTransition& transition) noexcept {
+        if (auto hotResizeGuard = Cache_.HotResize_.TryLock()) {
+            return Cache_.Space_->PublishMigrationView(transition);
+        }
+        return false;
+    }
+
+    Y_FORCE_INLINE bool TryDrainTransition(TTransition& transition) noexcept {
+        return Cache_.Space_->TryDrainTransition(transition);
+    }
+
     bool PublishFinalView(TTransition& transition) noexcept;
     bool AppendFreeHandles(TTransition& transition) noexcept;
     bool FinalDrain(TTransition& transition) noexcept;
-    bool TryReleaseTransition(TTransition& transition) noexcept;
+
+    Y_FORCE_INLINE bool TryReleaseTransition(TTransition& transition) noexcept {
+        return Cache_.Space_->TryReleaseTransition(transition);
+    }
+
     bool CommitTransition(TTransition& transition) noexcept;
     bool AbandonTransition(TTransition& transition) noexcept;
 
