@@ -8232,6 +8232,170 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         }
         UNIT_ASSERT(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache) < hotSlots);
     }
+    void CheckHotRequeueAdmissionWake(bool releaseForeignRef) {
+        TFixture fixture(6, 2);
+        const auto collectionKey = TSharedCacheKey::Collection(TLogoBlobID(601, 602, 1));
+        const auto collection = AllocateCollection(*fixture.Cache, collectionKey);
+        UNIT_ASSERT(TSharedCacheTestAccess::MakeReady(
+            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+        TSharedCacheTestAccess::ShrinkHotToMinimum(*fixture.Cache);
+        UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(1));
+
+        TVector<TTestSharedPageRef> held;
+        TPageCacheItem cold;
+        for (ui64 offset = 0; offset < 2; ++offset) {
+            const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, offset));
+            UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsCold());
+            held.emplace_back();
+            UNIT_ASSERT(TSharedCacheTestAccess::AcquirePage(*fixture.Cache, page, held.back()));
+            if (offset == 0) {
+                cold = page;
+            }
+        }
+
+        UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(fixture.Cache->CurrentLimit()));
+        const ui64 l1Slots = TSharedCacheTestAccess::WithSpace(*fixture.Cache, [](auto& spaceOp) {
+            return spaceOp.Hot(1).Capacity;
+        });
+        TPageCacheItem hot;
+        for (ui64 offset = 2; offset < l1Slots + 2; ++offset) {
+            const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, offset));
+            if (offset == 2) {
+                hot = page;
+            } else {
+                held.emplace_back();
+                UNIT_ASSERT(TSharedCacheTestAccess::AcquirePage(*fixture.Cache, page, held.back()));
+            }
+        }
+        TTestSharedPageRef foreign;
+        UNIT_ASSERT(fixture.Cache->Find(collection, 2, foreign) == ESharedCacheResultStatus::Hit);
+        if (!releaseForeignRef) {
+            foreign.Drop();
+        }
+        const ui64 bytes = held.front().size() + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(fixture.Cache->PayloadUsage()));
+        UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(fixture.Cache->CurrentLimit() - 1));
+        UNIT_ASSERT(!fixture.Cache->CanReserve(bytes));
+
+        struct TObservation {
+            TSharedCacheGate Gate;
+            std::atomic<ui32> Notifications = 0;
+        } observation;
+
+        observation.Gate.Slots[0].Arm(ESharedCacheHookPoint::BeforeHotExchange, hot.CacheItem());
+        TTestTraits hooks{ &observation, [](void* context, ESharedCacheHookPoint point, TCacheItem item) noexcept {
+                              auto& observation = *static_cast<TObservation*>(context);
+                              if (point == ESharedCacheHookPoint::ResourcesAvailable) {
+                                  observation.Notifications.fetch_add(1, std::memory_order_relaxed);
+                              }
+                              TSharedCacheGate::Invoke(&observation.Gate, point, item);
+                          } };
+        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+        Y_DEFER {
+            fixture.Cache->DisarmResourceWait();
+        };
+        fixture.Cache->ArmResourceWait(fixture.Cache->AdmissionGeneration());
+        TTestSharedPageRef found;
+        TGateThread lookup(observation.Gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazard);
+            TlsCacheHazard = &TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+            Y_DEFER {
+                TlsCacheHazard = nullptr;
+            };
+            Y_ABORT_UNLESS(fixture.Cache->Find(collection, 0, found) == ESharedCacheResultStatus::Hit);
+        });
+        observation.Gate.Slots[0].Wait();
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), releaseForeignRef ? 0 : 1);
+        foreign.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, hot.Index()).Refs(), 0);
+        const auto hotIsQueued = [&] {
+            return TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
+                for (ui64 slot = 0; slot < spaceOp.EffectiveHotSlots(); ++slot) {
+                    if (spaceOp.View().HotSlots[slot].load(std::memory_order_acquire) == hot.CacheItem().Raw()) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+        };
+        UNIT_ASSERT(!hotIsQueued());
+
+        // Consume the early wake and exhaust reclamation before the actor would re-arm
+        for (ui32 step = 0;; ++step) {
+            UNIT_ASSERT(step < 1000);
+            if (!fixture.Cache->ReclaimForAdmission(bytes)) {
+                break;
+            }
+        }
+        UNIT_ASSERT(!fixture.Cache->CanReserve(bytes));
+        UNIT_ASSERT(!fixture.Cache->EnforceCurrentLimit());
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        fixture.Cache->ArmResourceWait(generation);
+        UNIT_ASSERT(!TSharedCacheTestAccess::TryReserve(*fixture.Cache, bytes));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), 1);
+
+        observation.Gate.Slots[0].Release();
+        lookup.Join();
+        UNIT_ASSERT(found && found.CacheItem() == cold);
+        UNIT_ASSERT(hotIsQueued());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), 2);
+        UNIT_ASSERT(!fixture.Cache->CanReserve(bytes));
+        UNIT_ASSERT(!fixture.Cache->EnforceCurrentLimit());
+        UNIT_ASSERT(!fixture.Cache->RunMaintenance());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReserve(*fixture.Cache, bytes));
+        TSharedCacheTestAccess::ReleaseReservation(*fixture.Cache, bytes);
+        UNIT_ASSERT_VALUES_EQUAL(found.size(), 4096);
+        UNIT_ASSERT_VALUES_EQUAL(found.data()[0], static_cast<char>(cold.Index()));
+    }
+
+    Y_UNIT_TEST(HotRequeueNotifiesAfterEarlyLastRefWake) {
+        CheckHotRequeueAdmissionWake(false);
+    }
+
+    Y_UNIT_TEST(HotRequeueNotifiesAfterForeignLastRefWake) {
+        CheckHotRequeueAdmissionWake(true);
+    }
+
+    Y_UNIT_TEST(HeldColdBytePressureDoesNotWakeWithoutProgress) {
+        TFixture fixture;
+        TSharedCacheTestAccess::ShrinkHotToMinimum(*fixture.Cache);
+        const auto key = TSharedCacheKey::Page(MakeCollectionCacheItem(603, 604), 1);
+        const auto page = InsertReadyPage(*fixture.Cache, key);
+        TTestSharedPageRef held;
+        UNIT_ASSERT(TSharedCacheTestAccess::AcquirePage(*fixture.Cache, page, held));
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        const ui64 bytes = held.size() + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(bytes));
+        UNIT_ASSERT(!TSharedCacheTestAccess::TryReserve(*fixture.Cache, bytes));
+
+        ui32 notifications = 0;
+        TTestTraits hooks{ &notifications, [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
+                              if (point == ESharedCacheHookPoint::ResourcesAvailable) {
+                                  ++*static_cast<ui32*>(context);
+                              }
+                          } };
+        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+        Y_DEFER {
+            fixture.Cache->DisarmResourceWait();
+        };
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        fixture.Cache->ArmResourceWait(generation);
+        for (ui32 attempt = 0; attempt < 3; ++attempt) {
+            UNIT_ASSERT(!TSharedCacheTestAccess::TryReserve(*fixture.Cache, bytes));
+            UNIT_ASSERT(!fixture.Cache->ReclaimForAdmission(bytes));
+            UNIT_ASSERT(!fixture.Cache->EnforceCurrentLimit());
+            UNIT_ASSERT(!fixture.Cache->RunMaintenance());
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+            UNIT_ASSERT_VALUES_EQUAL(notifications, 0);
+        }
+    }
+
     Y_UNIT_TEST(LateHotExchangeAfterLogicalShrinkIsRecovered) {
         TFixture fixture;
         const TCollectionCacheItem collection = MakeCollectionCacheItem(43, 44);
