@@ -11244,14 +11244,24 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const char* data = page.data();
         auto moved = std::move(page);
         UNIT_ASSERT(!page);
+        const auto* handles = TSharedCacheTestAccess::WithSpace(*fixture.Cache, [](const auto& operation) {
+            return operation.Handles();
+        });
 
-        TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
-        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
-        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
-        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
-        CompleteBucketResize(*fixture.Cache, *fixture.Space);
-        CommitTransition(*fixture.Cache, growth);
+        for (const auto* target : { &fixture.ReservedCapacity, &fixture.Capacity, &fixture.ReservedCapacity }) {
+            TTransition transition;
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, *target, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, target->AddressBits));
+            CompleteBucketResize(*fixture.Cache, *fixture.Space);
+            CommitTransition(*fixture.Cache, transition);
+            UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::WithSpace(*fixture.Cache, [](const auto& operation) {
+                return operation.Handles();
+            }), handles);
+            UNIT_ASSERT_VALUES_EQUAL(moved.data(), data);
+            UNIT_ASSERT_VALUES_EQUAL(moved.size(), 4096);
+        }
 
         UNIT_ASSERT_VALUES_EQUAL(moved.data(), data);
         UNIT_ASSERT_VALUES_EQUAL(moved.size(), 4096);
@@ -11311,6 +11321,15 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(shared);
         UNIT_ASSERT_VALUES_EQUAL(shared.GetType(), NTable::NPage::EPage::DataPage);
         TSharedPageRef pinned = std::move(shared);
+        {
+            auto* hazard = std::exchange(NSharedCache::TlsCacheHazard, nullptr);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = hazard;
+            };
+            UNIT_ASSERT_VALUES_EQUAL(pinned.data()[0], static_cast<char>(inserted.Index()));
+            UNIT_ASSERT_VALUES_EQUAL(pinned.size(), 4096);
+            UNIT_ASSERT(pinned.GetType() == NTable::NPage::EPage::DataPage);
+        }
         UNIT_ASSERT_VALUES_EQUAL(pinned.BuildSharedData().size(), 4096);
         UNIT_ASSERT_VALUES_EQUAL(pinned.BuildSharedData().data()[0], static_cast<char>(inserted.Index()));
     }

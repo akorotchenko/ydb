@@ -203,6 +203,7 @@ void TSharedCacheSpace::CancelPreparedView(TSpaceView& view) noexcept {
 
 void TSharedCacheSpace::PublishPreparedView(THolder<TSpaceView> view, THolder<TSpaceView>& oldView) noexcept {
     Y_DEBUG_ABORT_UNLESS(view);
+    Y_DEBUG_ABORT_UNLESS(view->Handles == Handles_);
     oldView = std::move(NewestViewOwner_);
     HandlesMapping_.Publish(view->Handles, view->HandlesBytes);
     BucketsMapping_.Publish(view->Buckets, view->BucketsBytes);

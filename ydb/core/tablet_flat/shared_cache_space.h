@@ -769,6 +769,15 @@ private:
 
     void PrepareView(ui32 generation, TSpaceView view) noexcept;
 
+    template <class TTraits>
+    friend class TSharedPageRefImpl;
+
+    // The caller already owns a native reference to this physical handle
+    Y_FORCE_INLINE const THandle& OwnedHandle(TCacheItem item) const noexcept {
+        Y_DEBUG_ABORT_UNLESS(Handles_ && !item.IsNull() && item.Index() < ReservedCapacity_.HandleCount());
+        return Handles_[item.Index()];
+    }
+
     Y_FORCE_INLINE const TSpaceView& NewestView() const noexcept {
         TSpaceView* view = NewestView_.load(std::memory_order_acquire);
         Y_DEBUG_ABORT_UNLESS(view);
@@ -786,7 +795,8 @@ private:
         const TCacheThreadSubSystem& threads);
 
 private:
-    TSharedCacheMapping HandlesMapping_;
+    TSharedCacheMapping HandlesMapping_{ TSharedCacheMapping::EAddressMode::Stable };
+    THandle* Handles_ = nullptr;
     TSharedCacheMapping BucketsMapping_;
     TSharedCacheMapping HotMapping_;
     TSharedCacheMapping ColdMapping_;

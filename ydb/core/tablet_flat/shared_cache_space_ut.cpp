@@ -3,6 +3,7 @@
 
 #include <library/cpp/testing/unittest/registar.h>
 #include <util/generic/vector.h>
+#include <util/system/info.h>
 
 #include <atomic>
 #include <thread>
@@ -172,6 +173,88 @@ void CompleteFinalDrain(TSharedCacheSpace& space, TTransition& transition) {
 }
 
 Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
+    Y_UNIT_TEST(StableMappingCancellationAndRegrowthPreserveLivePrefix) {
+        const size_t small = NSystemInfo::GetPageSize() * 2;
+        const size_t large = small * 2;
+        TSharedCacheMapping mapping(TSharedCacheMapping::EAddressMode::Stable);
+        void* base = nullptr;
+        UNIT_ASSERT(mapping.Allocate(small, large * 2, base));
+        auto* bytes = static_cast<char*>(base);
+        bytes[0] = 17;
+        bytes[small - 1] = 29;
+
+        void* prepared = nullptr;
+        UNIT_ASSERT(mapping.Prepare(large, prepared));
+        UNIT_ASSERT_VALUES_EQUAL(prepared, base);
+        static_cast<char*>(prepared)[large - 1] = 41;
+        mapping.Cancel(prepared, large);
+        UNIT_ASSERT_VALUES_EQUAL(bytes[0], 17);
+        UNIT_ASSERT_VALUES_EQUAL(bytes[small - 1], 29);
+
+        UNIT_ASSERT(mapping.Prepare(large, prepared));
+        UNIT_ASSERT_VALUES_EQUAL(prepared, base);
+        bytes[large - 1] = 53;
+        mapping.Publish(prepared, large);
+        void* old = base;
+        UNIT_ASSERT(mapping.Release(old, small, base, large));
+        UNIT_ASSERT_VALUES_EQUAL(bytes[small - 1], 29);
+
+        UNIT_ASSERT(mapping.Prepare(small, prepared));
+        mapping.Cancel(prepared, small);
+        UNIT_ASSERT_VALUES_EQUAL(bytes[large - 1], 53);
+
+        UNIT_ASSERT(mapping.Prepare(small, prepared));
+        mapping.Publish(prepared, small);
+        const void* begin = nullptr;
+        size_t size = 0;
+        mapping.ReleaseRange(base, large, base, small, begin, size);
+        UNIT_ASSERT_VALUES_EQUAL(begin, bytes + small);
+        UNIT_ASSERT_VALUES_EQUAL(size, large - small);
+        old = base;
+        UNIT_ASSERT(mapping.Release(old, large, base, small));
+        UNIT_ASSERT_VALUES_EQUAL(bytes[0], 17);
+        UNIT_ASSERT_VALUES_EQUAL(bytes[small - 1], 29);
+
+        UNIT_ASSERT(mapping.Prepare(large, prepared));
+        UNIT_ASSERT_VALUES_EQUAL(prepared, base);
+        bytes[large - 1] = 67;
+        mapping.Publish(prepared, large);
+        old = base;
+        UNIT_ASSERT(mapping.Release(old, small, base, large));
+        UNIT_ASSERT_VALUES_EQUAL(bytes[small - 1], 29);
+        UNIT_ASSERT_VALUES_EQUAL(bytes[large - 1], 67);
+    }
+
+    Y_UNIT_TEST(StableMappingReleaseRangeUsesBackingExtent) {
+        const size_t small = NSystemInfo::GetPageSize() * 2;
+        const size_t middle = small * 2;
+        const size_t large = small * 4;
+        TSharedCacheMapping mapping(TSharedCacheMapping::EAddressMode::Stable);
+        void* base = nullptr;
+        UNIT_ASSERT(mapping.Allocate(small, large, base));
+        auto* bytes = static_cast<char*>(base);
+        bytes[small - 1] = 17;
+
+        // A failed growth cancellation can leave a backing larger than the published prefix
+        void* prepared = nullptr;
+        UNIT_ASSERT(mapping.Prepare(large, prepared));
+        UNIT_ASSERT(mapping.Prepare(middle, prepared));
+        UNIT_ASSERT_VALUES_EQUAL(prepared, base);
+        bytes[middle - 1] = 29;
+        mapping.Publish(prepared, middle);
+        const void* begin = nullptr;
+        size_t size = 0;
+        if (mapping.NeedsRelease(base, small, base, middle)) {
+            mapping.ReleaseRange(base, small, base, middle, begin, size);
+            UNIT_ASSERT_VALUES_EQUAL(begin, bytes + middle);
+            UNIT_ASSERT(size > 0 && size <= large - middle);
+        }
+        void* old = base;
+        UNIT_ASSERT(mapping.Release(old, small, base, middle));
+        UNIT_ASSERT_VALUES_EQUAL(bytes[small - 1], 17);
+        UNIT_ASSERT_VALUES_EQUAL(bytes[middle - 1], 29);
+    }
+
     Y_UNIT_TEST(HotResizeCoalescesContendedUnlockNotification) {
         ui32 notifications = 0;
         THotResize resize({
@@ -858,6 +941,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT(growth.Phase() == ETransitionPhase::Commit);
         UNIT_ASSERT(space->CommitTransition(growth));
         UNIT_ASSERT(growth.Phase() == ETransitionPhase::Idle);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::Handles(*space), smallHandles);
 
         TTransition shrink;
         UNIT_ASSERT(space->PrepareTransition(small, shrink));
@@ -888,6 +972,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), small.HandleCount() - 2);
         UNIT_ASSERT(space->TryReleaseTransition(shrink));
         UNIT_ASSERT(space->CommitTransition(shrink));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::Handles(*space), smallHandles);
     }
 
     Y_UNIT_TEST(CapacityGrowthAddsEveryNewHandleToFree) {
