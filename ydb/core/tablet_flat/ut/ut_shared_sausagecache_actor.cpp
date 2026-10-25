@@ -2,6 +2,7 @@
 #include <ydb/core/base/counters.h>
 #include <ydb/core/cms/console/console.h>
 #include <ydb/core/protos/bootstrap.pb.h>
+#include <ydb/core/protos/memory_controller_config.pb.h>
 #include <ydb/core/testlib/actors/block_events.h>
 #include <ydb/core/testlib/actors/test_runtime.h>
 #include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
@@ -250,10 +251,14 @@ struct TSharedPageCacheMock {
         return config;
     }
 
-    TSharedPageCacheMock(const TSharedCacheConfig& config = DefaultConfig(), bool enableSchedule = false) {
+    TSharedPageCacheMock(
+        const TSharedCacheConfig& config = DefaultConfig(), bool enableSchedule = false, ui64 nodeMemoryLimit = 0) {
         TAutoPtr<TAppPrepare> app = new TAppPrepare();
         TCacheThreadTestAccess::Setup(Runtime);
         Runtime.Initialize(app->Unwrap());
+        if (nodeMemoryLimit) {
+            Runtime.GetAppData().MemoryControllerConfig.SetHardLimitBytes(nodeMemoryLimit);
+        }
         Runtime.SetLogPriority(NKikimrServices::TABLET_EXECUTOR, NLog::PRI_TRACE);
         Runtime.SetLogPriority(NKikimrServices::TABLET_SAUSAGECACHE, NLog::PRI_TRACE);
 
@@ -618,6 +623,41 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_EXCEPTION_CONTAINS(
             TSharedPageCacheMock(config), yexception, "Shared-cache MemoryLimit must be positive");
         UNIT_ASSERT(!TlsActivationContext && !TlsCacheHazard);
+    }
+
+    Y_UNIT_TEST(ReservationUsesNodeCeilingAndAllowsLaterGrowth) {
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(8_MB);
+        TSharedPageCacheMock sharedCache(config, false, 128_MB);
+        auto* core = TSharedCache::TryGet();
+        UNIT_ASSERT(core);
+        UNIT_ASSERT_VALUES_EQUAL(core->ReservationLimit(), 128_MB);
+        UNIT_ASSERT_VALUES_EQUAL(core->HardLimit(), 8_MB);
+
+        sharedCache.SetLimit(0, 64_MB);
+        NKikimrConfig::TAppConfig update;
+        update.MutableSharedCacheConfig()->CopyFrom(config);
+        update.MutableSharedCacheConfig()->SetMemoryLimit(48_MB);
+        sharedCache.UpdateConfig(update);
+        UNIT_ASSERT_VALUES_EQUAL(core->HardLimit(), 48_MB);
+        UNIT_ASSERT_VALUES_EQUAL(core->ReservationLimit(), 128_MB);
+
+        update.MutableSharedCacheConfig()->ClearMemoryLimit();
+        sharedCache.UpdateConfig(update);
+        UNIT_ASSERT_VALUES_EQUAL(core->HardLimit(), 64_MB);
+        UNIT_ASSERT_VALUES_EQUAL(core->ReservationLimit(), 128_MB);
+    }
+
+    Y_UNIT_TEST(ReservationPreservesKnownControllerCeiling) {
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        config.ClearMemoryLimit();
+        TSharedPageCacheMock sharedCache(config, false, 16_MB);
+        UNIT_ASSERT(!TSharedCache::TryGet());
+        sharedCache.SetLimit(0, 64_MB);
+        auto* core = TSharedCache::TryGet();
+        UNIT_ASSERT(core);
+        UNIT_ASSERT_VALUES_EQUAL(core->HardLimit(), 64_MB);
+        UNIT_ASSERT_VALUES_EQUAL(core->ReservationLimit(), 64_MB);
     }
 
     Y_UNIT_TEST(ControllerMaximumSizesCoreBeforeZeroAllocationAdmission) {

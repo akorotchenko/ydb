@@ -13,8 +13,11 @@
 #include <ydb/core/cms/console/console.h>
 #include <ydb/core/cms/console/configs_dispatcher.h>
 #include <ydb/core/protos/bootstrap.pb.h>
+#include <ydb/core/protos/memory_controller_config.pb.h>
 #include <ydb/core/base/blobstorage.h>
 #include <ydb/library/actors/core/hfunc.h>
+#include <ydb/library/actors/core/process_stats.h>
+#include <util/system/getpid.h>
 #include <util/generic/algorithm.h>
 #include <util/generic/set.h>
 
@@ -272,6 +275,23 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
     }
 
+    ui64 GetCacheReservationLimitBytes(ui64 allocationLimit) const {
+        ui64 nodeLimit = AppData()->MemoryControllerConfig.GetHardLimitBytes();
+        if (!nodeLimit) {
+            NActors::TProcStat process;
+            if (process.Fill(static_cast<pid_t>(GetPID()))) {
+                nodeLimit = process.CGroupMemLim;
+                if (process.MemTotal) {
+                    nodeLimit = nodeLimit ? Min(nodeLimit, process.MemTotal) : process.MemTotal;
+                }
+            }
+            if (!nodeLimit) {
+                nodeLimit = 2_GB;
+            }
+        }
+        return Max(Max(allocationLimit, nodeLimit), Max(ControllerMaxBytes, Config.GetMemoryLimit()));
+    }
+
     bool InitializeCache() {
         if (Cache) {
             return true;
@@ -300,8 +320,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             return false;
         }
         TSharedCacheCapacity reserved;
-        if (!TryCalculateSharedCacheFootprint(
-                MaxSharedCacheAddressBits, TSharedCache::ExpectedPageSize, 0, hazardCount, reserved)) {
+        if (!TryCalculateSharedCacheCapacity(GetCacheReservationLimitBytes(allocationLimit),
+                TSharedCache::ExpectedPageSize, 0, hazardCount, reserved)) {
             return false;
         }
         auto space = TSharedCacheSpace::Create(current, reserved, *threads);
