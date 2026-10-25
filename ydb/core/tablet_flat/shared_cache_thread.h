@@ -28,6 +28,7 @@ struct alignas(64) TSpaceHazard {
     std::atomic<ui64> SpareItem{ 0 };
     TSharedCacheImpl<TTestTraits>* TestCache = nullptr;
     const TSharedCacheSpace* Space = nullptr;
+    bool PreloadReclaim = false; // Current thread's synchronous handle reclamation
 };
 
 inline void SetHazardSpace(TConstArrayRef<TSpaceHazard*> hazards, const TSharedCacheSpace* space) noexcept {

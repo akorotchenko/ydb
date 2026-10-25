@@ -3,6 +3,7 @@
 #include "shared_cache.h"
 
 #include <util/generic/cast.h>
+#include <util/generic/scope.h>
 
 namespace NKikimr::NSharedCache {
 
@@ -215,11 +216,33 @@ void TCacheEviction<TTraits>::ReleaseKeepColdRef(
 }
 
 template <class TTraits>
-TCacheItem TCacheEviction<TTraits>::PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept {
-    const TRingExchangeResult exchange =
-        spaceOp.Hot(ToUnderlying(level)).PutAndPopWithHook(cacheItem.Raw(), [&]() noexcept {
-            Cache_.InvokeHook(ESharedCacheHookPoint::BeforeHotExchange, cacheItem);
-        });
+TCacheItem TCacheEviction<TTraits>::PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept {
+    return PutHotImpl<false>(spaceOp, level, item);
+}
+
+template <class TTraits>
+template <bool Preload, bool Requeue>
+TCacheItem TCacheEviction<TTraits>::PutHotImpl(
+    TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem, TRingExchangeResult* placement) noexcept {
+    const TRingExchangeResult exchange = [&]() noexcept {
+        if constexpr (Preload) {
+            const auto hot = spaceOp.Hot(ToUnderlying(level));
+            auto* slot = Requeue ? hot.SelectPushSlot() : hot.SelectPutSlot();
+            return ExchangeForPreload(spaceOp, slot, cacheItem.Raw(), false);
+        } else {
+            return spaceOp.Hot(ToUnderlying(level)).PutAndPopWithHook(cacheItem.Raw(), [&]() noexcept {
+                Cache_.InvokeHook(ESharedCacheHookPoint::BeforeHotExchange, cacheItem);
+            });
+        }
+    }();
+    if constexpr (Preload) {
+        if (placement) {
+            *placement = exchange;
+        }
+        if (!exchange.Slot) {
+            return cacheItem;
+        }
+    }
     // The operation protects the mapping; a concurrent cut may still exclude this slot.
     if (!spaceOp.IsAllowedHotSlot(exchange.Slot)) {
         ui64 expected = cacheItem.Raw();
@@ -277,7 +300,13 @@ Y_FORCE_INLINE void TCacheEviction<TTraits>::CompleteHotEviction(TSpaceOperation
 }
 
 template <class TTraits>
-void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept {
+void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept {
+    ProcessHotImpl<false>(spaceOp, level, item);
+}
+
+template <class TTraits>
+template <bool Preload>
+void TCacheEviction<TTraits>::ProcessHotImpl(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept {
     for (;;) {
         TOperationItemRef<TTraits> evictionRef(
             spaceOp, Cache_.Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
@@ -290,6 +319,7 @@ void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel lev
         if (!TakeHotFrequency(handle, cacheItem, state, frequency)) {
             return;
         }
+        const EHotLevel sourceLevel = level;
 
         if (frequency == 0) {
             if (level != EHotLevel::L0) {
@@ -321,7 +351,21 @@ void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel lev
         }
 
         evictionRef.Drop();
-        const TCacheItem displaced = PutHot(spaceOp, level, cacheItem);
+        TRingExchangeResult placement;
+        TCacheItem displaced = PutHotImpl<Preload>(spaceOp, level, cacheItem, &placement);
+        if constexpr (Preload) {
+            // Retry the source tier when protected pages block promotion
+            if (!placement.Slot && frequency != 0) {
+                const ui64 attempts = spaceOp.Hot(ToUnderlying(sourceLevel)).Capacity;
+                for (ui64 attempt = 0; attempt < attempts; ++attempt) {
+                    displaced = PutHotImpl<true, true>(spaceOp, sourceLevel, cacheItem, &placement);
+                    if (placement.Slot) {
+                        level = sourceLevel;
+                        break;
+                    }
+                }
+            }
+        }
         // The last ref may have notified while this token was still outside the ring
         Cache_.NotifyResourcesAvailable();
         if (displaced.IsNull()) {
@@ -419,15 +463,22 @@ bool TCacheEviction<TTraits>::PromoteCold(TSpaceOperation& spaceOp, TCacheItem c
 
 template <class TTraits>
 bool TCacheEviction<TTraits>::ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept {
+    return ProcessHotBatch<false>(spaceOp);
+}
+
+template <class TTraits>
+template <bool Preload>
+bool TCacheEviction<TTraits>::ProcessHotBatch(TSpaceOperation& spaceOp) noexcept {
     bool progress = false;
     // Give every level a share of the bounded work even when the lower rings are large or empty.
     for (ui32 level = 0; level < 4; ++level) {
         const TRingView hot = spaceOp.Hot(level);
         const ui64 attempts = Min<ui64>(hot.Capacity, SharedCacheTransitionWorkBatch / 4);
         for (ui64 attempt = 0; attempt < attempts; ++attempt) {
-            const ui64 raw = hot.Pop();
-            if (raw != 0) {
-                ProcessHot(spaceOp, static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
+            const auto popped =
+                Preload ? PopForPreload(spaceOp, hot, false) : TRingExchangeResult{ nullptr, hot.Pop() };
+            if (popped.Previous != 0) {
+                ProcessHotImpl<Preload>(spaceOp, static_cast<EHotLevel>(level), TCacheItem::FromRaw(popped.Previous));
                 progress = true;
             }
         }
@@ -538,6 +589,22 @@ void TCacheEviction<TTraits>::RouteCold(TSpaceOperation& spaceOp, TColdCacheItem
         return;
     }
 
+    if (spaceOp.Hazard().PreloadReclaim && state.IsPageKind()) {
+        TOperationItemRef<TTraits> collectionRef(spaceOp, AcquireRegularCollection(spaceOp, handle));
+        if (collectionRef) {
+            Cache_.Memory_.AddColdRingEntry();
+            Cache_.InvokeHook(ESharedCacheHookPoint::BeforeColdExchange, TCacheItem::FromRaw(coldItem.Raw()));
+            const auto exchange = ExchangeForPreload(spaceOp, spaceOp.Cold().SelectPutSlot(), coldItem.Raw(), true);
+            if (!exchange.Slot) {
+                Cache_.Memory_.RemoveColdRingEntry();
+                TryErasePreloadPage(spaceOp, coldItem);
+            } else if (exchange.Previous != 0) {
+                Cache_.Memory_.RemoveColdRingEntry();
+                TryErasePreloadPage(spaceOp, TColdCacheItem::FromRaw(exchange.Previous));
+            }
+            return;
+        }
+    }
     Cache_.Memory_.AddColdRingEntry();
     Cache_.InvokeHook(ESharedCacheHookPoint::BeforeColdExchange, TCacheItem::FromRaw(coldItem.Raw()));
     const TColdCacheItem displaced = spaceOp.PutCold(coldItem);
@@ -549,18 +616,158 @@ void TCacheEviction<TTraits>::RouteCold(TSpaceOperation& spaceOp, TColdCacheItem
 
 template <class TTraits>
 bool TCacheEviction<TTraits>::ReclaimCold(TSpaceOperation& spaceOp) noexcept {
+    return ReclaimColdImpl<false>(spaceOp);
+}
+
+template <class TTraits>
+template <bool Preload>
+bool TCacheEviction<TTraits>::ReclaimColdImpl(TSpaceOperation& spaceOp) noexcept {
     const TRingView cold = spaceOp.Cold();
-    for (ui64 attempt = 0; attempt < cold.Capacity; ++attempt) {
+    const ui64 attempts = Preload ? Min<ui64>(cold.Capacity, SharedCacheTransitionWorkBatch / 2) : cold.Capacity;
+    for (ui64 attempt = 0; attempt < attempts; ++attempt) {
         if (Cache_.Memory_.ColdRingEntries() == 0) {
             return false;
         }
         Cache_.InvokeHook(ESharedCacheHookPoint::BeforeColdRingPop, TCacheItem{});
-        const ui64 rawItem = cold.Pop();
+        const ui64 rawItem = Preload ? PopForPreload(spaceOp, cold, true).Previous : cold.Pop();
         if (rawItem != 0) {
             Cache_.Memory_.RemoveColdRingEntry();
-            if (EraseCold(spaceOp, TColdCacheItem::FromRaw(rawItem))) {
+            if (Preload ? TryErasePreloadPage(spaceOp, TColdCacheItem::FromRaw(rawItem))
+                        : EraseCold(spaceOp, TColdCacheItem::FromRaw(rawItem))) {
                 return true;
             }
+        }
+    }
+    return false;
+}
+
+template <class TTraits>
+TSharedCacheItemRefImpl<TTraits> TCacheEviction<TTraits>::AcquireRegularCollection(
+    TSpaceOperation& spaceOp, const THandle& page) noexcept {
+    const TCacheItem collection = TCacheItem::FromRaw(page.Key0.load(std::memory_order_relaxed));
+    if (!spaceOp.Contains(collection) || collection.IsFrozen()) {
+        return {};
+    }
+    THandle& handle = spaceOp.Handles()[collection.Index()];
+    ui64 raw = handle.State.load(std::memory_order_acquire);
+    for (;;) {
+        const THandleState state = THandleState::FromRaw(raw);
+        if (!collection.Matches(state) || !state.IsCollectionKind() || !state.IsSticky() || !state.IsStickyField() ||
+            state.Refs() == MaxHandleRefs) {
+            return {};
+        }
+        if (handle.State.compare_exchange_weak(
+                raw, state.IncrementRefs().Raw(), std::memory_order_acquire, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+    TOperationItemRef<TTraits> ref(spaceOp, collection);
+    return handle.Body.Collection && handle.Body.Collection->GetCacheMode() == ECacheMode::Regular
+               ? ref.Take()
+               : TSharedCacheItemRefImpl<TTraits>{};
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::IsPreloadProtected(
+    TSpaceOperation& spaceOp, ui64 raw, bool cold, TOperationItemRef<TTraits>& collectionRef) noexcept {
+    if (raw == 0) {
+        return false;
+    }
+    const TCacheItem token = TCacheItem::FromRaw(raw);
+    if (!spaceOp.Contains(token) || token.IsFrozen()) {
+        return false;
+    }
+    THandle& handle = spaceOp.Handles()[token.Index()];
+    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+    if (cold) {
+        if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) !=
+                TColdCacheItem::FromRaw(raw).ColdVersion() ||
+            !state.IsCold()) {
+            return false;
+        }
+    } else if (!token.Matches(state)) {
+        return false;
+    }
+    // A same-version Cold Keep page can reheat before the slot CAS, reviving its old Hot token
+    if (!state.IsPageKind() || !state.IsStickyNoneField() || state.Refs() != 0) {
+        return true;
+    }
+    collectionRef.Get() = AcquireRegularCollection(spaceOp, handle);
+    return !collectionRef;
+}
+
+template <class TTraits>
+TRingExchangeResult TCacheEviction<TTraits>::PopForPreload(
+    TSpaceOperation& spaceOp, TRingView ring, bool cold) noexcept {
+    auto* slot = ring.SelectPopSlot();
+    ui64 raw = slot->load(std::memory_order_acquire);
+    TOperationItemRef<TTraits> collectionRef(spaceOp);
+    const bool protect = IsPreloadProtected(spaceOp, raw, cold, collectionRef);
+    if (!cold && raw != 0) {
+        Cache_.InvokeHook(ESharedCacheHookPoint::AfterPreloadHotTokenChecked, TCacheItem::FromRaw(raw));
+    }
+    if (protect || !slot->compare_exchange_strong(raw, 0, std::memory_order_acquire, std::memory_order_relaxed)) {
+        return {};
+    }
+    return { slot, raw };
+}
+
+template <class TTraits>
+TRingExchangeResult TCacheEviction<TTraits>::ExchangeForPreload(
+    TSpaceOperation& spaceOp, std::atomic<ui64>* slot, ui64 incoming, bool cold) noexcept {
+    ui64 raw = slot->load(std::memory_order_acquire);
+    TOperationItemRef<TTraits> collectionRef(spaceOp);
+    if (IsPreloadProtected(spaceOp, raw, cold, collectionRef) ||
+        !slot->compare_exchange_strong(raw, incoming, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        return {};
+    }
+    return { slot, raw };
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::TryErasePreloadPage(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept {
+    if (!spaceOp.Contains(item) || item.IsFrozen()) {
+        return false;
+    }
+    THandle& handle = spaceOp.Handles()[item.Index()];
+    THandleState expected = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+    if (!expected.IsCold() || !expected.IsPageKind() || expected.Refs() != 0 || !expected.IsStickyNoneField() ||
+        (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != item.ColdVersion()) {
+        return false;
+    }
+    TOperationItemRef<TTraits> collectionRef(spaceOp, AcquireRegularCollection(spaceOp, handle));
+    if (!collectionRef) {
+        return false;
+    }
+    const TCacheItem page = TCacheItem::Make(expected.Version(), item.Index());
+    Cache_.InvokeHook(ESharedCacheHookPoint::BeforePreloadPageErase, page);
+    TOperationItemRef<TTraits> pageRef(spaceOp);
+    if (!Cache_.Table_.TryBeginErase(spaceOp, page, expected, pageRef.Get())) {
+        return false;
+    }
+    const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
+    Cache_.UpdateColdReclaimable(bytes, expected, expected.IncrementRefs().WithState(EHandleState::Tombstone));
+    CompleteColdPageRelease(pageRef);
+    return true;
+}
+
+template <class TTraits>
+bool TCacheEviction<TTraits>::ReclaimRegularPage(TSpaceOperation& spaceOp) noexcept {
+    bool& preload = spaceOp.Hazard().PreloadReclaim;
+    Y_DEBUG_ABORT_UNLESS(!preload);
+    preload = true;
+    Y_DEFER {
+        preload = false;
+    };
+    for (ui32 step = 0; step < SharedCacheTransitionWorkBatch; ++step) {
+        if (ReclaimColdImpl<true>(spaceOp)) {
+            return true;
+        }
+        if (!ProcessHotBatch<true>(spaceOp)) {
+            return false;
+        }
+        if (spaceOp.AvailableHandleCount() != 0) {
+            return true;
         }
     }
     return false;

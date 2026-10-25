@@ -2277,7 +2277,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
     }
 
-    Y_UNIT_TEST(ReviewR15KeepCancellationDrainsHandleWait) {
+    Y_UNIT_TEST(ReviewR15KeepCancellationDropsDeferredPreload) {
         TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
         auto collection = MakeIntrusive<TPageCollectionMock>(2ul, 1u);
         collection->PageTypes = { EPage::Skip };
@@ -2291,10 +2291,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         seed.LevelCount = 0;
         seed.QueueDataPages = true;
         sharedCache.Attach(sharedCache.Sender2, collection, ECacheMode::TryKeepInMemory, { seed });
-        sharedCache.Runtime.WaitFor("Keep preload is waiting before a handle exists", [&] {
-            return sharedCache.Counters->PendingRequests->Val() != 0;
-        }, TDuration::Seconds(5));
         sharedCache.CheckFetches({});
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT(sharedCache.Results.empty());
 
         sharedCache.Attach(sharedCache.Sender2, collection, ECacheMode::Regular);
@@ -2302,6 +2300,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             return sharedCache.Counters->PendingRequests->Val() == 0;
         }, TDuration::Seconds(5));
         held.pop_back();
+        auto& cache = TSharedCache::Get();
+        UNIT_ASSERT(cache.AvailableHandleCount() != 0 || cache.ReclaimForPreload());
+        sharedCache.Send(sharedCache.Sender2, new TKikimrEvents::TEvWakeup(ui64(EWakeupTag::DoGCScheduled)));
         sharedCache.CheckFetches({});
         UNIT_ASSERT(sharedCache.Results.empty());
     }
@@ -4060,6 +4061,192 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(KeepPreloadPreservesMaximumBatchSize) {
         CheckKeepPreloadBatchLimit(32_MB, 1100, false);
+    }
+
+    Y_UNIT_TEST(KeepPreloadStopsAtHandleCapacityAndResumesAfterGrowth) {
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(1_MB);
+        config.SetInMemoryInFlyLimit(200 * PAGE_TOTAL_SIZE);
+        TSharedPageCacheMock sharedCache(config);
+        auto& cache = TSharedCache::Get();
+        const ui32 pageCount = 300;
+        const ui64 pageLimit = cache.TargetHandleCount() - TSharedCache::RequestHandleOverhead;
+        UNIT_ASSERT(pageLimit > 200 && pageLimit < pageCount);
+        sharedCache.Collection1 = MakeIntrusiveConst<TPageCollectionMock>(1ul, pageCount);
+        TVector<TPageLocation> first, second, remaining;
+        for (ui32 page = 0; page < pageCount; ++page) {
+            (page < 200 ? first : page < pageLimit ? second : remaining).push_back(_P(page));
+        }
+        ui32 evictions = 0;
+        TBlockEvents<TEvKeepPageEvicted> observer(sharedCache.Runtime, [&](const auto&) {
+            ++evictions;
+            return false;
+        });
+
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
+        sharedCache.CheckFetches({ TFetch{ 10 * first.size(), sharedCache.Collection1, first } });
+        sharedCache.Provide(sharedCache.Collection1, first, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
+        sharedCache.CheckFetches({ TFetch{ 10 * second.size(), sharedCache.Collection1, second } });
+        sharedCache.Provide(sharedCache.Collection1, second, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
+        sharedCache.CheckFetches({});
+        for (ui32 retry = 0; retry < 3; ++retry) {
+            sharedCache.Send(sharedCache.Sender1, new TEvResourcesAvailable);
+            sharedCache.Send(sharedCache.Sender1, new TKikimrEvents::TEvWakeup(ui64(EWakeupTag::DoGCScheduled)));
+            sharedCache.CheckFetches({});
+        }
+        UNIT_ASSERT_VALUES_EQUAL(evictions, 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.KeepResidentPageBytes(), pageLimit * PAGE_TOTAL_SIZE);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
+
+        NKikimrConfig::TAppConfig appConfig;
+        appConfig.MutableSharedCacheConfig()->CopyFrom(config);
+        appConfig.MutableSharedCacheConfig()->SetMemoryLimit(4_MB);
+        sharedCache.UpdateConfig(appConfig);
+        sharedCache.CheckFetches({ TFetch{ 10 * remaining.size(), sharedCache.Collection1, remaining } });
+        sharedCache.Provide(sharedCache.Collection1, remaining, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({});
+        UNIT_ASSERT_VALUES_EQUAL(evictions, 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.KeepResidentPageBytes(), pageCount * PAGE_TOTAL_SIZE);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
+    }
+
+    Y_UNIT_TEST(KeepPreloadReplacesRegularPagesWhenAllHandlesAreOccupied) {
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(1_MB);
+        config.SetInMemoryInFlyLimit(1_MB);
+        TSharedPageCacheMock sharedCache(config);
+        auto& cache = TSharedCache::Get();
+        sharedCache.Collection1 = MakeIntrusiveConst<TPageCollectionMock>(1ul, 4u);
+        sharedCache.Collection2 =
+            MakeIntrusiveConst<TPageCollectionMock>(2ul, static_cast<ui32>(cache.TargetHandleCount()));
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular);
+        sharedCache.Attach(sharedCache.Sender2, sharedCache.Collection2, ECacheMode::Regular);
+        auto retained = cache.AdmitPage(sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'x')));
+        UNIT_ASSERT(retained);
+        retained.Drop();
+        for (ui32 page = 0; cache.AvailableHandleCount() != 0; ++page) {
+            auto regular = cache.AdmitPage(sharedCache.Collection2, _P(page), TSharedData::Copy(TString(10, 'x')));
+            UNIT_ASSERT(regular);
+        }
+        ui32 keepEvictions = 0;
+        TBlockEvents<TEvKeepPageEvicted> observer(sharedCache.Runtime, [&](const auto&) {
+            ++keepEvictions;
+            return false;
+        });
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
+        const TVector<TPageLocation> missing{ _P(1), _P(2), _P(3) };
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, missing } });
+        sharedCache.Provide(sharedCache.Collection1, missing, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({});
+        UNIT_ASSERT_VALUES_EQUAL(keepEvictions, 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.KeepResidentPageBytes(), 4 * PAGE_TOTAL_SIZE);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
+    }
+
+    void CheckKeepPreloadAdmissionRace(bool pendingPage) {
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(1_MB);
+        config.SetInMemoryInFlyLimit(1_MB);
+        TSharedPageCacheMock sharedCache(config);
+        auto& cache = TSharedCache::Get();
+
+        struct TRacingCollection final : TPageCollectionMock {
+            using TPageCollectionMock::TPageCollectionMock;
+
+            const TLogoBlobID& Label() const noexcept override {
+                if (OnRequest) {
+                    auto callback = std::move(OnRequest);
+                    if (!callback()) {
+                        OnRequest = std::move(callback);
+                    }
+                }
+                return TPageCollectionMock::Label();
+            }
+
+            mutable std::function<bool()> OnRequest;
+        };
+
+        TIntrusiveConstPtr<TRacingCollection> collection = MakeIntrusive<TRacingCollection>(1ul, pendingPage ? 3u : 2u);
+        const TLogoBlobID id = collection->Label();
+        sharedCache.Collection1 = collection;
+        sharedCache.Attach(sharedCache.Sender1, collection, ECacheMode::Regular);
+        TVector<TSharedCacheCollectionRef> foreignCollections;
+        TPageFetch foreignFetch;
+        TPageCacheItem readyItem;
+        bool raced = false;
+        collection->OnRequest = [&] {
+            TSharedCacheCollectionRef owner;
+            Y_ABORT_UNLESS(cache.Find(id, owner) == ESharedCacheResultStatus::Hit);
+            if (owner->GetActorState()->KeepPreloadRequests.empty()) {
+                return false;
+            }
+            raced = true;
+            if (pendingPage) {
+                auto ready = cache.AdmitPage(collection, _P(0), TSharedData::Copy(TString(10, 'x')));
+                Y_ABORT_UNLESS(ready);
+                readyItem = ready.CacheItem();
+                TSharedCachePageRequest request(_P(1), MakeIntrusive<TPageFetchWaiter>());
+                Y_ABORT_UNLESS(cache.FindOrInsertBatch(owner.CacheItem(), { &request, 1 }));
+                Y_ABORT_UNLESS(request.Status() == ESharedCacheResultStatus::Inserted);
+                foreignFetch = std::move(request.Fetch());
+            } else {
+                for (ui64 foreignId = 100; cache.AvailableHandleCount() > 1; ++foreignId) {
+                    foreignCollections.push_back(
+                        cache.AdmitCollection(MakeIntrusiveConst<TPageCollectionMock>(foreignId, 1u)));
+                }
+            }
+            return true;
+        };
+        Y_DEFER {
+            collection->OnRequest = {};
+        };
+        sharedCache.Attach(sharedCache.Sender1, collection, ECacheMode::TryKeepInMemory);
+        if (pendingPage) {
+            sharedCache.CheckFetches({ TFetch{ 10, collection, { _P(2) } } });
+            sharedCache.Provide(collection, { _P(2) }, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
+        }
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({});
+        UNIT_ASSERT(raced);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
+        if (pendingPage) {
+            auto cacheOp = cache.BeginOperation();
+            const auto state =
+                THandleState::FromRaw(cacheOp.Handles()[readyItem.Index()].State.load(std::memory_order_relaxed));
+            UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 0);
+            UNIT_ASSERT(foreignFetch.FailReady());
+        } else {
+            UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+            for (auto& owner : foreignCollections) {
+                UNIT_ASSERT(cache.DetachCollection(owner.CacheItem()));
+                UNIT_ASSERT(cache.EraseCollection(owner.CacheItem()));
+            }
+            foreignCollections.clear();
+        }
+        sharedCache.Send(sharedCache.Sender1, new TEvResourcesAvailable);
+        sharedCache.CheckFetches({});
+        sharedCache.Send(sharedCache.Sender1, new TKikimrEvents::TEvWakeup(ui64(EWakeupTag::DoGCScheduled)));
+        const TVector<TPageLocation> missing = pendingPage ? TVector{ _P(1) } : TVector{ _P(0), _P(1) };
+        sharedCache.CheckFetches({ TFetch{ 10 * missing.size(), collection, missing } });
+        sharedCache.Provide(collection, missing, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({});
+        UNIT_ASSERT_VALUES_EQUAL(cache.KeepResidentPageBytes(), (pendingPage ? 3 : 2) * PAGE_TOTAL_SIZE);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
+    }
+
+    Y_UNIT_TEST(KeepPreloadAbandonsBatchWhenHandlesDisappearAfterPreflight) {
+        CheckKeepPreloadAdmissionRace(false);
+    }
+
+    Y_UNIT_TEST(KeepPreloadAbandonsPartialHitsWhenAnotherRequestOwnsPendingPage) {
+        CheckKeepPreloadAdmissionRace(true);
     }
 
     enum class EIndexFetchLimit {

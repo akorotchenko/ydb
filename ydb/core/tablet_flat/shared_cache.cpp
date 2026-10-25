@@ -292,10 +292,7 @@ bool TSharedCache::CanAllocateHandles(TArrayRef<const TSharedCacheHandleRequirem
                                           ESharedCacheResultStatus::Miss;
         }
     }
-    const auto& spaceOp = cacheOp.SpaceOperation();
-    const TCacheItem spare = TCacheItem::FromRaw(spaceOp.Hazard().SpareItem.load(std::memory_order_acquire));
-    const bool hasSpare = !spare.IsNull() && spare.Index() < spaceOp.AllocationLimit();
-    return missing <= spaceOp.View().Free().Count() + hasSpare;
+    return missing <= cacheOp.SpaceOperation().AvailableHandleCount();
 }
 
 SHARED_CACHE_TEMPLATE
@@ -612,6 +609,14 @@ bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandida
         if (cacheItem.IsNull()) {
             ReleaseReservation(reservedBytes, 1);
         }
+    } else if (candidate.Admission == EPageAdmission::Preload) {
+        if (!cacheOp.TryReserve(reservedBytes, 1)) {
+            return false;
+        }
+        cacheItem = cacheOp.Items().AllocateForPreload();
+        if (cacheItem.IsNull()) {
+            ReleaseReservation(reservedBytes, 1);
+        }
     } else if (candidate.WaitForMemory) {
         reserved = cacheOp.TryReserve(reservedBytes, 1);
         cacheItem = cacheOp.Allocate();
@@ -796,7 +801,8 @@ bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& coll
         if (!candidate.Prepare) {
             continue;
         }
-        const TCacheItem cacheItem = cacheOp.Allocate();
+        const TCacheItem cacheItem =
+            admission == EPageAdmission::Preload ? cacheOp.Items().AllocateForPreload() : cacheOp.Allocate();
         if (cacheItem.IsNull()) {
             for (TPageInsertCandidate& initialized : candidates) {
                 if (!initialized.CacheItem.IsNull()) {

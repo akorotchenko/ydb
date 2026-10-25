@@ -128,52 +128,56 @@ TCollection* TCacheItems<TTraits>::ReleaseTombstone(TSpaceOperation& spaceOp, TC
 }
 
 template <class TTraits>
-ui32 TCacheItems<TTraits>::TryAllocateHandle(TSpaceOperation& spaceOp) noexcept {
-    auto evictionOp = Cache_.Eviction_.BindOperation(spaceOp);
+ui32 TCacheItems<TTraits>::TryAllocateAvailableHandle(TSpaceOperation& spaceOp) noexcept {
     const TCacheItem spare = TCacheItem::FromRaw(spaceOp.Hazard().SpareItem.exchange(0, std::memory_order_relaxed));
-    if (spare.IsNull()) {
-        if (const ui32 index = spaceOp.TryAllocateHandle()) {
-            return index;
-        }
-        if (spaceOp.ReclaimSpareHandle()) {
-            Cache_.NotifyResourcesAvailable();
-            if (const ui32 index = spaceOp.TryAllocateHandle()) {
-                return index;
-            }
-        }
-        // Byte headroom does not guarantee a free handle when pages are much smaller than the expected size.
-        // Reclaim Cold, or shrink Hot to feed Cold, before refusing the admission.
-        const ui32 workLimit = static_cast<ui32>(Min<ui64>(spaceOp.HandleCount(), SharedCacheTransitionWorkBatch));
-        for (ui32 attempt = 0; attempt < workLimit; ++attempt) {
-            bool progress = evictionOp.ReclaimCold();
-            if (!progress) {
-                progress = evictionOp.EnforceCurrentLimit(0, true);
-                // The caller's view may predate growth; drain with a fresh operation under the resize lock.
-                progress = Cache_.DrainHotResize() || progress;
-                progress = evictionOp.ReclaimCold() || progress;
-            }
-            if (const ui32 index = spaceOp.TryAllocateHandle()) {
-                return index;
-            }
-            if (!progress) {
-                return 0;
-            }
-            Cache_.InvokeHook(ESharedCacheHookPoint::AfterAdmissionReclaimStep, TCacheItem{});
-        }
-        Cache_.NotifyResourcesAvailable();
-        return 0;
+    if (!spare.IsNull()) {
+        Y_ABORT_UNLESS(!spare.IsFrozen() && spare.Index() >= 2 && spare.Index() < spaceOp.AccessibleHandleCount());
+        const THandle& handle = spaceOp.Handles()[spare.Index()];
+        const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+        Y_ABORT_UNLESS(spare.Matches(state) && state.IsBegin() && state.Refs() == 0);
+        return spare.Index();
     }
-
-    Y_ABORT_UNLESS(!spare.IsFrozen() && spare.Index() >= 2 && spare.Index() < spaceOp.AccessibleHandleCount());
-    const THandle& handle = spaceOp.Handles()[spare.Index()];
-    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    Y_ABORT_UNLESS(spare.Matches(state) && state.IsBegin() && state.Refs() == 0);
-    return spare.Index();
+    if (const ui32 index = spaceOp.TryAllocateHandle()) {
+        return index;
+    }
+    if (spaceOp.ReclaimSpareHandle()) {
+        Cache_.NotifyResourcesAvailable();
+        return spaceOp.TryAllocateHandle();
+    }
+    return 0;
 }
 
 template <class TTraits>
-TCacheItem TCacheItems<TTraits>::Allocate(TSpaceOperation& spaceOp) noexcept {
-    const ui32 index = TryAllocateHandle(spaceOp);
+ui32 TCacheItems<TTraits>::TryAllocateHandle(TSpaceOperation& spaceOp) noexcept {
+    if (const ui32 index = TryAllocateAvailableHandle(spaceOp)) {
+        return index;
+    }
+    auto evictionOp = Cache_.Eviction_.BindOperation(spaceOp);
+    // Byte headroom does not guarantee a free handle when pages are much smaller than the expected size.
+    // Reclaim Cold, or shrink Hot to feed Cold, before refusing the admission.
+    const ui32 workLimit = static_cast<ui32>(Min<ui64>(spaceOp.HandleCount(), SharedCacheTransitionWorkBatch));
+    for (ui32 attempt = 0; attempt < workLimit; ++attempt) {
+        bool progress = evictionOp.ReclaimCold();
+        if (!progress) {
+            progress = evictionOp.EnforceCurrentLimit(0, true);
+            // The caller's view may predate growth; drain with a fresh operation under the resize lock.
+            progress = Cache_.DrainHotResize() || progress;
+            progress = evictionOp.ReclaimCold() || progress;
+        }
+        if (const ui32 index = spaceOp.TryAllocateHandle()) {
+            return index;
+        }
+        if (!progress) {
+            return 0;
+        }
+        Cache_.InvokeHook(ESharedCacheHookPoint::AfterAdmissionReclaimStep, TCacheItem{});
+    }
+    Cache_.NotifyResourcesAvailable();
+    return 0;
+}
+
+template <class TTraits>
+TCacheItem TCacheItems<TTraits>::Allocate(TSpaceOperation& spaceOp, ui32 index) noexcept {
     if (!index) {
         return {};
     }
@@ -182,6 +186,20 @@ TCacheItem TCacheItems<TTraits>::Allocate(TSpaceOperation& spaceOp) noexcept {
     spaceOp.Handles()[index].Key0.store(0, std::memory_order_relaxed);
     spaceOp.Handles()[index].Body.Fetch = nullptr;
     return TCacheItem::Make(state.Version(), index);
+}
+
+template <class TTraits>
+TCacheItem TCacheItems<TTraits>::Allocate(TSpaceOperation& spaceOp) noexcept {
+    return Allocate(spaceOp, TryAllocateHandle(spaceOp));
+}
+
+template <class TTraits>
+TCacheItem TCacheItems<TTraits>::AllocateForPreload(TSpaceOperation& spaceOp) noexcept {
+    ui32 index = TryAllocateAvailableHandle(spaceOp);
+    if (!index && Cache_.Eviction_.BindOperation(spaceOp).ReclaimRegularPage()) {
+        index = TryAllocateAvailableHandle(spaceOp);
+    }
+    return Allocate(spaceOp, index);
 }
 
 template <class TTraits>
