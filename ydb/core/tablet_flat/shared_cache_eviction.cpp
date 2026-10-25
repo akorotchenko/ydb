@@ -322,6 +322,8 @@ void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel lev
 
         evictionRef.Drop();
         const TCacheItem displaced = PutHot(spaceOp, level, cacheItem);
+        // The last ref may have notified while this token was still outside the ring
+        Cache_.NotifyResourcesAvailable();
         if (displaced.IsNull()) {
             return;
         }
