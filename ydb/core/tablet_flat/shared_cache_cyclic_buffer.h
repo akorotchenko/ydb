@@ -54,6 +54,22 @@ public:
 
     Y_FORCE_INLINE TRingExchangeResult PopExchange(std::atomic<ui64>* slots, ui64 capacity) noexcept;
 
+    Y_FORCE_INLINE std::atomic<ui64>* SelectPopSlot(std::atomic<ui64>* slots, ui64 capacity) noexcept {
+        const ui64 position = Head_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
+        return &slots[Map(position, capacity)];
+    }
+
+    Y_FORCE_INLINE std::atomic<ui64>* SelectPutSlot(std::atomic<ui64>* slots, ui64 capacity) noexcept {
+        const ui64 position = Tail_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
+        Head_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
+        return &slots[Map(position, capacity)];
+    }
+
+    Y_FORCE_INLINE std::atomic<ui64>* SelectPushSlot(std::atomic<ui64>* slots, ui64 capacity) noexcept {
+        const ui64 position = Tail_.Value.fetch_add(ui64{ 1 }, std::memory_order_relaxed);
+        return &slots[Map(position, capacity)];
+    }
+
     template <class TOnReserved>
     ui64 PopWithHook(std::atomic<ui64>* slots, ui64 capacity, TOnReserved&& onReserved) noexcept(
         noexcept(std::forward<TOnReserved>(onReserved)())) {
@@ -118,6 +134,18 @@ struct TRingView {
     Y_FORCE_INLINE ui64 Pop() const noexcept {
         Y_DEBUG_ABORT_UNLESS(Cursor);
         return Cursor->Pop(Slots, Capacity);
+    }
+
+    Y_FORCE_INLINE std::atomic<ui64>* SelectPopSlot() const noexcept {
+        return Cursor->SelectPopSlot(Slots, Capacity);
+    }
+
+    Y_FORCE_INLINE std::atomic<ui64>* SelectPutSlot() const noexcept {
+        return Cursor->SelectPutSlot(Slots, Capacity);
+    }
+
+    Y_FORCE_INLINE std::atomic<ui64>* SelectPushSlot() const noexcept {
+        return Cursor->SelectPushSlot(Slots, Capacity);
     }
 };
 

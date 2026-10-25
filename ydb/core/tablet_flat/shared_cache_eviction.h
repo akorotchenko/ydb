@@ -91,6 +91,9 @@ private:
 
     // Hot routing and eviction
     TCacheItem PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
+    template <bool Preload, bool Requeue = false>
+    TCacheItem PutHotImpl(
+        TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item, TRingExchangeResult* placement = nullptr) noexcept;
 
     Y_FORCE_INLINE void RouteHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept {
         const TCacheItem displaced = PutHot(spaceOp, level, item);
@@ -104,18 +107,34 @@ private:
     Y_FORCE_INLINE void CompleteHotEviction(TSpaceOperation& spaceOp, THandle& handle, THandleState coldState,
         ui64 bytes, TOperationItemRef<TTraits>& itemRef, ui32 initialColdVersion) noexcept;
     void ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
+    template <bool Preload>
+    void ProcessHotImpl(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
     bool EvictFromHot(TSpaceOperation& spaceOp, ui32 index) noexcept;
     bool EvictFromHot(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem item, bool force = false) noexcept;
     bool ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept;
+    template <bool Preload>
+    bool ProcessHotBatch(TSpaceOperation& spaceOp) noexcept;
 
     // Cold routing and reclamation
     void CompleteColdPageRelease(TOperationItemRef<TTraits>& ownerRef) noexcept;
     bool EraseCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
     void RouteCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
     bool ReclaimCold(TSpaceOperation& spaceOp) noexcept;
+    template <bool Preload>
+    bool ReclaimColdImpl(TSpaceOperation& spaceOp) noexcept;
     bool DemoteKeepColdForSoftLimit(TSpaceOperation& spaceOp) noexcept;
     bool ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept;
+
+    // Preload handle reclamation
+    TSharedCacheItemRefImpl<TTraits> AcquireRegularCollection(TSpaceOperation& spaceOp, const THandle& page) noexcept;
+    bool IsPreloadProtected(
+        TSpaceOperation& spaceOp, ui64 raw, bool cold, TOperationItemRef<TTraits>& collectionRef) noexcept;
+    TRingExchangeResult PopForPreload(TSpaceOperation& spaceOp, TRingView ring, bool cold) noexcept;
+    TRingExchangeResult ExchangeForPreload(
+        TSpaceOperation& spaceOp, std::atomic<ui64>* slot, ui64 raw, bool cold) noexcept;
+    bool TryErasePreloadPage(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
+    bool ReclaimRegularPage(TSpaceOperation& spaceOp) noexcept;
 
     // Policy resizing and maintenance
     bool TrimKeepCold(TSpaceOperation& spaceOp) noexcept;
@@ -236,6 +255,11 @@ public:
 
     Y_FORCE_INLINE bool ReclaimKeepCold() noexcept {
         return Cache_.Eviction_.ReclaimKeepCold(SpaceOp_);
+    }
+
+    // Preload handle reclamation
+    Y_FORCE_INLINE bool ReclaimRegularPage() noexcept {
+        return Cache_.Eviction_.ReclaimRegularPage(SpaceOp_);
     }
 
     // Policy resizing and maintenance

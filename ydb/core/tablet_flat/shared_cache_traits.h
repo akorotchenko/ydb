@@ -22,6 +22,8 @@ enum class ESharedCacheHookPoint {
     AfterTombstoneOwnerClaim, // Payload is the claimed item.
     AfterTombstoneHelperClaim, // Payload is the claimed item.
     BeforeTombstoneFinalCas, // Payload is the item at its final CAS.
+    BeforePreloadPageErase, // Page, after protecting its Regular collection and before the zero-ref erase CAS
+    AfterPreloadHotTokenChecked, // Hot token, after protection classification and before the slot CAS
     BeforeHotExchange, // Payload is the Hot item; the target slot has been reserved but not exchanged.
     AfterHotEvictionPublished, // Payload is the evicted item, before category accounting.
     AfterKeepColdDemoted, // Cold membership token, immediately after the demotion CAS.

@@ -557,6 +557,11 @@ public:
 
     ui32 TryAllocateHandle() noexcept;
 
+    Y_FORCE_INLINE ui64 AvailableHandleCount() const noexcept {
+        const TCacheItem spare = TCacheItem::FromRaw(Hazard().SpareItem.load(std::memory_order_acquire));
+        return View().Free().Count() + (!spare.IsNull() && spare.Index() < AllocationLimit());
+    }
+
     bool ReclaimSpareHandle() noexcept;
 
     bool ReturnFreeHandle(ui32 index, ui32 version) noexcept;

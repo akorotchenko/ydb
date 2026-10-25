@@ -71,8 +71,11 @@ private:
     TCollection* ReleaseTombstone(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
     // Allocation
+    ui32 TryAllocateAvailableHandle(TSpaceOperation& spaceOp) noexcept;
     ui32 TryAllocateHandle(TSpaceOperation& spaceOp) noexcept;
+    TCacheItem Allocate(TSpaceOperation& spaceOp, ui32 index) noexcept;
     TCacheItem Allocate(TSpaceOperation& spaceOp) noexcept;
+    TCacheItem AllocateForPreload(TSpaceOperation& spaceOp) noexcept;
     TCacheItem TryAllocateReservedItem(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) noexcept;
 
     // Spare handles
@@ -145,6 +148,10 @@ public:
 
     Y_FORCE_INLINE TCacheItem Allocate() noexcept {
         return Cache_.Items_.Allocate(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE TCacheItem AllocateForPreload() noexcept {
+        return Cache_.Items_.AllocateForPreload(SpaceOp_);
     }
 
     Y_FORCE_INLINE TCacheItem TryAllocateReservedItem(ui64 bytes, ui64 pages) noexcept {

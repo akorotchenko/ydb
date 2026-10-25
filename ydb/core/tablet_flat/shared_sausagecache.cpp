@@ -407,6 +407,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             UpdateKeepColdLimit();
             Counters.ActiveLimitBytes->Set(currentLimit);
             if (limitsChanged) {
+                KeepPreloadRetryBlocked.clear();
                 CancelOversizedWalkRequests();
             }
         } else {
@@ -839,7 +840,12 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             admission->Sticky.push_back(stickyRequest || (!msg.Sticky.empty() && msg.Sticky[index]));
         }
         if (!TryAdmitPages(*admission)) {
-            if (RestartBlockedWalk(*admission)) {
+            if (eventCookie == KeepPreloadResultCookie) {
+                requestIt->second.Cancelled = true;
+                completion->Cancel(true);
+                ActualizeCacheSizeLimit();
+                return false;
+            } else if (RestartBlockedWalk(*admission)) {
                 TryAdmitPages(*admission);
             } else {
                 ResourceWaits.push_back(std::move(admission));
@@ -875,7 +881,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             ++owner->GetActorState()->PendingRequests;
             RecordPendingInMemoryPages(*owner, admission.Completion->Locations());
         }
-        const auto& request = Requests.at(admission.Completion->CompletionId());
+        auto& request = Requests.at(admission.Completion->CompletionId());
+        const bool preload = request.EventCookie == KeepPreloadResultCookie;
         const bool recordStats =
             request.EventCookie != KeepPreloadResultCookie && request.EventCookie != WalkResultCookie;
         const bool keepPages = owner->GetCacheMode() == ECacheMode::TryKeepInMemory;
@@ -886,8 +893,20 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             requests.emplace_back(
                 locations[index], new TRequestPageWaiter(admission.Completion, index), admission.Sticky[index]);
         }
-        if (!Cache->FindOrInsertBatch(admission.CollectionItem, requests, recordStats, true)) {
+        const bool admitted = preload ? Cache->FindOrInsertPreloadBatch(admission.CollectionItem, requests)
+                                      : Cache->FindOrInsertBatch(admission.CollectionItem, requests, recordStats, true);
+        if (!admitted) {
             return false;
+        }
+
+        // Optional work must not hold hits while waiting for missing handles or another request's admission
+        const bool retryPreload = preload && AnyOf(requests, [](const auto& page) {
+            return page.Status() == ESharedCacheResultStatus::Miss ||
+                   page.Status() == ESharedCacheResultStatus::Pending;
+        });
+        if (retryPreload) {
+            request.Cancelled = true;
+            admission.Completion->Cancel(true);
         }
 
         TVector<ui32> unresolved;
@@ -942,7 +961,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             QueueFetch(admission.PageCollection, std::move(toFetch), admission.Priority, admission.Sender,
                 NWilson::TTraceId(admission.TraceId), admission.Completion);
         }
-        return admission.AdmissionIndices.empty();
+        return admission.AdmissionIndices.empty() && !retryPreload;
     }
 
     void RecordPendingInMemoryPages(TCollection& collection, TArrayRef<const TPageLocation> locations) {
@@ -1808,6 +1827,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     // KeepCold reserves protected space; Hot and Cold may hold more Keep pages when memory is free.
     // Use the reclaim target for extra preload room so eviction does not immediately restart the same fetch.
     ui64 remainingBytes = Min(KeepRemainingBytes(), Min(targetRoom, Max(protectedRoom, freePreloadRoom)));
+    ui64 remainingHandles = Cache->AvailableHandleCount();
     THashSet<TLogoBlobID> waitingForInFlight;
 
         while (PendingInMemoryPages) {
@@ -1864,13 +1884,26 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                     ++locationIt;
                     continue;
                 }
-            const ui64 pageBytes = KeepPageBytes(location);
-            if (pageBytes > remainingBytes) {
-                budgetBlocked = true;
-                        break;
-                    }
-            remainingBytes -= pageBytes;
-            pagesToRequest.push_back(location);
+                const ui64 pageBytes = KeepPageBytes(location);
+                if (pageBytes > remainingBytes) {
+                    budgetBlocked = true;
+                    break;
+                }
+                if (remainingHandles == 0) {
+                    const ui64 available = Cache->AvailableHandleCount();
+                    remainingHandles = available - Min<ui64>(available, pagesToRequest.size());
+                }
+                if (remainingHandles == 0 && (Cache->ReclaimSpareHandle() || Cache->ReclaimForPreload())) {
+                    const ui64 available = Cache->AvailableHandleCount();
+                    remainingHandles = available - Min<ui64>(available, pagesToRequest.size());
+                }
+                if (remainingHandles == 0) {
+                    budgetBlocked = true;
+                    break;
+                }
+                remainingBytes -= pageBytes;
+                --remainingHandles;
+                pagesToRequest.push_back(location);
                 locationIt = pagesToLoad.erase(locationIt);
             }
 

@@ -213,6 +213,21 @@ public:
         return FindOrInsertBatch(collection, requests, recordStats, waitForMemory, EPageAdmission::Bounded);
     }
 
+    // Optional preloads may reclaim Regular pages for handles, preserving resident Keep pages
+    Y_FORCE_INLINE bool FindOrInsertPreloadBatch(
+        TCollectionCacheItem collection, TArrayRef<TSharedCachePageRequestImpl<TTraits>> requests) noexcept {
+        return FindOrInsertBatch(collection, requests, false, false, EPageAdmission::Preload);
+    }
+
+    Y_FORCE_INLINE ui64 AvailableHandleCount() noexcept {
+        return BeginOperation().SpaceOperation().AvailableHandleCount();
+    }
+
+    Y_FORCE_INLINE bool ReclaimForPreload() noexcept {
+        auto cacheOp = BeginOperation();
+        return cacheOp.Eviction().ReclaimRegularPage();
+    }
+
     Y_FORCE_INLINE ESharedCacheResultStatus FindOrInsert(const TCollectionLocation& collection,
         TCollectionCacheItem& inserted, TSharedCacheCollectionRefImpl<TTraits>& hit) noexcept {
         return FindOrInsert(Collections_.Registry(), collection, inserted, hit);
@@ -479,6 +494,7 @@ private:
 
     enum class EPageAdmission {
         Bounded,
+        Preload,
         Written,
     };
 
