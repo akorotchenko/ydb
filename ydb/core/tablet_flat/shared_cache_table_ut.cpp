@@ -2743,7 +2743,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto main = MakeReviewRetainedCollection(fixture, TLogoBlobID(120, 50020, 1));
         auto pseudo = MakeReviewRetainedCollection(fixture, TLogoBlobID(120, 50020, 2));
         TVector<NTable::NPage::TPageLocation> pages;
-        for (ui64 offset = 100; pages.size() < fixture.Cache->TargetHandleCount() - 3; ++offset) {
+        for (ui64 offset = 100;
+             pages.size() < fixture.Cache->TargetHandleCount() - TTestSharedCache::RequestHandleOverhead; ++offset) {
             pages.push_back(MakePageLocation(offset, 16));
         }
         const TSharedCacheHandleRequirement requirement{ main->Id(), pages };
@@ -2784,7 +2785,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         auto current = MakeReviewRetainedCollection(fixture, id);
         UNIT_ASSERT(retired.CacheItem() != current.CacheItem());
         TVector<NTable::NPage::TPageLocation> pages;
-        for (ui64 offset = 100; pages.size() < fixture.Cache->TargetHandleCount() - 3; ++offset) {
+        for (ui64 offset = 100;
+             pages.size() < fixture.Cache->TargetHandleCount() - TTestSharedCache::RequestHandleOverhead; ++offset) {
             pages.push_back(MakePageLocation(offset, 16));
         }
         const TSharedCacheHandleRequirement requirement{ id, pages };

@@ -118,6 +118,8 @@ template <class TTraits = TProdTraits>
 class TSharedCacheImpl : public TThrRefBase, private TTraits {
 public:
     static constexpr ui64 ExpectedPageSize = 7_KB;
+    // Null handle, resize marker and collection metadata
+    static constexpr ui64 RequestHandleOverhead = 3;
 
     static TIntrusivePtr<TSharedCacheImpl> Create(
         THolder<TSharedCacheSpace> space, ui64 hardLimit, TTraits traits = {});

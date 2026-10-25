@@ -17,6 +17,7 @@
 #include <flat_executor_bootlogic.h>
 #include <flat_page_btree_index_writer.h>
 #include <shared_cache.h>
+#include <shared_cache_btree_walk.h>
 #include <shared_cache_counters.h>
 #include <shared_cache_events.h>
 #include <shared_sausagecache.h>
@@ -4014,6 +4015,53 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckFetches({});
     }
 
+    void CheckKeepPreloadBatchLimit(ui64 initialLimit, ui32 pageCount, bool growBeforeCompletion) {
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(initialLimit);
+        config.SetInMemoryInFlyLimit(1_MB);
+        TSharedPageCacheMock sharedCache(config);
+        auto& cache = TSharedCache::Get();
+        const ui64 pageLimit =
+            Min<ui64>(MaxPreloadBatchLocations, cache.TargetHandleCount() - TSharedCache::RequestHandleOverhead);
+        UNIT_ASSERT(pageCount > pageLimit);
+        sharedCache.Collection1 = MakeIntrusiveConst<TPageCollectionMock>(1ul, pageCount);
+        TVector<TPageLocation> first;
+        TVector<TPageLocation> remaining;
+        for (ui32 page = 0; page < pageCount; ++page) {
+            (page < pageLimit ? first : remaining).push_back(_P(page));
+        }
+
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
+        sharedCache.CheckFetches({ TFetch{ 10 * first.size(), sharedCache.Collection1, first } });
+
+        if (growBeforeCompletion) {
+            // Grow before completing I/O so every page can remain resident
+            NKikimrConfig::TAppConfig appConfig;
+            appConfig.MutableSharedCacheConfig()->CopyFrom(config);
+            appConfig.MutableSharedCacheConfig()->SetMemoryLimit(4_MB);
+            sharedCache.UpdateConfig(appConfig);
+            sharedCache.CheckFetches({ TFetch{ 10 * remaining.size(), sharedCache.Collection1, remaining } });
+            sharedCache.Provide(sharedCache.Collection1, first, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
+        } else {
+            sharedCache.Provide(sharedCache.Collection1, first, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
+            sharedCache.CheckFetches({ TFetch{ 10 * remaining.size(), sharedCache.Collection1, remaining } });
+        }
+        sharedCache.Provide(sharedCache.Collection1, remaining, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({});
+        UNIT_ASSERT_VALUES_EQUAL(cache.KeepResidentPageBytes(), pageCount * PAGE_TOTAL_SIZE);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
+    }
+
+    Y_UNIT_TEST(KeepPreloadSplitsAtHandleCapacity) {
+        CheckKeepPreloadBatchLimit(1_MB, 300, true);
+    }
+
+    Y_UNIT_TEST(KeepPreloadPreservesMaximumBatchSize) {
+        CheckKeepPreloadBatchLimit(32_MB, 1100, false);
+    }
+
     enum class EIndexFetchLimit {
         Handles,
         Bytes,
@@ -4172,7 +4220,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             sharedCache.Fetches->pop_front();
             const auto& fetch = *event->Get();
             UNIT_ASSERT_VALUES_EQUAL(fetch.PageCollection->Label(), index->Label());
-            UNIT_ASSERT(fetch.Pages.size() <= cache.TargetHandleCount() - 3);
+            UNIT_ASSERT(fetch.Pages.size() <= cache.TargetHandleCount() - TSharedCache::RequestHandleOverhead);
             ui64 bytes = 0;
             auto response = MakeHolder<NBlockIO::TEvData>(NKikimrProto::OK, index, fetch.Cookie);
             for (const auto& location : fetch.Pages) {

@@ -203,7 +203,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     size_t AllowedFetchPageCount(TArrayRef<const TPageLocation> locations, ui64& bytes) const {
         const ui64 byteLimit = Cache->CurrentLimit();
-        const ui64 pageLimit = Cache->TargetHandleCount() - 3;
+        const ui64 pageLimit = Cache->TargetHandleCount() - TSharedCache::RequestHandleOverhead;
         size_t count = 0;
         bytes = 0;
         // Keep the first page so an insufficient limit uses the normal resource-wait path
@@ -779,7 +779,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     bool RequestPages(TActorId sender, ui64 eventCookie, NSharedCache::TEvRequest& msg) {
         const TLogoBlobID id = msg.PageCollection->Label();
         TCollection* owner = FindCollection(id);
-        const ui64 maxPageHandles = Cache->TargetHandleCount() - 3;
+        const ui64 maxPageHandles = Cache->TargetHandleCount() - TSharedCache::RequestHandleOverhead;
         if (msg.Pages.size() > maxPageHandles) {
             THashSet<TPageOffset> distinctOffsets;
             distinctOffsets.reserve(msg.Pages.size());
@@ -1840,10 +1840,12 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 continue;
             }
 
+            const ui64 pageLimit =
+                Min<ui64>(MaxPreloadBatchLocations, Cache->TargetHandleCount() - TSharedCache::RequestHandleOverhead);
             TVector<TPageLocation> pagesToRequest;
             bool budgetBlocked = false;
             auto locationIt = pagesToLoad.begin();
-            while (locationIt != pagesToLoad.end() && pagesToRequest.size() < MaxPreloadBatchLocations)
+            while (locationIt != pagesToLoad.end() && pagesToRequest.size() < pageLimit)
             {
                 const TPageLocation location = *locationIt;
                 ESharedCacheResultStatus status;
