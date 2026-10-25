@@ -90,7 +90,7 @@ private:
     size_t ReservedMappingSize_ = 0;
 };
 
-TSharedCacheMapping::TSharedCacheMapping()
+TSharedCacheMapping::TSharedCacheMapping(EAddressMode)
     : Impl_(MakeHolder<TImpl>())
 {}
 

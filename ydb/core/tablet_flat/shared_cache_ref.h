@@ -362,9 +362,8 @@ template <class TCallback>
 Y_FORCE_INLINE decltype(auto) TSharedPageRefImpl<TTraits>::WithHandle(TCallback&& callback) const noexcept {
     Y_DEBUG_ABORT_UNLESS(Ref_);
     TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
-    auto spaceOp = cache.BeginOperation();
     const TCacheItem item = Ref_.CacheItem();
-    const THandle& handle = spaceOp.Handles()[item.Index()];
+    const THandle& handle = cache.Space_->OwnedHandle(item);
     Y_DEBUG_ABORT_UNLESS([&] {
         const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
         return item.Matches(state) && state.IsPageKind() && state.Refs() != 0;

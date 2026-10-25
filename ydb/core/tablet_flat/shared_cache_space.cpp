@@ -231,6 +231,7 @@ bool TSharedCacheSpace::Initialize(
         return false;
     }
 
+    Handles_ = view->Handles;
     for (ui64 index = 0; index < current.HandleCount(); ++index) {
         new (&view->Handles[index]) THandle();
         new (&view->FreeSlots[index]) std::atomic<ui64>(0);

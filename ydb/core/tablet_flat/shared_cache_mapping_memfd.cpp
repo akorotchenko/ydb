@@ -39,6 +39,10 @@ private:
     };
 
 public:
+    explicit TImpl(EAddressMode addressMode)
+        : StableAddress_(addressMode == EAddressMode::Stable)
+    {}
+
     ~TImpl() {
         for (const TView& view : Views_) {
             munmap(view.Pointer, view.Size);
@@ -54,7 +58,7 @@ public:
             return false;
         }
         Backing_ = TFileHandle(fd);
-        if (!ResizeBacking(currentSize) || !Map(currentSize, pointer)) {
+        if (!ResizeBacking(currentSize) || !Map(StableAddress_ ? reservedSize : currentSize, pointer)) {
             return false;
         }
         CurrentPointer_ = pointer;
@@ -76,6 +80,10 @@ public:
         if (targetSize > BackingSize_ && !ResizeBacking(targetSize)) {
             return false;
         }
+        if (StableAddress_) {
+            pointer = CurrentPointer_;
+            return true;
+        }
         if (!Map(targetSize, pointer)) {
             if (BackingSize_ != oldBackingSize) {
                 ResizeBacking(oldBackingSize);
@@ -86,6 +94,13 @@ public:
     }
 
     void Cancel(void* pointer, size_t targetSize) noexcept {
+        if (StableAddress_) {
+            Y_DEBUG_ABORT_UNLESS(!pointer || pointer == CurrentPointer_);
+            if (pointer && BackingSize_ > CurrentSize_) {
+                ResizeBacking(CurrentSize_);
+            }
+            return;
+        }
         if (!pointer || pointer == CurrentPointer_ && targetSize == CurrentSize_) {
             return;
         }
@@ -102,11 +117,19 @@ public:
     }
 
     bool NeedsRelease(void* oldPointer, void* currentPointer, size_t currentSize) const noexcept {
+        if (StableAddress_) {
+            return BackingSize_ > currentSize;
+        }
         return (oldPointer && oldPointer != currentPointer) || BackingSize_ > currentSize;
     }
 
-    void ReleaseRange(
-        void* oldPointer, size_t oldSize, void* currentPointer, const void*& begin, size_t& size) const noexcept {
+    void ReleaseRange(void* oldPointer, size_t oldSize, void* currentPointer, size_t currentSize, const void*& begin,
+        size_t& size) const noexcept {
+        if (StableAddress_) {
+            begin = static_cast<char*>(currentPointer) + currentSize;
+            size = BackingSize_ > currentSize ? BackingSize_ - currentSize : 0;
+            return;
+        }
         if (oldPointer && oldPointer != currentPointer) {
             begin = oldPointer;
             size = oldSize;
@@ -117,6 +140,10 @@ public:
     }
 
     bool Release(void*& oldPointer, size_t oldSize, void* currentPointer, size_t currentSize) noexcept {
+        if (StableAddress_) {
+            Y_DEBUG_ABORT_UNLESS(currentPointer == CurrentPointer_);
+            return BackingSize_ <= currentSize || ResizeBacking(currentSize);
+        }
         if (!NeedsRelease(oldPointer, currentPointer, currentSize)) {
             oldPointer = nullptr;
             return true;
@@ -180,6 +207,7 @@ private:
     }
 
 private:
+    const bool StableAddress_;
     TFileHandle Backing_;
     void* CurrentPointer_ = nullptr;
     size_t CurrentSize_ = 0;
@@ -188,8 +216,8 @@ private:
     TVector<TView> Views_;
 };
 
-TSharedCacheMapping::TSharedCacheMapping()
-    : Impl_(MakeHolder<TImpl>())
+TSharedCacheMapping::TSharedCacheMapping(EAddressMode addressMode)
+    : Impl_(MakeHolder<TImpl>(addressMode))
 {}
 
 TSharedCacheMapping::~TSharedCacheMapping() = default;
@@ -215,9 +243,9 @@ bool TSharedCacheMapping::NeedsRelease(
     return Impl_->NeedsRelease(oldPointer, currentPointer, currentSize);
 }
 
-void TSharedCacheMapping::ReleaseRange(
-    void* oldPointer, size_t oldSize, void* currentPointer, size_t, const void*& begin, size_t& size) const noexcept {
-    Impl_->ReleaseRange(oldPointer, oldSize, currentPointer, begin, size);
+void TSharedCacheMapping::ReleaseRange(void* oldPointer, size_t oldSize, void* currentPointer, size_t currentSize,
+    const void*& begin, size_t& size) const noexcept {
+    Impl_->ReleaseRange(oldPointer, oldSize, currentPointer, currentSize, begin, size);
 }
 
 bool TSharedCacheMapping::Release(

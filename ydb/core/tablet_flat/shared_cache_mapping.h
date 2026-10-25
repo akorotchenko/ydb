@@ -7,7 +7,12 @@ namespace NKikimr::NSharedCache {
 
 class TSharedCacheMapping : TMoveOnly {
 public:
-    TSharedCacheMapping();
+    enum class EAddressMode {
+        Default,
+        Stable,
+    };
+
+    explicit TSharedCacheMapping(EAddressMode addressMode = EAddressMode::Default);
     ~TSharedCacheMapping();
 
     bool Allocate(size_t currentSize, size_t reservedSize, void*& pointer) noexcept;
