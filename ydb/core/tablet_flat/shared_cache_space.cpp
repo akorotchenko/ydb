@@ -50,7 +50,7 @@ void TSharedCacheSpace::PrepareView(ui32 generation, TSpaceView view) noexcept {
     view.Rings = S5FifoRings_.Get();
     view.FreeCursor = FreeRingCursor_.Get();
     view.EffectiveHotSlots = &EffectiveHotSlots_;
-    SpaceViews_[generation & 1] = view;
+    SpaceViews_[generation % SpaceViewBankCount] = view;
 }
 
 ui32 TSharedCacheSpace::HotLevelForSlot(ui64 slot, ui64 hotSlotCount) noexcept {
@@ -128,7 +128,10 @@ bool TryCalculateSharedCacheFootprint(
     }
 
     ui64 staticBytes;
-    if (!TryAdd(fixedBytes, sizeof(TS5FifoRings) + sizeof(TFreeRingCursor), staticBytes) ||
+    // Reserve metadata for both banks and the peak Newest plus Prepared/Old owners
+    if (!TryAdd(fixedBytes,
+            sizeof(TS5FifoRings) + sizeof(TFreeRingCursor) + sizeof(THotResize) + sizeof(TSpaceViews) +
+                MaxOwnedSpaceViews * sizeof(TSpaceView), staticBytes) ||
         !TryAccumulateProduct(handleCount, sizeof(THandle), staticBytes) ||
         !TryAccumulateProduct(bucketCount, sizeof(std::atomic<ui64>), staticBytes) ||
         !TryAccumulateProduct(hotSlotCount, sizeof(std::atomic<ui64>), staticBytes) ||

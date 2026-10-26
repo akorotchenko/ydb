@@ -44,12 +44,7 @@ private:
     // Capacity transitions
     bool PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept;
 
-    Y_FORCE_INLINE bool PublishMigrationView(TTransition& transition) noexcept {
-        if (auto hotResizeGuard = Cache_.HotResize_.TryLock()) {
-            return Cache_.Space_->PublishMigrationView(transition);
-        }
-        return false;
-    }
+    bool PublishMigrationView(TTransition& transition) noexcept;
 
     Y_FORCE_INLINE bool TryDrainTransition(TTransition& transition) noexcept {
         return Cache_.Space_->TryDrainTransition(transition);

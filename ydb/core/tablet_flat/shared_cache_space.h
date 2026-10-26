@@ -252,6 +252,11 @@ struct TSpaceView {
     void CopyMappings(const TSpaceView& source) noexcept;
 };
 
+inline constexpr ui32 SpaceViewBankCount = 2;
+// NewestView plus either PreparedView or OldView
+inline constexpr ui32 MaxOwnedSpaceViews = 2;
+using TSpaceViews = std::array<TSpaceView, SpaceViewBankCount>;
+
 enum class ETransitionPhase {
     Idle,
     Prepare,
@@ -279,6 +284,12 @@ enum class ESpaceMap : ui8 {
 
 class TTransition {
 public:
+    TTransition() noexcept = default;
+    TTransition(const TTransition&) = delete;
+    TTransition& operator=(const TTransition&) = delete;
+    TTransition(TTransition&&) = delete;
+    TTransition& operator=(TTransition&&) = delete;
+
     ETransitionPhase Phase() const noexcept {
         return Phase_;
     }
@@ -461,6 +472,16 @@ private:
     void Unlock() noexcept;
 
     friend class TSharedCacheSpace;
+    template <class TTraits>
+    friend class TCacheCapacity;
+    friend class TSharedCacheTestAccess;
+
+    // Requires the shared resize lock
+    bool ClaimCapacityTransition(const TTransition& transition) noexcept;
+    bool OwnsCapacityTransition(const TTransition& transition) const noexcept;
+    void ReleaseCapacityTransition(const TTransition& transition) noexcept;
+    void CloseCapacityTransition(const TTransition& transition) noexcept;
+    bool CanChangeTiers() const noexcept;
 
     void Reset() noexcept {
         Phase_ = EHotResizePhase::Idle;
@@ -477,6 +498,9 @@ private:
     EHotResizePhase Phase_ = EHotResizePhase::Idle;
     ui64 OldEffectiveHotSlots_ = 0;
     ui64 NextCutSlot_ = 0;
+    // Retained after published shutdown abandonment so the space cannot reopen
+    const TTransition* CapacityTransition_ = nullptr;
+    bool CapacityAbandoned_ = false;
 };
 
 bool TryCalculateSharedCacheFootprint(
@@ -504,14 +528,14 @@ public:
     Y_FORCE_INLINE ~TSpaceOperation();
 
     static Y_FORCE_INLINE TSpaceOperation Begin(
-        std::atomic<ui64>& spaceState, TSpaceHazard& hazard, const std::array<TSpaceView, 2>& views) noexcept {
+        std::atomic<ui64>& spaceState, TSpaceHazard& hazard, const TSpaceViews& views) noexcept {
         return BeginImpl<false>(spaceState, hazard, views, [] {
         });
     }
 
     template <class TAfterIncrement>
     static Y_FORCE_INLINE TSpaceOperation BeginWithHook(std::atomic<ui64>& spaceState, TSpaceHazard& hazard,
-        const std::array<TSpaceView, 2>& views,
+        const TSpaceViews& views,
         TAfterIncrement&& afterIncrement) noexcept(noexcept(std::forward<TAfterIncrement>(afterIncrement)())) {
         return BeginImpl<true>(spaceState, hazard, views, std::forward<TAfterIncrement>(afterIncrement));
     }
@@ -604,7 +628,7 @@ public:
 private:
     template <bool WithHook, class TAfterIncrement>
     static Y_FORCE_INLINE TSpaceOperation BeginImpl(std::atomic<ui64>& spaceState, TSpaceHazard& hazard,
-        const std::array<TSpaceView, 2>& views,
+        const TSpaceViews& views,
         TAfterIncrement&& afterIncrement) noexcept(noexcept(std::forward<TAfterIncrement>(afterIncrement)()));
 
     static Y_FORCE_INLINE void LeaveHazard(TSpaceHazard& hazard) noexcept;
@@ -615,11 +639,10 @@ private:
         return (generation << 32) | activeCount;
     }
 
-    Y_FORCE_INLINE TSpaceOperation(
-        TSpaceHazard& hazard, TSpaceState entryState, const std::array<TSpaceView, 2>& views) noexcept
+    Y_FORCE_INLINE TSpaceOperation(TSpaceHazard& hazard, TSpaceState entryState, const TSpaceViews& views) noexcept
         : Hazard_(&hazard)
         , EntryState_(entryState)
-        , View_(&views[entryState.Generation() & 1])
+        , View_(&views[entryState.Generation() % SpaceViewBankCount])
     {
         Y_DEBUG_ABORT_UNLESS(View_->Generation == entryState.Generation());
     }
@@ -663,7 +686,7 @@ public:
     }
 
     Y_FORCE_INLINE const TSpaceView& SpaceView(TSpaceState state) const noexcept {
-        const TSpaceView& view = SpaceViews_[state.Generation() & 1];
+        const TSpaceView& view = SpaceViews_[state.Generation() % SpaceViewBankCount];
         Y_DEBUG_ABORT_UNLESS(view.Generation == state.Generation());
         return view;
     }
@@ -845,7 +868,7 @@ private:
     TSharedCacheMapping FreeMapping_;
     THolder<TSpaceView> NewestViewOwner_;
     std::atomic<TSpaceView*> NewestView_{ nullptr };
-    std::array<TSpaceView, 2> SpaceViews_;
+    TSpaceViews SpaceViews_;
     THolder<TS5FifoRings> S5FifoRings_;
     THolder<TFreeRingCursor> FreeRingCursor_;
     TVector<TSpaceHazard*> Hazards_;
@@ -917,7 +940,7 @@ Y_FORCE_INLINE bool TSpaceOperation::TryStoreSpareItem(TCacheItem cacheItem) noe
 
 template <bool WithHook, class TAfterIncrement>
 Y_FORCE_INLINE TSpaceOperation TSpaceOperation::BeginImpl(std::atomic<ui64>& spaceState, TSpaceHazard& hazard,
-    const std::array<TSpaceView, 2>& views,
+    const TSpaceViews& views,
     TAfterIncrement&& afterIncrement) noexcept(noexcept(std::forward<TAfterIncrement>(afterIncrement)())) {
     for (;;) {
         TSpaceState entryState = TSpaceState::FromRaw(spaceState.load(std::memory_order_acquire));

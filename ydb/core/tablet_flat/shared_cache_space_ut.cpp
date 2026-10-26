@@ -608,10 +608,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(footprint.ColdSlotCount(), 16);
         UNIT_ASSERT_VALUES_EQUAL(footprint.KeepColdSlotCount(), 16);
 
-        const ui64 expectedStatic = 128 + sizeof(TS5FifoRings) + sizeof(TFreeRingCursor) + 32 * sizeof(THandle) +
-                                    32 * sizeof(std::atomic<ui64>) + 24 * sizeof(std::atomic<ui64>) +
-                                    16 * sizeof(std::atomic<ui64>) + 16 * sizeof(std::atomic<ui64>) +
-                                    32 * sizeof(std::atomic<ui64>) + 3 * (sizeof(TSpaceHazard) + sizeof(TSpaceHazard*));
+        const ui64 expectedStatic =
+            128 + sizeof(TS5FifoRings) + sizeof(TFreeRingCursor) + sizeof(THotResize) + sizeof(TSpaceViews) +
+            MaxOwnedSpaceViews * sizeof(TSpaceView) + 32 * sizeof(THandle) + 32 * sizeof(std::atomic<ui64>) +
+            24 * sizeof(std::atomic<ui64>) + 16 * sizeof(std::atomic<ui64>) + 16 * sizeof(std::atomic<ui64>) +
+            32 * sizeof(std::atomic<ui64>) + 3 * (sizeof(TSpaceHazard) + sizeof(TSpaceHazard*));
         const ui64 expectedPayload = 30 * (4096 + NActors::TSharedData::OverheadSize);
         UNIT_ASSERT_VALUES_EQUAL(footprint.StaticBytes, expectedStatic);
         UNIT_ASSERT_VALUES_EQUAL(footprint.MinimumPayloadBytes, expectedPayload);
