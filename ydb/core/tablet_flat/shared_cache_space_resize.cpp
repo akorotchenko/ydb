@@ -332,21 +332,28 @@ bool TSharedCacheSpace::TryDrainTransition(TTransition& transition) noexcept {
         return false;
     }
 
-    while (transition.NextHazardIndex_ < HazardSlotCount_) {
+    if (!TryDrainBefore(transition.Generation_, transition.NextHazardIndex_)) {
+        return false;
+    }
+    if (transition.Phase_ == ETransitionPhase::MigrationDrain) {
+        transition.Phase_ = ETransitionPhase::Migrate;
+    }
+    return true;
+}
+
+bool TSharedCacheSpace::TryDrainBefore(ui32 publishedGeneration, ui32& nextHazardIndex) noexcept {
+    while (nextHazardIndex < HazardSlotCount_) {
         // Pair with registration CAS so late readers observe the published generation.
-        auto& state = Hazards_[transition.NextHazardIndex_]->State;
+        auto& state = Hazards_[nextHazardIndex]->State;
         ui64 hazardState = state.fetch_add(0, std::memory_order_acq_rel);
-        if (!SpaceHazardIsDrained(hazardState, transition.Generation_)) {
+        if (!SpaceHazardIsDrained(hazardState, publishedGeneration)) {
             if (!state.compare_exchange_strong(hazardState, hazardState | SpaceHazardDrainWaiter,
                     std::memory_order_acq_rel, std::memory_order_relaxed)) {
                 continue;
             }
             return false;
         }
-        ++transition.NextHazardIndex_;
-    }
-    if (transition.Phase_ == ETransitionPhase::MigrationDrain) {
-        transition.Phase_ = ETransitionPhase::Migrate;
+        ++nextHazardIndex;
     }
     return true;
 }
