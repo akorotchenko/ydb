@@ -51,9 +51,10 @@ struct TCollectionActorState;
 class TCollection {
 public:
     Y_FORCE_INLINE explicit TCollection(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection,
-        TCollectionCacheItem cacheItem = {}) noexcept
+        TCollectionCacheItem cacheItem = {}, ECacheMode initialMode = ECacheMode::Sticky) noexcept
         : CacheItem(cacheItem)
         , PageCollection_(std::move(pageCollection))
+        , CacheMode_(initialMode)
     {
         Y_DEBUG_ABORT_UNLESS(PageCollection_);
     }
@@ -165,7 +166,7 @@ private:
     std::atomic<TCollectionActorState*> ActorState_{ nullptr };
     const TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
     std::atomic<TCollectionRegistry*> Registry_{ nullptr };
-    std::atomic<ECacheMode> CacheMode_{ ECacheMode::Sticky };
+    std::atomic<ECacheMode> CacheMode_;
     std::atomic<ui64> KeepGeneration_{ 0 };
     std::atomic<ui64> ResidentPageBytes_{ 0 };
     // Ring transitions update this estimate after publishing their page state.

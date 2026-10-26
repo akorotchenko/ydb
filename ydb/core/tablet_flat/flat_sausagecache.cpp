@@ -30,8 +30,8 @@ TSharedPageRef TCollection::TryGetPage(const NTable::NPage::TPageLocation& locat
         const TCollectionLocation collectionLocation{ .Id = Id(), .BackingSize = PageCollection_->BackingSize() };
         const auto status = cache->FindOrInsert(collectionLocation, inserted, attached);
         if (status == ESharedCacheResultStatus::Inserted) {
-            Y_ENSURE(cache->MakeReady(inserted, MakeHolder<TCollection>(PageCollection_, inserted)));
-            Y_ENSURE(cache->SetCollectionPagesCacheMode(inserted, ECacheMode::Regular));
+            Y_ENSURE(
+                cache->MakeReady(inserted, MakeHolder<TCollection>(PageCollection_, inserted, ECacheMode::Regular)));
             return {};
         }
         if (status != ESharedCacheResultStatus::Hit || attached.CacheItem() != item) {

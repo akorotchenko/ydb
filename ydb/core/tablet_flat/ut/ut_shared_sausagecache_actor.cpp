@@ -533,6 +533,73 @@ struct TSharedPageCacheMock {
 };
 
 Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
+    void CheckInitialCollectionMode(ECacheMode ownerMode, bool actorCreates) {
+        TSharedPageCacheMock sharedCache;
+        auto& cache = TSharedCache::Get();
+        auto source = MakeIntrusiveConst<TPageCollectionMock>(ui64{ 19800 }, ui32{ 0 });
+        const auto id = source->Label();
+        bool seenReady = false;
+        bool ownerModePublished = false;
+        ECacheMode initialMode = ECacheMode::Sticky;
+        NActors::TTestActorRuntimeBase::TEventFilter previousFilter;
+        previousFilter = sharedCache.Runtime.SetEventFilter([&](NActors::TTestActorRuntimeBase& runtime,
+                                                                TAutoPtr<IEventHandle>& event) {
+            if (event->GetRecipientRewrite() == sharedCache.ActorId &&
+                event->GetTypeRewrite() == TEvResourcesAvailable::EventType) {
+                if (!seenReady) {
+                    TSharedCacheCollectionRef published;
+                    if (cache.Find(id, published) == ESharedCacheResultStatus::Hit) {
+                        seenReady = true;
+                        initialMode = published->GetCacheMode();
+                        if (!actorCreates) {
+                            // Empty metadata lets this native controller update send no nested events
+                            ownerModePublished = cache.SetCollectionPagesCacheMode(published.CacheItem(), ownerMode);
+                        }
+                    } else {
+                        cache.ArmResourceWait(cache.AdmissionGeneration());
+                    }
+                }
+                return true; // Consume the test-owned synchronous publication notification
+            }
+            return previousFilter(runtime, event);
+        });
+        Y_DEFER {
+            sharedCache.Runtime.SetEventFilter(std::move(previousFilter));
+        };
+        cache.ArmResourceWait(cache.AdmissionGeneration());
+        TSharedCacheCollectionRef result;
+        if (actorCreates) {
+            sharedCache.Attach(sharedCache.Sender1, source, ownerMode);
+            UNIT_ASSERT(cache.Find(id, result) == ESharedCacheResultStatus::Hit);
+        } else {
+            result = cache.AdmitCollection(source);
+        }
+        UNIT_ASSERT(seenReady);
+        UNIT_ASSERT(actorCreates || ownerModePublished);
+        UNIT_ASSERT(result->GetCacheMode() == ownerMode);
+        UNIT_ASSERT(initialMode == ECacheMode::Regular);
+        UNIT_ASSERT_VALUES_EQUAL(result->KeepGeneration(), ownerMode == ECacheMode::TryKeepInMemory ? 1 : 0);
+        auto joined = cache.AdmitCollection(source);
+        UNIT_ASSERT(joined.CacheItem() == result.CacheItem());
+        UNIT_ASSERT(joined->GetCacheMode() == ownerMode);
+    }
+
+    Y_UNIT_TEST(LoaderPublishesRegularBeforeKeepOwnerMode) {
+        CheckInitialCollectionMode(ECacheMode::TryKeepInMemory, false);
+    }
+
+    Y_UNIT_TEST(LoaderPublishesRegularBeforeStickyOwnerMode) {
+        CheckInitialCollectionMode(ECacheMode::Sticky, false);
+    }
+
+    Y_UNIT_TEST(ActorPublishesRegularBeforeKeepOwnerMode) {
+        CheckInitialCollectionMode(ECacheMode::TryKeepInMemory, true);
+    }
+
+    Y_UNIT_TEST(ActorPublishesRegularBeforeStickyOwnerMode) {
+        CheckInitialCollectionMode(ECacheMode::Sticky, true);
+    }
+
     Y_UNIT_TEST(QueuedResultIsAbandonedDuringRuntimeShutdown) {
         UNIT_ASSERT(!TlsActivationContext && !TlsCacheHazard);
         {

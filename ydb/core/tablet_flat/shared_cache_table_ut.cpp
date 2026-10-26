@@ -1191,6 +1191,20 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TIntrusivePtr<TTestSharedCache> Cache;
     };
 
+    Y_UNIT_TEST(CollectionPublicationKeepsFoundationStickyDefault) {
+        TFixture fixture;
+        const TLogoBlobID id(111, 112, 150);
+        TCollectionCacheItem collection;
+        TTestSharedCacheCollectionRef published;
+        UNIT_ASSERT(fixture.Cache->FindOrInsert(TCollectionLocation{ .Id = id }, collection, published) ==
+                    ESharedCacheResultStatus::Inserted);
+        auto value = MakeCollection(id);
+        UNIT_ASSERT(value->GetCacheMode() == ECacheMode::Sticky);
+        UNIT_ASSERT(fixture.Cache->MakeReady(collection, std::move(value)));
+        UNIT_ASSERT(fixture.Cache->Find(id, published) == ESharedCacheResultStatus::Hit);
+        UNIT_ASSERT(published->GetCacheMode() == ECacheMode::Sticky);
+    }
+
     TSharedCacheKey ReviewKeyForBucket(TCollectionCacheItem collection, ui32 mask, ui32 bucket, ui64 startOffset,
         const TSharedCacheKey* after = nullptr) {
         for (ui64 offset = startOffset; offset - startOffset < (1u << 20); ++offset) {
