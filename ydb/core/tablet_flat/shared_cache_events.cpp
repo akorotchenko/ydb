@@ -22,8 +22,7 @@ TSharedCacheCollectionRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitCollectio
         status = FindOrInsert(location, inserted, hit);
     }
     if (status == ESharedCacheResultStatus::Inserted) {
-        Y_ENSURE(MakeReady(inserted, MakeHolder<TCollection>(std::move(collection), inserted)));
-        Y_ENSURE(SetCollectionPagesCacheMode(inserted, ECacheMode::Regular));
+        Y_ENSURE(MakeReady(inserted, MakeHolder<TCollection>(std::move(collection), inserted, ECacheMode::Regular)));
         Y_ENSURE(Find(location.Id, hit) == ESharedCacheResultStatus::Hit);
     } else {
         Y_ENSURE(status == ESharedCacheResultStatus::Hit);

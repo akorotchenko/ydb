@@ -349,7 +349,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             return nullptr;
         }
         if (status == ESharedCacheResultStatus::Inserted) {
-            auto value = MakeHolder<TCollection>(pageCollection, inserted);
+            auto value = MakeHolder<TCollection>(pageCollection, inserted, ECacheMode::Regular);
             Y_ENSURE(Cache->MakeReady(inserted, std::move(value)));
             Y_ENSURE(Cache->Find(pageCollectionId, ref) == ESharedCacheResultStatus::Hit);
         } else {
