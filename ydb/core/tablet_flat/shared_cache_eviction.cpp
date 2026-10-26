@@ -2,7 +2,6 @@
 #include "shared_cache_items.h"
 #include "shared_cache.h"
 
-#include <util/generic/cast.h>
 #include <util/generic/scope.h>
 
 namespace NKikimr::NSharedCache {
@@ -226,11 +225,11 @@ TCacheItem TCacheEviction<TTraits>::PutHotImpl(
     TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem, TRingExchangeResult* placement) noexcept {
     const TRingExchangeResult exchange = [&]() noexcept {
         if constexpr (Preload) {
-            const auto hot = spaceOp.Hot(ToUnderlying(level));
+            const auto hot = spaceOp.Hot(level);
             auto* slot = Requeue ? hot.SelectPushSlot() : hot.SelectPutSlot();
             return ExchangeForPreload(spaceOp, slot, cacheItem.Raw(), false);
         } else {
-            return spaceOp.Hot(ToUnderlying(level)).PutAndPopWithHook(cacheItem.Raw(), [&]() noexcept {
+            return spaceOp.Hot(level).PutAndPopWithHook(cacheItem.Raw(), [&]() noexcept {
                 Cache_.InvokeHook(ESharedCacheHookPoint::BeforeHotExchange, cacheItem);
             });
         }
@@ -356,7 +355,7 @@ void TCacheEviction<TTraits>::ProcessHotImpl(TSpaceOperation& spaceOp, EHotLevel
         if constexpr (Preload) {
             // Retry the source tier when protected pages block promotion
             if (!placement.Slot && frequency != 0) {
-                const ui64 attempts = spaceOp.Hot(ToUnderlying(sourceLevel)).Capacity;
+                const ui64 attempts = spaceOp.Hot(sourceLevel).Capacity;
                 for (ui64 attempt = 0; attempt < attempts; ++attempt) {
                     displaced = PutHotImpl<true, true>(spaceOp, sourceLevel, cacheItem, &placement);
                     if (placement.Slot) {
@@ -471,14 +470,15 @@ template <bool Preload>
 bool TCacheEviction<TTraits>::ProcessHotBatch(TSpaceOperation& spaceOp) noexcept {
     bool progress = false;
     // Give every level a share of the bounded work even when the lower rings are large or empty.
-    for (ui32 level = 0; level < 4; ++level) {
+    for (ui32 index = 0; index < HotLevelCount; ++index) {
+        const auto level = static_cast<EHotLevel>(index);
         const TRingView hot = spaceOp.Hot(level);
-        const ui64 attempts = Min<ui64>(hot.Capacity, SharedCacheTransitionWorkBatch / 4);
+        const ui64 attempts = Min<ui64>(hot.Capacity, SharedCacheTransitionWorkBatch / HotLevelCount);
         for (ui64 attempt = 0; attempt < attempts; ++attempt) {
             const auto popped =
                 Preload ? PopForPreload(spaceOp, hot, false) : TRingExchangeResult{ nullptr, hot.Pop() };
             if (popped.Previous != 0) {
-                ProcessHotImpl<Preload>(spaceOp, static_cast<EHotLevel>(level), TCacheItem::FromRaw(popped.Previous));
+                ProcessHotImpl<Preload>(spaceOp, level, TCacheItem::FromRaw(popped.Previous));
                 progress = true;
             }
         }

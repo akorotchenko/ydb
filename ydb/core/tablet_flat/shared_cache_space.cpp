@@ -127,8 +127,9 @@ bool TryCalculateSharedCacheFootprint(
         return false;
     }
 
-    ui64 staticBytes = fixedBytes;
-    if (!TryAccumulateProduct(handleCount, sizeof(THandle), staticBytes) ||
+    ui64 staticBytes;
+    if (!TryAdd(fixedBytes, sizeof(TS5FifoRings) + sizeof(TFreeRingCursor), staticBytes) ||
+        !TryAccumulateProduct(handleCount, sizeof(THandle), staticBytes) ||
         !TryAccumulateProduct(bucketCount, sizeof(std::atomic<ui64>), staticBytes) ||
         !TryAccumulateProduct(hotSlotCount, sizeof(std::atomic<ui64>), staticBytes) ||
         !TryAccumulateProduct(handleCount / 2, sizeof(std::atomic<ui64>), staticBytes) ||

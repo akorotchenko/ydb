@@ -188,37 +188,111 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
 
     Y_UNIT_TEST(LevelPlacementLeavesAnUntouchedGap) {
         constexpr THotRingLayout layout{ 160, 64, 64 };
-        const std::array<ui64, 4> regularOffsets{ 33, 12, 4, 0 };
-        const std::array<ui64, 4> keepOffsets{ 96, 127, 148, 156 };
-        const std::array<ui64, 4> sizes{ 31, 21, 8, 4 };
+        const std::array<ui64, HotLevelCount> regularOffsets{ 33, 12, 4, 0 };
+        const std::array<ui64, HotLevelCount> keepOffsets{ 96, 127, 148, 156 };
+        const std::array<ui64, HotLevelCount> sizes{ 31, 21, 8, 4 };
         std::array<std::atomic<ui64>, 160> slots{};
-        std::array<TRingCursor, 8> cursors;
+        TS5FifoRings cursors;
+        TSpaceView space;
+        space.HotSlots = slots.data();
+        space.HotSlotCount = slots.size();
+        space.Rings = &cursors;
         const auto gap = layout.Gap();
         UNIT_ASSERT_VALUES_EQUAL(gap.Offset, 64);
         UNIT_ASSERT_VALUES_EQUAL(gap.Size, 32);
         for (ui64 index = gap.Offset; index < gap.End(); ++index) {
             slots[index].store(99);
         }
-        for (ui32 tier = 0; tier < 2; ++tier) {
-            for (ui32 level = 0; level < 4; ++level) {
+        for (ui32 tier = 0; tier < CacheTierCount; ++tier) {
+            for (ui32 level = 0; level < HotLevelCount; ++level) {
                 const auto range = layout.Ring(static_cast<ECacheTier>(tier), static_cast<EHotLevel>(level));
                 UNIT_ASSERT_VALUES_EQUAL(range.Offset, (tier ? keepOffsets : regularOffsets)[level]);
                 UNIT_ASSERT_VALUES_EQUAL(range.Size, sizes[level]);
                 UNIT_ASSERT(range.End() <= slots.size());
-                TRingView view{ &cursors[tier * 4 + level], slots.data() + range.Offset, range.Size };
+                const auto view = space.Hot(layout, static_cast<ECacheTier>(tier), static_cast<EHotLevel>(level));
                 for (ui64 index = 0; index < range.Size; ++index) {
-                    const auto value = 100 * (tier * 4 + level + 1) + index;
+                    const auto value = 100 * (tier * HotLevelCount + level + 1) + index;
                     const auto result = view.Cursor->Push(view.Slots, view.Capacity, value);
                     UNIT_ASSERT_VALUES_EQUAL(result.Previous, 0);
                     UNIT_ASSERT(result.Slot == slots.data() + range.Offset + index);
                 }
                 for (ui64 index = 0; index < range.Size; ++index) {
-                    UNIT_ASSERT_VALUES_EQUAL(view.Pop(), 100 * (tier * 4 + level + 1) + index);
+                    UNIT_ASSERT_VALUES_EQUAL(view.Pop(), 100 * (tier * HotLevelCount + level + 1) + index);
                 }
             }
         }
         for (ui64 index = gap.Offset; index < gap.End(); ++index) {
             UNIT_ASSERT_VALUES_EQUAL(slots[index].load(), 99);
+        }
+    }
+
+    Y_UNIT_TEST(SpaceViewCopiesShareTierCursorPositions) {
+        constexpr THotRingLayout layout{ 96, 32, 32 };
+        std::array<std::atomic<ui64>, 96> slots{};
+        TS5FifoRings cursors;
+        TSpaceView space;
+        space.HotSlots = slots.data();
+        space.HotSlotCount = slots.size();
+        space.Rings = &cursors;
+        const auto copied = space;
+        std::array<TRingCursor*, CacheTierCount * HotLevelCount> seen{};
+        ui32 count = 0;
+        for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+            for (ui32 level = 0; level < HotLevelCount; ++level) {
+                const auto first = space.Hot(layout, tier, static_cast<EHotLevel>(level));
+                const auto second = copied.Hot(layout, tier, static_cast<EHotLevel>(level));
+                UNIT_ASSERT(first.Cursor == second.Cursor);
+                UNIT_ASSERT(first.Slots == second.Slots);
+                for (ui32 index = 0; index < count; ++index) {
+                    UNIT_ASSERT(first.Cursor != seen[index]);
+                }
+                seen[count++] = first.Cursor;
+                if (tier == ECacheTier::Regular) {
+                    UNIT_ASSERT(first.Cursor == &cursors.Hot(static_cast<EHotLevel>(level)));
+                }
+                UNIT_ASSERT_VALUES_EQUAL(first.PutAndPop(11), 0);
+                UNIT_ASSERT_VALUES_EQUAL(second.PutAndPop(22), 0);
+                UNIT_ASSERT_VALUES_EQUAL(first.Slots[0].load(), 11);
+                UNIT_ASSERT_VALUES_EQUAL(first.Slots[1].load(), 22);
+                for (ui64 index = 2; index < first.Capacity; ++index) {
+                    UNIT_ASSERT_VALUES_EQUAL(second.Pop(), 0);
+                }
+                UNIT_ASSERT_VALUES_EQUAL(first.Pop(), 11);
+                UNIT_ASSERT_VALUES_EQUAL(second.Pop(), 22);
+            }
+        }
+    }
+
+    Y_UNIT_TEST(BothTiersUseForwardFifoAcrossWrap) {
+        for (const auto layout : { THotRingLayout{ 12, 4, 4 }, THotRingLayout{ 160, 64, 64 } }) {
+            std::array<std::atomic<ui64>, 160> slots{};
+            TS5FifoRings cursors;
+            TSpaceView space;
+            space.HotSlots = slots.data();
+            space.HotSlotCount = layout.ArenaSlots;
+            space.Rings = &cursors;
+            const auto gap = layout.Gap();
+            for (ui64 index = gap.Offset; index < gap.End(); ++index) {
+                slots[index].store(99);
+            }
+            for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+                for (auto level : { EHotLevel::L0, EHotLevel::L1, EHotLevel::L2, EHotLevel::L3 }) {
+                    const auto ring = space.Hot(layout, tier, level);
+                    const ui64 writes = 2 * ring.Capacity + 3;
+                    for (ui64 index = 0; index < writes; ++index) {
+                        const ui64 expected = index < ring.Capacity ? 0 : index - ring.Capacity + 1;
+                        UNIT_ASSERT_VALUES_EQUAL(ring.PutAndPop(index + 1), expected);
+                        UNIT_ASSERT_VALUES_EQUAL(ring.Slots[index % ring.Capacity].load(), index + 1);
+                    }
+                    for (ui64 index = writes - ring.Capacity; index < writes; ++index) {
+                        UNIT_ASSERT_VALUES_EQUAL(ring.Pop(), index + 1);
+                    }
+                    UNIT_ASSERT_VALUES_EQUAL(ring.Pop(), 0);
+                }
+            }
+            for (ui64 index = gap.Offset; index < gap.End(); ++index) {
+                UNIT_ASSERT_VALUES_EQUAL(slots[index].load(), 99);
+            }
         }
     }
 
@@ -229,10 +303,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
                     const THotRingLayout layout{ regular + keep + gap, regular, keep };
                     UNIT_ASSERT(layout.IsValid());
                     std::array<ui8, 131> owners{};
-                    for (ui32 tier = 0; tier < 2; ++tier) {
+                    for (ui32 tier = 0; tier < CacheTierCount; ++tier) {
                         const auto span = layout.Tier(static_cast<ECacheTier>(tier));
                         ui64 count = 0;
-                        for (ui32 level = 0; level < 4; ++level) {
+                        for (ui32 level = 0; level < HotLevelCount; ++level) {
                             const auto range =
                                 layout.Ring(static_cast<ECacheTier>(tier), static_cast<EHotLevel>(level));
                             UNIT_ASSERT(range.Size > 0);
@@ -263,8 +337,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
         for (ui64 count = 15; count <= slots.size(); ++count) {
             view.HotSlotCount = count;
             const THotRingLayout layout{ count + 4, count, 4 };
-            for (ui32 level = 0; level < 4; ++level) {
-                const auto existing = view.Hot(level);
+            for (ui32 level = 0; level < HotLevelCount; ++level) {
+                const auto existing = view.Hot(static_cast<EHotLevel>(level));
                 const auto range = layout.Ring(ECacheTier::Regular, static_cast<EHotLevel>(level));
                 UNIT_ASSERT_VALUES_EQUAL(range.Size, existing.Capacity);
                 UNIT_ASSERT(existing.Slots == slots.data() + range.Offset);
@@ -508,6 +582,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(Footprint) {
         TSharedCacheCapacity footprint;
         UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 128, 3, footprint));
+        UNIT_ASSERT_VALUES_EQUAL(footprint.FixedBytes, 128);
         UNIT_ASSERT_VALUES_EQUAL(footprint.AddressBits, 5);
         UNIT_ASSERT_VALUES_EQUAL(footprint.HandleCount(), 32);
         UNIT_ASSERT_VALUES_EQUAL(footprint.BucketCount(), 32);
@@ -515,10 +590,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(footprint.ColdSlotCount(), 16);
         UNIT_ASSERT_VALUES_EQUAL(footprint.KeepColdSlotCount(), 16);
 
-        const ui64 expectedStatic = 128 + 32 * sizeof(THandle) + 32 * sizeof(std::atomic<ui64>) +
-                                    24 * sizeof(std::atomic<ui64>) + 16 * sizeof(std::atomic<ui64>) +
-                                    16 * sizeof(std::atomic<ui64>) + 32 * sizeof(std::atomic<ui64>) +
-                                    3 * (sizeof(TSpaceHazard) + sizeof(TSpaceHazard*));
+        const ui64 expectedStatic = 128 + sizeof(TS5FifoRings) + sizeof(TFreeRingCursor) + 32 * sizeof(THandle) +
+                                    32 * sizeof(std::atomic<ui64>) + 24 * sizeof(std::atomic<ui64>) +
+                                    16 * sizeof(std::atomic<ui64>) + 16 * sizeof(std::atomic<ui64>) +
+                                    32 * sizeof(std::atomic<ui64>) + 3 * (sizeof(TSpaceHazard) + sizeof(TSpaceHazard*));
         const ui64 expectedPayload = 30 * (4096 + NActors::TSharedData::OverheadSize);
         UNIT_ASSERT_VALUES_EQUAL(footprint.StaticBytes, expectedStatic);
         UNIT_ASSERT_VALUES_EQUAL(footprint.MinimumPayloadBytes, expectedPayload);

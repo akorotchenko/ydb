@@ -8,6 +8,21 @@
 
 namespace NKikimr::NSharedCache {
 
+enum class ECacheTier : ui8 {
+    Regular,
+    Keep,
+};
+
+enum EHotLevel : ui32 {
+    L0,
+    L1,
+    L2,
+    L3,
+};
+
+inline constexpr ui32 CacheTierCount = 2;
+inline constexpr ui32 HotLevelCount = 4;
+
 struct TRingExchangeResult {
     std::atomic<ui64>* Slot = nullptr;
     ui64 Previous = 0;
@@ -96,8 +111,14 @@ private:
 
 class TS5FifoRings {
 public:
-    Y_FORCE_INLINE TRingCursor& Hot(ui32 index) noexcept {
-        return HotCursors_[index];
+    Y_FORCE_INLINE TRingCursor& Hot(EHotLevel level) noexcept {
+        return Hot(ECacheTier::Regular, level);
+    }
+
+    Y_FORCE_INLINE TRingCursor& Hot(ECacheTier tier, EHotLevel level) noexcept {
+        const auto tierIndex = static_cast<ui32>(tier);
+        Y_DEBUG_ABORT_UNLESS(tierIndex < CacheTierCount && level < HotLevelCount);
+        return HotCursors_[tierIndex][level];
     }
 
     Y_FORCE_INLINE TRingCursor& Cold() noexcept {
@@ -109,7 +130,7 @@ public:
     }
 
 private:
-    std::array<TRingCursor, 4> HotCursors_;
+    std::array<std::array<TRingCursor, HotLevelCount>, CacheTierCount> HotCursors_;
     TRingCursor ColdCursor_;
     TRingCursor KeepColdCursor_;
 };

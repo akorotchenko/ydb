@@ -3851,10 +3851,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedPages(), 0);
     }
 
-    void MovePreloadTestPageToLevel(TTestSharedCache & cache, TPageCacheItem page, ui32 level) {
+    void MovePreloadTestPageToLevel(TTestSharedCache & cache, TPageCacheItem page, EHotLevel level) {
         auto cacheOp = cache.BeginOperation();
         auto& spaceOp = cacheOp.SpaceOperation();
-        const auto source = spaceOp.Hot(1);
+        const auto source = spaceOp.Hot(EHotLevel::L1);
         for (ui64 slot = 0; slot < source.Capacity; ++slot) {
             ui64 raw = page.CacheItem().Raw();
             if (source.Slots[slot].compare_exchange_strong(raw, 0)) {
@@ -3877,10 +3877,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const auto first = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(regular, 1));
         const auto second = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(regular, 2));
         if (protectedPromotion) {
-            const ui64 slots = fixture.Cache->BeginOperation().SpaceOperation().Hot(2).Capacity;
+            const ui64 slots = fixture.Cache->BeginOperation().SpaceOperation().Hot(EHotLevel::L2).Capacity;
             for (ui64 offset = 1000; offset < 1000 + slots; ++offset) {
                 const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(keep, offset));
-                MovePreloadTestPageToLevel(*fixture.Cache, page, 2);
+                MovePreloadTestPageToLevel(*fixture.Cache, page, EHotLevel::L2);
             }
         }
         if (cold) {
@@ -3932,13 +3932,14 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(regular, ECacheMode::Regular));
         const auto first = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(regular, 1));
         const auto second = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(regular, 2));
-        MovePreloadTestPageToLevel(*fixture.Cache, first, 0);
-        MovePreloadTestPageToLevel(*fixture.Cache, second, 2);
+        MovePreloadTestPageToLevel(*fixture.Cache, first, EHotLevel::L0);
+        MovePreloadTestPageToLevel(*fixture.Cache, second, EHotLevel::L2);
         for (ui32 level : { 2, 3 }) {
-            const ui64 slots = fixture.Cache->BeginOperation().SpaceOperation().Hot(level).Capacity;
+            const ui64 slots =
+                fixture.Cache->BeginOperation().SpaceOperation().Hot(static_cast<EHotLevel>(level)).Capacity;
             for (ui64 slot = level == 2 ? 1 : 0; slot < slots; ++slot) {
                 const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(keep, level * 1000 + slot));
-                MovePreloadTestPageToLevel(*fixture.Cache, page, level);
+                MovePreloadTestPageToLevel(*fixture.Cache, page, static_cast<EHotLevel>(level));
             }
         }
         for (ui32 hit = 0; hit < 3; ++hit) {
@@ -3969,7 +3970,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::TryKeepInMemory));
         UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(16 * 4096));
         const auto page = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 1));
-        MovePreloadTestPageToLevel(*fixture.Cache, page, 0);
+        MovePreloadTestPageToLevel(*fixture.Cache, page, EHotLevel::L0);
         UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
         UNIT_ASSERT(TSharedCacheTestAccess::DemoteKeepCold(*fixture.Cache, MakeColdItem(*fixture.Cache, page.Index())));
         UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsCold());
@@ -5159,7 +5160,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const auto restoredKey = ReviewKeyForBucket(collection, bucketMask, (bucket + 1) & bucketMask, 2000);
         const TPageCacheItem victim = InsertReadyPage(*fixture.Cache, victimKey);
         const ui64 hotPages = TSharedCacheTestAccess::WithSpace(*fixture.Cache, [](TSpaceOperation& spaceOp) {
-            return spaceOp.Hot(0).Capacity + spaceOp.Hot(1).Capacity;
+            return spaceOp.Hot(EHotLevel::L0).Capacity + spaceOp.Hot(EHotLevel::L1).Capacity;
         });
         ui64 nextOffset = restoredKey.Word(1) + 1;
         for (ui64 index = 1; index < hotPages; ++index) {
@@ -6559,7 +6560,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TVector<ui32> counts(fixture.ReservedCapacity.HandleCount(), 0);
             TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
                 for (ui32 level = 0; level < 4; ++level) {
-                    const TRingView& ring = spaceOp.Hot(level);
+                    const TRingView& ring = spaceOp.Hot(static_cast<EHotLevel>(level));
                     for (ui64 slot = 0; slot < ring.Capacity; ++slot) {
                         const TCacheItem cacheItem =
                             TCacheItem::FromRaw(ring.Slots[slot].load(std::memory_order_relaxed));
@@ -7691,7 +7692,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             .Rings = &rings,
         };
         for (ui32 level = 0; level < 4; ++level) {
-            const auto hot = view.Hot(level);
+            const auto hot = view.Hot(static_cast<EHotLevel>(level));
             UNIT_ASSERT(hot.Capacity > 0);
             UNIT_ASSERT(hot.Capacity <= SharedCacheTransitionWorkBatch / 4);
             hot.Slots[hot.Capacity - 1].store(level + 1, std::memory_order_relaxed);
@@ -7730,7 +7731,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache), 15);
         TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
             for (ui32 level = 0; level < 4; ++level) {
-                UNIT_ASSERT(spaceOp.Hot(level).Capacity <= SharedCacheTransitionWorkBatch / 4);
+                UNIT_ASSERT(spaceOp.Hot(static_cast<EHotLevel>(level)).Capacity <= SharedCacheTransitionWorkBatch / 4);
             }
         });
     }
@@ -7764,7 +7765,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(fixture.Cache->Find(collection, 0, ref) == ESharedCacheResultStatus::Hit);
         }
         TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
-            UNIT_ASSERT(spaceOp.Hot(0).Capacity > SharedCacheTransitionWorkBatch);
+            UNIT_ASSERT(spaceOp.Hot(EHotLevel::L0).Capacity > SharedCacheTransitionWorkBatch);
         });
         for (ui32 pass = 0; pass < 200 && fixture.Cache->HotPages() != 0; ++pass) {
             TSharedCacheTestAccess::ProcessHotAtMinimum(*fixture.Cache);
@@ -8637,7 +8638,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(fixture.Cache->CurrentLimit()));
         const ui64 l1Slots = TSharedCacheTestAccess::WithSpace(*fixture.Cache, [](auto& spaceOp) {
-            return spaceOp.Hot(1).Capacity;
+            return spaceOp.Hot(EHotLevel::L1).Capacity;
         });
         TPageCacheItem hot;
         for (ui64 offset = 2; offset < l1Slots + 2; ++offset) {

@@ -41,18 +41,6 @@ constexpr bool SharedCacheHotLayoutIsValid(ui64 hotSlotCount) noexcept {
     return l0Size && l1Size && l2Size && l3Size;
 }
 
-enum class ECacheTier : ui8 {
-    Regular,
-    Keep,
-};
-
-enum class EHotLevel : ui32 {
-    L0,
-    L1,
-    L2,
-    L3,
-};
-
 struct THotRingRange {
     ui64 Offset = 0;
     ui64 Size = 0;
@@ -63,7 +51,7 @@ struct THotRingRange {
 };
 
 struct THotRingLayout {
-    static constexpr ui64 MinimumTierSlots = 4;
+    static constexpr ui64 MinimumTierSlots = HotLevelCount;
 
     ui64 ArenaSlots = 0;
     ui64 RegularSlots = 0;
@@ -241,7 +229,10 @@ struct TSpaceView {
         return Min(effective, HotSlotCount);
     }
 
-    Y_FORCE_INLINE TRingView Hot(ui32 level) const noexcept;
+    Y_FORCE_INLINE TRingView Hot(EHotLevel level) const noexcept;
+
+    // The caller must protect this layout's slot ownership while using the returned view
+    Y_FORCE_INLINE TRingView Hot(const THotRingLayout& layout, ECacheTier tier, EHotLevel level) const noexcept;
 
     Y_FORCE_INLINE TRingView Cold() const noexcept {
         Y_DEBUG_ABORT_UNLESS(Rings);
@@ -574,7 +565,7 @@ public:
         return View().EffectiveHotSlotCount();
     }
 
-    Y_FORCE_INLINE TRingView Hot(ui32 level) const noexcept {
+    Y_FORCE_INLINE TRingView Hot(EHotLevel level) const noexcept {
         return View().Hot(level);
     }
 
@@ -1135,8 +1126,7 @@ constexpr THotRingRange THotRingLayout::Tier(ECacheTier tier) const noexcept {
 
 constexpr THotRingRange THotRingLayout::Ring(ECacheTier tier, EHotLevel level) const noexcept {
     const auto range = Tier(tier);
-    const ui32 index = static_cast<ui32>(level);
-    Y_DEBUG_ABORT_UNLESS(index < 4);
+    Y_DEBUG_ABORT_UNLESS(level < HotLevelCount);
     // 7:5:2:1 weights, with one slot per level even in a four-slot standby tier
     const ui64 l3 = Max<ui64>(1, range.Size / 15);
     const ui64 l2 = Max<ui64>(1, (range.Size / 15) * 2 + ((range.Size % 15) * 2) / 15);
@@ -1145,29 +1135,36 @@ constexpr THotRingRange THotRingLayout::Ring(ECacheTier tier, EHotLevel level) c
     const ui64 sizes[]{ l0, l1, l2, l3 };
     const ui64 regularOffsets[]{ l3 + l2 + l1, l3 + l2, l3, 0 };
     const ui64 keepOffsets[]{ 0, l0, l0 + l1, l0 + l1 + l2 };
-    const ui64 offset = tier == ECacheTier::Regular ? regularOffsets[index] : keepOffsets[index];
-    return { range.Offset + offset, sizes[index] };
+    const ui64 offset = tier == ECacheTier::Regular ? regularOffsets[level] : keepOffsets[level];
+    return { range.Offset + offset, sizes[level] };
 }
 
-Y_FORCE_INLINE TRingView TSpaceView::Hot(ui32 level) const noexcept {
-    Y_DEBUG_ABORT_UNLESS(Rings && level < 4);
+Y_FORCE_INLINE TRingView TSpaceView::Hot(EHotLevel level) const noexcept {
+    Y_DEBUG_ABORT_UNLESS(Rings && level < HotLevelCount);
     const ui64 hotSlotCount = EffectiveHotSlotCount();
     const ui64 l3Size = hotSlotCount / 15;
     const ui64 l2Size = (hotSlotCount * 2) / 15;
     const ui64 l1Size = (hotSlotCount * 5) / 15;
-    const ui64 sizes[4] = {
+    const ui64 sizes[HotLevelCount] = {
         hotSlotCount - l3Size - l2Size - l1Size,
         l1Size,
         l2Size,
         l3Size,
     };
-    const ui64 offsets[4] = {
+    const ui64 offsets[HotLevelCount] = {
         l3Size + l2Size + l1Size,
         l3Size + l2Size,
         l3Size,
         0,
     };
     return { &Rings->Hot(level), HotSlots + offsets[level], sizes[level] };
+}
+
+Y_FORCE_INLINE TRingView TSpaceView::Hot(
+    const THotRingLayout& layout, ECacheTier tier, EHotLevel level) const noexcept {
+    Y_DEBUG_ABORT_UNLESS(Rings && HotSlots && layout.ArenaSlots == HotSlotCount);
+    const auto range = layout.Ring(tier, level);
+    return { &Rings->Hot(tier, level), HotSlots + range.Offset, range.Size };
 }
 
 inline void TSpaceView::CopyMappings(const TSpaceView& source) noexcept {
