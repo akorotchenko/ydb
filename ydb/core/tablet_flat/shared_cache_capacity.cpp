@@ -5,6 +5,10 @@ namespace NKikimr::NSharedCache {
 
 template <class TTraits>
 bool TCacheCapacity<TTraits>::PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept {
+    auto hotResizeGuard = Cache_.HotResize_.TryLock();
+    if (!hotResizeGuard || !Cache_.HotResize_.ClaimCapacityTransition(transition)) {
+        return false;
+    }
     const ui64 currentStaticBytes = Cache_.Space_->CurrentConfiguration().StaticBytes;
     const ui64 staticDeltaBytes = target.StaticBytes > currentStaticBytes ? target.StaticBytes - currentStaticBytes : 0;
     if (staticDeltaBytes != 0) {
@@ -16,6 +20,17 @@ bool TCacheCapacity<TTraits>::PrepareTransition(const TSharedCacheCapacity& targ
     if (staticDeltaBytes != 0) {
         Cache_.Memory_.CancelStaticResize(staticDeltaBytes);
     }
+    Cache_.HotResize_.ReleaseCapacityTransition(transition);
+    return false;
+}
+
+template <class TTraits>
+bool TCacheCapacity<TTraits>::PublishMigrationView(TTransition& transition) noexcept {
+    if (auto hotResizeGuard = Cache_.HotResize_.TryLock()) {
+        if (Cache_.HotResize_.OwnsCapacityTransition(transition)) {
+            return Cache_.Space_->PublishMigrationView(transition);
+        }
+    }
     return false;
 }
 
@@ -23,6 +38,9 @@ template <class TTraits>
 bool TCacheCapacity<TTraits>::PublishFinalView(TTransition& transition) noexcept {
     bool published = false;
     if (auto hotResizeGuard = Cache_.HotResize_.TryLock()) {
+        if (!Cache_.HotResize_.OwnsCapacityTransition(transition)) {
+            return false;
+        }
         if (Cache_.HotResize_.Phase() == EHotResizePhase::Cut) {
             auto spaceOp = Cache_.Space_->BeginOperation();
             Cache_.Eviction_.BindOperation(spaceOp).DrainHotResize();
@@ -90,6 +108,10 @@ bool TCacheCapacity<TTraits>::FinalDrain(TTransition& transition) noexcept {
 
 template <class TTraits>
 bool TCacheCapacity<TTraits>::CommitTransition(TTransition& transition) noexcept {
+    auto hotResizeGuard = Cache_.HotResize_.TryLock();
+    if (!hotResizeGuard || !Cache_.HotResize_.OwnsCapacityTransition(transition)) {
+        return false;
+    }
     const ui64 oldStaticBytes = transition.OldConfiguration().StaticBytes;
     const ui64 targetStaticBytes = transition.TargetConfiguration().StaticBytes;
     const ui64 targetLimit = transition.TargetConfiguration().Limit;
@@ -104,23 +126,35 @@ bool TCacheCapacity<TTraits>::CommitTransition(TTransition& transition) noexcept
         TargetHandleCount_.store(targetHandleCount, std::memory_order_relaxed);
         Cache_.Memory_.SetHardLimit(targetLimit);
     }
+    Cache_.HotResize_.ReleaseCapacityTransition(transition);
+    hotResizeGuard = {};
     Cache_.RefreshSoftLimit();
+    Cache_.NotifyResourcesAvailable();
     return true;
 }
 
 template <class TTraits>
 bool TCacheCapacity<TTraits>::AbandonTransition(TTransition& transition) noexcept {
+    auto hotResizeGuard = Cache_.HotResize_.TryLock();
+    if (!hotResizeGuard || !Cache_.HotResize_.OwnsCapacityTransition(transition)) {
+        return false;
+    }
     const ETransitionPhase phase = transition.Phase();
     const ui64 oldStaticBytes = transition.OldConfiguration().StaticBytes;
     const ui64 targetStaticBytes = transition.TargetConfiguration().StaticBytes;
     if (!Cache_.Space_->AbandonTransition(transition)) {
         return false;
     }
-    if ((phase == ETransitionPhase::Prepare || phase == ETransitionPhase::InitializeGrowth) &&
-        targetStaticBytes > oldStaticBytes)
-    {
-        const ui64 delta = targetStaticBytes - oldStaticBytes;
-        Cache_.Memory_.CancelStaticResize(delta);
+    if (phase == ETransitionPhase::Prepare || phase == ETransitionPhase::InitializeGrowth) {
+        if (targetStaticBytes > oldStaticBytes) {
+            const ui64 delta = targetStaticBytes - oldStaticBytes;
+            Cache_.Memory_.CancelStaticResize(delta);
+        }
+        Cache_.HotResize_.ReleaseCapacityTransition(transition);
+        hotResizeGuard = {};
+        Cache_.NotifyResourcesAvailable();
+    } else {
+        Cache_.HotResize_.CloseCapacityTransition(transition);
     }
     return true;
 }

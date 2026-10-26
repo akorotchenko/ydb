@@ -4,6 +4,38 @@
 
 namespace NKikimr::NSharedCache {
 
+bool THotResize::ClaimCapacityTransition(const TTransition& transition) noexcept {
+    Y_DEBUG_ABORT_UNLESS(State_.load(std::memory_order_relaxed) & Locked);
+    if (CapacityAbandoned_ || CapacityTransition_ ||
+        (Phase_ != EHotResizePhase::Idle && Phase_ != EHotResizePhase::Cut)) {
+        return false;
+    }
+    CapacityTransition_ = &transition;
+    return true;
+}
+
+bool THotResize::OwnsCapacityTransition(const TTransition& transition) const noexcept {
+    Y_DEBUG_ABORT_UNLESS(State_.load(std::memory_order_relaxed) & Locked);
+    return !CapacityAbandoned_ && CapacityTransition_ == &transition;
+}
+
+void THotResize::ReleaseCapacityTransition(const TTransition& transition) noexcept {
+    Y_DEBUG_ABORT_UNLESS(State_.load(std::memory_order_relaxed) & Locked);
+    Y_DEBUG_ABORT_UNLESS(OwnsCapacityTransition(transition));
+    CapacityTransition_ = nullptr;
+}
+
+void THotResize::CloseCapacityTransition(const TTransition& transition) noexcept {
+    Y_DEBUG_ABORT_UNLESS(State_.load(std::memory_order_relaxed) & Locked);
+    Y_DEBUG_ABORT_UNLESS(OwnsCapacityTransition(transition));
+    CapacityAbandoned_ = true;
+}
+
+bool THotResize::CanChangeTiers() const noexcept {
+    Y_DEBUG_ABORT_UNLESS(State_.load(std::memory_order_relaxed) & Locked);
+    return !CapacityAbandoned_ && !CapacityTransition_ && Phase_ == EHotResizePhase::Idle;
+}
+
 bool TSharedCacheSpace::BeginBucketResize(ui8 newAddressBits) noexcept {
     const TSpaceState spaceState = CurrentSpaceState();
     if (spaceState.Resizing()) {

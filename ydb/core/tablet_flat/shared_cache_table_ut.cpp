@@ -28,6 +28,8 @@ using TTestSharedCachePageRequest = TSharedCachePageRequestImpl<TTestTraits>;
 static_assert(sizeof(TTestSharedCacheItemRef) == sizeof(TCacheItem));
 static_assert(sizeof(TTestSharedPageRef) == 8);
 static_assert(sizeof(TTestSharedCacheCollectionRef) == sizeof(TCacheItem));
+static_assert(!std::is_move_constructible_v<TTransition>);
+static_assert(!std::is_move_assignable_v<TTransition>);
 
 struct TSeparatePageRequest {
     NTable::NPage::TPageLocation Location;
@@ -331,6 +333,28 @@ public:
 
     static THotResize::TGuard LockHotResize(TTestSharedCache& cache) noexcept {
         return cache.HotResize_.TryLock();
+    }
+
+    static bool CanChangeTiers(TTestSharedCache& cache) noexcept {
+        auto guard = cache.HotResize_.TryLock();
+        return guard && cache.HotResize_.CanChangeTiers();
+    }
+
+    static bool OwnsCapacityTransition(TTestSharedCache& cache, const TTransition& transition) noexcept {
+        auto guard = cache.HotResize_.TryLock();
+        return guard && cache.HotResize_.OwnsCapacityTransition(transition);
+    }
+
+    template <class TCallback>
+    static bool TryReleaseTransitionWithHook(
+        TTestSharedCache& cache, TTransition& transition, TCallback& callback) noexcept {
+        return cache.Space_->TryReleaseTransitionWithHook(
+            transition, {
+                            .Context = &callback,
+                            .Function = [](void* context, ESpaceMap mapping, const void* begin, size_t size) noexcept {
+                                return (*static_cast<TCallback*>(context))(mapping, begin, size);
+                            },
+                        });
     }
 
     static std::pair<ui64, ui64> ColdByteWatermarks(const TTestSharedCache& cache) noexcept {
@@ -6659,10 +6683,12 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         TTransition canceled;
         UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, canceled));
+        UNIT_ASSERT(!TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.Capacity.StaticBytes);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), growthDelta);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.ReservedCapacity.StaticBytes);
         UNIT_ASSERT(TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, canceled));
+        UNIT_ASSERT(TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.Capacity.StaticBytes);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Capacity.StaticBytes);
@@ -6674,6 +6700,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
         CompleteBucketResize(*fixture.Cache, *fixture.Space);
         CommitTransition(*fixture.Cache, growth);
+        UNIT_ASSERT(TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.ReservedCapacity.StaticBytes);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->TargetHandleCount(), fixture.ReservedCapacity.HandleCount());
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
@@ -6689,10 +6716,111 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 6));
         CompleteBucketResize(*fixture.Cache, *fixture.Space);
         CommitTransition(*fixture.Cache, shrink);
+        UNIT_ASSERT(TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.Capacity.StaticBytes);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->TargetHandleCount(), fixture.Capacity.HandleCount());
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Capacity.StaticBytes);
+    }
+
+    Y_UNIT_TEST(CapacityPreparationExcludesOtherResizeOwners) {
+        TFixture fixture(6, 8, 7);
+        TTransition first;
+        TTransition second;
+        {
+            auto guard = TSharedCacheTestAccess::LockHotResize(*fixture.Cache);
+            UNIT_ASSERT(guard);
+            UNIT_ASSERT(!TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, first));
+        }
+        UNIT_ASSERT(first.Phase() == ETransitionPhase::Idle);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
+        auto invalid = fixture.ReservedCapacity;
+        ++invalid.ExpectedPageSize;
+        UNIT_ASSERT(!TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, invalid, first));
+        UNIT_ASSERT(TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, first));
+        const ui64 pendingBytes = fixture.Cache->StaticDeltaBytes();
+        UNIT_ASSERT(TSharedCacheTestAccess::OwnsCapacityTransition(*fixture.Cache, first));
+        UNIT_ASSERT(!TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
+        UNIT_ASSERT(!TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, second));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), pendingBytes);
+
+        auto [foreignThreads, foreignSpace] =
+            TCacheThreadTestAccess::MakeSpace(fixture.Capacity, fixture.ReservedCapacity, 1);
+        UNIT_ASSERT(foreignSpace);
+        UNIT_ASSERT(foreignSpace->PrepareTransition(fixture.ReservedCapacity, second));
+        UNIT_ASSERT(!TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, second));
+        UNIT_ASSERT(!TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, second));
+        UNIT_ASSERT(!TSharedCacheTestAccess::CommitTransition(*fixture.Cache, second));
+        UNIT_ASSERT(!TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, second));
+        UNIT_ASSERT(second.Phase() == ETransitionPhase::Prepare);
+        UNIT_ASSERT(foreignSpace->AbandonTransition(second));
+        UNIT_ASSERT(TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, first));
+        UNIT_ASSERT(TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
+    }
+
+    Y_UNIT_TEST(CapacityOwnershipAllowsLegacyHotShrink) {
+        TFixture fixture(6, 8, 7);
+        TTransition transition;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, transition));
+        {
+            auto guard = TSharedCacheTestAccess::LockHotResize(*fixture.Cache);
+            UNIT_ASSERT(guard);
+            const ui32 target = static_cast<ui32>(TSharedCacheTestAccess::EffectiveHotSlots(*fixture.Cache) - 1);
+            UNIT_ASSERT(TSharedCacheTestAccess::BeginHotResize(*fixture.Cache, target));
+        }
+        while (TSharedCacheTestAccess::HotResizePhase(*fixture.Cache) == EHotResizePhase::Cut) {
+            UNIT_ASSERT(TSharedCacheTestAccess::DrainHotResize(*fixture.Cache));
+        }
+        UNIT_ASSERT(TSharedCacheTestAccess::OwnsCapacityTransition(*fixture.Cache, transition));
+        UNIT_ASSERT(!TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, transition));
+        UNIT_ASSERT(TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
+    }
+
+    Y_UNIT_TEST(PublishedCapacityAbandonmentKeepsSpaceClosed) {
+        TFixture fixture(6, 8, 7);
+        TTransition transition;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, transition));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
+        UNIT_ASSERT(TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, transition));
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::AbandonedForShutdown);
+        UNIT_ASSERT(!TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
+        UNIT_ASSERT(!TSharedCacheTestAccess::OwnsCapacityTransition(*fixture.Cache, transition));
+        TTransition next;
+        UNIT_ASSERT(!TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, next));
+        UNIT_ASSERT(!TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
+        UNIT_ASSERT(!TSharedCacheTestAccess::CommitTransition(*fixture.Cache, transition));
+    }
+
+    Y_UNIT_TEST(CapacityOwnershipSurvivesReleaseRetry) {
+        TFixture fixture(11, 8, 11);
+        TSharedCacheCapacity target;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(
+            10, fixture.Capacity.ExpectedPageSize, fixture.Capacity.FixedBytes, fixture.Space->HazardCount(), target));
+        TTransition shrink;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 10));
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
+        while (shrink.Phase() == ETransitionPhase::FinalDrain) {
+            UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, shrink));
+        }
+        auto failRelease = [](ESpaceMap, const void*, size_t) noexcept {
+            return false;
+        };
+        UNIT_ASSERT(!TSharedCacheTestAccess::TryReleaseTransitionWithHook(*fixture.Cache, shrink, failRelease));
+        UNIT_ASSERT(shrink.Phase() == ETransitionPhase::ReleaseRetry);
+        UNIT_ASSERT(TSharedCacheTestAccess::OwnsCapacityTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(!TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
+        UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::OwnsCapacityTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
     }
     Y_UNIT_TEST(ColdReclaimSkipsEmptyRingAndFindsSparseEntry) {
         TFixture fixture;
