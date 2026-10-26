@@ -78,6 +78,24 @@ public:
         return space.AdvanceSpaceGeneration();
     }
 
+    static bool TryDrainBefore(TSharedCacheSpace& space, ui32 generation, ui32& cursor) noexcept {
+        return space.TryDrainBefore(generation, cursor);
+    }
+
+    static void SetHazardDrainNotify(TSharedCacheSpace& space, TCacheNotify notify) noexcept {
+        space.HazardDrainNotify_ = notify;
+    }
+
+    static TSpaceOperation BeginOnHazard(TSharedCacheSpace& space, ui32 index) noexcept {
+        return TSpaceOperation::Begin(space.SpaceState_, Hazard(space, index), space.SpaceViews_);
+    }
+
+    template <class TCallback>
+    static TSpaceOperation BeginOnHazardWithHook(TSharedCacheSpace& space, ui32 index, TCallback&& callback) noexcept {
+        return TSpaceOperation::BeginWithHook(
+            space.SpaceState_, Hazard(space, index), space.SpaceViews_, std::forward<TCallback>(callback));
+    }
+
     template <class TCallback>
     static ui32 TryAllocateHandle(TSharedCacheSpace& space, TSpaceOperation& operation, TCallback& callback) noexcept {
         return space.TryAllocateHandleWithHook(operation, {
@@ -850,6 +868,104 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         }
         UNIT_ASSERT_VALUES_EQUAL(
             SpaceHazardActiveCount(TSharedCacheSpaceTestAccess::Hazard(*space, 0).State.load()), 1);
+    }
+
+    Y_UNIT_TEST(GenerationDrainResumesAtFirstBlockedHazard) {
+        TSharedCacheCapacity capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 3, capacity));
+        auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 3);
+        UNIT_ASSERT(space);
+        ui32 notifications = 0;
+        TSharedCacheSpaceTestAccess::SetHazardDrainNotify(*space, { &notifications, [](void* context) noexcept {
+                                                                       ++*static_cast<ui32*>(context);
+                                                                   } });
+        auto first = MakeHolder<TSpaceOperation>(TSharedCacheSpaceTestAccess::BeginOnHazard(*space, 0));
+        auto second = MakeHolder<TSpaceOperation>(TSharedCacheSpaceTestAccess::BeginOnHazard(*space, 1));
+        auto third = MakeHolder<TSpaceOperation>(TSharedCacheSpaceTestAccess::BeginOnHazard(*space, 2));
+        first.Reset();
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+
+        ui32 cursor = 0;
+        UNIT_ASSERT(!TSharedCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+        UNIT_ASSERT_VALUES_EQUAL(cursor, 1);
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::Hazard(*space, 1).State.load() & SpaceHazardDrainWaiter);
+        second.Reset();
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        UNIT_ASSERT(!TSharedCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+        UNIT_ASSERT_VALUES_EQUAL(cursor, 2);
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::Hazard(*space, 2).State.load() & SpaceHazardDrainWaiter);
+        third.Reset();
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 2);
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+        UNIT_ASSERT_VALUES_EQUAL(cursor, 3);
+
+        auto current = MakeHolder<TSpaceOperation>(TSharedCacheSpaceTestAccess::BeginOnHazard(*space, 0));
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+        cursor = 0;
+        UNIT_ASSERT(!TSharedCacheSpaceTestAccess::TryDrainBefore(*space, 2, cursor));
+        UNIT_ASSERT_VALUES_EQUAL(cursor, 0);
+        current.Reset();
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 3);
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::TryDrainBefore(*space, 2, cursor));
+        UNIT_ASSERT_VALUES_EQUAL(cursor, 3);
+    }
+
+    Y_UNIT_TEST(GenerationDrainKeepsNestedWaiterUntilLastExit) {
+        TSharedCacheCapacity capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
+        UNIT_ASSERT(space);
+        ui32 notifications = 0;
+        TSharedCacheSpaceTestAccess::SetHazardDrainNotify(*space, { &notifications, [](void* context) noexcept {
+                                                                       ++*static_cast<ui32*>(context);
+                                                                   } });
+        auto outer = MakeHolder<TSpaceOperation>(TSharedCacheSpaceTestAccess::BeginOnHazard(*space, 0));
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+        auto nested = MakeHolder<TSpaceOperation>(TSharedCacheSpaceTestAccess::BeginOnHazard(*space, 0));
+        UNIT_ASSERT_VALUES_EQUAL(nested->EntryGeneration(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(SpaceHazardGeneration(outer->Hazard().State.load()), 0);
+
+        ui32 cursor = 0;
+        UNIT_ASSERT(!TSharedCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+        nested.Reset();
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 0);
+        UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(outer->Hazard().State.load()), 1);
+        UNIT_ASSERT(outer->Hazard().State.load() & SpaceHazardDrainWaiter);
+        UNIT_ASSERT(!TSharedCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+        outer.Reset();
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+        UNIT_ASSERT_VALUES_EQUAL(cursor, 1);
+    }
+
+    Y_UNIT_TEST(GenerationDrainWakesAfterRejectedOldRegistration) {
+        TSharedCacheCapacity capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
+        UNIT_ASSERT(space);
+        ui32 notifications = 0;
+        TSharedCacheSpaceTestAccess::SetHazardDrainNotify(*space, { &notifications, [](void* context) noexcept {
+                                                                       ++*static_cast<ui32*>(context);
+                                                                   } });
+        ui32 hookCalls = 0;
+        ui32 cursor = 0;
+        bool advanced = false;
+        bool blocked = false;
+        auto operation = TSharedCacheSpaceTestAccess::BeginOnHazardWithHook(*space, 0, [&]() noexcept {
+            if (++hookCalls == 1) {
+                advanced = TSharedCacheSpaceTestAccess::AdvanceSpaceGeneration(*space);
+                blocked = !TSharedCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor);
+            }
+        });
+        UNIT_ASSERT(advanced && blocked);
+        UNIT_ASSERT_VALUES_EQUAL(hookCalls, 2);
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(operation.EntryGeneration(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(cursor, 0);
+        UNIT_ASSERT(!(operation.Hazard().State.load() & SpaceHazardDrainWaiter));
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+        UNIT_ASSERT_VALUES_EQUAL(cursor, 1);
     }
 
     Y_UNIT_TEST(InitialMappingsAndFreeContents) {

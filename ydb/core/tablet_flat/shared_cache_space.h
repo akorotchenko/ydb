@@ -788,6 +788,9 @@ private:
 
     void ResetHazardScan(TTransition& transition) noexcept;
 
+    // Resume the cursor only for the same published generation
+    bool TryDrainBefore(ui32 publishedGeneration, ui32& nextHazardIndex) noexcept;
+
     static ui32 HotLevelForSlot(ui64 slot, ui64 hotSlotCount) noexcept;
 
     template <bool WithHook>
