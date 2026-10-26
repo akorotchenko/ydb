@@ -172,6 +172,145 @@ void CompleteFinalDrain(TSharedCacheSpace& space, TTransition& transition) {
     UNIT_ASSERT(transition.Phase() == ETransitionPhase::Release);
 }
 
+Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
+    Y_UNIT_TEST(StandbyHasOneSlotInEachLevel) {
+        constexpr THotRingLayout layout{ 8, 4, 4 };
+        static_assert(layout.IsValid());
+        static_assert(layout.Ring(ECacheTier::Regular, EHotLevel::L3).Offset == 0);
+        static_assert(layout.Ring(ECacheTier::Keep, EHotLevel::L0).Offset == 4);
+        static_assert(layout.Ring(ECacheTier::Keep, EHotLevel::L3).End() == 8);
+        for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+            for (auto level : { EHotLevel::L0, EHotLevel::L1, EHotLevel::L2, EHotLevel::L3 }) {
+                UNIT_ASSERT_VALUES_EQUAL(layout.Ring(tier, level).Size, 1);
+            }
+        }
+    }
+
+    Y_UNIT_TEST(LevelPlacementLeavesAnUntouchedGap) {
+        constexpr THotRingLayout layout{ 160, 64, 64 };
+        const std::array<ui64, 4> regularOffsets{ 33, 12, 4, 0 };
+        const std::array<ui64, 4> keepOffsets{ 96, 127, 148, 156 };
+        const std::array<ui64, 4> sizes{ 31, 21, 8, 4 };
+        std::array<std::atomic<ui64>, 160> slots{};
+        std::array<TRingCursor, 8> cursors;
+        const auto gap = layout.Gap();
+        UNIT_ASSERT_VALUES_EQUAL(gap.Offset, 64);
+        UNIT_ASSERT_VALUES_EQUAL(gap.Size, 32);
+        for (ui64 index = gap.Offset; index < gap.End(); ++index) {
+            slots[index].store(99);
+        }
+        for (ui32 tier = 0; tier < 2; ++tier) {
+            for (ui32 level = 0; level < 4; ++level) {
+                const auto range = layout.Ring(static_cast<ECacheTier>(tier), static_cast<EHotLevel>(level));
+                UNIT_ASSERT_VALUES_EQUAL(range.Offset, (tier ? keepOffsets : regularOffsets)[level]);
+                UNIT_ASSERT_VALUES_EQUAL(range.Size, sizes[level]);
+                UNIT_ASSERT(range.End() <= slots.size());
+                TRingView view{ &cursors[tier * 4 + level], slots.data() + range.Offset, range.Size };
+                for (ui64 index = 0; index < range.Size; ++index) {
+                    const auto value = 100 * (tier * 4 + level + 1) + index;
+                    const auto result = view.Cursor->Push(view.Slots, view.Capacity, value);
+                    UNIT_ASSERT_VALUES_EQUAL(result.Previous, 0);
+                    UNIT_ASSERT(result.Slot == slots.data() + range.Offset + index);
+                }
+                for (ui64 index = 0; index < range.Size; ++index) {
+                    UNIT_ASSERT_VALUES_EQUAL(view.Pop(), 100 * (tier * 4 + level + 1) + index);
+                }
+            }
+        }
+        for (ui64 index = gap.Offset; index < gap.End(); ++index) {
+            UNIT_ASSERT_VALUES_EQUAL(slots[index].load(), 99);
+        }
+    }
+
+    Y_UNIT_TEST(SmallLayoutsCoverEachTierExactly) {
+        for (ui64 regular = 4; regular <= 64; ++regular) {
+            for (ui64 keep = 4; keep <= 64; ++keep) {
+                for (ui64 gap = 0; gap <= 3; ++gap) {
+                    const THotRingLayout layout{ regular + keep + gap, regular, keep };
+                    UNIT_ASSERT(layout.IsValid());
+                    std::array<ui8, 131> owners{};
+                    for (ui32 tier = 0; tier < 2; ++tier) {
+                        const auto span = layout.Tier(static_cast<ECacheTier>(tier));
+                        ui64 count = 0;
+                        for (ui32 level = 0; level < 4; ++level) {
+                            const auto range =
+                                layout.Ring(static_cast<ECacheTier>(tier), static_cast<EHotLevel>(level));
+                            UNIT_ASSERT(range.Size > 0);
+                            UNIT_ASSERT(range.Offset >= span.Offset && range.End() <= span.End());
+                            count += range.Size;
+                            for (ui64 index = range.Offset; index < range.End(); ++index) {
+                                UNIT_ASSERT_VALUES_EQUAL(owners[index], 0);
+                                owners[index] = static_cast<ui8>(tier + 1);
+                            }
+                        }
+                        UNIT_ASSERT_VALUES_EQUAL(count, span.Size);
+                    }
+                    for (ui64 index = 0; index < layout.ArenaSlots; ++index) {
+                        const ui8 expected = index < regular ? 1 : index < regular + gap ? 0 : 2;
+                        UNIT_ASSERT_VALUES_EQUAL(owners[index], expected);
+                    }
+                }
+            }
+        }
+    }
+
+    Y_UNIT_TEST(ExistingRegularLayoutIsPreserved) {
+        std::array<std::atomic<ui64>, 512> slots{};
+        TS5FifoRings cursors;
+        TSpaceView view;
+        view.HotSlots = slots.data();
+        view.Rings = &cursors;
+        for (ui64 count = 15; count <= slots.size(); ++count) {
+            view.HotSlotCount = count;
+            const THotRingLayout layout{ count + 4, count, 4 };
+            for (ui32 level = 0; level < 4; ++level) {
+                const auto existing = view.Hot(level);
+                const auto range = layout.Ring(ECacheTier::Regular, static_cast<EHotLevel>(level));
+                UNIT_ASSERT_VALUES_EQUAL(range.Size, existing.Capacity);
+                UNIT_ASSERT(existing.Slots == slots.data() + range.Offset);
+            }
+        }
+    }
+
+    Y_UNIT_TEST(TierRangesStayNestedAtFixedArenaSize) {
+        constexpr THotRingLayout original{ 192, 64, 64 };
+        constexpr THotRingLayout growingKeep{ 192, 48, 80 };
+        constexpr THotRingLayout shrinkingKeep{ 192, 80, 48 };
+        static_assert(growingKeep.Tier(ECacheTier::Regular).End() == 48);
+        static_assert(growingKeep.Tier(ECacheTier::Keep).Offset == 112);
+        static_assert(growingKeep.Ring(ECacheTier::Keep, EHotLevel::L3).End() == 192);
+        UNIT_ASSERT(growingKeep.Tier(ECacheTier::Keep).Offset < original.Tier(ECacheTier::Keep).Offset);
+        UNIT_ASSERT(shrinkingKeep.Tier(ECacheTier::Keep).Offset > original.Tier(ECacheTier::Keep).Offset);
+        UNIT_ASSERT_VALUES_EQUAL(shrinkingKeep.Tier(ECacheTier::Keep).End(), 192);
+        constexpr THotRingLayout largerArena{ 384, 64, 64 };
+        static_assert(largerArena.Tier(ECacheTier::Keep).Offset == 320);
+        UNIT_ASSERT_VALUES_EQUAL(original.Tier(ECacheTier::Keep).Offset, 128);
+    }
+
+    Y_UNIT_TEST(InvalidLayoutsAndLargeCounts) {
+        for (const auto layout :
+            { THotRingLayout{}, THotRingLayout{ 7, 4, 4 }, THotRingLayout{ 16, 3, 4 }, THotRingLayout{ 16, 4, 3 },
+                THotRingLayout{ 16, 17, 4 }, THotRingLayout{ Max<ui64>(), Max<ui64>(), 4 } }) {
+            UNIT_ASSERT(!layout.IsValid());
+        }
+        for (const auto layout :
+            { THotRingLayout{ Max<ui64>(), Max<ui64>() - 4, 4 }, THotRingLayout{ Max<ui64>(), 4, Max<ui64>() - 4 } }) {
+            UNIT_ASSERT(layout.IsValid());
+            for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+                const auto span = layout.Tier(tier);
+                ui64 count = 0;
+                for (auto level : { EHotLevel::L0, EHotLevel::L1, EHotLevel::L2, EHotLevel::L3 }) {
+                    const auto range = layout.Ring(tier, level);
+                    UNIT_ASSERT(range.Offset >= span.Offset && range.End() <= span.End());
+                    count += range.Size;
+                }
+                UNIT_ASSERT_VALUES_EQUAL(count, span.Size);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(layout.Gap().Size, 0);
+        }
+    }
+}
+
 Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(StableMappingCancellationAndRegrowthPreserveLivePrefix) {
         const size_t small = NSystemInfo::GetPageSize() * 2;

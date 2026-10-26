@@ -13,13 +13,6 @@ class TSharedCacheItemRefImpl;
 template <class TTraits>
 class TOperationItemRef;
 
-enum class EHotLevel : ui32 {
-    L0,
-    L1,
-    L2,
-    L3,
-};
-
 template <class TTraits>
 class TCacheEviction {
 public:
