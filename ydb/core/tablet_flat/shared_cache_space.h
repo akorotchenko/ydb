@@ -41,6 +41,48 @@ constexpr bool SharedCacheHotLayoutIsValid(ui64 hotSlotCount) noexcept {
     return l0Size && l1Size && l2Size && l3Size;
 }
 
+enum class ECacheTier : ui8 {
+    Regular,
+    Keep,
+};
+
+enum class EHotLevel : ui32 {
+    L0,
+    L1,
+    L2,
+    L3,
+};
+
+struct THotRingRange {
+    ui64 Offset = 0;
+    ui64 Size = 0;
+
+    constexpr ui64 End() const noexcept {
+        return Offset + Size;
+    }
+};
+
+struct THotRingLayout {
+    static constexpr ui64 MinimumTierSlots = 4;
+
+    ui64 ArenaSlots = 0;
+    ui64 RegularSlots = 0;
+    ui64 KeepSlots = 0;
+
+    constexpr bool IsValid() const noexcept {
+        return RegularSlots >= MinimumTierSlots && KeepSlots >= MinimumTierSlots && RegularSlots <= ArenaSlots &&
+               KeepSlots <= ArenaSlots - RegularSlots;
+    }
+
+    constexpr THotRingRange Tier(ECacheTier tier) const noexcept;
+    constexpr THotRingRange Ring(ECacheTier tier, EHotLevel level) const noexcept;
+
+    constexpr THotRingRange Gap() const noexcept {
+        Y_DEBUG_ABORT_UNLESS(IsValid());
+        return { RegularSlots, ArenaSlots - RegularSlots - KeepSlots };
+    }
+};
+
 struct TSharedCacheCapacity {
     ui8 AddressBits = 0;
     ui64 Limit = 0;
@@ -1082,6 +1124,29 @@ constexpr ui32 TBucketResizeState::SplitBit() const noexcept {
     }
     const ui8 bits = Direction() == EBucketResize::Growing ? OldAddressBits() : NewAddressBits();
     return ui32{ 1 } << bits;
+}
+
+constexpr THotRingRange THotRingLayout::Tier(ECacheTier tier) const noexcept {
+    Y_DEBUG_ABORT_UNLESS(IsValid());
+    Y_DEBUG_ABORT_UNLESS(tier == ECacheTier::Regular || tier == ECacheTier::Keep);
+    return tier == ECacheTier::Regular ? THotRingRange{ 0, RegularSlots }
+                                       : THotRingRange{ ArenaSlots - KeepSlots, KeepSlots };
+}
+
+constexpr THotRingRange THotRingLayout::Ring(ECacheTier tier, EHotLevel level) const noexcept {
+    const auto range = Tier(tier);
+    const ui32 index = static_cast<ui32>(level);
+    Y_DEBUG_ABORT_UNLESS(index < 4);
+    // 7:5:2:1 weights, with one slot per level even in a four-slot standby tier
+    const ui64 l3 = Max<ui64>(1, range.Size / 15);
+    const ui64 l2 = Max<ui64>(1, (range.Size / 15) * 2 + ((range.Size % 15) * 2) / 15);
+    const ui64 l1 = Max<ui64>(1, range.Size / 3);
+    const ui64 l0 = range.Size - l3 - l2 - l1;
+    const ui64 sizes[]{ l0, l1, l2, l3 };
+    const ui64 regularOffsets[]{ l3 + l2 + l1, l3 + l2, l3, 0 };
+    const ui64 keepOffsets[]{ 0, l0, l0 + l1, l0 + l1 + l2 };
+    const ui64 offset = tier == ECacheTier::Regular ? regularOffsets[index] : keepOffsets[index];
+    return { range.Offset + offset, sizes[index] };
 }
 
 Y_FORCE_INLINE TRingView TSpaceView::Hot(ui32 level) const noexcept {
