@@ -20,6 +20,7 @@ public:
     }
 
     bool Prepare(size_t targetSize, void*& pointer) const noexcept {
+        pointer = nullptr;
         if (targetSize == 0 || targetSize > ReservedSize_) {
             return false;
         }
@@ -27,10 +28,12 @@ public:
         return true;
     }
 
-    void Cancel(size_t targetSize) noexcept {
-        if (targetSize > CurrentSize_) {
-            Evict(CurrentSize_, targetSize);
-        }
+    bool Cancel(size_t targetSize) noexcept {
+        return targetSize <= CurrentSize_ || Evict(CurrentSize_, targetSize);
+    }
+
+    void SetTestHook(TTestHook hook) noexcept {
+        TestHook_ = hook;
     }
 
     void Publish(size_t size) noexcept {
@@ -62,6 +65,9 @@ private:
         if (begin == end) {
             return true;
         }
+        if (!TestHook_.Run(ETestStep::DiscardTail)) {
+            return false;
+        }
         try {
             MadviseEvict(Allocation_.Begin() + begin, end - begin);
             return true;
@@ -71,6 +77,7 @@ private:
     }
 
 private:
+    TTestHook TestHook_;
     TMappedAllocation Allocation_;
     size_t CurrentSize_ = 0;
     size_t ReservedSize_ = 0;
@@ -90,10 +97,16 @@ bool TSharedCacheMapping::Prepare(size_t targetSize, void*& pointer) noexcept {
     return Impl_->Prepare(targetSize, pointer);
 }
 
-void TSharedCacheMapping::Cancel(void* pointer, size_t targetSize) noexcept {
-    if (pointer) {
-        Impl_->Cancel(targetSize);
+bool TSharedCacheMapping::Cancel(void*& pointer, size_t targetSize) noexcept {
+    if (!Impl_->Cancel(targetSize)) {
+        return false;
     }
+    pointer = nullptr;
+    return true;
+}
+
+void TSharedCacheMapping::SetTestHook(TTestHook hook) noexcept {
+    Impl_->SetTestHook(hook);
 }
 
 void TSharedCacheMapping::Publish(void*, size_t size) noexcept {

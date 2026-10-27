@@ -248,6 +248,7 @@ enum class ETransitionPhase {
     Idle,
     Prepare,
     InitializeGrowth,
+    CancelRetry,
     PublishMigration,
     MigrationDrain,
     Migrate,
@@ -257,6 +258,14 @@ enum class ETransitionPhase {
     ReleaseRetry,
     Commit,
     AbandonedForShutdown,
+};
+
+// Preparation requires a fresh Idle transition; CleanupPending retains its ownership
+// until AbandonTransition acknowledges complete cleanup
+enum class [[nodiscard]] EPrepareResult {
+    Rejected,
+    Prepared,
+    CleanupPending,
 };
 
 enum class ESpaceMap : ui8 {
@@ -718,7 +727,7 @@ public:
     bool BeginHotResize(ui32 targetEffectiveHotSlots, THotResize& resize) noexcept;
     bool DrainHotResize(THotResize& resize, ui32& level, ui64& raw) noexcept;
 
-    bool PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept;
+    EPrepareResult PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept;
 
     bool PublishMigrationView(TTransition& transition) noexcept;
 
@@ -788,7 +797,7 @@ private:
 
     bool PublishMigrationViewWithHook(TTransition& transition, TPublishMigrationViewHook hook) noexcept;
 
-    bool PrepareTransitionWithHook(
+    EPrepareResult PrepareTransitionWithHook(
         const TSharedCacheCapacity& target, TTransition& transition, TPrepareHook hook) noexcept;
 
     bool TryReleaseTransitionWithHook(TTransition& transition, TReleaseHook hook) noexcept;
@@ -808,7 +817,8 @@ private:
     bool PublishMigrationViewImpl(TTransition& transition, TPublishMigrationViewHook hook) noexcept;
 
     template <bool WithHook>
-    bool PrepareTransitionImpl(const TSharedCacheCapacity& target, TTransition& transition, TPrepareHook hook) noexcept;
+    EPrepareResult PrepareTransitionImpl(
+        const TSharedCacheCapacity& target, TTransition& transition, TPrepareHook hook) noexcept;
 
     template <bool WithHook>
     bool TryReleaseTransitionImpl(TTransition& transition, TReleaseHook hook) noexcept;
@@ -834,7 +844,7 @@ private:
     // Legacy bindings until policy migration: Regular has Hot/shared Cold; Keep has only KeepCold
     static void SetLegacyTierSlotCounts(TSpaceView& view, const TSharedCacheCapacity& capacity) noexcept;
 
-    void CancelPreparedView(TSpaceView& view) noexcept;
+    bool CancelPreparedView(TTransition& transition) noexcept;
 
     void PublishPreparedView(THolder<TSpaceView> view, THolder<TSpaceView>& oldView) noexcept;
 

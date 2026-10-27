@@ -1,5 +1,6 @@
 #include <ydb/core/tablet_flat/shared_cache_thread_test.h>
 #include "shared_cache.h"
+#include "shared_cache_mapping_test.h"
 #include "shared_cache_traits.h"
 
 #include <ydb/core/testlib/actor_helpers.h>
@@ -165,7 +166,19 @@ public:
         cache.ReleaseReservation(bytes);
     }
 
-    static bool PrepareTransition(
+    static TSharedCacheMapping& BucketsMapping(TTestSharedCache& cache) noexcept {
+        return cache.Space_->BucketsMapping_;
+    }
+
+    static void SetCapacityTarget(TTestSharedCache& cache, const TSharedCacheCapacity& target) noexcept {
+        cache.Capacity_.SetTarget(target);
+    }
+
+    static TTransition& CapacityTransition(TTestSharedCache& cache) noexcept {
+        return cache.Capacity_.Transition_;
+    }
+
+    static EPrepareResult PrepareTransition(
         TTestSharedCache& cache, const TSharedCacheCapacity& target, TTransition& transition) noexcept {
         return cache.Capacity_.PrepareTransition(target, transition);
     }
@@ -1392,7 +1405,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture(6, 8, grow ? 7 : 6);
         TTransition growth;
         if (grow) {
-            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                        EPrepareResult::Prepared);
             UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
             UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         }
@@ -3112,7 +3126,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             }
         };
         fillHandles();
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         do {
             UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
         } while (growth.Phase() == ETransitionPhase::InitializeGrowth);
@@ -3458,7 +3473,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(!spare.IsNull() && spare.Index() >= target.HandleCount());
         }
         TTransition shrink;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, shrink));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, shrink) == EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, target.AddressBits));
@@ -3498,7 +3514,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
             fixture.Cache->DisarmResourceWait();
         };
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         if (finalDrain) {
             UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
             UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
@@ -3598,7 +3615,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TSharedCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
             fixture.Cache->DisarmResourceWait();
         };
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         TTestTraits hooks{ &notifications, [](void* context, ESharedCacheHookPoint point, TCacheItem) noexcept {
                               if (point == ESharedCacheHookPoint::ResourcesAvailable) {
                                   ++*static_cast<ui32*>(context);
@@ -6119,7 +6137,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         };
 
         TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -6174,7 +6193,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, growth));
 
         TTransition shrink;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.Capacity, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.Capacity, shrink) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 6));
@@ -6223,8 +6243,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TFixture fixture(6, 8, 7, reserved.Limit);
             if (!growing) {
                 TTransition growth;
-                UNIT_ASSERT(
-                    TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(
+                                *fixture.Cache, fixture.ReservedCapacity, growth) == EPrepareResult::Prepared);
                 UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
                 UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
                 UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -6235,7 +6255,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(fixture.ReservedCapacity.Limit));
             const auto& target = growing ? fixture.ReservedCapacity : fixture.Capacity;
             TTransition transition;
-            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, transition) ==
+                        EPrepareResult::Prepared);
             UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
             UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
             UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, target.AddressBits));
@@ -6283,7 +6304,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture(6, 8, 7, reserved.Limit);
         UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(fixture.ReservedCapacity.Limit));
         TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         {
             auto lock = TSharedCacheTestAccess::LockHotResize(*fixture.Cache);
             UNIT_ASSERT(lock);
@@ -6349,8 +6371,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TFixture fixture(6, 8, 7);
             if (!growing) {
                 TTransition growth;
-                UNIT_ASSERT(
-                    TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+                UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(
+                                *fixture.Cache, fixture.ReservedCapacity, growth) == EPrepareResult::Prepared);
                 UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
                 UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
                 UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -6359,7 +6381,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             }
             const auto& target = growing ? fixture.ReservedCapacity : fixture.Capacity;
             TTransition transition;
-            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, transition) ==
+                        EPrepareResult::Prepared);
             UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
             UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
             UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, target.AddressBits));
@@ -6449,7 +6472,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 0);
 
             TTransition growth;
-            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                        EPrepareResult::Prepared);
             UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
             UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
             UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -6562,7 +6586,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::SpareItem(*fixture.Cache, 7), 0);
 
         TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -6613,7 +6638,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture(6, 8, 7);
 
         TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -6650,7 +6676,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         }
 
         TTransition shrink;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.Capacity, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.Capacity, shrink) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 6));
@@ -6671,7 +6698,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TFixture fixture(6, 8, 7);
 
         TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -6706,7 +6734,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(fixture.Capacity.Limit));
         TTransition shrink;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.Capacity, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.Capacity, shrink) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 6));
@@ -6729,7 +6758,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Capacity.StaticBytes);
 
         TTransition canceled;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, canceled));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, canceled) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(!TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.Capacity.StaticBytes);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), growthDelta);
@@ -6741,7 +6771,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Capacity.StaticBytes);
 
         TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -6754,7 +6785,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.ReservedCapacity.StaticBytes);
 
         TTransition shrink;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.Capacity, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.Capacity, shrink) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticBytes(), fixture.ReservedCapacity.StaticBytes);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.ReservedCapacity.StaticBytes);
@@ -6770,6 +6802,109 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Capacity.StaticBytes);
     }
 
+    Y_UNIT_TEST(CapacityCleanupRetainsOwnerAndReservationUntilAcknowledged) {
+        using EStep = TSharedCacheMappingTestAccess::EStep;
+        TFixture fixture(6, 8, 7);
+        auto& mapping = TSharedCacheTestAccess::BucketsMapping(*fixture.Cache);
+        bool failCleanup = true;
+        ui32 maps = 0;
+        auto hook = [&](EStep step) noexcept {
+            if (step == EStep::Map) {
+                ++maps;
+            }
+            if (step == EStep::AfterMap) {
+                return false;
+            }
+            return !failCleanup || (step != EStep::Unmap && step != EStep::ShrinkBacking && step != EStep::DiscardTail);
+        };
+        TSharedCacheMappingTestAccess::SetHook(mapping, hook);
+        TTransition transition;
+        // Register cleanup before any assertion can unwind the retained owner
+        Y_DEFER {
+            TSharedCacheMappingTestAccess::ClearHook(mapping);
+            if (transition.Phase() != ETransitionPhase::Idle) {
+                TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, transition);
+            }
+        };
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        const auto result =
+            TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, transition);
+        if (maps == 0) {
+            return;
+        }
+        UNIT_ASSERT(result == EPrepareResult::CleanupPending);
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::CancelRetry);
+        const ui64 pending = fixture.ReservedCapacity.StaticBytes - fixture.Capacity.StaticBytes;
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), pending);
+        UNIT_ASSERT(TSharedCacheTestAccess::OwnsCapacityTransition(*fixture.Cache, transition));
+        UNIT_ASSERT(!TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
+        UNIT_ASSERT(!TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, transition));
+        TTransition contender;
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, contender) ==
+                    EPrepareResult::Rejected);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), pending);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        failCleanup = false;
+        UNIT_ASSERT(TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, transition));
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::Idle);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
+        UNIT_ASSERT(TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT(!TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, transition));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+    }
+
+    Y_UNIT_TEST(FailedCapacityPreparationAndCleanupYieldToPeriodicRetry) {
+        using EStep = TSharedCacheMappingTestAccess::EStep;
+        for (bool delayed : { false, true }) {
+            TFixture fixture(6, 8, 7);
+            auto& mapping = TSharedCacheTestAccess::BucketsMapping(*fixture.Cache);
+            bool failCleanup = delayed;
+            ui32 prepares = 0;
+            auto hook = [&](EStep step) noexcept {
+                if (step == EStep::Map) {
+                    ++prepares;
+                }
+                return step != EStep::AfterMap &&
+                       (!failCleanup ||
+                           (step != EStep::Unmap && step != EStep::ShrinkBacking && step != EStep::DiscardTail));
+            };
+            TSharedCacheMappingTestAccess::SetHook(mapping, hook);
+            auto& transition = TSharedCacheTestAccess::CapacityTransition(*fixture.Cache);
+            Y_DEFER {
+                TSharedCacheMappingTestAccess::ClearHook(mapping);
+                if (transition.Phase() != ETransitionPhase::Idle) {
+                    TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, transition);
+                }
+            };
+            TSharedCacheTestAccess::SetCapacityTarget(*fixture.Cache, fixture.ReservedCapacity);
+            const ui64 generation = fixture.Cache->AdmissionGeneration();
+            const bool moreWork = fixture.Cache->RunMaintenance();
+            if (prepares == 0) {
+                return;
+            }
+            UNIT_ASSERT(!moreWork);
+            if (!delayed) {
+                UNIT_ASSERT(transition.Phase() == ETransitionPhase::Idle);
+                UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
+                UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+                continue;
+            }
+            UNIT_ASSERT(transition.Phase() == ETransitionPhase::CancelRetry);
+            for (ui32 attempt = 0; attempt < 3; ++attempt) {
+                UNIT_ASSERT(!fixture.Cache->RunMaintenance());
+            }
+            UNIT_ASSERT_VALUES_EQUAL(prepares, 1);
+            failCleanup = false;
+            UNIT_ASSERT(!fixture.Cache->RunMaintenance());
+            UNIT_ASSERT(transition.Phase() == ETransitionPhase::Idle);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(prepares, 1);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        }
+    }
+
     Y_UNIT_TEST(CapacityPreparationExcludesOtherResizeOwners) {
         TFixture fixture(6, 8, 7);
         TTransition first;
@@ -6777,25 +6912,29 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         {
             auto guard = TSharedCacheTestAccess::LockHotResize(*fixture.Cache);
             UNIT_ASSERT(guard);
-            UNIT_ASSERT(!TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, first));
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, first) ==
+                        EPrepareResult::Rejected);
         }
         UNIT_ASSERT(first.Phase() == ETransitionPhase::Idle);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
         auto invalid = fixture.ReservedCapacity;
         ++invalid.ExpectedPageSize;
-        UNIT_ASSERT(!TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, invalid, first));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, invalid, first) == EPrepareResult::Rejected);
         UNIT_ASSERT(TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, first));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, first) ==
+                    EPrepareResult::Prepared);
         const ui64 pendingBytes = fixture.Cache->StaticDeltaBytes();
         UNIT_ASSERT(TSharedCacheTestAccess::OwnsCapacityTransition(*fixture.Cache, first));
         UNIT_ASSERT(!TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
-        UNIT_ASSERT(!TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, second));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, second) ==
+                    EPrepareResult::Rejected);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), pendingBytes);
 
         auto [foreignThreads, foreignSpace] =
             TCacheThreadTestAccess::MakeSpace(fixture.Capacity, fixture.ReservedCapacity, 1);
         UNIT_ASSERT(foreignSpace);
-        UNIT_ASSERT(foreignSpace->PrepareTransition(fixture.ReservedCapacity, second));
+        UNIT_ASSERT(foreignSpace->PrepareTransition(fixture.ReservedCapacity, second) == EPrepareResult::Prepared);
         UNIT_ASSERT(!TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, second));
         UNIT_ASSERT(!TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, second));
         UNIT_ASSERT(!TSharedCacheTestAccess::CommitTransition(*fixture.Cache, second));
@@ -6810,7 +6949,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
     Y_UNIT_TEST(CapacityOwnershipAllowsLegacyHotShrink) {
         TFixture fixture(6, 8, 7);
         TTransition transition;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, transition));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, transition) ==
+                    EPrepareResult::Prepared);
         {
             auto guard = TSharedCacheTestAccess::LockHotResize(*fixture.Cache);
             UNIT_ASSERT(guard);
@@ -6829,14 +6969,16 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
     Y_UNIT_TEST(PublishedCapacityAbandonmentKeepsSpaceClosed) {
         TFixture fixture(6, 8, 7);
         TTransition transition;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, transition));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, transition) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
         UNIT_ASSERT(TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, transition));
         UNIT_ASSERT(transition.Phase() == ETransitionPhase::AbandonedForShutdown);
         UNIT_ASSERT(!TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
         UNIT_ASSERT(!TSharedCacheTestAccess::OwnsCapacityTransition(*fixture.Cache, transition));
         TTransition next;
-        UNIT_ASSERT(!TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, next));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, next) ==
+                    EPrepareResult::Rejected);
         UNIT_ASSERT(!TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
         UNIT_ASSERT(!TSharedCacheTestAccess::CommitTransition(*fixture.Cache, transition));
     }
@@ -6847,7 +6989,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TryCalculateSharedCacheFootprint(
             10, fixture.Capacity.ExpectedPageSize, fixture.Capacity.FixedBytes, fixture.Space->HazardCount(), target));
         TTransition shrink;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, shrink));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, shrink) == EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 10));
@@ -9319,7 +9462,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, low.Index()).IsCold());
 
         TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -9388,7 +9532,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         TTransition growth;
         if (grow) {
-            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                        EPrepareResult::Prepared);
             UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
             UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         }
@@ -9475,7 +9620,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, low));
 
         TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -9531,7 +9677,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         candidates.pop_back();
         UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), 1);
         TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -9615,7 +9762,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
         }
         TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -9724,7 +9872,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                         EStickyState::None, waiter, hit, fetch) == ESharedCacheResultStatus::Inserted);
         const auto page = fetch.CacheItem();
         TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -9974,7 +10123,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         };
         TTransition growth;
         if (grow) {
-            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                        EPrepareResult::Prepared);
             UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
             UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         }
@@ -10148,7 +10298,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         TTransition growth;
         if (grow) {
-            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                        EPrepareResult::Prepared);
             UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
             UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         }
@@ -10253,7 +10404,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const ui64 pageBytes = 4096 + NActors::TSharedData::OverheadSize;
 
         TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -10382,7 +10534,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const ui64 pageBytes = 4096 + NActors::TSharedData::OverheadSize;
 
         TTransition growth;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 7));
@@ -10390,7 +10543,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         CommitTransition(*fixture.Cache, growth);
 
         TTransition shrink;
-        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.Capacity, shrink));
+        UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.Capacity, shrink) ==
+                    EPrepareResult::Prepared);
         UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, shrink));
         UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, 6));
@@ -12238,7 +12392,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
         for (const auto* target : { &fixture.ReservedCapacity, &fixture.Capacity, &fixture.ReservedCapacity }) {
             TTransition transition;
-            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, *target, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, *target, transition) ==
+                        EPrepareResult::Prepared);
             UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
             UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
             UNIT_ASSERT(TSharedCacheTestAccess::BeginBucketResize(*fixture.Cache, target->AddressBits));

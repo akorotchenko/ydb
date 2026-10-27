@@ -68,6 +68,7 @@ public:
     }
 
     bool Prepare(size_t targetSize, void*& pointer) noexcept {
+        pointer = nullptr;
         if (targetSize == 0 || targetSize > ReservedSize_) {
             return false;
         }
@@ -76,7 +77,6 @@ public:
             return true;
         }
 
-        const size_t oldBackingSize = BackingSize_;
         if (targetSize > BackingSize_ && !ResizeBacking(targetSize)) {
             return false;
         }
@@ -84,30 +84,27 @@ public:
             pointer = CurrentPointer_;
             return true;
         }
-        if (!Map(targetSize, pointer)) {
-            if (BackingSize_ != oldBackingSize) {
-                ResizeBacking(oldBackingSize);
-            }
-            return false;
-        }
-        return true;
+        return Map(targetSize, pointer);
     }
 
-    void Cancel(void* pointer, size_t targetSize) noexcept {
+    bool Cancel(void*& pointer, size_t targetSize) noexcept {
         if (StableAddress_) {
             Y_DEBUG_ABORT_UNLESS(!pointer || pointer == CurrentPointer_);
-            if (pointer && BackingSize_ > CurrentSize_) {
-                ResizeBacking(CurrentSize_);
+            pointer = nullptr;
+        } else if (pointer == CurrentPointer_) {
+            // Same-size preparation borrows the published mapping
+            pointer = nullptr;
+        } else if (pointer) {
+            if (!Unmap(pointer, targetSize)) {
+                return false;
             }
-            return;
+            pointer = nullptr;
         }
-        if (!pointer || pointer == CurrentPointer_ && targetSize == CurrentSize_) {
-            return;
-        }
-        Unmap(pointer, targetSize);
-        if (BackingSize_ > CurrentSize_) {
-            ResizeBacking(CurrentSize_);
-        }
+        return BackingSize_ <= CurrentSize_ || ResizeBacking(CurrentSize_);
+    }
+
+    void SetTestHook(TTestHook hook) noexcept {
+        TestHook_ = hook;
     }
 
     void Publish(void* pointer, size_t size) noexcept {
@@ -159,7 +156,8 @@ public:
 
 private:
     bool ResizeBacking(size_t size) noexcept {
-        if (size > static_cast<size_t>(Max<i64>()) || !Backing_.Resize(static_cast<i64>(size))) {
+        if (!TestHook_.Run(size > BackingSize_ ? ETestStep::GrowBacking : ETestStep::ShrinkBacking) ||
+            size > static_cast<size_t>(Max<i64>()) || !Backing_.Resize(static_cast<i64>(size))) {
             return false;
         }
         BackingSize_ = size;
@@ -167,6 +165,15 @@ private:
     }
 
     bool Map(size_t size, void*& pointer) noexcept {
+        // Reserve bookkeeping before mmap so every created alias remains discoverable
+        try {
+            Views_.reserve(Views_.size() + 1);
+        } catch (...) {
+            return false;
+        }
+        if (!TestHook_.Run(ETestStep::Map)) {
+            return false;
+        }
         int flags = MAP_SHARED;
 #if defined(_freebsd_)
         flags |= MAP_NOCORE;
@@ -175,26 +182,23 @@ private:
         if (view == MAP_FAILED) {
             return false;
         }
+        Views_.push_back({ view, size });
+        pointer = view;
+        if (!TestHook_.Run(ETestStep::AfterMap)) {
+            return false;
+        }
 #if defined(_linux_)
         try {
             MadviseExcludeFromCoreDump(view, size);
         } catch (...) {
-            munmap(view, size);
             return false;
         }
 #endif
-        try {
-            Views_.push_back({ view, size });
-        } catch (...) {
-            munmap(view, size);
-            return false;
-        }
-        pointer = view;
         return true;
     }
 
     bool Unmap(void* pointer, size_t size) noexcept {
-        if (munmap(pointer, size) != 0) {
+        if (!TestHook_.Run(ETestStep::Unmap) || munmap(pointer, size) != 0) {
             return false;
         }
         for (auto it = Views_.begin(); it != Views_.end(); ++it) {
@@ -207,6 +211,7 @@ private:
     }
 
 private:
+    TTestHook TestHook_;
     const bool StableAddress_;
     TFileHandle Backing_;
     void* CurrentPointer_ = nullptr;
@@ -230,8 +235,12 @@ bool TSharedCacheMapping::Prepare(size_t targetSize, void*& pointer) noexcept {
     return Impl_->Prepare(targetSize, pointer);
 }
 
-void TSharedCacheMapping::Cancel(void* pointer, size_t targetSize) noexcept {
-    Impl_->Cancel(pointer, targetSize);
+bool TSharedCacheMapping::Cancel(void*& pointer, size_t targetSize) noexcept {
+    return Impl_->Cancel(pointer, targetSize);
+}
+
+void TSharedCacheMapping::SetTestHook(TTestHook hook) noexcept {
+    Impl_->SetTestHook(hook);
 }
 
 void TSharedCacheMapping::Publish(void* pointer, size_t size) noexcept {

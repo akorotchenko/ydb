@@ -42,7 +42,7 @@ private:
     friend class TSharedCacheTestAccess;
 
     // Capacity transitions
-    bool PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept;
+    EPrepareResult PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept;
 
     bool PublishMigrationView(TTransition& transition) noexcept;
 
