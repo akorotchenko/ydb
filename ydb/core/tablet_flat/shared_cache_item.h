@@ -25,6 +25,13 @@ inline constexpr ui32 KeepColdQueuedMask = ui32{ 1 } << 31;
 inline constexpr ui32 MaxHandleRefs = (ui32{ 1 } << 24) - 1;
 inline constexpr ui32 ResizeMarkerIndex = 1;
 
+enum ECacheTier : ui8 {
+    Regular,
+    Keep,
+};
+
+inline constexpr ui32 CacheTierCount = 2;
+
 enum class EItemKind : ui8 {
     Page = 0,
     Collection = 1,
@@ -53,11 +60,13 @@ enum class EHandleState : ui8 {
     BucketSplit,
     Tombstone,
     WaitingForMemory,
+    KeepHot,
 };
 
 static_assert(static_cast<ui8>(EItemKind::Collection) <= 0x1);
 static_assert(static_cast<ui8>(EStickyState::Transition) <= 0x3);
 static_assert(static_cast<ui8>(EHandleState::WaitingForMemory) <= 0xF);
+static_assert(static_cast<ui8>(EHandleState::KeepHot) <= 0xF);
 
 constexpr bool IsPending(EHandleState state) noexcept {
     return (state >= EHandleState::Begin && state <= EHandleState::QueuedRequested) ||
@@ -65,8 +74,8 @@ constexpr bool IsPending(EHandleState state) noexcept {
 }
 
 constexpr bool IsReady(EHandleState state) noexcept {
-    return state == EHandleState::Hot || state == EHandleState::Cold || state == EHandleState::KeepCold ||
-           state == EHandleState::Sticky;
+    return state == EHandleState::Hot || state == EHandleState::KeepHot || state == EHandleState::Cold ||
+           state == EHandleState::KeepCold || state == EHandleState::Sticky;
 }
 
 class THandleState;
@@ -272,6 +281,22 @@ public:
         return State() == EHandleState::KeepCold;
     }
 
+    constexpr bool IsHotInTier(ECacheTier tier) const noexcept {
+        return State() == HotState(tier);
+    }
+
+    constexpr bool IsColdInTier(ECacheTier tier) const noexcept {
+        return State() == ColdState(tier);
+    }
+
+    // Only Hot/Cold cache states carry a tier
+    constexpr ECacheTier Tier() const noexcept {
+        Y_DEBUG_ABORT_UNLESS(IsHotInTier(ECacheTier::Regular) || IsHotInTier(ECacheTier::Keep) ||
+                             IsColdInTier(ECacheTier::Regular) || IsColdInTier(ECacheTier::Keep));
+        return State() == EHandleState::KeepHot || State() == EHandleState::KeepCold ? ECacheTier::Keep
+                                                                                     : ECacheTier::Regular;
+    }
+
     constexpr bool IsSticky() const noexcept {
         return State() == EHandleState::Sticky;
     }
@@ -340,6 +365,14 @@ public:
         return Replace(StateMask, StateShift, ui64(value));
     }
 
+    constexpr THandleState WithHot(ECacheTier tier) const noexcept {
+        return WithState(HotState(tier));
+    }
+
+    constexpr THandleState WithCold(ECacheTier tier) const noexcept {
+        return WithState(ColdState(tier));
+    }
+
     constexpr THandleState WithKind(EItemKind value) const noexcept {
         return Replace(KindMask, KindShift, ui64(value));
     }
@@ -367,6 +400,16 @@ public:
     friend constexpr bool operator==(const THandleState&, const THandleState&) noexcept = default;
 
 private:
+    static constexpr EHandleState HotState(ECacheTier tier) noexcept {
+        Y_DEBUG_ABORT_UNLESS(tier < CacheTierCount);
+        return tier == ECacheTier::Keep ? EHandleState::KeepHot : EHandleState::Hot;
+    }
+
+    static constexpr EHandleState ColdState(ECacheTier tier) noexcept {
+        Y_DEBUG_ABORT_UNLESS(tier < CacheTierCount);
+        return tier == ECacheTier::Keep ? EHandleState::KeepCold : EHandleState::Cold;
+    }
+
     explicit constexpr THandleState(ui64 raw) noexcept
         : Raw_(raw)
     {}

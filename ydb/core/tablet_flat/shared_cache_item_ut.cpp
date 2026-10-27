@@ -61,6 +61,59 @@ Y_UNIT_TEST_SUITE(TSharedCacheItemTest) {
         UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 42);
     }
 
+    Y_UNIT_TEST(TierReadyTagsPreservePackedFields) {
+        static_assert(sizeof(THandleState) == sizeof(ui64));
+        static_assert(ui8(EHandleState::Hot) == 7);
+        static_assert(ui8(EHandleState::KeepCold) == 8);
+        static_assert(ui8(EHandleState::Cold) == 9);
+        static_assert(ui8(EHandleState::WaitingForMemory) == 14);
+        static_assert(ui8(EHandleState::KeepHot) == 15);
+        for (ui32 version : { ui32{ 0 }, MaxItemVersion }) {
+            for (auto kind : { EItemKind::Page, EItemKind::Collection }) {
+                for (ui8 frequency = 0; frequency < 4; ++frequency) {
+                    for (auto sticky : { EStickyState::None, EStickyState::Sticky, EStickyState::Transition }) {
+                        for (ui32 refs : { ui32{ 0 }, ui32{ 1 }, MaxHandleRefs }) {
+                            const auto base =
+                                THandleState::Make(version, EHandleState::Cold, kind, frequency, sticky, refs);
+                            for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+                                const auto hot = base.WithHot(tier);
+                                const auto cold = hot.WithCold(tier);
+                                const auto other = tier == ECacheTier::Regular ? ECacheTier::Keep : ECacheTier::Regular;
+                                UNIT_ASSERT(hot.IsHotInTier(tier) && !hot.IsHotInTier(other));
+                                UNIT_ASSERT(cold.IsColdInTier(tier) && !cold.IsColdInTier(other));
+                                UNIT_ASSERT(hot.IsReady() && cold.IsReady());
+                                UNIT_ASSERT(!hot.IsPending() && !cold.IsPending());
+                                UNIT_ASSERT(hot.Tier() == tier && cold.Tier() == tier);
+                                UNIT_ASSERT_VALUES_EQUAL((hot.Raw() ^ base.Raw()) & ~THandleState::StateMask, 0);
+                                UNIT_ASSERT_VALUES_EQUAL((cold.Raw() ^ base.Raw()) & ~THandleState::StateMask, 0);
+                                UNIT_ASSERT(cold.WithHot(tier) == hot);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Y_UNIT_TEST(TierReadyTagsKeepCurrentPredicatesNarrow) {
+        constexpr auto base = THandleState::Make(
+            MaxItemVersion, EHandleState::Cold, EItemKind::Page, 2, EStickyState::None, MaxHandleRefs);
+        constexpr auto regularHot = base.WithHot(ECacheTier::Regular);
+        constexpr auto keepHot = base.WithHot(ECacheTier::Keep);
+        constexpr auto regularCold = base.WithCold(ECacheTier::Regular);
+        constexpr auto keepCold = base.WithCold(ECacheTier::Keep);
+        static_assert(regularHot.IsHot() && !keepHot.IsHot());
+        static_assert(regularCold.IsCold() && !keepCold.IsCold());
+        static_assert(keepCold.IsKeepCold());
+        static_assert(keepHot.IsHotInTier(ECacheTier::Keep));
+        static_assert(keepCold.IsColdInTier(ECacheTier::Keep));
+        static_assert(keepHot.Tier() == ECacheTier::Keep);
+        static_assert(keepCold.Tier() == ECacheTier::Keep);
+        static_assert(regularHot.Tier() == ECacheTier::Regular);
+        static_assert(regularCold.Tier() == ECacheTier::Regular);
+        static_assert(TCacheItem::Make(MaxItemVersion, 2).Matches(keepHot));
+    }
+
     Y_UNIT_TEST(HandleStateRefs) {
         const auto base = THandleState::Make(7, EHandleState::Hot, EItemKind::Page, 2, EStickyState::None, 1);
 

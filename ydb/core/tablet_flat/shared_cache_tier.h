@@ -8,6 +8,8 @@
 
 namespace NKikimr::NSharedCache {
 
+enum ECacheTier : ui8;
+
 enum EHotLevel : ui32 {
     L0,
     L1,
@@ -86,6 +88,7 @@ struct TCacheTierView {
     TCacheRingStorageView HotStorage;
     TCacheRingStorageView ColdStorage;
     std::atomic<ui64>* EffectiveHotSlots = nullptr;
+    ECacheTier Id{};
 
     Y_FORCE_INLINE ui64 EffectiveHotSlotCount() const noexcept {
         const ui64 effective =
