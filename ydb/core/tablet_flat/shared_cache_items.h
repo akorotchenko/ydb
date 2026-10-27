@@ -366,6 +366,9 @@ Y_FORCE_INLINE bool TCacheItems<TTraits>::TryReleaseItemRef(
         handle.Body.Collection->StickyPageListHead.load(std::memory_order_acquire) != 0;
     const TLogoBlobID collectionId = notifyCollectionRelease ? handle.Body.Collection->Id() : TLogoBlobID{};
     const THandleState desired = expected.DecrementRefs();
+    if (publishCold) {
+        Cache_.InvokeHook(ESharedCacheHookPoint::BeforeLastColdRefRelease, cacheItem);
+    }
     if (handle.State.compare_exchange_weak(
             expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
     {
@@ -375,6 +378,8 @@ Y_FORCE_INLINE bool TCacheItems<TTraits>::TryReleaseItemRef(
         }
         Cache_.UpdateColdReclaimable(coldBytes, expected, desired);
         if (publishCold) {
+            // Acquire membership updates carried by earlier reference releases after a refcount ABA
+            std::atomic_thread_fence(std::memory_order_acquire);
             const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire);
             cacheOp.Eviction().RouteCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, cacheItem.Index()));
         } else if (lastKeepColdRef) {

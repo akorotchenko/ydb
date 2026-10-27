@@ -8171,6 +8171,47 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->RetainedBytes(), 20 * fixture.PageBytes);
     }
 
+    Y_UNIT_TEST(LastColdReleasePublishesAfterRefcountABA) {
+        TColdPoolFixture fixture;
+        auto held = fixture.Fetch(0);
+        const auto page = held.CacheItem();
+        const auto before = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+        const ui32 coldVersion = TSharedCacheTestAccess::ColdVersion(*fixture.Cache, page.Index());
+        UNIT_ASSERT(before.IsCold() && before.Refs() == 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 0);
+        TSharedCacheGate gate;
+        gate.Slots[0].Arm(ESharedCacheHookPoint::BeforeLastColdRefRelease, page.CacheItem());
+        TSharedCacheHookGuard hookGuard(*fixture.Cache, gate.Hooks);
+        auto cache = fixture.Cache;
+        TGateThread releaser(gate, [&] {
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
+            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
+            Y_DEFER {
+                NSharedCache::TlsCacheHazard = nullptr;
+            };
+            held.Drop();
+        });
+        gate.Slots[0].Wait();
+        TTestSharedPageRef other;
+        UNIT_ASSERT(cache->Find(fixture.Regular, 0, other) == ESharedCacheResultStatus::Hit);
+        const auto acquired = TSharedCacheTestAccess::HandleState(*cache, page.Index());
+        UNIT_ASSERT(acquired.IsCold() && acquired.Refs() == 2);
+        UNIT_ASSERT_VALUES_EQUAL(
+            TSharedCacheTestAccess::ColdVersion(*cache, page.Index()), AdvanceColdVersion(coldVersion));
+        other.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*cache, page.Index()).Raw(), before.Raw());
+        UNIT_ASSERT_VALUES_EQUAL(cache->ColdRingEntries(), 0);
+        gate.Slots[0].Release();
+        releaser.Join();
+        UNIT_ASSERT_VALUES_EQUAL(cache->ColdRingEntries(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(cache->ColdReclaimableItems(), 1);
+        UNIT_ASSERT(cache->ReclaimCold());
+        UNIT_ASSERT_VALUES_EQUAL(cache->ColdRingEntries(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache->ColdBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache->RetainedBytes(), 20 * fixture.PageBytes);
+        UNIT_ASSERT(cache->Find(fixture.Regular, 0, other) == ESharedCacheResultStatus::Miss);
+    }
+
     Y_UNIT_TEST(CurrentPressureReclaimsOrdinaryColdBeforeProtectedKeep) {
         TColdPoolFixture fixture;
         auto first = fixture.Fetch(0);
