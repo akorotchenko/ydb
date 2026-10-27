@@ -19,6 +19,13 @@ enum EHotLevel : ui32 {
 
 inline constexpr ui32 HotLevelCount = 4;
 
+struct TCacheTierCapacity {
+    ui64 HotSlots = 0;
+    ui64 ColdSlots = 0;
+
+    constexpr bool operator==(const TCacheTierCapacity&) const noexcept = default;
+};
+
 struct THotRingRange {
     ui64 Offset = 0;
     ui64 Size = 0;

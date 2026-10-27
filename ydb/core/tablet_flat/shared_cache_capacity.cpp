@@ -97,16 +97,18 @@ bool TCacheCapacity<TTraits>::FinalDrain(TTransition& transition) noexcept {
     auto evictionOp = Cache_.Eviction_.BindOperation(spaceOp);
     return Cache_.Space_->FinalDrain(
         transition,
-        [&](ui32 level, ui64 raw) noexcept {
-            evictionOp.RouteHot(static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
+        [&](ECacheTier tier, EHotLevel level, ui64 raw) noexcept {
+            // The production retention policy still uses only Regular Hot
+            Y_DEBUG_ABORT_UNLESS(tier == ECacheTier::Regular);
+            evictionOp.RouteHot(level, TCacheItem::FromRaw(raw));
         },
-        [&](ui64 raw) noexcept {
-            spaceOp.View().Tiers[ECacheTier::Regular].Rings->RemoveColdEntry();
-            evictionOp.RouteCold(TColdCacheItem::FromRaw(raw));
-        },
-        [&](ui64 raw) noexcept {
-            spaceOp.View().Tiers[ECacheTier::Keep].Rings->RemoveColdEntry();
-            evictionOp.RouteKeepCold(TColdCacheItem::FromRaw(raw));
+        [&](ECacheTier tier, ui64 raw) noexcept {
+            spaceOp.View().Tiers[tier].Rings->RemoveColdEntry();
+            if (tier == ECacheTier::Regular) {
+                evictionOp.RouteCold(TColdCacheItem::FromRaw(raw));
+            } else {
+                evictionOp.RouteKeepCold(TColdCacheItem::FromRaw(raw));
+            }
         });
 }
 

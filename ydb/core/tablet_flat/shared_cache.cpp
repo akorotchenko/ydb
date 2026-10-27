@@ -118,6 +118,13 @@ TIntrusivePtr<TSharedCache> TSharedCache::Create(THolder<TSharedCacheSpace> spac
     if (!space || hardLimit == 0 || hardLimit > space->ReservedConfiguration().Limit) {
         return {};
     }
+    const auto& capacity = space->CurrentConfiguration();
+    // Paired routing/accounting must be activated together with the new policy
+    if (capacity.Tiers[ECacheTier::Regular] !=
+            TCacheTierCapacity{ capacity.HotSlotCount(), capacity.ColdSlotCount() } ||
+        capacity.Tiers[ECacheTier::Keep] != TCacheTierCapacity{ 0, capacity.KeepColdSlotCount() }) {
+        return {};
+    }
     Y_DEBUG_ABORT_UNLESS(Policy_.CurrentLimitGap >= 0.0 && Policy_.CurrentLimitGap < 1.0 && Policy_.ColdMin >= 0.0 &&
                          Policy_.ColdMin < Policy_.Grow && Policy_.Grow <= 1.0 && Policy_.KeepColdMaxShare > 0.0 &&
                          Policy_.KeepColdMaxShare < 1.0 && Policy_.ResizeStep > 0.0 && Policy_.ResizeStep <= 1.0 &&
