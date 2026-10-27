@@ -70,6 +70,18 @@ struct TCacheTierView {
     TCacheTierRings* Rings = nullptr;
     TCacheRingStorageView HotStorage;
     TCacheRingStorageView ColdStorage;
+    std::atomic<ui64>* EffectiveHotSlots = nullptr;
+
+    Y_FORCE_INLINE ui64 EffectiveHotSlotCount() const noexcept {
+        const ui64 effective =
+            EffectiveHotSlots ? EffectiveHotSlots->load(std::memory_order_relaxed) : HotStorage.SlotCount;
+        return std::min(effective, HotStorage.SlotCount);
+    }
+
+    Y_FORCE_INLINE bool IsAllowedHotSlot(const std::atomic<ui64>* slot) const noexcept {
+        Y_DEBUG_ABORT_UNLESS(slot >= HotStorage.Slots && slot < HotStorage.Slots + HotStorage.SlotCount);
+        return static_cast<ui64>(slot - HotStorage.Slots) < EffectiveHotSlotCount();
+    }
 
     Y_FORCE_INLINE TRingView Hot(EHotLevel level) const noexcept;
 
@@ -104,7 +116,7 @@ constexpr THotRingRange THotRingLayout::Ring(EHotLevel level) const noexcept {
 
 Y_FORCE_INLINE TRingView TCacheTierView::Hot(EHotLevel level) const noexcept {
     Y_DEBUG_ABORT_UNLESS(Rings && HotStorage.Slots);
-    const auto range = THotRingLayout{ HotStorage.SlotCount }.Ring(level);
+    const auto range = THotRingLayout{ EffectiveHotSlotCount() }.Ring(level);
     return { &Rings->Hot(level), HotStorage.Slots + range.Offset, range.Size };
 }
 

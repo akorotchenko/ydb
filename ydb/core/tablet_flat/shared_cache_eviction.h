@@ -1,5 +1,6 @@
 #pragma once
 
+#include "shared_cache_hot_policy.h"
 #include "shared_cache_memory.h"
 #include "shared_cache_space.h"
 #include "shared_cache_traits.h"
@@ -20,6 +21,7 @@ public:
 
     explicit TCacheEviction(TSharedCacheImpl<TTraits>& cache) noexcept
         : Cache_(cache)
+        , HotPolicy_(cache)
     {}
 
     Y_FORCE_INLINE TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
@@ -69,6 +71,7 @@ public:
 
 private:
     friend class TCacheEvictionOperation<TTraits>;
+    friend class TCacheHotPolicy<TTraits>;
     friend class TSharedCacheTestAccess;
 
     // KeepCold routing
@@ -83,31 +86,29 @@ private:
         TSpaceOperation& spaceOp, TOperationItemRef<TTraits>& itemRef, ui32 initialColdVersion) noexcept;
 
     // Hot routing and eviction
-    TCacheItem PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
-    template <bool Preload, bool Requeue = false>
-    TCacheItem PutHotImpl(
-        TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item, TRingExchangeResult* placement = nullptr) noexcept;
-
-    Y_FORCE_INLINE void RouteHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept {
-        const TCacheItem displaced = PutHot(spaceOp, level, item);
-        if (!displaced.IsNull()) {
-            ProcessHot(spaceOp, level, displaced);
-        }
+    Y_FORCE_INLINE TCacheItem PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept {
+        return HotPolicy_.PutHot(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular], level, item);
     }
 
-    static Y_FORCE_INLINE bool TakeHotFrequency(
-        THandle& handle, TCacheItem item, THandleState& state, ui8& frequency) noexcept;
+    Y_FORCE_INLINE void RouteHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept {
+        HotPolicy_.RouteHot(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular], level, item);
+    }
+
     Y_FORCE_INLINE void CompleteHotEviction(TSpaceOperation& spaceOp, THandle& handle, THandleState coldState,
         ui64 bytes, TOperationItemRef<TTraits>& itemRef, ui32 initialColdVersion) noexcept;
-    void ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
-    template <bool Preload>
-    void ProcessHotImpl(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
+    bool TryEvictHot(TSpaceOperation& spaceOp, THandle& handle, THandleState state,
+        TOperationItemRef<TTraits>& evictionRef) noexcept;
+
+    Y_FORCE_INLINE void ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept {
+        HotPolicy_.ProcessHot(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular], level, item);
+    }
     bool EvictFromHot(TSpaceOperation& spaceOp, ui32 index) noexcept;
     bool EvictFromHot(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem item, bool force = false) noexcept;
-    bool ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept;
-    template <bool Preload>
-    bool ProcessHotBatch(TSpaceOperation& spaceOp) noexcept;
+
+    Y_FORCE_INLINE bool ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept {
+        return HotPolicy_.ProcessBatch(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular]);
+    }
 
     // Cold routing and reclamation
     void CompleteColdPageRelease(TOperationItemRef<TTraits>& ownerRef) noexcept;
@@ -156,6 +157,7 @@ private:
 private:
     // Dependencies
     TSharedCacheImpl<TTraits>& Cache_;
+    TCacheHotPolicy<TTraits> HotPolicy_;
 
     // Policy resizing state
     ui64 ColdByteBudget_ = Max<ui64>(); // Protected by the shared HotResize lock; watermark calculation input

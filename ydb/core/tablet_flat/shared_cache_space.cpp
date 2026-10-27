@@ -50,8 +50,8 @@ void TSharedCacheSpace::PrepareView(ui32 generation, TSpaceView view) noexcept {
     for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
         view.Tiers[tier].Rings = &S5FifoRings_->Tier(tier);
     }
+    view.Tiers[ECacheTier::Regular].EffectiveHotSlots = &EffectiveHotSlots_;
     view.FreeCursor = FreeRingCursor_.Get();
-    view.EffectiveHotSlots = &EffectiveHotSlots_;
     SpaceViews_[generation % SpaceViewBankCount] = view;
 }
 

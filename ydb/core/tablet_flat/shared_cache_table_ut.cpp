@@ -7833,6 +7833,29 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(0));
         checkWatermarks();
     }
+    Y_UNIT_TEST(HotPolicyUsesTheSuppliedTierView) {
+        TFixture fixture;
+        TCacheHotPolicy<TTestTraits> policy(*fixture.Cache);
+        std::array<std::atomic<ui64>, 64> firstSlots{};
+        std::array<std::atomic<ui64>, 32> secondSlots{};
+        TCacheTierRings firstRings;
+        TCacheTierRings secondRings;
+        const TCacheTierView first{ &firstRings, { firstSlots.data(), sizeof(firstSlots), firstSlots.size() }, {} };
+        const TCacheTierView second{ &secondRings, { secondSlots.data(), sizeof(secondSlots), secondSlots.size() },
+            {} };
+        TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
+            ui32 index = 2;
+            for (auto level : { EHotLevel::L0, EHotLevel::L1, EHotLevel::L2, EHotLevel::L3 }) {
+                const auto a = TCacheItem::Make(1, index++);
+                const auto b = TCacheItem::Make(1, index++);
+                UNIT_ASSERT(policy.PutHot(spaceOp, first, level, a).IsNull());
+                UNIT_ASSERT(policy.PutHot(spaceOp, second, level, b).IsNull());
+                UNIT_ASSERT_VALUES_EQUAL(first.Hot(level).Slots[0].load(), a.Raw());
+                UNIT_ASSERT_VALUES_EQUAL(second.Hot(level).Slots[0].load(), b.Raw());
+            }
+        });
+    }
+
     Y_UNIT_TEST(ProductionHotMinimumFitsOneBoundedPass) {
         constexpr ui32 hotSlots = SharedCachePolicyFor<TProdTraits>.MinHotSlots;
         UNIT_ASSERT(hotSlots >= 64 && hotSlots <= 1024);

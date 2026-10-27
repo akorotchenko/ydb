@@ -215,65 +215,6 @@ void TCacheEviction<TTraits>::ReleaseKeepColdRef(
 }
 
 template <class TTraits>
-TCacheItem TCacheEviction<TTraits>::PutHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept {
-    return PutHotImpl<false>(spaceOp, level, item);
-}
-
-template <class TTraits>
-template <bool Preload, bool Requeue>
-TCacheItem TCacheEviction<TTraits>::PutHotImpl(
-    TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem, TRingExchangeResult* placement) noexcept {
-    const TRingExchangeResult exchange = [&]() noexcept {
-        if constexpr (Preload) {
-            const auto hot = spaceOp.Hot(level);
-            auto* slot = Requeue ? hot.SelectPushSlot() : hot.SelectPutSlot();
-            return ExchangeForPreload(spaceOp, slot, cacheItem.Raw(), false);
-        } else {
-            return spaceOp.Hot(level).PutAndPopWithHook(cacheItem.Raw(), [&]() noexcept {
-                Cache_.InvokeHook(ESharedCacheHookPoint::BeforeHotExchange, cacheItem);
-            });
-        }
-    }();
-    if constexpr (Preload) {
-        if (placement) {
-            *placement = exchange;
-        }
-        if (!exchange.Slot) {
-            return cacheItem;
-        }
-    }
-    // The operation protects the mapping; a concurrent cut may still exclude this slot.
-    if (!spaceOp.IsAllowedHotSlot(exchange.Slot)) {
-        ui64 expected = cacheItem.Raw();
-        if (exchange.Slot->compare_exchange_strong(expected, 0, std::memory_order_relaxed, std::memory_order_relaxed))
-        {
-            EvictFromHot(spaceOp, cacheItem);
-        }
-    }
-    return TCacheItem::FromRaw(exchange.Previous);
-}
-
-template <class TTraits>
-Y_FORCE_INLINE bool TCacheEviction<TTraits>::TakeHotFrequency(
-    THandle& handle, TCacheItem cacheItem, THandleState& state, ui8& frequency) noexcept {
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        if (!cacheItem.Matches(expected) || !expected.IsHot() || !expected.IsStickyNoneField()) {
-            return false;
-        }
-        const THandleState desired = expected.WithFrequency(0);
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed))
-        {
-            state = desired;
-            frequency = expected.Frequency();
-            return true;
-        }
-    }
-}
-
-template <class TTraits>
 Y_FORCE_INLINE void TCacheEviction<TTraits>::CompleteHotEviction(TSpaceOperation& spaceOp, THandle& handle,
     THandleState coldState, ui64 bytes, TOperationItemRef<TTraits>& itemRef, ui32 initialColdVersion) noexcept {
     Y_DEBUG_ABORT_UNLESS(coldState.Refs() > 0);
@@ -299,79 +240,26 @@ Y_FORCE_INLINE void TCacheEviction<TTraits>::CompleteHotEviction(TSpaceOperation
 }
 
 template <class TTraits>
-void TCacheEviction<TTraits>::ProcessHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept {
-    ProcessHotImpl<false>(spaceOp, level, item);
-}
-
-template <class TTraits>
-template <bool Preload>
-void TCacheEviction<TTraits>::ProcessHotImpl(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem cacheItem) noexcept {
-    for (;;) {
-        TOperationItemRef<TTraits> evictionRef(
-            spaceOp, Cache_.Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
-        if (!evictionRef) {
-            return;
-        }
-        THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-        THandleState state;
-        ui8 frequency;
-        if (!TakeHotFrequency(handle, cacheItem, state, frequency)) {
-            return;
-        }
-        const EHotLevel sourceLevel = level;
-
-        if (frequency == 0) {
-            if (level != EHotLevel::L0) {
-                level = EHotLevel::L0;
-            } else {
-                ui64 hotRaw = state.Raw();
-                const ui64 bytes = TCacheItems<TTraits>::PayloadBytes(handle, state.Kind());
-                const bool keep = state.IsPageKind() && state.Refs() == 1 && WantsKeepCold(spaceOp, handle);
-                if (keep) {
-                    Cache_.Memory_.AddKeepColdOwnedBytes(bytes);
-                }
-                const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
-                const THandleState cold = state.WithState(keep ? EHandleState::KeepCold : EHandleState::Cold);
-                if (handle.State.compare_exchange_strong(
-                        hotRaw, cold.Raw(), std::memory_order_relaxed, std::memory_order_relaxed))
-                {
-                    CompleteHotEviction(spaceOp, handle, cold, bytes, evictionRef, coldVersion);
-                    return;
-                }
-
-                if (keep) {
-                    Cache_.Memory_.ReleaseKeepColdOwnedBytes(bytes);
-                }
-
-                level = EHotLevel::L0;
-            }
-        } else {
-            level = level >= EHotLevel::L2 && frequency > 1 ? EHotLevel::L3 : EHotLevel::L2;
-        }
-
-        evictionRef.Drop();
-        TRingExchangeResult placement;
-        TCacheItem displaced = PutHotImpl<Preload>(spaceOp, level, cacheItem, &placement);
-        if constexpr (Preload) {
-            // Retry the source tier when protected pages block promotion
-            if (!placement.Slot && frequency != 0) {
-                const ui64 attempts = spaceOp.Hot(sourceLevel).Capacity;
-                for (ui64 attempt = 0; attempt < attempts; ++attempt) {
-                    displaced = PutHotImpl<true, true>(spaceOp, sourceLevel, cacheItem, &placement);
-                    if (placement.Slot) {
-                        level = sourceLevel;
-                        break;
-                    }
-                }
-            }
-        }
-        // The last ref may have notified while this token was still outside the ring
-        Cache_.NotifyResourcesAvailable();
-        if (displaced.IsNull()) {
-            return;
-        }
-        cacheItem = displaced;
+bool TCacheEviction<TTraits>::TryEvictHot(
+    TSpaceOperation& spaceOp, THandle& handle, THandleState state, TOperationItemRef<TTraits>& evictionRef) noexcept {
+    ui64 hotRaw = state.Raw();
+    const ui64 bytes = TCacheItems<TTraits>::PayloadBytes(handle, state.Kind());
+    const bool keep = state.IsPageKind() && state.Refs() == 1 && WantsKeepCold(spaceOp, handle);
+    if (keep) {
+        Cache_.Memory_.AddKeepColdOwnedBytes(bytes);
     }
+    const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
+    const THandleState cold = state.WithState(keep ? EHandleState::KeepCold : EHandleState::Cold);
+    if (handle.State.compare_exchange_strong(hotRaw, cold.Raw(), std::memory_order_relaxed, std::memory_order_relaxed))
+    {
+        CompleteHotEviction(spaceOp, handle, cold, bytes, evictionRef, coldVersion);
+        return true;
+    }
+
+    if (keep) {
+        Cache_.Memory_.ReleaseKeepColdOwnedBytes(bytes);
+    }
+    return false;
 }
 
 template <class TTraits>
@@ -458,32 +346,6 @@ bool TCacheEviction<TTraits>::PromoteCold(TSpaceOperation& spaceOp, TCacheItem c
         Cache_.Memory_.Hot().RemovePage(EItemKind::Page);
         Cache_.Memory_.ReleaseRetainedBytes(bytes);
     }
-}
-
-template <class TTraits>
-bool TCacheEviction<TTraits>::ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept {
-    return ProcessHotBatch<false>(spaceOp);
-}
-
-template <class TTraits>
-template <bool Preload>
-bool TCacheEviction<TTraits>::ProcessHotBatch(TSpaceOperation& spaceOp) noexcept {
-    bool progress = false;
-    // Give every level a share of the bounded work even when the lower rings are large or empty.
-    for (ui32 index = 0; index < HotLevelCount; ++index) {
-        const auto level = static_cast<EHotLevel>(index);
-        const TRingView hot = spaceOp.Hot(level);
-        const ui64 attempts = Min<ui64>(hot.Capacity, SharedCacheTransitionWorkBatch / HotLevelCount);
-        for (ui64 attempt = 0; attempt < attempts; ++attempt) {
-            const auto popped =
-                Preload ? PopForPreload(spaceOp, hot, false) : TRingExchangeResult{ nullptr, hot.Pop() };
-            if (popped.Previous != 0) {
-                ProcessHotImpl<Preload>(spaceOp, level, TCacheItem::FromRaw(popped.Previous));
-                progress = true;
-            }
-        }
-    }
-    return progress;
 }
 
 template <class TTraits>
@@ -763,7 +625,7 @@ bool TCacheEviction<TTraits>::ReclaimRegularPage(TSpaceOperation& spaceOp) noexc
         if (ReclaimColdImpl<true>(spaceOp)) {
             return true;
         }
-        if (!ProcessHotBatch<true>(spaceOp)) {
+        if (!HotPolicy_.ProcessPreloadBatch(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular])) {
             return false;
         }
         if (spaceOp.AvailableHandleCount() != 0) {
