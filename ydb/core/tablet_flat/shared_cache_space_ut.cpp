@@ -429,6 +429,34 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
         }
         UNIT_ASSERT_VALUES_EQUAL(total, layout.SlotCount);
     }
+
+    Y_UNIT_TEST(TierHotLimitsAreIndependentAndClampedByEachView) {
+        std::array<std::atomic<ui64>, 64> firstSlots{};
+        std::array<std::atomic<ui64>, 32> secondSlots{};
+        TCacheTierRings firstRings;
+        TCacheTierRings secondRings;
+        std::atomic<ui64> firstLimit = 32;
+        std::atomic<ui64> secondLimit = 16;
+        const TCacheTierView first{ &firstRings, { firstSlots.data(), sizeof(firstSlots), 64 }, {}, &firstLimit };
+        const TCacheTierView second{ &secondRings, { secondSlots.data(), sizeof(secondSlots), 32 }, {}, &secondLimit };
+        auto copied = first;
+        UNIT_ASSERT_VALUES_EQUAL(first.EffectiveHotSlotCount(), 32);
+        UNIT_ASSERT_VALUES_EQUAL(second.EffectiveHotSlotCount(), 16);
+        firstLimit.store(HotLevelCount);
+        for (auto level : { EHotLevel::L0, EHotLevel::L1, EHotLevel::L2, EHotLevel::L3 }) {
+            UNIT_ASSERT_VALUES_EQUAL(first.Hot(level).Capacity, 1);
+            UNIT_ASSERT_VALUES_EQUAL(copied.Hot(level).Capacity, 1);
+        }
+        UNIT_ASSERT(first.IsAllowedHotSlot(firstSlots.data() + HotLevelCount - 1));
+        UNIT_ASSERT(!first.IsAllowedHotSlot(firstSlots.data() + HotLevelCount));
+        UNIT_ASSERT_VALUES_EQUAL(second.EffectiveHotSlotCount(), 16);
+        firstLimit.store(128);
+        UNIT_ASSERT_VALUES_EQUAL(first.EffectiveHotSlotCount(), 64);
+        copied.HotStorage.SlotCount = 16;
+        UNIT_ASSERT_VALUES_EQUAL(copied.EffectiveHotSlotCount(), 16);
+        secondLimit.store(32);
+        UNIT_ASSERT_VALUES_EQUAL(second.EffectiveHotSlotCount(), 32);
+    }
 }
 
 Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
@@ -456,6 +484,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
         std::array<std::array<std::atomic<ui64>, 16>, CacheTierCount * 2> newSlots{};
         TS5FifoRings oldRings;
         TS5FifoRings newRings;
+        std::array<std::atomic<ui64>, CacheTierCount> oldLimits{};
+        std::array<std::atomic<ui64>, CacheTierCount> newLimits{};
         TSpaceView oldView;
         TSpaceView newView;
         for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
@@ -470,12 +500,15 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
                 { newSlots[index].data(), sizeof(newSlots[index]), 16 },
                 { newSlots[index + 1].data(), sizeof(newSlots[index + 1]), 16 },
             };
+            oldView.Tiers[tier].EffectiveHotSlots = &oldLimits[tier];
+            newView.Tiers[tier].EffectiveHotSlots = &newLimits[tier];
         }
         oldView.CopyMappings(newView);
         for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
             const ui32 index = tier * 2;
             const auto& view = oldView.Tiers[tier];
             UNIT_ASSERT(view.Rings == &oldRings.Tier(tier));
+            UNIT_ASSERT(view.EffectiveHotSlots == &oldLimits[tier]);
             UNIT_ASSERT(view.HotStorage.Slots == newSlots[index].data());
             UNIT_ASSERT(view.ColdStorage.Slots == newSlots[index + 1].data());
             UNIT_ASSERT_VALUES_EQUAL(view.HotStorage.Bytes, sizeof(newSlots[index]));

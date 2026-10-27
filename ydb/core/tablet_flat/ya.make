@@ -97,6 +97,7 @@ SRCS(
     shared_cache_eviction.cpp
     shared_cache_eviction_resize.cpp
     shared_cache_fetches.cpp
+    shared_cache_hot_policy.cpp
     shared_cache_items.cpp
     shared_cache_memory.cpp
     shared_cache_resize.cpp

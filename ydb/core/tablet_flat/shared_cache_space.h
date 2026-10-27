@@ -216,16 +216,13 @@ struct TSpaceView {
     ui64 ColdMinHandles = 0;
     ui64 ColdGrowHandles = 0;
     TFreeRingCursor* FreeCursor = nullptr;
-    std::atomic<ui64>* EffectiveHotSlots = nullptr;
 
     size_t HandlesBytes = 0;
     size_t BucketsBytes = 0;
     size_t FreeSlotBytes = 0;
 
     Y_FORCE_INLINE ui64 EffectiveHotSlotCount() const noexcept {
-        const ui64 maximum = Tiers[ECacheTier::Regular].HotStorage.SlotCount;
-        const ui64 effective = EffectiveHotSlots ? EffectiveHotSlots->load(std::memory_order_relaxed) : maximum;
-        return Min(effective, maximum);
+        return Tiers[ECacheTier::Regular].EffectiveHotSlotCount();
     }
 
     Y_FORCE_INLINE TRingView Hot(EHotLevel level) const noexcept;
@@ -588,9 +585,7 @@ public:
     }
 
     Y_FORCE_INLINE bool IsAllowedHotSlot(const std::atomic<ui64>* slot) const noexcept {
-        const auto& hot = View().Tiers[ECacheTier::Regular].HotStorage;
-        Y_DEBUG_ABORT_UNLESS(slot >= hot.Slots && slot < hot.Slots + hot.SlotCount);
-        return static_cast<ui64>(slot - hot.Slots) < View().EffectiveHotSlotCount();
+        return View().Tiers[ECacheTier::Regular].IsAllowedHotSlot(slot);
     }
 
     Y_FORCE_INLINE TRingView Cold() const noexcept {
@@ -1157,9 +1152,7 @@ constexpr ui32 TBucketResizeState::SplitBit() const noexcept {
 }
 
 Y_FORCE_INLINE TRingView TSpaceView::Hot(EHotLevel level) const noexcept {
-    TCacheTierView tier = Tiers[ECacheTier::Regular];
-    tier.HotStorage.SlotCount = EffectiveHotSlotCount();
-    return tier.Hot(level);
+    return Tiers[ECacheTier::Regular].Hot(level);
 }
 
 inline void TSpaceView::CopyMappings(const TSpaceView& source) noexcept {

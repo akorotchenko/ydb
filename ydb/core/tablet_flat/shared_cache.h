@@ -464,6 +464,7 @@ private:
     friend class TCacheFetches<TTraits>;
     friend class TCacheCollections<TTraits>;
     friend class TCacheEviction<TTraits>;
+    friend class TCacheHotPolicy<TTraits>;
     friend class TCacheCapacity<TTraits>;
     friend class TCacheOperation<TTraits>;
     friend class TCacheOperationView<TTraits>;
