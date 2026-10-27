@@ -333,7 +333,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
     }
 
     Y_UNIT_TEST(IndependentCoresAndLegacyBindings) {
-        static_assert(sizeof(TCacheTierRings) == (HotLevelCount + 1) * sizeof(TRingCursor));
+        static_assert(sizeof(TCacheTierRings) >= (HotLevelCount + 1) * sizeof(TRingCursor) + sizeof(std::atomic<ui64>));
         static_assert(sizeof(TS5FifoRings) == CacheTierCount * sizeof(TCacheTierRings));
         std::array<std::array<std::atomic<ui64>, 64>, CacheTierCount> hot{};
         std::array<std::array<std::atomic<ui64>, 8>, CacheTierCount> cold{};

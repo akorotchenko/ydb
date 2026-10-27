@@ -136,9 +136,11 @@ void TCacheEviction<TTraits>::RouteKeepCold(TSpaceOperation& spaceOp, TColdCache
         return;
     }
     const TColdCacheItem queuedItem = TColdCacheItem::Make(queuedVersion, coldItem.Index());
+    spaceOp.View().Tiers[ECacheTier::Keep].Rings->AddColdEntry();
     const ui64 displaced = spaceOp.KeepCold().PutAndPop(queuedItem.Raw());
     Cache_.InvokeHook(ESharedCacheHookPoint::AfterKeepColdQueued, TCacheItem::FromRaw(queuedItem.Raw()));
     if (displaced != 0) {
+        spaceOp.View().Tiers[ECacheTier::Keep].Rings->RemoveColdEntry();
         const TColdCacheItem displacedItem = TColdCacheItem::FromRaw(displaced);
         if (!DemoteKeepCold(spaceOp, displacedItem)) {
             // The displaced page stays KeepCold without a ring entry: demote it on its last release.
@@ -437,67 +439,22 @@ bool TCacheEviction<TTraits>::EraseCold(TSpaceOperation& spaceOp, TColdCacheItem
 }
 
 template <class TTraits>
-void TCacheEviction<TTraits>::RouteCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
-    if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen()) {
-        return;
-    }
-
-    THandle& handle = spaceOp.Handles()[coldItem.Index()];
-    if ((handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
-        return;
-    }
-    const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    if (!state.IsCold() || !state.IsStickyNoneField() || state.Refs() != 0) {
-        return;
-    }
-
+bool TCacheEviction<TTraits>::TryEnqueueColdForPreload(TSpaceOperation& spaceOp, const TCacheTierView& tier,
+    TColdCacheItem coldItem, THandle& handle, THandleState state) noexcept {
     if (spaceOp.Hazard().PreloadReclaim && state.IsPageKind()) {
         TOperationItemRef<TTraits> collectionRef(spaceOp, AcquireRegularCollection(spaceOp, handle));
         if (collectionRef) {
-            Cache_.Memory_.AddColdRingEntry();
+            tier.Rings->AddColdEntry();
             Cache_.InvokeHook(ESharedCacheHookPoint::BeforeColdExchange, TCacheItem::FromRaw(coldItem.Raw()));
-            const auto exchange = ExchangeForPreload(spaceOp, spaceOp.Cold().SelectPutSlot(), coldItem.Raw(), true);
+            const auto exchange = ExchangeForPreload(spaceOp, tier.Cold().SelectPutSlot(), coldItem.Raw(), true);
             if (!exchange.Slot) {
-                Cache_.Memory_.RemoveColdRingEntry();
+                tier.Rings->RemoveColdEntry();
                 TryErasePreloadPage(spaceOp, coldItem);
             } else if (exchange.Previous != 0) {
-                Cache_.Memory_.RemoveColdRingEntry();
+                tier.Rings->RemoveColdEntry();
                 TryErasePreloadPage(spaceOp, TColdCacheItem::FromRaw(exchange.Previous));
             }
-            return;
-        }
-    }
-    Cache_.Memory_.AddColdRingEntry();
-    Cache_.InvokeHook(ESharedCacheHookPoint::BeforeColdExchange, TCacheItem::FromRaw(coldItem.Raw()));
-    const TColdCacheItem displaced = spaceOp.PutCold(coldItem);
-    if (!displaced.IsNull()) {
-        Cache_.Memory_.RemoveColdRingEntry();
-        EraseCold(spaceOp, displaced);
-    }
-}
-
-template <class TTraits>
-bool TCacheEviction<TTraits>::ReclaimCold(TSpaceOperation& spaceOp) noexcept {
-    return ReclaimColdImpl<false>(spaceOp);
-}
-
-template <class TTraits>
-template <bool Preload>
-bool TCacheEviction<TTraits>::ReclaimColdImpl(TSpaceOperation& spaceOp) noexcept {
-    const TRingView cold = spaceOp.Cold();
-    const ui64 attempts = Preload ? Min<ui64>(cold.Capacity, SharedCacheTransitionWorkBatch / 2) : cold.Capacity;
-    for (ui64 attempt = 0; attempt < attempts; ++attempt) {
-        if (Cache_.Memory_.ColdRingEntries() == 0) {
-            return false;
-        }
-        Cache_.InvokeHook(ESharedCacheHookPoint::BeforeColdRingPop, TCacheItem{});
-        const ui64 rawItem = Preload ? PopForPreload(spaceOp, cold, true).Previous : cold.Pop();
-        if (rawItem != 0) {
-            Cache_.Memory_.RemoveColdRingEntry();
-            if (Preload ? TryErasePreloadPage(spaceOp, TColdCacheItem::FromRaw(rawItem))
-                        : EraseCold(spaceOp, TColdCacheItem::FromRaw(rawItem))) {
-                return true;
-            }
+            return true;
         }
     }
     return false;
@@ -622,7 +579,7 @@ bool TCacheEviction<TTraits>::ReclaimRegularPage(TSpaceOperation& spaceOp) noexc
         preload = false;
     };
     for (ui32 step = 0; step < SharedCacheTransitionWorkBatch; ++step) {
-        if (ReclaimColdImpl<true>(spaceOp)) {
+        if (ColdPolicy_.ReclaimForPreload(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular])) {
             return true;
         }
         if (!HotPolicy_.ProcessPreloadBatch(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular])) {
@@ -643,6 +600,7 @@ bool TCacheEviction<TTraits>::DemoteKeepColdForSoftLimit(TSpaceOperation& spaceO
         if (raw == 0) {
             continue;
         }
+        spaceOp.View().Tiers[ECacheTier::Keep].Rings->RemoveColdEntry();
         const TColdCacheItem item = TColdCacheItem::FromRaw(raw);
         if (DemoteKeepCold(spaceOp, item)) {
             return true;
@@ -661,6 +619,7 @@ bool TCacheEviction<TTraits>::ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept
         if (raw == 0) {
             continue;
         }
+        spaceOp.View().Tiers[ECacheTier::Keep].Rings->RemoveColdEntry();
         const TColdCacheItem item = TColdCacheItem::FromRaw(raw);
         if (!MatchesKeepColdEntry(spaceOp, item)) {
             continue;

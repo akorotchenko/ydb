@@ -47,9 +47,24 @@ public:
         return ColdCursor_;
     }
 
+    ui64 ColdEntries() const noexcept {
+        return ColdEntries_.load(std::memory_order_relaxed);
+    }
+
+    void AddColdEntry() noexcept {
+        ColdEntries_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void RemoveColdEntry() noexcept {
+        const ui64 previous = ColdEntries_.fetch_sub(1, std::memory_order_relaxed);
+        Y_ABORT_UNLESS(previous != 0);
+    }
+
 private:
     std::array<TRingCursor, HotLevelCount> HotCursors_;
     TRingCursor ColdCursor_;
+    // Occupied physical words, including stale hints and enqueues in progress
+    std::atomic<ui64> ColdEntries_{ 0 };
 };
 
 struct TCacheRingStorageView {

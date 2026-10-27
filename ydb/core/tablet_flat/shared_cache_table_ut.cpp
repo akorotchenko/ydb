@@ -283,7 +283,11 @@ public:
                 AdvanceColdVersion(handle.ColdVersion.load(std::memory_order_relaxed) & MaxItemVersion) |
                 KeepColdQueuedMask;
             handle.ColdVersion.store(coldVersion, std::memory_order_relaxed);
-            spaceOp.KeepCold().PutAndPop(TColdCacheItem::Make(coldVersion & MaxItemVersion, page.Index()).Raw());
+            auto& rings = *spaceOp.View().Tiers[ECacheTier::Keep].Rings;
+            rings.AddColdEntry();
+            if (spaceOp.KeepCold().PutAndPop(TColdCacheItem::Make(coldVersion & MaxItemVersion, page.Index()).Raw())) {
+                rings.RemoveColdEntry();
+            }
             return coldVersion;
         });
     }
@@ -318,6 +322,17 @@ public:
 
     static ui32 MinimumHotSlots(TTestSharedCache& cache) noexcept {
         return cache.Eviction_.MinimumHotSlots();
+    }
+
+    static ui64 ColdEntries(TTestSharedCache& cache, ECacheTier tier) noexcept {
+        return cache.Space_->ColdRingEntries(tier);
+    }
+
+    static bool SweepKeepCold(TTestSharedCache& cache) noexcept {
+        WithSpace(cache, [&](TSpaceOperation& spaceOp) {
+            cache.Eviction_.ScheduleKeepColdSweep(spaceOp.KeepCold().Capacity);
+        });
+        return cache.Eviction_.SweepKeepCold();
     }
 
     static std::array<ui64, 4> HotPolicy(TTestSharedCache& cache, const TSpaceOperation& spaceOp) noexcept {
@@ -8169,6 +8184,113 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, item.Index()).IsCold());
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableItems(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->RetainedBytes(), 20 * fixture.PageBytes);
+    }
+
+    Y_UNIT_TEST(ColdPolicyUsesIndependentQueueOwnersAndDrainsStaleWords) {
+        TColdPoolFixture fixture;
+        auto held = fixture.Fetch(0);
+        const auto page = held.CacheItem();
+        held.Drop();
+        const auto ticket =
+            TColdCacheItem::Make(TSharedCacheTestAccess::ColdVersion(*fixture.Cache, page.Index()), page.Index());
+        TCacheColdPolicy<TTestTraits> policy(*fixture.Cache);
+        std::array<std::atomic<ui64>, 4> firstSlots{};
+        std::array<std::atomic<ui64>, 8> secondSlots{};
+        TCacheTierRings firstRings;
+        TCacheTierRings secondRings;
+        const TCacheTierView first{ &firstRings, {}, { firstSlots.data(), sizeof(firstSlots), firstSlots.size() } };
+        const TCacheTierView second{ &secondRings, {},
+            { secondSlots.data(), sizeof(secondSlots), secondSlots.size() } };
+        TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
+            policy.RouteCold(spaceOp, first, ticket);
+            UNIT_ASSERT_VALUES_EQUAL(firstRings.ColdEntries(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(secondRings.ColdEntries(), 0);
+            policy.RouteCold(spaceOp, second, ticket);
+            UNIT_ASSERT_VALUES_EQUAL(secondRings.ColdEntries(), 1);
+            UNIT_ASSERT(policy.Reclaim(spaceOp, first));
+            UNIT_ASSERT_VALUES_EQUAL(firstRings.ColdEntries(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdBytes(), 0);
+            UNIT_ASSERT(!policy.Reclaim(spaceOp, second));
+            UNIT_ASSERT_VALUES_EQUAL(secondRings.ColdEntries(), 0);
+        });
+        UNIT_ASSERT(!fixture.Cache->ReclaimCold());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->RetainedBytes(), 20 * fixture.PageBytes);
+    }
+
+    Y_UNIT_TEST(ColdRoutingDoesNotRefreshAStaleMembership) {
+        TColdPoolFixture fixture;
+        auto held = fixture.Fetch(0);
+        const auto page = held.CacheItem();
+        const auto oldTicket =
+            TColdCacheItem::Make(TSharedCacheTestAccess::ColdVersion(*fixture.Cache, page.Index()), page.Index());
+        held.Drop();
+        TTestSharedPageRef reader;
+        UNIT_ASSERT(fixture.Cache->Find(fixture.Regular, 0, reader) == ESharedCacheResultStatus::Hit);
+        reader.Drop();
+        UNIT_ASSERT(TSharedCacheTestAccess::ColdVersion(*fixture.Cache, page.Index()) != oldTicket.ColdVersion());
+        TCacheColdPolicy<TTestTraits> policy(*fixture.Cache);
+        std::array<std::atomic<ui64>, 4> slots{};
+        TCacheTierRings rings;
+        const TCacheTierView tier{ &rings, {}, { slots.data(), sizeof(slots), slots.size() } };
+        TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
+            policy.RouteCold(spaceOp, tier, oldTicket);
+            UNIT_ASSERT_VALUES_EQUAL(rings.ColdEntries(), 0);
+            UNIT_ASSERT(!policy.Reclaim(spaceOp, tier));
+        });
+        UNIT_ASSERT(fixture.Cache->ReclaimCold());
+    }
+
+    Y_UNIT_TEST(ColdPublicationRejectsAReusedNativeIdentity) {
+        TFixture fixture;
+        const TLogoBlobID id(95, 96, 126);
+        const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+        const auto key = TSharedCacheKey::Page(collection, 0);
+        const auto page = InsertReadyPage(*fixture.Cache, key);
+        auto held = FindPage(*fixture.Cache, key);
+        UNIT_ASSERT(held.Ref);
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        auto fillers = HoldReviewFillers(fixture, 63, key.Hash() & 63);
+        UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(1));
+        held.Ref.Drop();
+        UNIT_ASSERT(fixture.Cache->ReclaimCold());
+        const auto replacement = InsertReadyPage(*fixture.Cache, TSharedCacheKey::Page(collection, 1));
+        UNIT_ASSERT_VALUES_EQUAL(replacement.Index(), page.Index());
+        UNIT_ASSERT(replacement.Version() != page.Version());
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, replacement.Index()).IsCold());
+        const ui64 entries = fixture.Cache->ColdRingEntries();
+        const ui32 membership = TSharedCacheTestAccess::ColdVersion(*fixture.Cache, replacement.Index());
+        TCacheColdPolicy<TTestTraits> policy(*fixture.Cache);
+        TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
+            policy.PublishCold(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular], page.CacheItem());
+        });
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), entries);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::ColdVersion(*fixture.Cache, replacement.Index()), membership);
+    }
+
+    Y_UNIT_TEST(KeepColdPhysicalOccupancyIncludesStaleWords) {
+        TFixture fixture;
+        const TLogoBlobID id(95, 96, 127);
+        const auto collection = AllocateCollection(*fixture.Cache, TSharedCacheKey::Collection(id));
+        UNIT_ASSERT(
+            TSharedCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::TryKeepInMemory));
+        UNIT_ASSERT(fixture.Cache->UpdateKeepColdLimit(2 * TColdPoolFixture::PageBytes));
+        const auto key = TSharedCacheKey::Page(collection, 0);
+        const auto page = InsertReadyPage(*fixture.Cache, key);
+        UNIT_ASSERT(TSharedCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::ColdEntries(*fixture.Cache, ECacheTier::Keep), 1);
+        auto held = FindPage(*fixture.Cache, key);
+        UNIT_ASSERT(held.Ref && TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsHot());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdOwnedBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::ColdEntries(*fixture.Cache, ECacheTier::Keep), 1);
+        UNIT_ASSERT(TSharedCacheTestAccess::SweepKeepCold(*fixture.Cache));
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::ColdEntries(*fixture.Cache, ECacheTier::Keep), 0);
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsHot());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 0);
     }
 
     Y_UNIT_TEST(LastColdReleasePublishesAfterRefcountABA) {

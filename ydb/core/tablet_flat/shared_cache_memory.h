@@ -235,19 +235,6 @@ public:
         ColdItems_.fetch_sub(1, std::memory_order_relaxed);
     }
 
-    ui64 ColdRingEntries() const noexcept {
-        return ColdRingEntries_.load(std::memory_order_relaxed);
-    }
-
-    void AddColdRingEntry() noexcept {
-        ColdRingEntries_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    void RemoveColdRingEntry() noexcept {
-        const ui64 previous = ColdRingEntries_.fetch_sub(1, std::memory_order_relaxed);
-        Y_ABORT_UNLESS(previous != 0);
-    }
-
     ui64 Collections() const noexcept {
         return Collections_.load(std::memory_order_relaxed);
     }
@@ -370,7 +357,6 @@ private: // Data members
     std::atomic<i64> ColdReclaimableBytes_{ 0 }; // Unreferenced ordinary Cold payloads
     std::atomic<i64> ColdReclaimableItems_{ 0 }; // Unreferenced ordinary Cold items
     std::atomic<i64> ColdItems_{ 0 }; // All Cold-state items, including held items
-    std::atomic<ui64> ColdRingEntries_{ 0 }; // Occupied ring slots, including stale entries until popped
     std::atomic<ui64> Collections_{ 0 };
     std::atomic<ui64> CollectionBytes_{ 0 };
     std::atomic<ui64> KeepResidentPageBytes_{ 0 };

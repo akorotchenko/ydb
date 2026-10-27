@@ -98,10 +98,11 @@ bool TCacheCapacity<TTraits>::FinalDrain(TTransition& transition) noexcept {
             evictionOp.RouteHot(static_cast<EHotLevel>(level), TCacheItem::FromRaw(raw));
         },
         [&](ui64 raw) noexcept {
-            Cache_.Memory_.RemoveColdRingEntry();
+            spaceOp.View().Tiers[ECacheTier::Regular].Rings->RemoveColdEntry();
             evictionOp.RouteCold(TColdCacheItem::FromRaw(raw));
         },
         [&](ui64 raw) noexcept {
+            spaceOp.View().Tiers[ECacheTier::Keep].Rings->RemoveColdEntry();
             evictionOp.RouteKeepCold(TColdCacheItem::FromRaw(raw));
         });
 }
