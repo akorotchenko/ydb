@@ -44,6 +44,7 @@ private:
     // Capacity transitions
     EPrepareResult PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept;
 
+    bool PrepareReceiver(TTransition& transition) noexcept;
     bool PublishMigrationView(TTransition& transition) noexcept;
 
     Y_FORCE_INLINE bool TryDrainTransition(TTransition& transition) noexcept {

@@ -156,6 +156,22 @@ public:
     }
 
     template <class TCallback>
+    static bool PrepareReceiver(TSharedCacheSpace& space, TTransition& transition, TCallback& callback) noexcept {
+        return space.PrepareReceiverWithHook(transition, {
+                                                             .Context = &callback,
+                                                             .Function = [](void* context, ESpaceMap mapping) noexcept {
+                                                                 return (*static_cast<TCallback*>(context))(mapping);
+                                                             },
+                                                         });
+    }
+
+    static void SetGeneration(TSharedCacheSpace& space, ui32 generation) noexcept {
+        const auto old = space.CurrentSpaceState();
+        space.PrepareView(generation, space.SpaceView(old));
+        space.SpaceState_.store(old.WithGeneration(generation).Raw(), std::memory_order_release);
+    }
+
+    template <class TCallback>
     static bool TryReleaseTransition(TSharedCacheSpace& space, TTransition& transition, TCallback& callback) noexcept {
         return space.TryReleaseTransitionWithHook(
             transition, {
@@ -753,17 +769,13 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
         UNIT_ASSERT(!TSharedCacheImpl<TTestTraits>::Create(std::move(space), capacity.Limit));
     }
 
-    Y_UNIT_TEST(PairedCapacityRejectsUncoordinatedTransfers) {
+    Y_UNIT_TEST(PairedCapacityRejectsMixedCapacityAndPresenceChanges) {
         const auto small = PairedCapacity(5);
         const auto large = PairedCapacity(6);
         auto [threads, space] = TCacheThreadTestAccess::MakeSpace(small, large, 2);
         UNIT_ASSERT(space);
         TTransition transition;
-        auto transfer = small;
-        --transfer.Tiers[ECacheTier::Regular].HotSlots;
-        ++transfer.Tiers[ECacheTier::Keep].HotSlots;
-        UNIT_ASSERT(transfer.HasValidTierCapacity());
-        UNIT_ASSERT(space->PrepareTransition(transfer, transition) == EPrepareResult::Rejected);
+        UNIT_ASSERT(space->PrepareTransition(small, transition) == EPrepareResult::Rejected);
         auto mixed = large;
         mixed.Tiers[ECacheTier::Regular].HotSlots = small.Tiers[ECacheTier::Regular].HotSlots - 1;
         mixed.Tiers[ECacheTier::Keep].HotSlots = large.HotSlotCount() - mixed.Tiers[ECacheTier::Regular].HotSlots;
@@ -774,6 +786,248 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
         presence.Tiers[ECacheTier::Keep].HotSlots = 0;
         UNIT_ASSERT(presence.HasValidTierCapacity());
         UNIT_ASSERT(space->PrepareTransition(presence, transition) == EPrepareResult::Rejected);
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::Idle);
+    }
+
+    TSharedCacheCapacity ReverseTierShares(TSharedCacheCapacity capacity) {
+        std::swap(capacity.Tiers[ECacheTier::Regular], capacity.Tiers[ECacheTier::Keep]);
+        UNIT_ASSERT(capacity.HasValidTierCapacity());
+        return capacity;
+    }
+
+    void PublishRingStep(TSharedCacheSpace & space, TTransition & transition) {
+        do {
+            UNIT_ASSERT(space.PublishMigrationView(transition));
+        } while (transition.Phase() == ETransitionPhase::InitializeGrowth);
+        UNIT_ASSERT(space.TryDrainTransition(transition));
+        UNIT_ASSERT(space.PublishFinalView(transition));
+        UNIT_ASSERT(space.TryDrainTransition(transition));
+        CompleteFinalDrain(space, transition);
+    }
+
+    void CompleteReceiver(TSharedCacheSpace & space, TTransition & transition) {
+        UNIT_ASSERT(space.PrepareReceiver(transition));
+        PublishRingStep(space, transition);
+        UNIT_ASSERT(space.TryReleaseTransition(transition));
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::Commit);
+        UNIT_ASSERT(space.CommitTransition(transition));
+    }
+
+    Y_UNIT_TEST(TierTransferFencesLateDonorWritesAndInitializesReceiverTails) {
+        const auto source = PairedCapacity(6, true);
+        const auto target = ReverseTierShares(source);
+        auto [threads, space] = TCacheThreadTestAccess::MakeSpace(source, source, 2);
+        UNIT_ASSERT(space);
+        const auto initial = TSharedCacheSpaceTestAccess::CurrentView(*space);
+        const ui64 free = TSharedCacheSpaceTestAccess::FreeCount(*space);
+        TTransition transition;
+        UNIT_ASSERT(space->PrepareTransition(target, transition) == EPrepareResult::Prepared);
+        UNIT_ASSERT_VALUES_EQUAL(transition.ResizeDeltaBits(), 0);
+        {
+            auto old = TSharedCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+            UNIT_ASSERT(space->PublishMigrationView(transition));
+            UNIT_ASSERT(!space->TryDrainTransition(transition));
+            CheckPairedMappings(old.View(), source, source);
+        }
+        UNIT_ASSERT(space->TryDrainTransition(transition));
+        {
+            auto migration = TSharedCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+            UNIT_ASSERT(space->PublishFinalView(transition));
+            UNIT_ASSERT(!space->TryDrainTransition(transition));
+            // The held old view may still exchange excluded words after the donor cut
+            migration.View()
+                .Tiers[ECacheTier::Regular]
+                .HotStorage.Slots[source.Tiers[ECacheTier::Regular].HotSlots - 1]
+                .store(31);
+            migration.View()
+                .Tiers[ECacheTier::Keep]
+                .ColdStorage.Slots[source.Tiers[ECacheTier::Keep].ColdSlots - 1]
+                .store(41);
+        }
+        UNIT_ASSERT(space->TryDrainTransition(transition));
+        ui64 hot = 0;
+        ui64 cold = 0;
+        while (transition.Phase() == ETransitionPhase::FinalDrain) {
+            UNIT_ASSERT(space->FinalDrain(
+                transition,
+                [&](ECacheTier tier, EHotLevel level, ui64 raw) noexcept {
+                    UNIT_ASSERT(tier == ECacheTier::Regular && level == EHotLevel::L0);
+                    hot = raw;
+                },
+                [&](ECacheTier tier, ui64 raw) noexcept {
+                    UNIT_ASSERT(tier == ECacheTier::Keep);
+                    cold = raw;
+                }));
+        }
+        UNIT_ASSERT_VALUES_EQUAL(hot, 31);
+        UNIT_ASSERT_VALUES_EQUAL(cold, 41);
+        UNIT_ASSERT(!space->PrepareReceiver(transition));
+        UNIT_ASSERT(!space->CommitTransition(transition));
+        UNIT_ASSERT(space->TryReleaseTransition(transition));
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::PrepareReceiver);
+        UNIT_ASSERT(space->CurrentConfiguration().Tiers == source.Tiers);
+        const auto donor = TSharedCacheSpaceTestAccess::CurrentView(*space);
+        for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+            UNIT_ASSERT_VALUES_EQUAL(
+                donor.Tiers[tier].HotStorage.SlotCount, Min(source.Tiers[tier].HotSlots, target.Tiers[tier].HotSlots));
+            UNIT_ASSERT_VALUES_EQUAL(donor.Tiers[tier].ColdStorage.SlotCount,
+                Min(source.Tiers[tier].ColdSlots, target.Tiers[tier].ColdSlots));
+        }
+        UNIT_ASSERT(space->PrepareReceiver(transition));
+        {
+            auto old = TSharedCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+            do {
+                UNIT_ASSERT(space->PublishMigrationView(transition));
+            } while (transition.Phase() == ETransitionPhase::InitializeGrowth);
+            UNIT_ASSERT(!space->TryDrainTransition(transition));
+            UNIT_ASSERT_VALUES_EQUAL(old.View().Tiers[ECacheTier::Keep].HotStorage.SlotCount,
+                donor.Tiers[ECacheTier::Keep].HotStorage.SlotCount);
+        }
+        UNIT_ASSERT(space->TryDrainTransition(transition));
+        {
+            auto migration = TSharedCacheSpaceTestAccess::BeginOnHazard(*space, 1);
+            UNIT_ASSERT(space->PublishFinalView(transition));
+            UNIT_ASSERT(!space->TryDrainTransition(transition));
+            CheckPairedMappings(TSharedCacheSpaceTestAccess::CurrentView(*space), target, target);
+        }
+        UNIT_ASSERT(space->TryDrainTransition(transition));
+        CompleteFinalDrain(*space, transition);
+        UNIT_ASSERT(space->TryReleaseTransition(transition));
+        UNIT_ASSERT(space->CommitTransition(transition));
+        UNIT_ASSERT(space->CurrentConfiguration().Tiers == target.Tiers);
+        const auto& result = TSharedCacheSpaceTestAccess::CurrentView(*space);
+        UNIT_ASSERT_VALUES_EQUAL(
+            result.Tiers[ECacheTier::Regular].ColdStorage.Slots[target.Tiers[ECacheTier::Regular].ColdSlots - 1].load(),
+            0);
+        UNIT_ASSERT_VALUES_EQUAL(
+            result.Tiers[ECacheTier::Keep].HotStorage.Slots[target.Tiers[ECacheTier::Keep].HotSlots - 1].load(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(result.Handles, initial.Handles);
+        UNIT_ASSERT_VALUES_EQUAL(result.Buckets, initial.Buckets);
+        UNIT_ASSERT_VALUES_EQUAL(result.FreeSlots, initial.FreeSlots);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), free);
+        UNIT_ASSERT_VALUES_EQUAL(space->CurrentSpaceState().Generation(), 4);
+        UNIT_ASSERT(TSharedCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+        UNIT_ASSERT_VALUES_EQUAL(space->CurrentSpaceState().Generation(), 5);
+        // The same controller can transfer the shares back without replacing identities
+        TTransition reverse;
+        UNIT_ASSERT(space->PrepareTransition(source, reverse) == EPrepareResult::Prepared);
+        PublishRingStep(*space, reverse);
+        UNIT_ASSERT(space->TryReleaseTransition(reverse));
+        CompleteReceiver(*space, reverse);
+        CheckPairedMappings(TSharedCacheSpaceTestAccess::CurrentView(*space), source, source);
+    }
+
+    Y_UNIT_TEST(TierTransferCannotGrowReceiverBeforeDonorReleaseAcknowledgement) {
+        const auto source = PairedCapacity(16, true);
+        const auto target = ReverseTierShares(source);
+        for (auto failure : { ESpaceMap::RegularHot, ESpaceMap::KeepCold }) {
+            auto [threads, space] = TCacheThreadTestAccess::MakeSpace(source, source, 2);
+            UNIT_ASSERT(space);
+            TTransition transition;
+            UNIT_ASSERT(space->PrepareTransition(target, transition) == EPrepareResult::Prepared);
+            PublishRingStep(*space, transition);
+            auto release = [&](ESpaceMap mapping, const void*, size_t) noexcept {
+                return mapping != failure;
+            };
+            UNIT_ASSERT(!TSharedCacheSpaceTestAccess::TryReleaseTransition(*space, transition, release));
+            UNIT_ASSERT(transition.Phase() == ETransitionPhase::ReleaseRetry);
+            ui32 prepareCalls = 0;
+            auto prepare = [&](ESpaceMap) noexcept {
+                ++prepareCalls;
+                return true;
+            };
+            UNIT_ASSERT(!TSharedCacheSpaceTestAccess::PrepareReceiver(*space, transition, prepare));
+            UNIT_ASSERT_VALUES_EQUAL(prepareCalls, 0);
+            UNIT_ASSERT(space->TryReleaseTransition(transition));
+            UNIT_ASSERT(TSharedCacheSpaceTestAccess::PrepareReceiver(*space, transition, prepare));
+            UNIT_ASSERT(prepareCalls != 0);
+            // This private candidate belongs to an already-published transition
+            UNIT_ASSERT(space->AbandonTransition(transition));
+            UNIT_ASSERT(transition.Phase() == ETransitionPhase::AbandonedForShutdown);
+        }
+    }
+
+    Y_UNIT_TEST(TierTransferReceiverCleanupRetainsPublishedIntermediateState) {
+        using EStep = TSharedCacheMappingTestAccess::EStep;
+        const auto source = PairedCapacity(16, true);
+        const auto target = ReverseTierShares(source);
+        for (auto failure : { ESpaceMap::RegularCold, ESpaceMap::KeepHot }) {
+            auto [threads, space] = TCacheThreadTestAccess::MakeSpace(source, source, 2);
+            UNIT_ASSERT(space);
+            TTransition transition;
+            UNIT_ASSERT(space->PrepareTransition(target, transition) == EPrepareResult::Prepared);
+            PublishRingStep(*space, transition);
+            UNIT_ASSERT(space->TryReleaseTransition(transition));
+            const auto intermediate = TSharedCacheSpaceTestAccess::CurrentView(*space);
+            const auto generation = space->CurrentSpaceState().Generation();
+            auto& mapping = TSharedCacheSpaceTestAccess::RingMapping(*space, failure);
+            bool failCleanup = true;
+            ui32 unmaps = 0;
+            auto cleanup = [&](EStep step) noexcept {
+                if (step == EStep::Unmap) {
+                    ++unmaps;
+                }
+                return !failCleanup || (step != EStep::ShrinkBacking && step != EStep::DiscardTail);
+            };
+            TSharedCacheMappingTestAccess::SetHook(mapping, cleanup);
+            Y_DEFER {
+                TSharedCacheMappingTestAccess::ClearHook(mapping);
+            };
+            const auto next = static_cast<ESpaceMap>(static_cast<ui8>(failure) + 1);
+            auto prepare = [&](ESpaceMap stage) noexcept {
+                return stage != next;
+            };
+            UNIT_ASSERT(!TSharedCacheSpaceTestAccess::PrepareReceiver(*space, transition, prepare));
+            UNIT_ASSERT(transition.Phase() == ETransitionPhase::CancelReceiver);
+            UNIT_ASSERT_VALUES_EQUAL(space->CurrentSpaceState().Generation(), generation);
+            UNIT_ASSERT(space->CurrentConfiguration().Tiers == source.Tiers);
+            UNIT_ASSERT(transition.TargetConfiguration().Tiers == target.Tiers);
+            const ui32 completedUnmaps = unmaps;
+            UNIT_ASSERT(!space->PrepareReceiver(transition));
+            UNIT_ASSERT_VALUES_EQUAL(unmaps, completedUnmaps);
+            failCleanup = false;
+            UNIT_ASSERT(!space->PrepareReceiver(transition));
+            UNIT_ASSERT(transition.Phase() == ETransitionPhase::PrepareReceiver);
+            UNIT_ASSERT_VALUES_EQUAL(unmaps, completedUnmaps);
+            UNIT_ASSERT_VALUES_EQUAL(
+                TSharedCacheSpaceTestAccess::CurrentView(*space).Tiers[ECacheTier::Regular].HotStorage.Slots,
+                intermediate.Tiers[ECacheTier::Regular].HotStorage.Slots);
+            TSharedCacheMappingTestAccess::ClearHook(mapping);
+            CompleteReceiver(*space, transition);
+            CheckPairedMappings(TSharedCacheSpaceTestAccess::CurrentView(*space), target, target);
+        }
+    }
+
+    Y_UNIT_TEST(TierTransferAbandonAfterPrivateReceiverInitializationStaysClosed) {
+        const auto source = PairedCapacity(16, true);
+        const auto target = ReverseTierShares(source);
+        auto [threads, space] = TCacheThreadTestAccess::MakeSpace(source, source, 2);
+        UNIT_ASSERT(space);
+        TTransition transition;
+        UNIT_ASSERT(space->PrepareTransition(target, transition) == EPrepareResult::Prepared);
+        PublishRingStep(*space, transition);
+        UNIT_ASSERT(space->TryReleaseTransition(transition));
+        UNIT_ASSERT(space->PrepareReceiver(transition));
+        UNIT_ASSERT(space->PublishMigrationView(transition));
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::InitializeGrowth);
+        UNIT_ASSERT(space->AbandonTransition(transition));
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::AbandonedForShutdown);
+        UNIT_ASSERT(space->CurrentConfiguration().Tiers == source.Tiers);
+        UNIT_ASSERT(!space->PrepareReceiver(transition));
+    }
+
+    Y_UNIT_TEST(TierTransferReservesFourGenerationsBeforeSideEffects) {
+        const auto source = PairedCapacity(6, true);
+        const auto target = ReverseTierShares(source);
+        auto [threads, space] = TCacheThreadTestAccess::MakeSpace(source, source, 2);
+        UNIT_ASSERT(space);
+        TTransition transition;
+        TSharedCacheSpaceTestAccess::SetGeneration(*space, MaxSpaceGeneration - 3);
+        UNIT_ASSERT(space->PrepareTransition(target, transition) == EPrepareResult::Rejected);
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::Idle);
+        TSharedCacheSpaceTestAccess::SetGeneration(*space, MaxSpaceGeneration - 4);
+        UNIT_ASSERT(space->PrepareTransition(target, transition) == EPrepareResult::Prepared);
+        UNIT_ASSERT(space->AbandonTransition(transition));
         UNIT_ASSERT(transition.Phase() == ETransitionPhase::Idle);
     }
 

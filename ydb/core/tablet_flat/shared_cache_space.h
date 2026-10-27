@@ -255,6 +255,8 @@ enum class ETransitionPhase {
     Prepare,
     InitializeGrowth,
     CancelRetry,
+    PrepareReceiver,
+    CancelReceiver,
     PublishMigration,
     MigrationDrain,
     Migrate,
@@ -323,9 +325,18 @@ private:
     template <class TTraits>
     friend class TCacheCapacity;
 
+    enum class EStep {
+        Capacity,
+        Donor,
+        Receiver,
+    };
+
+    bool CanCancel() const noexcept;
+    bool IsGrowingStep() const noexcept;
     void Reset() noexcept;
 
 private:
+    EStep Step_ = EStep::Capacity;
     ETransitionPhase Phase_ = ETransitionPhase::Idle;
     ui32 Generation_ = 0;
     TSharedCacheCapacity OldConfiguration_;
@@ -736,6 +747,8 @@ public:
 
     EPrepareResult PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept;
 
+    bool PrepareReceiver(TTransition& transition) noexcept;
+
     bool PublishMigrationView(TTransition& transition) noexcept;
 
     bool TryDrainTransition(TTransition& transition) noexcept;
@@ -806,6 +819,8 @@ private:
     EPrepareResult PrepareTransitionWithHook(
         const TSharedCacheCapacity& target, TTransition& transition, TPrepareHook hook) noexcept;
 
+    bool PrepareReceiverWithHook(TTransition& transition, TPrepareHook hook) noexcept;
+
     bool TryReleaseTransitionWithHook(TTransition& transition, TReleaseHook hook) noexcept;
 
     bool AdvanceSpaceGeneration() noexcept;
@@ -825,6 +840,12 @@ private:
     template <bool WithHook>
     EPrepareResult PrepareTransitionImpl(
         const TSharedCacheCapacity& target, TTransition& transition, TPrepareHook hook) noexcept;
+
+    template <bool WithHook>
+    bool PrepareMappings(TTransition& transition, TPrepareHook hook) noexcept;
+
+    template <bool WithHook>
+    bool PrepareReceiverImpl(TTransition& transition, TPrepareHook hook) noexcept;
 
     template <bool WithHook>
     bool TryReleaseTransitionImpl(TTransition& transition, TReleaseHook hook) noexcept;
@@ -1092,10 +1113,13 @@ inline bool TSharedCacheSpace::FinalDrain(
                 if (transition.NextWorkIndex_ == old.SlotCount) {
                     transition.FinalDrainStage_ = static_cast<ESpaceMap>(static_cast<ui8>(mapping) + 1);
                     transition.NextWorkIndex_ = 0;
-                    if (transition.FinalDrainStage_ != ESpaceMap::Free) {
+                    if (transition.FinalDrainStage_ == ESpaceMap::Free &&
+                        transition.Step_ != TTransition::EStep::Capacity) {
+                        transition.FinalDrainStage_ = ESpaceMap::Done;
+                    } else if (transition.FinalDrainStage_ != ESpaceMap::Free) {
                         const auto next = transition.FinalDrainStage_;
-                        const auto& target = transition.TargetConfiguration_.Tiers[MappingTier(next)];
-                        transition.NextWorkIndex_ = IsHotMapping(next) ? target.HotSlots : target.ColdSlots;
+                        const auto& targetRing = RingStorage(*NewestViewOwner_, next);
+                        transition.NextWorkIndex_ = targetRing.SlotCount;
                     }
                 }
                 break;
@@ -1176,6 +1200,7 @@ inline void TSpaceView::CopyMappings(const TSpaceView& source) noexcept {
 }
 
 inline void TTransition::Reset() noexcept {
+    Step_ = EStep::Capacity;
     Phase_ = ETransitionPhase::Idle;
     Generation_ = 0;
     OldConfiguration_ = {};

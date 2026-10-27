@@ -28,6 +28,16 @@ EPrepareResult TCacheCapacity<TTraits>::PrepareTransition(
 }
 
 template <class TTraits>
+bool TCacheCapacity<TTraits>::PrepareReceiver(TTransition& transition) noexcept {
+    if (auto guard = Cache_.HotResize_.TryLock()) {
+        if (Cache_.HotResize_.OwnsCapacityTransition(transition)) {
+            return Cache_.Space_->PrepareReceiver(transition);
+        }
+    }
+    return false;
+}
+
+template <class TTraits>
 bool TCacheCapacity<TTraits>::PublishMigrationView(TTransition& transition) noexcept {
     if (auto hotResizeGuard = Cache_.HotResize_.TryLock()) {
         if (Cache_.HotResize_.OwnsCapacityTransition(transition)) {
@@ -145,14 +155,13 @@ bool TCacheCapacity<TTraits>::AbandonTransition(TTransition& transition) noexcep
     if (!hotResizeGuard || !Cache_.HotResize_.OwnsCapacityTransition(transition)) {
         return false;
     }
-    const ETransitionPhase phase = transition.Phase();
+    const bool canCancel = transition.CanCancel();
     const ui64 oldStaticBytes = transition.OldConfiguration().StaticBytes;
     const ui64 targetStaticBytes = transition.TargetConfiguration().StaticBytes;
     if (!Cache_.Space_->AbandonTransition(transition)) {
         return false;
     }
-    if (phase == ETransitionPhase::Prepare || phase == ETransitionPhase::InitializeGrowth ||
-        phase == ETransitionPhase::CancelRetry) {
+    if (canCancel) {
         if (targetStaticBytes > oldStaticBytes) {
             const ui64 delta = targetStaticBytes - oldStaticBytes;
             Cache_.Memory_.CancelStaticResize(delta);
@@ -261,6 +270,10 @@ bool TCacheCapacity<TTraits>::RunMaintenance() noexcept {
             // OS cleanup retries yield to periodic GC instead of scheduling themselves
             AbandonTransition(Transition_);
             return false;
+
+        case ETransitionPhase::PrepareReceiver:
+        case ETransitionPhase::CancelReceiver:
+            return PrepareReceiver(Transition_);
 
         case ETransitionPhase::Prepare:
         case ETransitionPhase::InitializeGrowth:
