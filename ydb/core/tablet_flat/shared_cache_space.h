@@ -208,42 +208,34 @@ struct TSpaceView {
     ui32 Generation = 0;
     THandle* Handles = nullptr;
     std::atomic<ui64>* Buckets = nullptr;
-    std::atomic<ui64>* HotSlots = nullptr;
-    std::atomic<ui64>* ColdSlots = nullptr;
-    std::atomic<ui64>* KeepColdSlots = nullptr;
+    std::array<TCacheTierView, CacheTierCount> Tiers;
     std::atomic<ui64>* FreeSlots = nullptr;
 
     ui64 HandleCount = 0;
     ui64 AllocationLimit = 0;
     ui64 ColdMinHandles = 0;
     ui64 ColdGrowHandles = 0;
-    ui64 HotSlotCount = 0;
-    TS5FifoRings* Rings = nullptr;
     TFreeRingCursor* FreeCursor = nullptr;
     std::atomic<ui64>* EffectiveHotSlots = nullptr;
 
     size_t HandlesBytes = 0;
     size_t BucketsBytes = 0;
-    size_t HotSlotBytes = 0;
-    size_t ColdSlotBytes = 0;
-    size_t KeepColdSlotBytes = 0;
     size_t FreeSlotBytes = 0;
 
     Y_FORCE_INLINE ui64 EffectiveHotSlotCount() const noexcept {
-        const ui64 effective = EffectiveHotSlots ? EffectiveHotSlots->load(std::memory_order_relaxed) : HotSlotCount;
-        return Min(effective, HotSlotCount);
+        const ui64 maximum = Tiers[ECacheTier::Regular].HotStorage.SlotCount;
+        const ui64 effective = EffectiveHotSlots ? EffectiveHotSlots->load(std::memory_order_relaxed) : maximum;
+        return Min(effective, maximum);
     }
 
     Y_FORCE_INLINE TRingView Hot(EHotLevel level) const noexcept;
 
     Y_FORCE_INLINE TRingView Cold() const noexcept {
-        Y_DEBUG_ABORT_UNLESS(Rings);
-        return { &Rings->Cold(), ColdSlots, HandleCount / 2 };
+        return Tiers[ECacheTier::Regular].Cold();
     }
 
     Y_FORCE_INLINE TRingView KeepCold() const noexcept {
-        Y_DEBUG_ABORT_UNLESS(Rings);
-        return { &Rings->KeepCold(), KeepColdSlots, HandleCount / 2 };
+        return Tiers[ECacheTier::Keep].Cold();
     }
 
     Y_FORCE_INLINE TFreeRingView Free() const noexcept {
@@ -596,9 +588,9 @@ public:
     }
 
     Y_FORCE_INLINE bool IsAllowedHotSlot(const std::atomic<ui64>* slot) const noexcept {
-        const TSpaceView& view = View();
-        Y_DEBUG_ABORT_UNLESS(slot >= view.HotSlots && slot < view.HotSlots + view.HotSlotCount);
-        return static_cast<ui64>(slot - view.HotSlots) < view.EffectiveHotSlotCount();
+        const auto& hot = View().Tiers[ECacheTier::Regular].HotStorage;
+        Y_DEBUG_ABORT_UNLESS(slot >= hot.Slots && slot < hot.Slots + hot.SlotCount);
+        return static_cast<ui64>(slot - hot.Slots) < View().EffectiveHotSlotCount();
     }
 
     Y_FORCE_INLINE TRingView Cold() const noexcept {
@@ -777,6 +769,15 @@ private:
         }
     };
 
+    struct TPrepareHook {
+        void* Context = nullptr;
+        bool (*Function)(void*, ESpaceMap) noexcept = nullptr;
+
+        bool Run(ESpaceMap mapping) const noexcept {
+            return Function(Context, mapping);
+        }
+    };
+
     struct TReleaseHook {
         void* Context = nullptr;
         bool (*Function)(void*, ESpaceMap, const void*, size_t) noexcept = nullptr;
@@ -791,6 +792,9 @@ private:
     bool ReturnFreeHandleWithHook(TSpaceOperation& spaceOp, ui32 index, ui32 version, TFreeExchangeHook hook) noexcept;
 
     bool PublishMigrationViewWithHook(TTransition& transition, TPublishMigrationViewHook hook) noexcept;
+
+    bool PrepareTransitionWithHook(
+        const TSharedCacheCapacity& target, TTransition& transition, TPrepareHook hook) noexcept;
 
     bool TryReleaseTransitionWithHook(TTransition& transition, TReleaseHook hook) noexcept;
 
@@ -807,6 +811,9 @@ private:
 
     template <bool WithHook>
     bool PublishMigrationViewImpl(TTransition& transition, TPublishMigrationViewHook hook) noexcept;
+
+    template <bool WithHook>
+    bool PrepareTransitionImpl(const TSharedCacheCapacity& target, TTransition& transition, TPrepareHook hook) noexcept;
 
     template <bool WithHook>
     bool TryReleaseTransitionImpl(TTransition& transition, TReleaseHook hook) noexcept;
@@ -828,6 +835,9 @@ private:
     void RouteFreeWord(const TSpaceView& view, ui64 raw) noexcept;
 
     static bool TryMappingSize(ui64 count, ui64 itemSize, size_t& result) noexcept;
+
+    // Legacy bindings until policy migration: Regular has Hot/shared Cold; Keep has only KeepCold
+    static void SetLegacyTierSlotCounts(TSpaceView& view, const TSharedCacheCapacity& capacity) noexcept;
 
     void CancelPreparedView(TSpaceView& view) noexcept;
 
@@ -864,9 +874,7 @@ private:
     TSharedCacheMapping HandlesMapping_{ TSharedCacheMapping::EAddressMode::Stable };
     THandle* Handles_ = nullptr;
     TSharedCacheMapping BucketsMapping_;
-    TSharedCacheMapping HotMapping_;
-    TSharedCacheMapping ColdMapping_;
-    TSharedCacheMapping KeepColdMapping_;
+    std::array<TCacheTierStorage, CacheTierCount> TierStorage_;
     TSharedCacheMapping FreeMapping_;
     THolder<TSpaceView> NewestViewOwner_;
     std::atomic<TSpaceView*> NewestView_{ nullptr };
@@ -1045,7 +1053,8 @@ inline bool TSharedCacheSpace::FinalDrain(TTransition& transition, THotRouter&& 
             case ESpaceMap::Hot:
                 while (remainingSlots != 0 && transition.NextWorkIndex_ < oldHotSlotCount) {
                     const ui64 slot = transition.NextWorkIndex_++;
-                    const ui64 raw = transition.OldView_->HotSlots[slot].exchange(0, std::memory_order_acquire);
+                    const ui64 raw = transition.OldView_->Tiers[ECacheTier::Regular].HotStorage.Slots[slot].exchange(
+                        0, std::memory_order_acquire);
                     if (raw != 0) {
                         hotRouter(HotLevelForSlot(slot, oldHotSlotCount), raw);
                     }
@@ -1059,8 +1068,9 @@ inline bool TSharedCacheSpace::FinalDrain(TTransition& transition, THotRouter&& 
 
             case ESpaceMap::Cold:
                 while (remainingSlots != 0 && transition.NextWorkIndex_ < oldColdSlotCount) {
-                    const ui64 raw = transition.OldView_->ColdSlots[transition.NextWorkIndex_++].exchange(
-                        0, std::memory_order_acquire);
+                    const ui64 raw = transition.OldView_->Tiers[ECacheTier::Regular]
+                                         .ColdStorage.Slots[transition.NextWorkIndex_++]
+                                         .exchange(0, std::memory_order_acquire);
                     if (raw != 0) {
                         coldRouter(raw);
                     }
@@ -1074,8 +1084,9 @@ inline bool TSharedCacheSpace::FinalDrain(TTransition& transition, THotRouter&& 
 
             case ESpaceMap::KeepCold:
                 while (remainingSlots != 0 && transition.NextWorkIndex_ < oldKeepColdSlotCount) {
-                    const ui64 raw = transition.OldView_->KeepColdSlots[transition.NextWorkIndex_++].exchange(
-                        0, std::memory_order_acquire);
+                    const ui64 raw = transition.OldView_->Tiers[ECacheTier::Keep]
+                                         .ColdStorage.Slots[transition.NextWorkIndex_++]
+                                         .exchange(0, std::memory_order_acquire);
                     if (raw != 0) {
                         keepColdRouter(raw);
                     }
@@ -1146,27 +1157,20 @@ constexpr ui32 TBucketResizeState::SplitBit() const noexcept {
 }
 
 Y_FORCE_INLINE TRingView TSpaceView::Hot(EHotLevel level) const noexcept {
-    Y_DEBUG_ABORT_UNLESS(Rings && level < HotLevelCount);
-    const TCacheTierView tier{
-        .Rings = &Rings->Tier(ECacheTier::Regular),
-        .HotSlots = HotSlots,
-        .HotSlotCount = EffectiveHotSlotCount(),
-    };
+    TCacheTierView tier = Tiers[ECacheTier::Regular];
+    tier.HotStorage.SlotCount = EffectiveHotSlotCount();
     return tier.Hot(level);
 }
 
 inline void TSpaceView::CopyMappings(const TSpaceView& source) noexcept {
     Handles = source.Handles;
     Buckets = source.Buckets;
-    HotSlots = source.HotSlots;
-    ColdSlots = source.ColdSlots;
-    KeepColdSlots = source.KeepColdSlots;
+    for (ui32 index = 0; index < CacheTierCount; ++index) {
+        Tiers[index].CopyMappings(source.Tiers[index]);
+    }
     FreeSlots = source.FreeSlots;
     HandlesBytes = source.HandlesBytes;
     BucketsBytes = source.BucketsBytes;
-    HotSlotBytes = source.HotSlotBytes;
-    ColdSlotBytes = source.ColdSlotBytes;
-    KeepColdSlotBytes = source.KeepColdSlotBytes;
     FreeSlotBytes = source.FreeSlotBytes;
 }
 

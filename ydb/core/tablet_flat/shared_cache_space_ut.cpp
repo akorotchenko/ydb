@@ -21,15 +21,15 @@ public:
     }
 
     static std::atomic<ui64>* HotSlots(const TSharedCacheSpace& space) noexcept {
-        return space.NewestView().HotSlots;
+        return space.NewestView().Tiers[ECacheTier::Regular].HotStorage.Slots;
     }
 
     static std::atomic<ui64>* ColdSlots(const TSharedCacheSpace& space) noexcept {
-        return space.NewestView().ColdSlots;
+        return space.NewestView().Tiers[ECacheTier::Regular].ColdStorage.Slots;
     }
 
     static std::atomic<ui64>* KeepColdSlots(const TSharedCacheSpace& space) noexcept {
-        return space.NewestView().KeepColdSlots;
+        return space.NewestView().Tiers[ECacheTier::Keep].ColdStorage.Slots;
     }
 
     static std::atomic<ui64>* FreeSlots(const TSharedCacheSpace& space) noexcept {
@@ -129,6 +129,18 @@ public:
     }
 
     template <class TCallback>
+    static bool PrepareTransition(TSharedCacheSpace& space, const TSharedCacheCapacity& target, TTransition& transition,
+        TCallback& callback) noexcept {
+        return space.PrepareTransitionWithHook(target, transition,
+            {
+                .Context = &callback,
+                .Function = [](void* context, ESpaceMap mapping) noexcept {
+                    return (*static_cast<TCallback*>(context))(mapping);
+                },
+            });
+    }
+
+    template <class TCallback>
     static bool TryReleaseTransition(TSharedCacheSpace& space, TTransition& transition, TCallback& callback) noexcept {
         return space.TryReleaseTransitionWithHook(
             transition, {
@@ -205,7 +217,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
         std::array<std::atomic<ui64>, 64> hot{};
         std::array<std::atomic<ui64>, 8> cold{};
         TCacheTierRings cursors;
-        const TCacheTierView tier{ &cursors, hot.data(), cold.data(), hot.size(), cold.size() };
+        const TCacheTierView tier{ &cursors, { hot.data(), sizeof(hot), hot.size() },
+            { cold.data(), sizeof(cold), cold.size() } };
         const std::array<ui64, HotLevelCount> offsets{ 33, 12, 4, 0 };
         const std::array<ui64, HotLevelCount> sizes{ 31, 21, 8, 4 };
         for (ui32 index = 0; index < HotLevelCount; ++index) {
@@ -270,11 +283,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
         std::array<std::atomic<ui64>, 512> slots{};
         TS5FifoRings cursors;
         TSpaceView view;
-        view.HotSlots = slots.data();
-        view.Rings = &cursors;
+        view.Tiers[ECacheTier::Regular].HotStorage.Slots = slots.data();
+        view.Tiers[ECacheTier::Regular].Rings = &cursors.Tier(ECacheTier::Regular);
         for (ui64 count = 15; count <= slots.size(); ++count) {
             UNIT_ASSERT(SharedCacheHotLayoutIsValid(count));
-            view.HotSlotCount = count;
+            view.Tiers[ECacheTier::Regular].HotStorage.SlotCount = count;
             const ui64 l3 = count / 15;
             const ui64 l2 = count * 2 / 15;
             const ui64 l1 = count * 5 / 15;
@@ -293,7 +306,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
         std::array<std::atomic<ui64>, 64> hot{};
         std::array<std::atomic<ui64>, 8> cold{};
         TCacheTierRings cursors;
-        const TCacheTierView first{ &cursors, hot.data(), cold.data(), hot.size(), cold.size() };
+        const TCacheTierView first{ &cursors, { hot.data(), sizeof(hot), hot.size() },
+            { cold.data(), sizeof(cold), cold.size() } };
         const auto second = first;
         for (auto level : { EHotLevel::L0, EHotLevel::L1, EHotLevel::L2, EHotLevel::L3 }) {
             auto a = first.Hot(level);
@@ -328,7 +342,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
         ui32 seenCount = 0;
         for (ui32 index = 0; index < CacheTierCount; ++index) {
             const auto id = static_cast<ECacheTier>(index);
-            TCacheTierView tier{ &composed.Tier(id), hot[index].data(), cold[index].data(), 64, 8 };
+            TCacheTierView tier{ &composed.Tier(id), { hot[index].data(), sizeof(hot[index]), 64 },
+                { cold[index].data(), sizeof(cold[index]), 8 } };
             for (auto level : { EHotLevel::L0, EHotLevel::L1, EHotLevel::L2, EHotLevel::L3 }) {
                 auto ring = tier.Hot(level);
                 UNIT_ASSERT(ring.Cursor == &composed.Hot(id, level));
@@ -360,7 +375,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
             std::array<std::atomic<ui64>, 64> hot{};
             std::array<std::atomic<ui64>, 7> cold{};
             TCacheTierRings cursors;
-            const TCacheTierView tier{ &cursors, hot.data(), cold.data(), hotSize, cold.size() };
+            const TCacheTierView tier{ &cursors, { hot.data(), sizeof(hot), hotSize },
+                { cold.data(), sizeof(cold), cold.size() } };
             const auto check = [](TRingView ring) {
                 const ui64 writes = 2 * ring.Capacity + 3;
                 for (ui64 pos = 0; pos < writes; ++pos) {
@@ -384,7 +400,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
         std::array<std::atomic<ui64>, 8> hot{};
         std::array<std::atomic<ui64>, 4> cold{};
         TCacheTierRings cursors;
-        const TCacheTierView tier{ &cursors, hot.data(), cold.data(), hot.size(), cold.size() };
+        const TCacheTierView tier{ &cursors, { hot.data(), sizeof(hot), hot.size() },
+            { cold.data(), sizeof(cold), cold.size() } };
         const auto ring = tier.Hot(EHotLevel::L0);
         for (ui64 value = 1; value <= ring.Capacity; ++value) {
             UNIT_ASSERT_VALUES_EQUAL(ring.Cursor->Push(ring.Slots, ring.Capacity, value).Previous, 0);
@@ -411,6 +428,196 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
             total += range.Size;
         }
         UNIT_ASSERT_VALUES_EQUAL(total, layout.SlotCount);
+    }
+}
+
+Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
+    void CheckLegacyMappings(
+        const TSpaceView& view, const TSharedCacheCapacity& logical, const TSharedCacheCapacity& mapped) {
+        const auto& regular = view.Tiers[ECacheTier::Regular];
+        const auto& keep = view.Tiers[ECacheTier::Keep];
+        UNIT_ASSERT(regular.Rings && keep.Rings && regular.Rings != keep.Rings);
+        UNIT_ASSERT(regular.HotStorage.Slots && regular.ColdStorage.Slots && keep.ColdStorage.Slots);
+        UNIT_ASSERT_VALUES_EQUAL(regular.HotStorage.SlotCount, logical.HotSlotCount());
+        UNIT_ASSERT_VALUES_EQUAL(regular.ColdStorage.SlotCount, logical.ColdSlotCount());
+        UNIT_ASSERT_VALUES_EQUAL(keep.ColdStorage.SlotCount, logical.KeepColdSlotCount());
+        UNIT_ASSERT_VALUES_EQUAL(regular.HotStorage.Bytes, mapped.HotSlotCount() * sizeof(std::atomic<ui64>));
+        UNIT_ASSERT_VALUES_EQUAL(regular.ColdStorage.Bytes, mapped.ColdSlotCount() * sizeof(std::atomic<ui64>));
+        UNIT_ASSERT_VALUES_EQUAL(keep.ColdStorage.Bytes, mapped.KeepColdSlotCount() * sizeof(std::atomic<ui64>));
+        UNIT_ASSERT(!keep.HotStorage.Slots);
+        UNIT_ASSERT_VALUES_EQUAL(keep.HotStorage.Bytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(keep.HotStorage.SlotCount, 0);
+        UNIT_ASSERT_VALUES_EQUAL(view.Cold().Capacity, logical.ColdSlotCount());
+        UNIT_ASSERT_VALUES_EQUAL(view.KeepCold().Capacity, logical.KeepColdSlotCount());
+    }
+
+    Y_UNIT_TEST(CopyMappingsPreservesTierBoundsAndCursors) {
+        std::array<std::array<std::atomic<ui64>, 16>, CacheTierCount * 2> oldSlots{};
+        std::array<std::array<std::atomic<ui64>, 16>, CacheTierCount * 2> newSlots{};
+        TS5FifoRings oldRings;
+        TS5FifoRings newRings;
+        TSpaceView oldView;
+        TSpaceView newView;
+        for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+            const ui32 index = tier * 2;
+            oldView.Tiers[tier] = {
+                &oldRings.Tier(tier),
+                { oldSlots[index].data(), sizeof(oldSlots[index]), 4 + index },
+                { oldSlots[index + 1].data(), sizeof(oldSlots[index + 1]), 5 + index },
+            };
+            newView.Tiers[tier] = {
+                &newRings.Tier(tier),
+                { newSlots[index].data(), sizeof(newSlots[index]), 16 },
+                { newSlots[index + 1].data(), sizeof(newSlots[index + 1]), 16 },
+            };
+        }
+        oldView.CopyMappings(newView);
+        for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+            const ui32 index = tier * 2;
+            const auto& view = oldView.Tiers[tier];
+            UNIT_ASSERT(view.Rings == &oldRings.Tier(tier));
+            UNIT_ASSERT(view.HotStorage.Slots == newSlots[index].data());
+            UNIT_ASSERT(view.ColdStorage.Slots == newSlots[index + 1].data());
+            UNIT_ASSERT_VALUES_EQUAL(view.HotStorage.Bytes, sizeof(newSlots[index]));
+            UNIT_ASSERT_VALUES_EQUAL(view.ColdStorage.Bytes, sizeof(newSlots[index + 1]));
+            UNIT_ASSERT_VALUES_EQUAL(view.HotStorage.SlotCount, 4 + index);
+            UNIT_ASSERT_VALUES_EQUAL(view.ColdStorage.SlotCount, 5 + index);
+        }
+    }
+
+    Y_UNIT_TEST(TierMappingsKeepLogicalBoundsAcrossGrowthAndShrink) {
+        TSharedCacheCapacity small;
+        TSharedCacheCapacity large;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, large));
+        for (bool growing : { true, false }) {
+            const auto& current = growing ? small : large;
+            const auto& target = growing ? large : small;
+            auto [threads, space] = TCacheThreadTestAccess::MakeSpace(current, large, 1);
+            UNIT_ASSERT(space);
+            const auto before = TSharedCacheSpaceTestAccess::CurrentView(*space);
+            CheckLegacyMappings(before, current, current);
+            before.Tiers[ECacheTier::Regular].HotStorage.Slots[0].store(11);
+            before.Tiers[ECacheTier::Regular].ColdStorage.Slots[0].store(22);
+            before.Tiers[ECacheTier::Keep].ColdStorage.Slots[0].store(33);
+            TTransition transition;
+            UNIT_ASSERT(space->PrepareTransition(target, transition));
+            {
+                auto oldOperation = TSharedCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+                UNIT_ASSERT(space->PublishMigrationView(transition));
+                CheckLegacyMappings(TSharedCacheSpaceTestAccess::CurrentView(*space), current, large);
+                CheckLegacyMappings(oldOperation.View(), current, current);
+                UNIT_ASSERT(!space->TryDrainTransition(transition));
+            }
+            UNIT_ASSERT(space->TryDrainTransition(transition));
+            CompleteEmptyBucketResize(*space, target.AddressBits);
+            {
+                auto migrationOperation = TSharedCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+                UNIT_ASSERT(space->PublishFinalView(transition));
+                if (growing) {
+                    CompleteGrowthAppend(*space, transition);
+                }
+                CheckLegacyMappings(TSharedCacheSpaceTestAccess::CurrentView(*space), target, target);
+                CheckLegacyMappings(migrationOperation.View(), current, large);
+                UNIT_ASSERT(!space->TryDrainTransition(transition));
+            }
+            UNIT_ASSERT(space->TryDrainTransition(transition));
+            CompleteFinalDrain(*space, transition);
+            UNIT_ASSERT(space->TryReleaseTransition(transition));
+            UNIT_ASSERT(space->CommitTransition(transition));
+            const auto& after = TSharedCacheSpaceTestAccess::CurrentView(*space);
+            CheckLegacyMappings(after, target, target);
+            UNIT_ASSERT(before.Tiers[ECacheTier::Regular].Rings == after.Tiers[ECacheTier::Regular].Rings);
+            UNIT_ASSERT(before.Tiers[ECacheTier::Keep].Rings == after.Tiers[ECacheTier::Keep].Rings);
+            UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Regular].HotStorage.Slots[0].load(), 11);
+            UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Regular].ColdStorage.Slots[0].load(), 22);
+            UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Keep].ColdStorage.Slots[0].load(), 33);
+        }
+    }
+
+    Y_UNIT_TEST(PartialPreparationKeepsThePublishedTierMappings) {
+        TSharedCacheCapacity small;
+        TSharedCacheCapacity large;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, large));
+        const std::array stages{ ESpaceMap::Handles, ESpaceMap::Buckets, ESpaceMap::Hot, ESpaceMap::Cold,
+            ESpaceMap::KeepCold, ESpaceMap::Free };
+        for (ui32 failure = 0; failure < stages.size(); ++failure) {
+            auto [threads, space] = TCacheThreadTestAccess::MakeSpace(small, large, 1);
+            UNIT_ASSERT(space);
+            const auto state = space->CurrentSpaceState();
+            const auto before = TSharedCacheSpaceTestAccess::CurrentView(*space);
+            before.Tiers[ECacheTier::Regular].HotStorage.Slots[0].store(11);
+            before.Tiers[ECacheTier::Regular].ColdStorage.Slots[0].store(22);
+            before.Tiers[ECacheTier::Keep].ColdStorage.Slots[0].store(33);
+            ui32 calls = 0;
+            bool ordered = true;
+            auto prepare = [&](ESpaceMap mapping) noexcept {
+                ordered &= calls < stages.size() && mapping == stages[calls];
+                ++calls;
+                return mapping != stages[failure];
+            };
+            TTransition failed;
+            UNIT_ASSERT(!TSharedCacheSpaceTestAccess::PrepareTransition(*space, large, failed, prepare));
+            UNIT_ASSERT(ordered);
+            UNIT_ASSERT_VALUES_EQUAL(calls, failure + 1);
+            UNIT_ASSERT(failed.Phase() == ETransitionPhase::Idle);
+            UNIT_ASSERT(space->CurrentSpaceState() == state);
+            TTransition retry;
+            UNIT_ASSERT(space->PrepareTransition(large, retry));
+            UNIT_ASSERT(space->AbandonTransition(retry));
+            const auto& after = TSharedCacheSpaceTestAccess::CurrentView(*space);
+            CheckLegacyMappings(after, small, small);
+            UNIT_ASSERT(after.Tiers[ECacheTier::Regular].HotStorage.Slots ==
+                        before.Tiers[ECacheTier::Regular].HotStorage.Slots);
+            UNIT_ASSERT(after.Tiers[ECacheTier::Regular].ColdStorage.Slots ==
+                        before.Tiers[ECacheTier::Regular].ColdStorage.Slots);
+            UNIT_ASSERT(
+                after.Tiers[ECacheTier::Keep].ColdStorage.Slots == before.Tiers[ECacheTier::Keep].ColdStorage.Slots);
+            UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Regular].HotStorage.Slots[0].load(), 11);
+            UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Regular].ColdStorage.Slots[0].load(), 22);
+            UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Keep].ColdStorage.Slots[0].load(), 33);
+        }
+    }
+
+    Y_UNIT_TEST(TierReleaseRetriesEachRingStage) {
+        TSharedCacheCapacity small;
+        TSharedCacheCapacity large;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(14, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(15, 4096, 0, 1, large));
+        for (auto failure : { ESpaceMap::Hot, ESpaceMap::Cold, ESpaceMap::KeepCold }) {
+            auto [threads, space] = TCacheThreadTestAccess::MakeSpace(large, large, 1);
+            UNIT_ASSERT(space);
+            TTransition transition;
+            UNIT_ASSERT(space->PrepareTransition(small, transition));
+            UNIT_ASSERT(space->PublishMigrationView(transition));
+            UNIT_ASSERT(space->TryDrainTransition(transition));
+            CompleteEmptyBucketResize(*space, small.AddressBits);
+            UNIT_ASSERT(space->PublishFinalView(transition));
+            UNIT_ASSERT(space->TryDrainTransition(transition));
+            CompleteFinalDrain(*space, transition);
+            bool reached = false;
+            auto release = [&](ESpaceMap mapping, const void*, size_t) noexcept {
+                reached |= mapping == failure;
+                return mapping != failure;
+            };
+            UNIT_ASSERT(!TSharedCacheSpaceTestAccess::TryReleaseTransition(*space, transition, release));
+            UNIT_ASSERT(reached);
+            UNIT_ASSERT(transition.Phase() == ETransitionPhase::ReleaseRetry);
+            UNIT_ASSERT(transition.ReleaseStage() == failure);
+            CheckLegacyMappings(TSharedCacheSpaceTestAccess::CurrentView(*space), small, small);
+            ESpaceMap first = ESpaceMap::Done;
+            auto retry = [&](ESpaceMap mapping, const void*, size_t) noexcept {
+                if (first == ESpaceMap::Done) {
+                    first = mapping;
+                }
+                return true;
+            };
+            UNIT_ASSERT(TSharedCacheSpaceTestAccess::TryReleaseTransition(*space, transition, retry));
+            UNIT_ASSERT(first == failure);
+            UNIT_ASSERT(space->CommitTransition(transition));
+            CheckLegacyMappings(TSharedCacheSpaceTestAccess::CurrentView(*space), small, small);
+        }
     }
 }
 
@@ -993,7 +1200,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::ReservedCapacity(*space).HandleCount(), 64);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::BucketCount(*space), 32);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::ReservedCapacity(*space).BucketCount(), 64);
-        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).HotSlotCount, 24);
+        UNIT_ASSERT_VALUES_EQUAL(
+            TSharedCacheSpaceTestAccess::CurrentView(*space).Tiers[ECacheTier::Regular].HotStorage.SlotCount, 24);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).Cold().Capacity, 16);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).KeepCold().Capacity, 16);
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), 30);
