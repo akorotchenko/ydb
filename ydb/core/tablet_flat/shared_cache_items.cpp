@@ -7,7 +7,7 @@ namespace NKikimr::NSharedCache {
 
 template <class TTraits>
 TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::TryAcquireHotItemRef(
-    TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
+    TSpaceOperation& spaceOp, TCacheItem cacheItem, ECacheTier expectedTier) noexcept {
     if (!spaceOp.Contains(cacheItem) || cacheItem.IsFrozen()) {
         return {};
     }
@@ -15,7 +15,8 @@ TSharedCacheItemRefImpl<TTraits> TCacheItems<TTraits>::TryAcquireHotItemRef(
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
     for (;;) {
         const THandleState expected = THandleState::FromRaw(expectedRaw);
-        if (!cacheItem.Matches(expected) || !expected.IsHot() || !expected.IsStickyNoneField()) {
+        if (!cacheItem.Matches(expected) || !expected.IsHot() || expected.Tier() != expectedTier ||
+            !expected.IsStickyNoneField()) {
             return {};
         }
         Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);

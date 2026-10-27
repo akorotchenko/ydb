@@ -12,7 +12,8 @@ void TCacheColdPolicy<TTraits>::PublishCold(
     THandle& handle = spaceOp.Handles()[nativeItem.Index()];
     const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    if (!nativeItem.Matches(state) || !state.IsCold() || !state.IsStickyNoneField() || state.Refs() != 0) {
+    if (!nativeItem.Matches(state) || !state.IsCold() || state.Tier() != tier.Id || !state.IsStickyNoneField() ||
+        state.Refs() != 0) {
         return;
     }
     Enqueue(spaceOp, tier, TColdCacheItem::Make(coldVersion, nativeItem.Index()), handle, state);
@@ -30,7 +31,7 @@ void TCacheColdPolicy<TTraits>::RouteCold(
         return;
     }
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    if (!state.IsCold() || !state.IsStickyNoneField() || state.Refs() != 0) {
+    if (!state.IsCold() || state.Tier() != tier.Id || !state.IsStickyNoneField() || state.Refs() != 0) {
         return;
     }
 
@@ -49,7 +50,7 @@ void TCacheColdPolicy<TTraits>::Enqueue(TSpaceOperation& spaceOp, const TCacheTi
     const TColdCacheItem displaced = TColdCacheItem::FromRaw(tier.Cold().PutAndPop(coldItem.Raw()));
     if (!displaced.IsNull()) {
         tier.Rings->RemoveColdEntry();
-        Cache_.Eviction_.EraseCold(spaceOp, displaced);
+        Cache_.Eviction_.EraseCold(spaceOp, displaced, tier.Id);
     }
 }
 
@@ -66,8 +67,8 @@ bool TCacheColdPolicy<TTraits>::ReclaimImpl(TSpaceOperation& spaceOp, const TCac
         const ui64 rawItem = Preload ? Cache_.Eviction_.PopForPreload(spaceOp, cold, true).Previous : cold.Pop();
         if (rawItem != 0) {
             tier.Rings->RemoveColdEntry();
-            if (Preload ? Cache_.Eviction_.TryErasePreloadPage(spaceOp, TColdCacheItem::FromRaw(rawItem))
-                        : Cache_.Eviction_.EraseCold(spaceOp, TColdCacheItem::FromRaw(rawItem))) {
+            if (Preload ? Cache_.Eviction_.TryErasePreloadPage(spaceOp, TColdCacheItem::FromRaw(rawItem), tier.Id)
+                        : Cache_.Eviction_.EraseCold(spaceOp, TColdCacheItem::FromRaw(rawItem), tier.Id)) {
                 return true;
             }
         }

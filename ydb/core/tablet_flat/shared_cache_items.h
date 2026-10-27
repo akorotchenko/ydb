@@ -52,7 +52,8 @@ private:
     // Reference acquisition
     Y_FORCE_INLINE EAcquireStatus TryAcquire(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending,
         TSharedCacheItemRefImpl<TTraits>& ref) noexcept;
-    TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+    TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(
+        TSpaceOperation& spaceOp, TCacheItem item, ECacheTier expectedTier) noexcept;
     TSharedCacheItemRefImpl<TTraits> AcquireMorePageRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     TSharedCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
 
@@ -114,8 +115,9 @@ public:
         return Cache_.Items_.TryAcquire(SpaceOp_, cacheItem, allowPending, ref);
     }
 
-    Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TCacheItem item) noexcept {
-        return Cache_.Items_.TryAcquireHotItemRef(SpaceOp_, item);
+    Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> TryAcquireHotItemRef(
+        TCacheItem item, ECacheTier expectedTier) noexcept {
+        return Cache_.Items_.TryAcquireHotItemRef(SpaceOp_, item, expectedTier);
     }
 
     Y_FORCE_INLINE TSharedCacheItemRefImpl<TTraits> AcquireMorePageRef(TCacheItem item) noexcept {
