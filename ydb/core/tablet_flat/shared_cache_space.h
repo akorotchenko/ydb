@@ -41,13 +41,6 @@ constexpr bool SharedCacheHotLayoutIsValid(ui64 hotSlotCount) noexcept {
     return l0Size && l1Size && l2Size && l3Size;
 }
 
-enum ECacheTier : ui8 {
-    Regular,
-    Keep,
-};
-
-inline constexpr ui32 CacheTierCount = 2;
-
 // Compatibility bindings for the current policy; the tier core has no collection modes
 class TS5FifoRings {
 public:
@@ -208,7 +201,10 @@ struct TSpaceView {
     ui32 Generation = 0;
     THandle* Handles = nullptr;
     std::atomic<ui64>* Buckets = nullptr;
-    std::array<TCacheTierView, CacheTierCount> Tiers;
+    std::array<TCacheTierView, CacheTierCount> Tiers{
+        TCacheTierView{ .Id = ECacheTier::Regular },
+        TCacheTierView{ .Id = ECacheTier::Keep },
+    };
     std::atomic<ui64>* FreeSlots = nullptr;
 
     ui64 HandleCount = 0;

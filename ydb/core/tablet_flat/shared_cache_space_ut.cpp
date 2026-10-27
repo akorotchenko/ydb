@@ -464,6 +464,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
         const TSpaceView& view, const TSharedCacheCapacity& logical, const TSharedCacheCapacity& mapped) {
         const auto& regular = view.Tiers[ECacheTier::Regular];
         const auto& keep = view.Tiers[ECacheTier::Keep];
+        UNIT_ASSERT(regular.Id == ECacheTier::Regular);
+        UNIT_ASSERT(keep.Id == ECacheTier::Keep);
         UNIT_ASSERT(regular.Rings && keep.Rings && regular.Rings != keep.Rings);
         UNIT_ASSERT(regular.HotStorage.Slots && regular.ColdStorage.Slots && keep.ColdStorage.Slots);
         UNIT_ASSERT_VALUES_EQUAL(regular.HotStorage.SlotCount, logical.HotSlotCount());
@@ -502,6 +504,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
             };
             oldView.Tiers[tier].EffectiveHotSlots = &oldLimits[tier];
             newView.Tiers[tier].EffectiveHotSlots = &newLimits[tier];
+            oldView.Tiers[tier].Id = tier;
+            newView.Tiers[tier].Id = tier == ECacheTier::Regular ? ECacheTier::Keep : ECacheTier::Regular;
         }
         oldView.CopyMappings(newView);
         for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
@@ -509,6 +513,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
             const auto& view = oldView.Tiers[tier];
             UNIT_ASSERT(view.Rings == &oldRings.Tier(tier));
             UNIT_ASSERT(view.EffectiveHotSlots == &oldLimits[tier]);
+            UNIT_ASSERT(view.Id == tier);
             UNIT_ASSERT(view.HotStorage.Slots == newSlots[index].data());
             UNIT_ASSERT(view.ColdStorage.Slots == newSlots[index + 1].data());
             UNIT_ASSERT_VALUES_EQUAL(view.HotStorage.Bytes, sizeof(newSlots[index]));
