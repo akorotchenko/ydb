@@ -259,7 +259,8 @@ EShrinkCutStatus TSharedCache::ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui3
         }
         if (state.Refs() == 0) {
             const ui32 coldVersion = spaceOp.Handles()[index].ColdVersion.load(std::memory_order_acquire);
-            if (cacheOp.Eviction().EraseCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, index))) {
+            if (cacheOp.Eviction().EraseCold(
+                    TColdCacheItem::Make(coldVersion & MaxItemVersion, index), ECacheTier::Regular)) {
                 return EShrinkCutStatus::Progress;
             }
         }

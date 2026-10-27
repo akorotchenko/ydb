@@ -106,7 +106,7 @@ private:
         HotPolicy_.ProcessHot(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular], level, item);
     }
     bool EvictFromHot(TSpaceOperation& spaceOp, ui32 index) noexcept;
-    bool EvictFromHot(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+    bool EvictFromHot(TSpaceOperation& spaceOp, TCacheItem item, ECacheTier expectedTier) noexcept;
     bool PromoteCold(TSpaceOperation& spaceOp, TCacheItem item, bool force = false) noexcept;
 
     Y_FORCE_INLINE bool ProcessHotAtMinimum(TSpaceOperation& spaceOp) noexcept {
@@ -115,7 +115,7 @@ private:
 
     // Cold routing and reclamation
     void CompleteColdPageRelease(TOperationItemRef<TTraits>& ownerRef) noexcept;
-    bool EraseCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
+    bool EraseCold(TSpaceOperation& spaceOp, TColdCacheItem item, ECacheTier expectedTier) noexcept;
 
     Y_FORCE_INLINE void PublishCold(TSpaceOperation& spaceOp, TCacheItem nativeItem) noexcept {
         ColdPolicy_.PublishCold(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular], nativeItem);
@@ -141,7 +141,7 @@ private:
     TRingExchangeResult PopForPreload(TSpaceOperation& spaceOp, TRingView ring, bool cold) noexcept;
     TRingExchangeResult ExchangeForPreload(
         TSpaceOperation& spaceOp, std::atomic<ui64>* slot, ui64 raw, bool cold) noexcept;
-    bool TryErasePreloadPage(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
+    bool TryErasePreloadPage(TSpaceOperation& spaceOp, TColdCacheItem item, ECacheTier expectedTier) noexcept;
     bool ReclaimRegularPage(TSpaceOperation& spaceOp) noexcept;
 
     // Policy resizing and maintenance
@@ -235,7 +235,7 @@ public:
     }
 
     Y_FORCE_INLINE bool EvictFromHot(TCacheItem item) noexcept {
-        return Cache_.Eviction_.EvictFromHot(SpaceOp_, item);
+        return Cache_.Eviction_.EvictFromHot(SpaceOp_, item, ECacheTier::Regular);
     }
 
     Y_FORCE_INLINE bool PromoteCold(TCacheItem item, bool force = false) noexcept {
@@ -251,8 +251,8 @@ public:
         Cache_.Eviction_.CompleteColdPageRelease(ownerRef);
     }
 
-    Y_FORCE_INLINE bool EraseCold(TColdCacheItem item) noexcept {
-        return Cache_.Eviction_.EraseCold(SpaceOp_, item);
+    Y_FORCE_INLINE bool EraseCold(TColdCacheItem item, ECacheTier expectedTier) noexcept {
+        return Cache_.Eviction_.EraseCold(SpaceOp_, item, expectedTier);
     }
 
     Y_FORCE_INLINE void RouteCold(TColdCacheItem item) noexcept {

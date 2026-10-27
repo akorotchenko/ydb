@@ -44,7 +44,7 @@ private:
         TRingExchangeResult* placement = nullptr) noexcept;
 
     static Y_FORCE_INLINE bool TakeHotFrequency(
-        THandle& handle, TCacheItem item, THandleState& state, ui8& frequency) noexcept;
+        THandle& handle, TCacheItem item, ECacheTier expectedTier, THandleState& state, ui8& frequency) noexcept;
 
     template <bool Preload>
     void ProcessHotImpl(

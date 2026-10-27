@@ -37,7 +37,7 @@ TCacheItem TCacheHotPolicy<TTraits>::PutHotImpl(TSpaceOperation& spaceOp, const 
         ui64 expected = cacheItem.Raw();
         if (exchange.Slot->compare_exchange_strong(expected, 0, std::memory_order_relaxed, std::memory_order_relaxed))
         {
-            Cache_.Eviction_.EvictFromHot(spaceOp, cacheItem);
+            Cache_.Eviction_.EvictFromHot(spaceOp, cacheItem, tier.Id);
         }
     }
     return TCacheItem::FromRaw(exchange.Previous);
@@ -45,11 +45,12 @@ TCacheItem TCacheHotPolicy<TTraits>::PutHotImpl(TSpaceOperation& spaceOp, const 
 
 template <class TTraits>
 Y_FORCE_INLINE bool TCacheHotPolicy<TTraits>::TakeHotFrequency(
-    THandle& handle, TCacheItem cacheItem, THandleState& state, ui8& frequency) noexcept {
+    THandle& handle, TCacheItem cacheItem, ECacheTier expectedTier, THandleState& state, ui8& frequency) noexcept {
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
     for (;;) {
         const THandleState expected = THandleState::FromRaw(expectedRaw);
-        if (!cacheItem.Matches(expected) || !expected.IsHot() || !expected.IsStickyNoneField()) {
+        if (!cacheItem.Matches(expected) || !expected.IsHot() || expected.Tier() != expectedTier ||
+            !expected.IsStickyNoneField()) {
             return false;
         }
         const THandleState desired = expected.WithFrequency(0);
@@ -75,14 +76,14 @@ void TCacheHotPolicy<TTraits>::ProcessHotImpl(
     TSpaceOperation& spaceOp, const TCacheTierView& tier, EHotLevel level, TCacheItem cacheItem) noexcept {
     for (;;) {
         TOperationItemRef<TTraits> evictionRef(
-            spaceOp, Cache_.Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
+            spaceOp, Cache_.Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem, tier.Id));
         if (!evictionRef) {
             return;
         }
         THandle& handle = spaceOp.Handles()[cacheItem.Index()];
         THandleState state;
         ui8 frequency;
-        if (!TakeHotFrequency(handle, cacheItem, state, frequency)) {
+        if (!TakeHotFrequency(handle, cacheItem, tier.Id, state, frequency)) {
             return;
         }
         const EHotLevel sourceLevel = level;

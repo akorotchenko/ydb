@@ -272,15 +272,16 @@ bool TCacheEviction<TTraits>::EvictFromHot(TSpaceOperation& spaceOp, ui32 index)
     if (!state.IsHot()) {
         return false;
     }
-    return EvictFromHot(spaceOp, TCacheItem::Make(state.Version(), index));
+    return EvictFromHot(spaceOp, TCacheItem::Make(state.Version(), index), ECacheTier::Regular);
 }
 
 template <class TTraits>
-bool TCacheEviction<TTraits>::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
+bool TCacheEviction<TTraits>::EvictFromHot(
+    TSpaceOperation& spaceOp, TCacheItem cacheItem, ECacheTier expectedTier) noexcept {
     Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem) && !cacheItem.IsFrozen() && cacheItem.Index() >= 2);
 
     TOperationItemRef<TTraits> evictionRef(
-        spaceOp, Cache_.Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem));
+        spaceOp, Cache_.Items_.BindOperation(spaceOp).TryAcquireHotItemRef(cacheItem, expectedTier));
     if (!evictionRef) {
         return false;
     }
@@ -289,7 +290,8 @@ bool TCacheEviction<TTraits>::EvictFromHot(TSpaceOperation& spaceOp, TCacheItem 
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
     for (;;) {
         const THandleState expected = THandleState::FromRaw(expectedRaw);
-        if (!cacheItem.Matches(expected) || !expected.IsHot() || !expected.IsStickyNoneField()) {
+        if (!cacheItem.Matches(expected) || !expected.IsHot() || expected.Tier() != expectedTier ||
+            !expected.IsStickyNoneField()) {
             return false;
         }
         const ui64 bytes = TCacheItems<TTraits>::PayloadBytes(handle, expected.Kind());
@@ -371,7 +373,8 @@ void TCacheEviction<TTraits>::CompleteColdPageRelease(TOperationItemRef<TTraits>
 }
 
 template <class TTraits>
-bool TCacheEviction<TTraits>::EraseCold(TSpaceOperation& spaceOp, TColdCacheItem coldItem) noexcept {
+bool TCacheEviction<TTraits>::EraseCold(
+    TSpaceOperation& spaceOp, TColdCacheItem coldItem, ECacheTier expectedTier) noexcept {
     if (!spaceOp.Contains(coldItem) || coldItem.IsFrozen())
     {
         return false;
@@ -386,7 +389,7 @@ bool TCacheEviction<TTraits>::EraseCold(TSpaceOperation& spaceOp, TColdCacheItem
     TOperationItemRef<TTraits> ownerRef(spaceOp);
     THandleState expected = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
     for (;;) {
-        if ((!expected.IsCold() && !expected.IsKeepCold()) || (expected.IsKeepCold() && expected.Refs() != 0) ||
+        if (!expected.IsColdInTier(expectedTier) || (expected.IsKeepCold() && expected.Refs() != 0) ||
             !expected.IsStickyNoneField() ||
             (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
             return false;
@@ -449,10 +452,10 @@ bool TCacheEviction<TTraits>::TryEnqueueColdForPreload(TSpaceOperation& spaceOp,
             const auto exchange = ExchangeForPreload(spaceOp, tier.Cold().SelectPutSlot(), coldItem.Raw(), true);
             if (!exchange.Slot) {
                 tier.Rings->RemoveColdEntry();
-                TryErasePreloadPage(spaceOp, coldItem);
+                TryErasePreloadPage(spaceOp, coldItem, tier.Id);
             } else if (exchange.Previous != 0) {
                 tier.Rings->RemoveColdEntry();
-                TryErasePreloadPage(spaceOp, TColdCacheItem::FromRaw(exchange.Previous));
+                TryErasePreloadPage(spaceOp, TColdCacheItem::FromRaw(exchange.Previous), tier.Id);
             }
             return true;
         }
@@ -544,13 +547,15 @@ TRingExchangeResult TCacheEviction<TTraits>::ExchangeForPreload(
 }
 
 template <class TTraits>
-bool TCacheEviction<TTraits>::TryErasePreloadPage(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept {
+bool TCacheEviction<TTraits>::TryErasePreloadPage(
+    TSpaceOperation& spaceOp, TColdCacheItem item, ECacheTier expectedTier) noexcept {
     if (!spaceOp.Contains(item) || item.IsFrozen()) {
         return false;
     }
     THandle& handle = spaceOp.Handles()[item.Index()];
     THandleState expected = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-    if (!expected.IsCold() || !expected.IsPageKind() || expected.Refs() != 0 || !expected.IsStickyNoneField() ||
+    if (!expected.IsCold() || expected.Tier() != expectedTier || !expected.IsPageKind() || expected.Refs() != 0 ||
+        !expected.IsStickyNoneField() ||
         (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != item.ColdVersion()) {
         return false;
     }
@@ -625,7 +630,7 @@ bool TCacheEviction<TTraits>::ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept
             continue;
         }
         Cache_.InvokeHook(ESharedCacheHookPoint::AfterKeepColdEntryMatched, TCacheItem::FromRaw(item.Raw()));
-        if (EraseCold(spaceOp, item)) {
+        if (EraseCold(spaceOp, item, ECacheTier::Keep)) {
             return true;
         }
         WithdrawKeepColdEntry(spaceOp, item);

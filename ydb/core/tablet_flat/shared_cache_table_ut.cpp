@@ -501,7 +501,11 @@ public:
 
     static bool EraseCold(TTestSharedCache& cache, TColdCacheItem cacheItem) {
         auto operation = cache.BeginOperation();
-        return operation.Eviction().EraseCold(cacheItem);
+        const bool keep =
+            operation.SpaceOperation().Contains(cacheItem) &&
+            THandleState::FromRaw(operation.Handles()[cacheItem.Index()].State.load(std::memory_order_acquire))
+                .IsKeepCold();
+        return operation.Eviction().EraseCold(cacheItem, keep ? ECacheTier::Keep : ECacheTier::Regular);
     }
 
     static bool ReclaimCold(TTestSharedCache& cache, TSpaceOperation& operation) noexcept {
@@ -1823,7 +1827,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         gate.Slots[1].Wait();
         gate.Slots[0].Release();
         consumer.Join();
-        UNIT_ASSERT(reclaimed);
+        UNIT_ASSERT(!reclaimed);
+        UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*cache, source.Index()).IsCold());
+        UNIT_ASSERT(TSharedCacheTestAccess::WithSpace(*cache, [&](TSpaceOperation& op) {
+            return TSharedCacheTestAccess::BindOperation(*cache, op).Eviction().EraseCold(token, ECacheTier::Regular);
+        }));
         const auto state = TSharedCacheTestAccess::HandleState(*cache, source.Index());
         const bool reusedEarly = state.IsFree();
         TPageCacheItem replacement;
@@ -7848,6 +7856,70 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(0));
         checkWatermarks();
     }
+    Y_UNIT_TEST(HotPolicyRejectsAnotherTiersPage) {
+        TFixture fixture;
+        const auto key = TSharedCacheKey::Page(MakeCollectionCacheItem(83, 84), 0);
+        const auto page = InsertReadyPage(*fixture.Cache, key);
+        const auto before = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+        UNIT_ASSERT(before.IsHot());
+        TCacheHotPolicy<TTestTraits> policy(*fixture.Cache);
+        std::array<std::atomic<ui64>, 64> slots{};
+        TCacheTierRings rings;
+        const TCacheTierView wrong{
+            .Rings = &rings,
+            .HotStorage = { slots.data(), sizeof(slots), slots.size() },
+            .Id = ECacheTier::Keep,
+        };
+        TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
+            policy.ProcessHot(spaceOp, wrong, EHotLevel::L0, page.CacheItem());
+        });
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Raw(), before.Raw());
+        for (const auto& slot : slots) {
+            UNIT_ASSERT_VALUES_EQUAL(slot.load(), 0);
+        }
+    }
+
+    Y_UNIT_TEST(HotCutDoesNotEvictAnotherTiersPage) {
+        TFixture fixture;
+        const auto key = TSharedCacheKey::Page(MakeCollectionCacheItem(83, 85), 0);
+        const auto page = InsertReadyPage(*fixture.Cache, key);
+        const auto before = TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+        UNIT_ASSERT(before.IsHot());
+        TCacheHotPolicy<TTestTraits> policy(*fixture.Cache);
+        std::array<std::atomic<ui64>, 64> slots{};
+        TCacheTierRings rings;
+        std::atomic<ui64> limit = slots.size();
+        const TCacheTierView wrong{
+            .Rings = &rings,
+            .HotStorage = { slots.data(), sizeof(slots), slots.size() },
+            .EffectiveHotSlots = &limit,
+            .Id = ECacheTier::Keep,
+        };
+
+        struct TContext {
+            std::atomic<ui64>& Limit;
+            TCacheItem Page;
+            bool Visited = false;
+        } context{ limit, page.CacheItem() };
+
+        TTestTraits hooks{ &context, [](void* ptr, ESharedCacheHookPoint point, TCacheItem item) noexcept {
+                              auto& ctx = *static_cast<TContext*>(ptr);
+                              if (point == ESharedCacheHookPoint::BeforeHotExchange && item == ctx.Page) {
+                                  ctx.Visited = true;
+                                  ctx.Limit.store(HotLevelCount);
+                              }
+                          } };
+        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+        TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
+            UNIT_ASSERT(policy.PutHot(spaceOp, wrong, EHotLevel::L0, page.CacheItem()).IsNull());
+        });
+        UNIT_ASSERT(context.Visited);
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Raw(), before.Raw());
+        for (const auto& slot : slots) {
+            UNIT_ASSERT_VALUES_EQUAL(slot.load(), 0);
+        }
+    }
+
     Y_UNIT_TEST(HotPolicyUsesTheSuppliedTierView) {
         TFixture fixture;
         TCacheHotPolicy<TTestTraits> policy(*fixture.Cache);
@@ -8184,6 +8256,37 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, item.Index()).IsCold());
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableItems(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->RetainedBytes(), 20 * fixture.PageBytes);
+    }
+
+    Y_UNIT_TEST(ColdPolicyRejectsAnotherTiersPage) {
+        TColdPoolFixture fixture;
+        auto held = fixture.Fetch(0);
+        const auto page = held.CacheItem();
+        held.Drop();
+        const auto ticket = MakeColdItem(*fixture.Cache, page.Index());
+        TCacheColdPolicy<TTestTraits> policy(*fixture.Cache);
+        std::array<std::atomic<ui64>, 4> slots{};
+        TCacheTierRings rings;
+        const TCacheTierView wrong{
+            .Rings = &rings,
+            .ColdStorage = { slots.data(), sizeof(slots), slots.size() },
+            .Id = ECacheTier::Keep,
+        };
+        TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
+            policy.PublishCold(spaceOp, wrong, page.CacheItem());
+            policy.RouteCold(spaceOp, wrong, ticket);
+            UNIT_ASSERT_VALUES_EQUAL(rings.ColdEntries(), 0);
+            UNIT_ASSERT(!TSharedCacheTestAccess::BindOperation(*fixture.Cache, spaceOp).Eviction().EraseCold(ticket,
+                ECacheTier::Keep));
+            for (bool preload : { false, true }) {
+                rings.AddColdEntry();
+                slots[0].store(ticket.Raw());
+                UNIT_ASSERT(!(preload ? policy.ReclaimForPreload(spaceOp, wrong) : policy.Reclaim(spaceOp, wrong)));
+                UNIT_ASSERT_VALUES_EQUAL(rings.ColdEntries(), 0);
+                UNIT_ASSERT(TSharedCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsCold());
+            }
+        });
+        UNIT_ASSERT(fixture.Cache->ReclaimCold());
     }
 
     Y_UNIT_TEST(ColdPolicyUsesIndependentQueueOwnersAndDrainsStaleWords) {
