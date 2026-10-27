@@ -77,6 +77,10 @@ struct TSharedCacheCapacity {
     ui64 StaticBytes = 0;
     ui64 MinimumPayloadBytes = 0;
     ui64 TotalBytes = 0;
+    // Physical shares within the shared Hot/Cold envelopes
+    std::array<TCacheTierCapacity, CacheTierCount> Tiers;
+
+    bool HasValidTierCapacity() const noexcept;
 
     constexpr ui64 HandleCount() const noexcept {
         return SharedCacheBucketCount(AddressBits);
@@ -86,10 +90,12 @@ struct TSharedCacheCapacity {
         return HandleCount();
     }
 
+    // Shared Hot envelope
     constexpr ui64 HotSlotCount() const noexcept {
         return (HandleCount() * 3) / 4;
     }
 
+    // Current policy's Cold split; actual mapping bounds come from Tiers
     constexpr ui64 ColdSlotCount() const noexcept {
         return HandleCount() / 2;
     }
@@ -271,8 +277,9 @@ enum class [[nodiscard]] EPrepareResult {
 enum class ESpaceMap : ui8 {
     Handles,
     Buckets,
-    Hot,
-    Cold,
+    RegularHot,
+    RegularCold,
+    KeepHot,
     KeepCold,
     Free,
     Done,
@@ -709,7 +716,7 @@ public:
     }
 
     ui64 EffectiveHotSlots() const noexcept {
-        return EffectiveHotSlots_.load(std::memory_order_acquire);
+        return EffectiveHotSlots_[ECacheTier::Regular].load(std::memory_order_acquire);
     }
 
     ui32 HazardCount() const noexcept {
@@ -733,9 +740,8 @@ public:
 
     bool TryDrainTransition(TTransition& transition) noexcept;
 
-    template <class THotRouter, class TColdRouter, class TKeepColdRouter>
-    bool FinalDrain(TTransition& transition, THotRouter&& hotRouter, TColdRouter&& coldRouter,
-        TKeepColdRouter&& keepColdRouter) noexcept;
+    template <class THotRouter, class TColdRouter>
+    bool FinalDrain(TTransition& transition, THotRouter&& hotRouter, TColdRouter&& coldRouter) noexcept;
 
     bool PublishFinalView(TTransition& transition) noexcept;
 
@@ -828,7 +834,7 @@ private:
     // Resume the cursor only for the same published generation
     bool TryDrainBefore(ui32 publishedGeneration, ui32& nextHazardIndex) noexcept;
 
-    static ui32 HotLevelForSlot(ui64 slot, ui64 hotSlotCount) noexcept;
+    static EHotLevel HotLevelForSlot(ui64 slot, ui64 hotSlotCount) noexcept;
 
     template <bool WithHook>
     bool TryReleaseOldMapping(ESpaceMap mapping, TTransition& transition, TReleaseHook hook) noexcept;
@@ -841,8 +847,22 @@ private:
 
     static bool TryMappingSize(ui64 count, ui64 itemSize, size_t& result) noexcept;
 
-    // Legacy bindings until policy migration: Regular has Hot/shared Cold; Keep has only KeepCold
-    static void SetLegacyTierSlotCounts(TSpaceView& view, const TSharedCacheCapacity& capacity) noexcept;
+    static void SetTierSlotCounts(TSpaceView& view, const TSharedCacheCapacity& capacity) noexcept;
+
+    static constexpr ECacheTier MappingTier(ESpaceMap mapping) noexcept {
+        return mapping == ESpaceMap::KeepHot || mapping == ESpaceMap::KeepCold ? ECacheTier::Keep : ECacheTier::Regular;
+    }
+
+    static constexpr bool IsHotMapping(ESpaceMap mapping) noexcept {
+        return mapping == ESpaceMap::RegularHot || mapping == ESpaceMap::KeepHot;
+    }
+
+    static TCacheRingStorageView& RingStorage(TSpaceView& view, ESpaceMap mapping) noexcept {
+        auto& tier = view.Tiers[MappingTier(mapping)];
+        return IsHotMapping(mapping) ? tier.HotStorage : tier.ColdStorage;
+    }
+
+    TSharedCacheMapping& RingMapping(ESpaceMap mapping) noexcept;
 
     bool CancelPreparedView(TTransition& transition) noexcept;
 
@@ -895,7 +915,7 @@ private:
     TSharedCacheCapacity ReservedCapacity_;
 
     std::atomic<ui64> SpaceState_{ 0 };
-    std::atomic<ui64> EffectiveHotSlots_{ 0 };
+    std::array<std::atomic<ui64>, CacheTierCount> EffectiveHotSlots_{};
     std::atomic<ui64> BucketResizeState_{ 0 };
 };
 
@@ -1036,9 +1056,9 @@ Y_FORCE_INLINE bool TSharedCacheSpace::RefreshBucketRoute(
     return false;
 }
 
-template <class THotRouter, class TColdRouter, class TKeepColdRouter>
-inline bool TSharedCacheSpace::FinalDrain(TTransition& transition, THotRouter&& hotRouter, TColdRouter&& coldRouter,
-    TKeepColdRouter&& keepColdRouter) noexcept {
+template <class THotRouter, class TColdRouter>
+inline bool TSharedCacheSpace::FinalDrain(
+    TTransition& transition, THotRouter&& hotRouter, TColdRouter&& coldRouter) noexcept {
     if (transition.Phase_ != ETransitionPhase::FinalDrain || transition.NextHazardIndex_ != HazardSlotCount_ ||
         transition.Generation_ != CurrentSpaceState().Generation() || !transition.OldView_)
     {
@@ -1046,62 +1066,40 @@ inline bool TSharedCacheSpace::FinalDrain(TTransition& transition, THotRouter&& 
     }
 
     ui32 remainingSlots = SharedCacheTransitionWorkBatch;
-    const ui64 oldHotSlotCount = transition.OldConfiguration_.HotSlotCount();
     const ui64 oldHandleCount = transition.OldConfiguration_.HandleCount();
-    const ui64 oldColdSlotCount = transition.OldConfiguration_.ColdSlotCount();
-    const ui64 oldKeepColdSlotCount = transition.OldConfiguration_.KeepColdSlotCount();
     const ui64 targetHandleCount = transition.TargetConfiguration_.HandleCount();
-    const ui64 targetColdSlotCount = transition.TargetConfiguration_.ColdSlotCount();
-    const ui64 targetKeepColdSlotCount = transition.TargetConfiguration_.KeepColdSlotCount();
     while (remainingSlots != 0 && transition.FinalDrainStage_ != ESpaceMap::Done) {
         switch (transition.FinalDrainStage_) {
-            case ESpaceMap::Hot:
-                while (remainingSlots != 0 && transition.NextWorkIndex_ < oldHotSlotCount) {
+            case ESpaceMap::RegularHot:
+            case ESpaceMap::RegularCold:
+            case ESpaceMap::KeepHot:
+            case ESpaceMap::KeepCold: {
+                const auto mapping = transition.FinalDrainStage_;
+                auto& old = RingStorage(*transition.OldView_, mapping);
+                const auto tier = MappingTier(mapping);
+                while (remainingSlots != 0 && transition.NextWorkIndex_ < old.SlotCount) {
                     const ui64 slot = transition.NextWorkIndex_++;
-                    const ui64 raw = transition.OldView_->Tiers[ECacheTier::Regular].HotStorage.Slots[slot].exchange(
-                        0, std::memory_order_acquire);
+                    const ui64 raw = old.Slots[slot].exchange(0, std::memory_order_acquire);
                     if (raw != 0) {
-                        hotRouter(HotLevelForSlot(slot, oldHotSlotCount), raw);
+                        if (IsHotMapping(mapping)) {
+                            hotRouter(tier, HotLevelForSlot(slot, old.SlotCount), raw);
+                        } else {
+                            coldRouter(tier, raw);
+                        }
                     }
                     --remainingSlots;
                 }
-                if (transition.NextWorkIndex_ == oldHotSlotCount) {
-                    transition.FinalDrainStage_ = ESpaceMap::Cold;
-                    transition.NextWorkIndex_ = targetColdSlotCount;
-                }
-                break;
-
-            case ESpaceMap::Cold:
-                while (remainingSlots != 0 && transition.NextWorkIndex_ < oldColdSlotCount) {
-                    const ui64 raw = transition.OldView_->Tiers[ECacheTier::Regular]
-                                         .ColdStorage.Slots[transition.NextWorkIndex_++]
-                                         .exchange(0, std::memory_order_acquire);
-                    if (raw != 0) {
-                        coldRouter(raw);
-                    }
-                    --remainingSlots;
-                }
-                if (transition.NextWorkIndex_ == oldColdSlotCount) {
-                    transition.FinalDrainStage_ = ESpaceMap::KeepCold;
-                    transition.NextWorkIndex_ = targetKeepColdSlotCount;
-                }
-                break;
-
-            case ESpaceMap::KeepCold:
-                while (remainingSlots != 0 && transition.NextWorkIndex_ < oldKeepColdSlotCount) {
-                    const ui64 raw = transition.OldView_->Tiers[ECacheTier::Keep]
-                                         .ColdStorage.Slots[transition.NextWorkIndex_++]
-                                         .exchange(0, std::memory_order_acquire);
-                    if (raw != 0) {
-                        keepColdRouter(raw);
-                    }
-                    --remainingSlots;
-                }
-                if (transition.NextWorkIndex_ == oldKeepColdSlotCount) {
-                    transition.FinalDrainStage_ = ESpaceMap::Free;
+                if (transition.NextWorkIndex_ == old.SlotCount) {
+                    transition.FinalDrainStage_ = static_cast<ESpaceMap>(static_cast<ui8>(mapping) + 1);
                     transition.NextWorkIndex_ = 0;
+                    if (transition.FinalDrainStage_ != ESpaceMap::Free) {
+                        const auto next = transition.FinalDrainStage_;
+                        const auto& target = transition.TargetConfiguration_.Tiers[MappingTier(next)];
+                        transition.NextWorkIndex_ = IsHotMapping(next) ? target.HotSlots : target.ColdSlots;
+                    }
                 }
                 break;
+            }
 
             case ESpaceMap::Free: {
                 const ui64 cutCount = oldHandleCount - targetHandleCount;

@@ -149,7 +149,7 @@ bool TSharedCacheSpace::BeginHotResize(ui32 targetEffectiveHotSlots, THotResize&
 
     resize.OldEffectiveHotSlots_ = currentEffectiveHotSlots;
     resize.NextCutSlot_ = targetEffectiveHotSlots;
-    EffectiveHotSlots_.store(targetEffectiveHotSlots, std::memory_order_release);
+    EffectiveHotSlots_[ECacheTier::Regular].store(targetEffectiveHotSlots, std::memory_order_release);
     if (targetEffectiveHotSlots < currentEffectiveHotSlots) {
         resize.Phase_ = EHotResizePhase::Cut;
     } else {
@@ -194,29 +194,44 @@ EPrepareResult TSharedCacheSpace::PrepareTransitionImpl(
         target.ExpectedPageSize != ReservedCapacity_.ExpectedPageSize ||
         target.StaticBytes > ReservedCapacity_.StaticBytes || current.HandleCount != Capacity_.HandleCount() ||
         current.AllocationLimit != Capacity_.HandleCount() || spaceState.Resizing() ||
-        spaceState.AddressBits() != Capacity_.AddressBits)
+        spaceState.AddressBits() != Capacity_.AddressBits || !target.HasValidTierCapacity())
     {
         return EPrepareResult::Rejected;
+    }
+
+    const bool growing = target.HandleCount() > Capacity_.HandleCount();
+    for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+        const auto& old = Capacity_.Tiers[tier];
+        const auto& next = target.Tiers[tier];
+        // Capacity transitions preserve active mappings and move all extents in one direction
+        if ((old.HotSlots == 0) != (next.HotSlots == 0) ||
+            (growing ? next.HotSlots < old.HotSlots || next.ColdSlots < old.ColdSlots
+                     : next.HotSlots > old.HotSlots || next.ColdSlots > old.ColdSlots)) {
+            return EPrepareResult::Rejected;
+        }
     }
 
     std::array<size_t, static_cast<size_t>(ESpaceMap::Done)> sizes;
     if (!TryMappingSize(target.HandleCount(), sizeof(THandle), sizes[static_cast<size_t>(ESpaceMap::Handles)]) ||
         !TryMappingSize(
             target.BucketCount(), sizeof(std::atomic<ui64>), sizes[static_cast<size_t>(ESpaceMap::Buckets)]) ||
-        !TryMappingSize(target.HotSlotCount(), sizeof(std::atomic<ui64>), sizes[static_cast<size_t>(ESpaceMap::Hot)]) ||
-        !TryMappingSize(
-            target.ColdSlotCount(), sizeof(std::atomic<ui64>), sizes[static_cast<size_t>(ESpaceMap::Cold)]) ||
-        !TryMappingSize(
-            target.KeepColdSlotCount(), sizeof(std::atomic<ui64>), sizes[static_cast<size_t>(ESpaceMap::KeepCold)]) ||
         !TryMappingSize(target.HandleCount(), sizeof(std::atomic<ui64>), sizes[static_cast<size_t>(ESpaceMap::Free)]))
     {
         return EPrepareResult::Rejected;
     }
 
+    for (auto mapping : { ESpaceMap::RegularHot, ESpaceMap::RegularCold, ESpaceMap::KeepHot, ESpaceMap::KeepCold }) {
+        const auto& tier = target.Tiers[MappingTier(mapping)];
+        if (!TryMappingSize(IsHotMapping(mapping) ? tier.HotSlots : tier.ColdSlots, sizeof(std::atomic<ui64>),
+                sizes[static_cast<size_t>(mapping)])) {
+            return EPrepareResult::Rejected;
+        }
+    }
+
     // Save ownership and intended extents before any mapping can leave partial work
     transition.PreparedView_ = MakeHolder<TSpaceView>();
     auto& view = *transition.PreparedView_;
-    SetLegacyTierSlotCounts(view, target);
+    SetTierSlotCounts(view, target);
     transition.Phase_ = ETransitionPhase::Prepare;
     transition.Generation_ = spaceState.Generation();
     transition.OldConfiguration_ = Capacity_;
@@ -234,16 +249,18 @@ EPrepareResult TSharedCacheSpace::PrepareTransitionImpl(
         bytes = sizes[static_cast<size_t>(mapping)];
         return owner.Prepare(bytes, slots);
     };
-    if (!prepare(ESpaceMap::Handles, HandlesMapping_, view.HandlesBytes, view.Handles) ||
-        !prepare(ESpaceMap::Buckets, BucketsMapping_, view.BucketsBytes, view.Buckets) ||
-        !prepare(ESpaceMap::Hot, TierStorage_[ECacheTier::Regular].Hot,
-            view.Tiers[ECacheTier::Regular].HotStorage.Bytes, view.Tiers[ECacheTier::Regular].HotStorage.Slots) ||
-        !prepare(ESpaceMap::Cold, TierStorage_[ECacheTier::Regular].Cold,
-            view.Tiers[ECacheTier::Regular].ColdStorage.Bytes, view.Tiers[ECacheTier::Regular].ColdStorage.Slots) ||
-        !prepare(ESpaceMap::KeepCold, TierStorage_[ECacheTier::Keep].Cold,
-            view.Tiers[ECacheTier::Keep].ColdStorage.Bytes, view.Tiers[ECacheTier::Keep].ColdStorage.Slots) ||
-        !prepare(ESpaceMap::Free, FreeMapping_, view.FreeSlotBytes, view.FreeSlots))
-    {
+    bool prepared = prepare(ESpaceMap::Handles, HandlesMapping_, view.HandlesBytes, view.Handles) &&
+                    prepare(ESpaceMap::Buckets, BucketsMapping_, view.BucketsBytes, view.Buckets);
+    for (auto mapping : { ESpaceMap::RegularHot, ESpaceMap::RegularCold, ESpaceMap::KeepHot, ESpaceMap::KeepCold }) {
+        auto& ring = RingStorage(view, mapping);
+        if (!prepared) {
+            break;
+        }
+        if (ring.SlotCount != 0) {
+            prepared = prepare(mapping, RingMapping(mapping), ring.Bytes, ring.Slots);
+        }
+    }
+    if (!prepared || !prepare(ESpaceMap::Free, FreeMapping_, view.FreeSlotBytes, view.FreeSlots)) {
         return CancelPreparedView(transition) ? EPrepareResult::Rejected : EPrepareResult::CleanupPending;
     }
     transition.ReleaseStage_ = ESpaceMap::Done;
@@ -268,19 +285,14 @@ bool TSharedCacheSpace::CancelPreparedView(TTransition& transition) noexcept {
             case ESpaceMap::Buckets:
                 complete = cancel(BucketsMapping_, view.Buckets, view.BucketsBytes);
                 break;
-            case ESpaceMap::Hot:
-                complete = cancel(TierStorage_[ECacheTier::Regular].Hot,
-                    view.Tiers[ECacheTier::Regular].HotStorage.Slots, view.Tiers[ECacheTier::Regular].HotStorage.Bytes);
+            case ESpaceMap::RegularHot:
+            case ESpaceMap::RegularCold:
+            case ESpaceMap::KeepHot:
+            case ESpaceMap::KeepCold: {
+                auto& ring = RingStorage(view, transition.ReleaseStage_);
+                complete = cancel(RingMapping(transition.ReleaseStage_), ring.Slots, ring.Bytes);
                 break;
-            case ESpaceMap::Cold:
-                complete =
-                    cancel(TierStorage_[ECacheTier::Regular].Cold, view.Tiers[ECacheTier::Regular].ColdStorage.Slots,
-                        view.Tiers[ECacheTier::Regular].ColdStorage.Bytes);
-                break;
-            case ESpaceMap::KeepCold:
-                complete = cancel(TierStorage_[ECacheTier::Keep].Cold, view.Tiers[ECacheTier::Keep].ColdStorage.Slots,
-                    view.Tiers[ECacheTier::Keep].ColdStorage.Bytes);
-                break;
+            }
             case ESpaceMap::Free:
                 complete = cancel(FreeMapping_, view.FreeSlots, view.FreeSlotBytes);
                 break;
@@ -322,28 +334,32 @@ bool TSharedCacheSpace::InitializeGrowth(TTransition& transition) noexcept {
     const TSharedCacheCapacity& old = transition.OldConfiguration_;
     const TSharedCacheCapacity& target = transition.TargetConfiguration_;
     const ui64 handleDelta = target.HandleCount() - old.HandleCount();
-    const ui64 hotDelta = target.HotSlotCount() - old.HotSlotCount();
-    const ui64 coldDelta = target.ColdSlotCount() - old.ColdSlotCount();
-    const ui64 keepColdDelta = target.KeepColdSlotCount() - old.KeepColdSlotCount();
-    const ui64 end = Min(handleDelta, transition.NextWorkIndex_ + SharedCacheTransitionWorkBatch);
+    ui64 work = handleDelta;
+    for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+        work = Max(work, target.Tiers[tier].HotSlots - old.Tiers[tier].HotSlots);
+        work = Max(work, target.Tiers[tier].ColdSlots - old.Tiers[tier].ColdSlots);
+    }
+    const ui64 end = Min(work, transition.NextWorkIndex_ + SharedCacheTransitionWorkBatch);
     while (transition.NextWorkIndex_ < end) {
         const ui64 offset = transition.NextWorkIndex_++;
-        const ui64 handleIndex = old.HandleCount() + offset;
-        new (&view.Handles[handleIndex]) THandle();
-        new (&view.Buckets[handleIndex]) std::atomic<ui64>(0);
-        new (&view.FreeSlots[handleIndex]) std::atomic<ui64>(0);
-        if (offset < coldDelta) {
-            new (&view.Tiers[ECacheTier::Regular].ColdStorage.Slots[old.ColdSlotCount() + offset]) std::atomic<ui64>(0);
+        if (offset < handleDelta) {
+            const ui64 handleIndex = old.HandleCount() + offset;
+            new (&view.Handles[handleIndex]) THandle();
+            new (&view.Buckets[handleIndex]) std::atomic<ui64>(0);
+            new (&view.FreeSlots[handleIndex]) std::atomic<ui64>(0);
         }
-        if (offset < keepColdDelta) {
-            new (&view.Tiers[ECacheTier::Keep].ColdStorage.Slots[old.KeepColdSlotCount() + offset])
-                std::atomic<ui64>(0);
-        }
-        if (offset < hotDelta) {
-            new (&view.Tiers[ECacheTier::Regular].HotStorage.Slots[old.HotSlotCount() + offset]) std::atomic<ui64>(0);
+        for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+            const auto& before = old.Tiers[tier];
+            const auto& after = target.Tiers[tier];
+            if (offset < after.HotSlots - before.HotSlots) {
+                new (&view.Tiers[tier].HotStorage.Slots[before.HotSlots + offset]) std::atomic<ui64>(0);
+            }
+            if (offset < after.ColdSlots - before.ColdSlots) {
+                new (&view.Tiers[tier].ColdStorage.Slots[before.ColdSlots + offset]) std::atomic<ui64>(0);
+            }
         }
     }
-    const bool complete = transition.NextWorkIndex_ == handleDelta;
+    const bool complete = transition.NextWorkIndex_ == work;
     if (complete) {
         transition.NextWorkIndex_ = 0;
     }
@@ -479,13 +495,15 @@ bool TSharedCacheSpace::PublishFinalView(TTransition& transition) noexcept {
     retiredView.CopyMappings(NewestView());
     retiredView.HandleCount = transition.TargetConfiguration_.HandleCount();
     retiredView.AllocationLimit = transition.TargetConfiguration_.HandleCount();
-    SetLegacyTierSlotCounts(retiredView, transition.TargetConfiguration_);
+    SetTierSlotCounts(retiredView, transition.TargetConfiguration_);
     PrepareView(retired.Generation(), retiredView);
 
-    const ui64 currentEffectiveHotSlots = EffectiveHotSlots();
-    const ui64 effectiveHotSlots = Min(currentEffectiveHotSlots, transition.TargetConfiguration_.HotSlotCount());
-    if (effectiveHotSlots != currentEffectiveHotSlots) {
-        EffectiveHotSlots_.store(effectiveHotSlots, std::memory_order_release);
+    for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+        const ui64 current = EffectiveHotSlots_[tier].load(std::memory_order_acquire);
+        const ui64 effective = Min(current, transition.TargetConfiguration_.Tiers[tier].HotSlots);
+        if (effective != current) {
+            EffectiveHotSlots_[tier].store(effective, std::memory_order_release);
+        }
     }
     SpaceState_.store(retired.Raw(), std::memory_order_release);
     transition.Generation_ = retired.Generation();
@@ -498,8 +516,8 @@ bool TSharedCacheSpace::PublishFinalView(TTransition& transition) noexcept {
         return AppendFreeHandles(transition);
     }
 
-    transition.NextWorkIndex_ = transition.TargetConfiguration_.HotSlotCount();
-    transition.FinalDrainStage_ = ESpaceMap::Hot;
+    transition.NextWorkIndex_ = transition.TargetConfiguration_.Tiers[ECacheTier::Regular].HotSlots;
+    transition.FinalDrainStage_ = ESpaceMap::RegularHot;
     transition.Phase_ = ETransitionPhase::FinalDrain;
     return true;
 }
@@ -529,27 +547,22 @@ bool TSharedCacheSpace::TryReleaseOldMapping(ESpaceMap mapping, TTransition& tra
             currentPointer = newest.Buckets;
             currentSize = newest.BucketsBytes;
             break;
-        case ESpaceMap::Hot:
-            owner = &TierStorage_[ECacheTier::Regular].Hot;
-            oldPointer = old.Tiers[ECacheTier::Regular].HotStorage.Slots;
-            oldSize = old.Tiers[ECacheTier::Regular].HotStorage.Bytes;
-            currentPointer = newest.Tiers[ECacheTier::Regular].HotStorage.Slots;
-            currentSize = newest.Tiers[ECacheTier::Regular].HotStorage.Bytes;
+        case ESpaceMap::RegularHot:
+        case ESpaceMap::RegularCold:
+        case ESpaceMap::KeepHot:
+        case ESpaceMap::KeepCold: {
+            auto& oldRing = RingStorage(old, mapping);
+            const auto& currentRing = RingStorage(*NewestViewOwner_, mapping);
+            if (oldRing.Bytes == 0 && currentRing.Bytes == 0) {
+                return true;
+            }
+            owner = &RingMapping(mapping);
+            oldPointer = oldRing.Slots;
+            oldSize = oldRing.Bytes;
+            currentPointer = currentRing.Slots;
+            currentSize = currentRing.Bytes;
             break;
-        case ESpaceMap::Cold:
-            owner = &TierStorage_[ECacheTier::Regular].Cold;
-            oldPointer = old.Tiers[ECacheTier::Regular].ColdStorage.Slots;
-            oldSize = old.Tiers[ECacheTier::Regular].ColdStorage.Bytes;
-            currentPointer = newest.Tiers[ECacheTier::Regular].ColdStorage.Slots;
-            currentSize = newest.Tiers[ECacheTier::Regular].ColdStorage.Bytes;
-            break;
-        case ESpaceMap::KeepCold:
-            owner = &TierStorage_[ECacheTier::Keep].Cold;
-            oldPointer = old.Tiers[ECacheTier::Keep].ColdStorage.Slots;
-            oldSize = old.Tiers[ECacheTier::Keep].ColdStorage.Bytes;
-            currentPointer = newest.Tiers[ECacheTier::Keep].ColdStorage.Slots;
-            currentSize = newest.Tiers[ECacheTier::Keep].ColdStorage.Bytes;
-            break;
+        }
         case ESpaceMap::Free:
             owner = &FreeMapping_;
             oldPointer = old.FreeSlots;
@@ -582,14 +595,11 @@ bool TSharedCacheSpace::TryReleaseOldMapping(ESpaceMap mapping, TTransition& tra
         case ESpaceMap::Buckets:
             old.Buckets = static_cast<std::atomic<ui64>*>(oldPointer);
             break;
-        case ESpaceMap::Hot:
-            old.Tiers[ECacheTier::Regular].HotStorage.Slots = static_cast<std::atomic<ui64>*>(oldPointer);
-            break;
-        case ESpaceMap::Cold:
-            old.Tiers[ECacheTier::Regular].ColdStorage.Slots = static_cast<std::atomic<ui64>*>(oldPointer);
-            break;
+        case ESpaceMap::RegularHot:
+        case ESpaceMap::RegularCold:
+        case ESpaceMap::KeepHot:
         case ESpaceMap::KeepCold:
-            old.Tiers[ECacheTier::Keep].ColdStorage.Slots = static_cast<std::atomic<ui64>*>(oldPointer);
+            RingStorage(old, mapping).Slots = static_cast<std::atomic<ui64>*>(oldPointer);
             break;
         case ESpaceMap::Free:
             old.FreeSlots = static_cast<std::atomic<ui64>*>(oldPointer);
