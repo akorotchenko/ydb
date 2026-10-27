@@ -4,6 +4,16 @@
 
 namespace NKikimr::NSharedCache {
 
+bool TTransition::CanCancel() const noexcept {
+    return Step_ != EStep::Receiver &&
+           (Phase_ == ETransitionPhase::Prepare || Phase_ == ETransitionPhase::InitializeGrowth ||
+               Phase_ == ETransitionPhase::CancelRetry);
+}
+
+bool TTransition::IsGrowingStep() const noexcept {
+    return Step_ == EStep::Receiver || TargetConfiguration_.HandleCount() > OldConfiguration_.HandleCount();
+}
+
 bool THotResize::ClaimCapacityTransition(const TTransition& transition) noexcept {
     Y_DEBUG_ABORT_UNLESS(State_.load(std::memory_order_relaxed) & Locked);
     if (CapacityAbandoned_ || CapacityTransition_ ||
@@ -190,7 +200,7 @@ EPrepareResult TSharedCacheSpace::PrepareTransitionImpl(
     const TSpaceState spaceState = CurrentSpaceState();
     const TSpaceView& current = SpaceView(spaceState);
     if (target.AddressBits < MinSharedCacheAddressBits || target.AddressBits > MaxSharedCacheAddressBits ||
-        target.AddressBits > ReservedCapacity_.AddressBits || target.AddressBits == Capacity_.AddressBits ||
+        target.AddressBits > ReservedCapacity_.AddressBits ||
         target.ExpectedPageSize != ReservedCapacity_.ExpectedPageSize ||
         target.StaticBytes > ReservedCapacity_.StaticBytes || current.HandleCount != Capacity_.HandleCount() ||
         current.AllocationLimit != Capacity_.HandleCount() || spaceState.Resizing() ||
@@ -199,31 +209,21 @@ EPrepareResult TSharedCacheSpace::PrepareTransitionImpl(
         return EPrepareResult::Rejected;
     }
 
+    const bool transfer = target.AddressBits == Capacity_.AddressBits;
+    const ui32 generations = transfer ? 4 : 2;
+    if ((transfer && (target.Tiers == Capacity_.Tiers || target.StaticBytes != Capacity_.StaticBytes)) ||
+        spaceState.Generation() > MaxSpaceGeneration - generations) {
+        return EPrepareResult::Rejected;
+    }
+
     const bool growing = target.HandleCount() > Capacity_.HandleCount();
     for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
         const auto& old = Capacity_.Tiers[tier];
         const auto& next = target.Tiers[tier];
-        // Capacity transitions preserve active mappings and move all extents in one direction
+        // Share transfers cut donors first; ordinary capacity changes remain monotone
         if ((old.HotSlots == 0) != (next.HotSlots == 0) ||
-            (growing ? next.HotSlots < old.HotSlots || next.ColdSlots < old.ColdSlots
-                     : next.HotSlots > old.HotSlots || next.ColdSlots > old.ColdSlots)) {
-            return EPrepareResult::Rejected;
-        }
-    }
-
-    std::array<size_t, static_cast<size_t>(ESpaceMap::Done)> sizes;
-    if (!TryMappingSize(target.HandleCount(), sizeof(THandle), sizes[static_cast<size_t>(ESpaceMap::Handles)]) ||
-        !TryMappingSize(
-            target.BucketCount(), sizeof(std::atomic<ui64>), sizes[static_cast<size_t>(ESpaceMap::Buckets)]) ||
-        !TryMappingSize(target.HandleCount(), sizeof(std::atomic<ui64>), sizes[static_cast<size_t>(ESpaceMap::Free)]))
-    {
-        return EPrepareResult::Rejected;
-    }
-
-    for (auto mapping : { ESpaceMap::RegularHot, ESpaceMap::RegularCold, ESpaceMap::KeepHot, ESpaceMap::KeepCold }) {
-        const auto& tier = target.Tiers[MappingTier(mapping)];
-        if (!TryMappingSize(IsHotMapping(mapping) ? tier.HotSlots : tier.ColdSlots, sizeof(std::atomic<ui64>),
-                sizes[static_cast<size_t>(mapping)])) {
+            (!transfer && (growing ? next.HotSlots < old.HotSlots || next.ColdSlots < old.ColdSlots
+                                   : next.HotSlots > old.HotSlots || next.ColdSlots > old.ColdSlots))) {
             return EPrepareResult::Rejected;
         }
     }
@@ -232,6 +232,13 @@ EPrepareResult TSharedCacheSpace::PrepareTransitionImpl(
     transition.PreparedView_ = MakeHolder<TSpaceView>();
     auto& view = *transition.PreparedView_;
     SetTierSlotCounts(view, target);
+    transition.Step_ = transfer ? TTransition::EStep::Donor : TTransition::EStep::Capacity;
+    if (transfer) {
+        for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+            view.Tiers[tier].HotStorage.SlotCount = Min(Capacity_.Tiers[tier].HotSlots, target.Tiers[tier].HotSlots);
+            view.Tiers[tier].ColdStorage.SlotCount = Min(Capacity_.Tiers[tier].ColdSlots, target.Tiers[tier].ColdSlots);
+        }
+    }
     transition.Phase_ = ETransitionPhase::Prepare;
     transition.Generation_ = spaceState.Generation();
     transition.OldConfiguration_ = Capacity_;
@@ -240,6 +247,38 @@ EPrepareResult TSharedCacheSpace::PrepareTransitionImpl(
                                       ? target.AddressBits - Capacity_.AddressBits
                                       : Capacity_.AddressBits - target.AddressBits;
     transition.ReleaseStage_ = ESpaceMap::Handles;
+    if (!PrepareMappings<WithHook>(transition, hook)) {
+        transition.Phase_ = ETransitionPhase::CancelRetry;
+        if (CancelPreparedView(transition)) {
+            transition.Reset();
+            return EPrepareResult::Rejected;
+        }
+        return EPrepareResult::CleanupPending;
+    }
+    transition.ReleaseStage_ = ESpaceMap::Done;
+    return EPrepareResult::Prepared;
+}
+
+template <bool WithHook>
+bool TSharedCacheSpace::PrepareMappings(TTransition& transition, TPrepareHook hook) noexcept {
+    const auto& target = transition.TargetConfiguration_;
+    auto& view = *transition.PreparedView_;
+    std::array<size_t, static_cast<size_t>(ESpaceMap::Done)> sizes;
+    if (!TryMappingSize(target.HandleCount(), sizeof(THandle), sizes[static_cast<size_t>(ESpaceMap::Handles)]) ||
+        !TryMappingSize(
+            target.BucketCount(), sizeof(std::atomic<ui64>), sizes[static_cast<size_t>(ESpaceMap::Buckets)]) ||
+        !TryMappingSize(target.HandleCount(), sizeof(std::atomic<ui64>), sizes[static_cast<size_t>(ESpaceMap::Free)]))
+    {
+        return false;
+    }
+
+    for (auto mapping : { ESpaceMap::RegularHot, ESpaceMap::RegularCold, ESpaceMap::KeepHot, ESpaceMap::KeepCold }) {
+        const auto& ring = RingStorage(view, mapping);
+        if (!TryMappingSize(ring.SlotCount, sizeof(std::atomic<ui64>), sizes[static_cast<size_t>(mapping)])) {
+            return false;
+        }
+    }
+
     const auto prepare = [&](ESpaceMap mapping, TSharedCacheMapping& owner, size_t& bytes, auto*& slots) noexcept {
         if constexpr (WithHook) {
             if (!hook.Run(mapping)) {
@@ -261,17 +300,52 @@ EPrepareResult TSharedCacheSpace::PrepareTransitionImpl(
         }
     }
     if (!prepared || !prepare(ESpaceMap::Free, FreeMapping_, view.FreeSlotBytes, view.FreeSlots)) {
-        return CancelPreparedView(transition) ? EPrepareResult::Rejected : EPrepareResult::CleanupPending;
+        return false;
+    }
+    return true;
+}
+
+bool TSharedCacheSpace::PrepareReceiver(TTransition& transition) noexcept {
+    return PrepareReceiverImpl<false>(transition, {});
+}
+
+bool TSharedCacheSpace::PrepareReceiverWithHook(TTransition& transition, TPrepareHook hook) noexcept {
+    return PrepareReceiverImpl<true>(transition, hook);
+}
+
+template <bool WithHook>
+bool TSharedCacheSpace::PrepareReceiverImpl(TTransition& transition, TPrepareHook hook) noexcept {
+    if (transition.Step_ != TTransition::EStep::Receiver) {
+        return false;
+    }
+    if (transition.Phase_ == ETransitionPhase::CancelReceiver) {
+        if (CancelPreparedView(transition)) {
+            transition.Phase_ = ETransitionPhase::PrepareReceiver;
+        }
+        // Completed cleanup still yields before another private attempt
+        return false;
+    }
+    if (transition.Phase_ != ETransitionPhase::PrepareReceiver) {
+        return false;
+    }
+    Y_DEBUG_ABORT_UNLESS(!transition.OldView_ && !transition.PreparedView_);
+    transition.PreparedView_ = MakeHolder<TSpaceView>();
+    SetTierSlotCounts(*transition.PreparedView_, transition.TargetConfiguration_);
+    transition.ReleaseStage_ = ESpaceMap::Handles;
+    if (!PrepareMappings<WithHook>(transition, hook)) {
+        transition.Phase_ = ETransitionPhase::CancelReceiver;
+        if (CancelPreparedView(transition)) {
+            transition.Phase_ = ETransitionPhase::PrepareReceiver;
+        }
+        return false;
     }
     transition.ReleaseStage_ = ESpaceMap::Done;
-    return EPrepareResult::Prepared;
+    transition.NextWorkIndex_ = 0;
+    transition.Phase_ = ETransitionPhase::Prepare;
+    return true;
 }
 
 bool TSharedCacheSpace::CancelPreparedView(TTransition& transition) noexcept {
-    if (transition.Phase_ != ETransitionPhase::CancelRetry) {
-        transition.Phase_ = ETransitionPhase::CancelRetry;
-        transition.ReleaseStage_ = ESpaceMap::Handles;
-    }
     auto& view = *transition.PreparedView_;
     const auto cancel = [](TSharedCacheMapping& owner, auto*& pointer, size_t bytes) noexcept {
         return bytes == 0 || owner.Cancel(pointer, bytes);
@@ -304,7 +378,7 @@ bool TSharedCacheSpace::CancelPreparedView(TTransition& transition) noexcept {
         }
         transition.ReleaseStage_ = static_cast<ESpaceMap>(static_cast<ui8>(transition.ReleaseStage_) + 1);
     }
-    transition.Reset();
+    transition.PreparedView_.Reset();
     return true;
 }
 
@@ -333,11 +407,12 @@ bool TSharedCacheSpace::InitializeGrowth(TTransition& transition) noexcept {
     TSpaceView& view = *transition.PreparedView_;
     const TSharedCacheCapacity& old = transition.OldConfiguration_;
     const TSharedCacheCapacity& target = transition.TargetConfiguration_;
+    const TSpaceView& source = NewestView();
     const ui64 handleDelta = target.HandleCount() - old.HandleCount();
     ui64 work = handleDelta;
     for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
-        work = Max(work, target.Tiers[tier].HotSlots - old.Tiers[tier].HotSlots);
-        work = Max(work, target.Tiers[tier].ColdSlots - old.Tiers[tier].ColdSlots);
+        work = Max(work, view.Tiers[tier].HotStorage.SlotCount - source.Tiers[tier].HotStorage.SlotCount);
+        work = Max(work, view.Tiers[tier].ColdStorage.SlotCount - source.Tiers[tier].ColdStorage.SlotCount);
     }
     const ui64 end = Min(work, transition.NextWorkIndex_ + SharedCacheTransitionWorkBatch);
     while (transition.NextWorkIndex_ < end) {
@@ -349,13 +424,13 @@ bool TSharedCacheSpace::InitializeGrowth(TTransition& transition) noexcept {
             new (&view.FreeSlots[handleIndex]) std::atomic<ui64>(0);
         }
         for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
-            const auto& before = old.Tiers[tier];
-            const auto& after = target.Tiers[tier];
-            if (offset < after.HotSlots - before.HotSlots) {
-                new (&view.Tiers[tier].HotStorage.Slots[before.HotSlots + offset]) std::atomic<ui64>(0);
+            const auto& before = source.Tiers[tier];
+            const auto& after = view.Tiers[tier];
+            if (offset < after.HotStorage.SlotCount - before.HotStorage.SlotCount) {
+                new (&view.Tiers[tier].HotStorage.Slots[before.HotStorage.SlotCount + offset]) std::atomic<ui64>(0);
             }
-            if (offset < after.ColdSlots - before.ColdSlots) {
-                new (&view.Tiers[tier].ColdStorage.Slots[before.ColdSlots + offset]) std::atomic<ui64>(0);
+            if (offset < after.ColdStorage.SlotCount - before.ColdStorage.SlotCount) {
+                new (&view.Tiers[tier].ColdStorage.Slots[before.ColdStorage.SlotCount + offset]) std::atomic<ui64>(0);
             }
         }
     }
@@ -408,7 +483,7 @@ bool TSharedCacheSpace::PublishMigrationViewImpl(TTransition& transition, TPubli
         return false;
     }
 
-    const bool growing = transition.TargetConfiguration_.HandleCount() > transition.OldConfiguration_.HandleCount();
+    const bool growing = transition.IsGrowingStep();
     if (transition.Phase_ == ETransitionPhase::Prepare) {
         transition.Phase_ = growing ? ETransitionPhase::InitializeGrowth : ETransitionPhase::PublishMigration;
     }
@@ -485,7 +560,7 @@ bool TSharedCacheSpace::PublishFinalView(TTransition& transition) noexcept {
         return false;
     }
 
-    const bool growing = transition.TargetConfiguration_.HandleCount() > transition.OldConfiguration_.HandleCount();
+    const bool growing = transition.IsGrowingStep();
     if (!growing) {
         PublishPreparedView(std::move(transition.PreparedView_), transition.OldView_);
     }
@@ -495,12 +570,15 @@ bool TSharedCacheSpace::PublishFinalView(TTransition& transition) noexcept {
     retiredView.CopyMappings(NewestView());
     retiredView.HandleCount = transition.TargetConfiguration_.HandleCount();
     retiredView.AllocationLimit = transition.TargetConfiguration_.HandleCount();
-    SetTierSlotCounts(retiredView, transition.TargetConfiguration_);
+    for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+        retiredView.Tiers[tier].HotStorage.SlotCount = NewestView().Tiers[tier].HotStorage.SlotCount;
+        retiredView.Tiers[tier].ColdStorage.SlotCount = NewestView().Tiers[tier].ColdStorage.SlotCount;
+    }
     PrepareView(retired.Generation(), retiredView);
 
     for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
         const ui64 current = EffectiveHotSlots_[tier].load(std::memory_order_acquire);
-        const ui64 effective = Min(current, transition.TargetConfiguration_.Tiers[tier].HotSlots);
+        const ui64 effective = Min(current, retiredView.Tiers[tier].HotStorage.SlotCount);
         if (effective != current) {
             EffectiveHotSlots_[tier].store(effective, std::memory_order_release);
         }
@@ -509,15 +587,15 @@ bool TSharedCacheSpace::PublishFinalView(TTransition& transition) noexcept {
     transition.Generation_ = retired.Generation();
     transition.ReleaseStage_ = ESpaceMap::Handles;
     ResetHazardScan(transition);
-    if (growing) {
+    if (growing && transition.Step_ == TTransition::EStep::Capacity) {
         transition.NextWorkIndex_ = transition.OldConfiguration_.HandleCount();
         transition.FinalDrainStage_ = ESpaceMap::Done;
         transition.Phase_ = ETransitionPhase::AppendGrowth;
         return AppendFreeHandles(transition);
     }
 
-    transition.NextWorkIndex_ = transition.TargetConfiguration_.Tiers[ECacheTier::Regular].HotSlots;
-    transition.FinalDrainStage_ = ESpaceMap::RegularHot;
+    transition.NextWorkIndex_ = retiredView.Tiers[ECacheTier::Regular].HotStorage.SlotCount;
+    transition.FinalDrainStage_ = growing ? ESpaceMap::Done : ESpaceMap::RegularHot;
     transition.Phase_ = ETransitionPhase::FinalDrain;
     return true;
 }
@@ -631,7 +709,12 @@ bool TSharedCacheSpace::TryReleaseTransitionImpl(TTransition& transition, TRelea
     }
 
     transition.OldView_.Reset();
-    transition.Phase_ = ETransitionPhase::Commit;
+    if (transition.Step_ == TTransition::EStep::Donor) {
+        transition.Step_ = TTransition::EStep::Receiver;
+        transition.Phase_ = ETransitionPhase::PrepareReceiver;
+    } else {
+        transition.Phase_ = ETransitionPhase::Commit;
+    }
     return true;
 }
 
@@ -654,10 +737,16 @@ bool TSharedCacheSpace::AbandonTransition(TTransition& transition) noexcept {
     {
         return false;
     }
-    if (transition.Phase_ == ETransitionPhase::Prepare || transition.Phase_ == ETransitionPhase::InitializeGrowth ||
-        transition.Phase_ == ETransitionPhase::CancelRetry)
-    {
-        return CancelPreparedView(transition);
+    if (transition.CanCancel()) {
+        if (transition.Phase_ != ETransitionPhase::CancelRetry) {
+            transition.ReleaseStage_ = ESpaceMap::Handles;
+            transition.Phase_ = ETransitionPhase::CancelRetry;
+        }
+        if (!CancelPreparedView(transition)) {
+            return false;
+        }
+        transition.Reset();
+        return true;
     }
     transition.Phase_ = ETransitionPhase::AbandonedForShutdown;
     return true;

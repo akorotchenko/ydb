@@ -183,6 +183,29 @@ public:
         return cache.Capacity_.PrepareTransition(target, transition);
     }
 
+    static bool PrepareReceiver(TTestSharedCache& cache, TTransition& transition) noexcept {
+        return cache.Capacity_.PrepareReceiver(transition);
+    }
+
+    template <class TCallback>
+    static bool PrepareReceiver(TTestSharedCache& cache, TTransition& transition, TCallback& callback) noexcept {
+        auto guard = cache.HotResize_.TryLock();
+        if (!guard || !cache.HotResize_.OwnsCapacityTransition(transition)) {
+            return false;
+        }
+        return cache.Space_->PrepareReceiverWithHook(
+            transition, {
+                            .Context = &callback,
+                            .Function = [](void* context, ESpaceMap mapping) noexcept {
+                                return (*static_cast<TCallback*>(context))(mapping);
+                            },
+                        });
+    }
+
+    static TSharedCacheMapping& RingMapping(TTestSharedCache& cache, ESpaceMap mapping) noexcept {
+        return cache.Space_->RingMapping(mapping);
+    }
+
     static bool PublishMigrationView(TTestSharedCache& cache, TTransition& transition) noexcept {
         return cache.Capacity_.PublishMigrationView(transition);
     }
@@ -6902,6 +6925,85 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
             UNIT_ASSERT_VALUES_EQUAL(prepares, 1);
             UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        }
+    }
+
+    Y_UNIT_TEST(CapacityTierTransferRetainsOwnerThroughPostDonorCleanup) {
+        using EStep = TSharedCacheMappingTestAccess::EStep;
+        for (bool abandon : { false, true }) {
+            TFixture fixture(16, 2);
+            auto target = fixture.Capacity;
+            target.Tiers[ECacheTier::Regular].ColdSlots = target.HandleCount() / 4;
+            target.Tiers[ECacheTier::Keep].ColdSlots = target.HandleCount() * 3 / 4;
+            UNIT_ASSERT(target.HasValidTierCapacity());
+            TTransition transition;
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, transition) ==
+                        EPrepareResult::Prepared);
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(transition.Phase() == ETransitionPhase::PrepareReceiver);
+            const ui64 generation = fixture.Cache->AdmissionGeneration();
+            UNIT_ASSERT(TSharedCacheTestAccess::OwnsCapacityTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(!TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
+            auto& mapping = TSharedCacheTestAccess::RingMapping(*fixture.Cache, ESpaceMap::KeepCold);
+            bool fail = true;
+            auto cleanup = [&](EStep step) noexcept {
+                return !fail || (step != EStep::Unmap && step != EStep::ShrinkBacking && step != EStep::DiscardTail);
+            };
+            TSharedCacheMappingTestAccess::SetHook(mapping, cleanup);
+            Y_DEFER {
+                TSharedCacheMappingTestAccess::ClearHook(mapping);
+                if (transition.Phase() != ETransitionPhase::Idle &&
+                    transition.Phase() != ETransitionPhase::AbandonedForShutdown) {
+                    TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, transition);
+                }
+            };
+            auto prepare = [](ESpaceMap mapping) noexcept {
+                return mapping != ESpaceMap::Free;
+            };
+            UNIT_ASSERT(!TSharedCacheTestAccess::PrepareReceiver(*fixture.Cache, transition, prepare));
+            UNIT_ASSERT(transition.Phase() == ETransitionPhase::CancelReceiver);
+            UNIT_ASSERT(TSharedCacheTestAccess::OwnsCapacityTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(!TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Capacity.StaticBytes);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+            if (abandon) {
+                UNIT_ASSERT(TSharedCacheTestAccess::AbandonTransition(*fixture.Cache, transition));
+                UNIT_ASSERT(transition.Phase() == ETransitionPhase::AbandonedForShutdown);
+                UNIT_ASSERT(!TSharedCacheTestAccess::OwnsCapacityTransition(*fixture.Cache, transition));
+                UNIT_ASSERT(!TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
+                TTransition next;
+                UNIT_ASSERT(TSharedCacheTestAccess::PrepareTransition(*fixture.Cache, target, next) ==
+                            EPrepareResult::Rejected);
+                UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+                continue;
+            }
+            fail = false;
+            UNIT_ASSERT(!TSharedCacheTestAccess::PrepareReceiver(*fixture.Cache, transition));
+            UNIT_ASSERT(transition.Phase() == ETransitionPhase::PrepareReceiver);
+            UNIT_ASSERT(TSharedCacheTestAccess::OwnsCapacityTransition(*fixture.Cache, transition));
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+            TSharedCacheMappingTestAccess::ClearHook(mapping);
+            UNIT_ASSERT(TSharedCacheTestAccess::PrepareReceiver(*fixture.Cache, transition));
+            do {
+                UNIT_ASSERT(TSharedCacheTestAccess::PublishMigrationView(*fixture.Cache, transition));
+            } while (transition.Phase() == ETransitionPhase::InitializeGrowth);
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(TSharedCacheTestAccess::CanChangeTiers(*fixture.Cache));
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StaticDeltaBytes(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->OverallUsage(), fixture.Capacity.StaticBytes);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+            UNIT_ASSERT(fixture.Space->CurrentConfiguration().Tiers == target.Tiers);
         }
     }
 
