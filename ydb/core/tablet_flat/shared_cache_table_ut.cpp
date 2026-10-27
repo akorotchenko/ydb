@@ -474,8 +474,8 @@ public:
 
     static ui64 HotSlot(TTestSharedCache& cache, ui64 slot) noexcept {
         return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
-            Y_ABORT_UNLESS(slot < spaceOp.View().HotSlotCount);
-            return spaceOp.View().HotSlots[slot].load(std::memory_order_acquire);
+            Y_ABORT_UNLESS(slot < spaceOp.View().Tiers[ECacheTier::Regular].HotStorage.SlotCount);
+            return spaceOp.View().Tiers[ECacheTier::Regular].HotStorage.Slots[slot].load(std::memory_order_acquire);
         });
     }
 
@@ -6222,7 +6222,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 const auto oldPolicy = TSharedCacheTestAccess::HotPolicy(*fixture.Cache, oldOp);
                 UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, transition));
                 TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& newOp) {
-                    UNIT_ASSERT_VALUES_EQUAL(newOp.View().HotSlotCount, target.HotSlotCount());
+                    UNIT_ASSERT_VALUES_EQUAL(
+                        newOp.View().Tiers[ECacheTier::Regular].HotStorage.SlotCount, target.HotSlotCount());
                     const auto policy = TSharedCacheTestAccess::HotPolicy(*fixture.Cache, newOp);
                     for (ui64 bound : policy) {
                         UNIT_ASSERT(bound <= target.HotSlotCount());
@@ -6231,10 +6232,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                     UNIT_ASSERT_VALUES_EQUAL(policy[1], oldPolicy[1]);
                     if (growing) {
                         UNIT_ASSERT(policy[3] > oldPolicy[3]);
-                        UNIT_ASSERT_VALUES_EQUAL(oldOp.EffectiveHotSlots(), oldOp.View().HotSlotCount);
+                        UNIT_ASSERT_VALUES_EQUAL(
+                            oldOp.EffectiveHotSlots(), oldOp.View().Tiers[ECacheTier::Regular].HotStorage.SlotCount);
                     }
                     for (ui64 bound : TSharedCacheTestAccess::HotPolicy(*fixture.Cache, oldOp)) {
-                        UNIT_ASSERT(bound <= oldOp.View().HotSlotCount);
+                        UNIT_ASSERT(bound <= oldOp.View().Tiers[ECacheTier::Regular].HotStorage.SlotCount);
                     }
                 });
             });
@@ -6294,11 +6296,14 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 UNIT_ASSERT(state.IsHot());
                 handle.State.store(state.WithFrequency(0).Raw(), std::memory_order_relaxed);
                 bool moved = false;
-                for (ui64 slot = 0; slot < newOp.View().HotSlotCount; ++slot) {
-                    auto& word = newOp.View().HotSlots[slot];
+                for (ui64 slot = 0; slot < newOp.View().Tiers[ECacheTier::Regular].HotStorage.SlotCount; ++slot) {
+                    auto& word = newOp.View().Tiers[ECacheTier::Regular].HotStorage.Slots[slot];
                     if (word.load(std::memory_order_relaxed) == highPage.CacheItem().Raw()) {
-                        const ui64 displaced = newOp.View().HotSlots[newOp.View().HotSlotCount - 1].exchange(
-                            highPage.CacheItem().Raw(), std::memory_order_relaxed);
+                        const ui64 displaced =
+                            newOp.View()
+                                .Tiers[ECacheTier::Regular]
+                                .HotStorage.Slots[newOp.View().Tiers[ECacheTier::Regular].HotStorage.SlotCount - 1]
+                                .exchange(highPage.CacheItem().Raw(), std::memory_order_relaxed);
                         word.store(displaced, std::memory_order_relaxed);
                         moved = true;
                         break;
@@ -7833,10 +7838,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(hotSlots >= 64 && hotSlots <= 1024);
         std::array<std::atomic<ui64>, hotSlots> slots{};
         TS5FifoRings rings;
-        const TSpaceView view{
-            .HotSlots = slots.data(),
-            .HotSlotCount = hotSlots,
-            .Rings = &rings,
+        TSpaceView view;
+        view.Tiers[ECacheTier::Regular] = {
+            .Rings = &rings.Tier(ECacheTier::Regular),
+            .HotStorage = { slots.data(), sizeof(slots), hotSlots },
         };
         for (ui32 level = 0; level < 4; ++level) {
             const auto hot = view.Hot(static_cast<EHotLevel>(level));
@@ -8842,7 +8847,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const auto hotIsQueued = [&] {
             return TSharedCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
                 for (ui64 slot = 0; slot < spaceOp.EffectiveHotSlots(); ++slot) {
-                    if (spaceOp.View().HotSlots[slot].load(std::memory_order_acquire) == hot.CacheItem().Raw()) {
+                    if (spaceOp.View().Tiers[ECacheTier::Regular].HotStorage.Slots[slot].load(
+                            std::memory_order_acquire) == hot.CacheItem().Raw()) {
                         return true;
                     }
                 }

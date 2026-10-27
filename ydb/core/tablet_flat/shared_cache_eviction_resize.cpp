@@ -205,7 +205,7 @@ ui32 TCacheEviction<TTraits>::ShrinkHotTarget(ui32 effectiveHotSlots, ui32 step)
 template <class TTraits>
 ui32 TCacheEviction<TTraits>::GrowHotTarget(
     const TSpaceOperation& spaceOp, ui32 effectiveHotSlots, ui32 step) const noexcept {
-    const ui32 maximum = static_cast<ui32>(spaceOp.View().HotSlotCount);
+    const ui32 maximum = static_cast<ui32>(spaceOp.View().Tiers[ECacheTier::Regular].HotStorage.SlotCount);
     const ui32 growthStep = Max<ui32>(1, step / 2);
     const ui64 grownHotSlots = ui64(effectiveHotSlots) + growthStep;
     if (grownHotSlots < maximum) {

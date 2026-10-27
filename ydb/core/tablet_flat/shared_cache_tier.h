@@ -1,6 +1,7 @@
 #pragma once
 
 #include "shared_cache_cyclic_buffer.h"
+#include "shared_cache_mapping.h"
 
 #include <algorithm>
 #include <array>
@@ -51,20 +52,42 @@ private:
     TRingCursor ColdCursor_;
 };
 
+struct TCacheRingStorageView {
+    std::atomic<ui64>* Slots = nullptr;
+    size_t Bytes = 0;
+    // Logical geometry can remain smaller than the mapped backing during migration
+    ui64 SlotCount = 0;
+
+    // Copy backing without changing this snapshot's logical bounds
+    void CopyMapping(const TCacheRingStorageView& source) noexcept {
+        Slots = source.Slots;
+        Bytes = source.Bytes;
+    }
+};
+
 // Borrows one tier's storage and stable cursors; the caller protects their lifetime
 struct TCacheTierView {
     TCacheTierRings* Rings = nullptr;
-    std::atomic<ui64>* HotSlots = nullptr;
-    std::atomic<ui64>* ColdSlots = nullptr;
-    ui64 HotSlotCount = 0;
-    ui64 ColdSlotCount = 0;
+    TCacheRingStorageView HotStorage;
+    TCacheRingStorageView ColdStorage;
 
     Y_FORCE_INLINE TRingView Hot(EHotLevel level) const noexcept;
 
     Y_FORCE_INLINE TRingView Cold() const noexcept {
-        Y_DEBUG_ABORT_UNLESS(Rings && ColdSlots && ColdSlotCount != 0);
-        return { &Rings->Cold(), ColdSlots, ColdSlotCount };
+        Y_DEBUG_ABORT_UNLESS(Rings && ColdStorage.Slots && ColdStorage.SlotCount != 0);
+        return { &Rings->Cold(), ColdStorage.Slots, ColdStorage.SlotCount };
     }
+
+    void CopyMappings(const TCacheTierView& source) noexcept {
+        HotStorage.CopyMapping(source.HotStorage);
+        ColdStorage.CopyMapping(source.ColdStorage);
+    }
+};
+
+// Mapping ownership only; the shared space coordinates publication and reclamation
+struct TCacheTierStorage {
+    TSharedCacheMapping Hot;
+    TSharedCacheMapping Cold;
 };
 
 constexpr THotRingRange THotRingLayout::Ring(EHotLevel level) const noexcept {
@@ -80,9 +103,9 @@ constexpr THotRingRange THotRingLayout::Ring(EHotLevel level) const noexcept {
 }
 
 Y_FORCE_INLINE TRingView TCacheTierView::Hot(EHotLevel level) const noexcept {
-    Y_DEBUG_ABORT_UNLESS(Rings && HotSlots);
-    const auto range = THotRingLayout{ HotSlotCount }.Ring(level);
-    return { &Rings->Hot(level), HotSlots + range.Offset, range.Size };
+    Y_DEBUG_ABORT_UNLESS(Rings && HotStorage.Slots);
+    const auto range = THotRingLayout{ HotStorage.SlotCount }.Ring(level);
+    return { &Rings->Hot(level), HotStorage.Slots + range.Offset, range.Size };
 }
 
 } // namespace NKikimr::NSharedCache

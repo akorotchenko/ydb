@@ -47,10 +47,19 @@ void TSharedCacheSpace::PrepareView(ui32 generation, TSpaceView view) noexcept {
     const ui64 usableHandles = view.AllocationLimit - 2;
     view.ColdMinHandles = (usableHandles + 4) / 5;
     view.ColdGrowHandles = (usableHandles * 3 + 9) / 10;
-    view.Rings = S5FifoRings_.Get();
+    for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+        view.Tiers[tier].Rings = &S5FifoRings_->Tier(tier);
+    }
     view.FreeCursor = FreeRingCursor_.Get();
     view.EffectiveHotSlots = &EffectiveHotSlots_;
     SpaceViews_[generation % SpaceViewBankCount] = view;
+}
+
+void TSharedCacheSpace::SetLegacyTierSlotCounts(TSpaceView& view, const TSharedCacheCapacity& capacity) noexcept {
+    view.Tiers[ECacheTier::Regular].HotStorage.SlotCount = capacity.HotSlotCount();
+    view.Tiers[ECacheTier::Regular].ColdStorage.SlotCount = capacity.ColdSlotCount();
+    view.Tiers[ECacheTier::Keep].HotStorage.SlotCount = 0;
+    view.Tiers[ECacheTier::Keep].ColdStorage.SlotCount = capacity.KeepColdSlotCount();
 }
 
 ui32 TSharedCacheSpace::HotLevelForSlot(ui64 slot, ui64 hotSlotCount) noexcept {
@@ -211,15 +220,19 @@ bool TSharedCacheSpace::Initialize(
     }
 
     THolder<TSpaceView> view = MakeHolder<TSpaceView>();
+    SetLegacyTierSlotCounts(*view, current);
     size_t reservedHandlesBytes;
     size_t reservedBucketsBytes;
     size_t reservedHotBytes;
     size_t reservedSlotsBytes;
     if (!TryMappingSize(current.HandleCount(), sizeof(THandle), view->HandlesBytes) ||
         !TryMappingSize(current.BucketCount(), sizeof(std::atomic<ui64>), view->BucketsBytes) ||
-        !TryMappingSize(current.HotSlotCount(), sizeof(std::atomic<ui64>), view->HotSlotBytes) ||
-        !TryMappingSize(current.ColdSlotCount(), sizeof(std::atomic<ui64>), view->ColdSlotBytes) ||
-        !TryMappingSize(current.KeepColdSlotCount(), sizeof(std::atomic<ui64>), view->KeepColdSlotBytes) ||
+        !TryMappingSize(
+            current.HotSlotCount(), sizeof(std::atomic<ui64>), view->Tiers[ECacheTier::Regular].HotStorage.Bytes) ||
+        !TryMappingSize(
+            current.ColdSlotCount(), sizeof(std::atomic<ui64>), view->Tiers[ECacheTier::Regular].ColdStorage.Bytes) ||
+        !TryMappingSize(
+            current.KeepColdSlotCount(), sizeof(std::atomic<ui64>), view->Tiers[ECacheTier::Keep].ColdStorage.Bytes) ||
         !TryMappingSize(current.HandleCount(), sizeof(std::atomic<ui64>), view->FreeSlotBytes) ||
         !TryMappingSize(reserved.HandleCount(), sizeof(THandle), reservedHandlesBytes) ||
         !TryMappingSize(reserved.BucketCount(), sizeof(std::atomic<ui64>), reservedBucketsBytes) ||
@@ -227,9 +240,12 @@ bool TSharedCacheSpace::Initialize(
         !TryMappingSize(reserved.HandleCount(), sizeof(std::atomic<ui64>), reservedSlotsBytes) ||
         !HandlesMapping_.Allocate(view->HandlesBytes, reservedHandlesBytes, view->Handles) ||
         !BucketsMapping_.Allocate(view->BucketsBytes, reservedBucketsBytes, view->Buckets) ||
-        !HotMapping_.Allocate(view->HotSlotBytes, reservedHotBytes, view->HotSlots) ||
-        !ColdMapping_.Allocate(view->ColdSlotBytes, reservedSlotsBytes / 2, view->ColdSlots) ||
-        !KeepColdMapping_.Allocate(view->KeepColdSlotBytes, reservedSlotsBytes / 2, view->KeepColdSlots) ||
+        !TierStorage_[ECacheTier::Regular].Hot.Allocate(view->Tiers[ECacheTier::Regular].HotStorage.Bytes,
+            reservedHotBytes, view->Tiers[ECacheTier::Regular].HotStorage.Slots) ||
+        !TierStorage_[ECacheTier::Regular].Cold.Allocate(view->Tiers[ECacheTier::Regular].ColdStorage.Bytes,
+            reservedSlotsBytes / 2, view->Tiers[ECacheTier::Regular].ColdStorage.Slots) ||
+        !TierStorage_[ECacheTier::Keep].Cold.Allocate(view->Tiers[ECacheTier::Keep].ColdStorage.Bytes,
+            reservedSlotsBytes / 2, view->Tiers[ECacheTier::Keep].ColdStorage.Slots) ||
         !FreeMapping_.Allocate(view->FreeSlotBytes, reservedSlotsBytes, view->FreeSlots))
     {
         return false;
@@ -241,16 +257,16 @@ bool TSharedCacheSpace::Initialize(
         new (&view->FreeSlots[index]) std::atomic<ui64>(0);
     }
     for (ui64 index = 0; index < current.ColdSlotCount(); ++index) {
-        new (&view->ColdSlots[index]) std::atomic<ui64>(0);
+        new (&view->Tiers[ECacheTier::Regular].ColdStorage.Slots[index]) std::atomic<ui64>(0);
     }
     for (ui64 index = 0; index < current.BucketCount(); ++index) {
         new (&view->Buckets[index]) std::atomic<ui64>(0);
     }
     for (ui64 index = 0; index < current.HotSlotCount(); ++index) {
-        new (&view->HotSlots[index]) std::atomic<ui64>(0);
+        new (&view->Tiers[ECacheTier::Regular].HotStorage.Slots[index]) std::atomic<ui64>(0);
     }
     for (ui64 index = 0; index < current.KeepColdSlotCount(); ++index) {
-        new (&view->KeepColdSlots[index]) std::atomic<ui64>(0);
+        new (&view->Tiers[ECacheTier::Keep].ColdStorage.Slots[index]) std::atomic<ui64>(0);
     }
 
     for (ui64 index = 2; index < current.HandleCount(); ++index) {
@@ -275,7 +291,7 @@ bool TSharedCacheSpace::Initialize(
     initialView.CopyMappings(*NewestViewOwner_);
     initialView.HandleCount = current.HandleCount();
     initialView.AllocationLimit = current.HandleCount();
-    initialView.HotSlotCount = current.HotSlotCount();
+    SetLegacyTierSlotCounts(initialView, current);
     PrepareView(0, initialView);
     SpaceState_.store(TSpaceState::Make(0, current.AddressBits).Raw(), std::memory_order_release);
     EffectiveHotSlots_.store(current.HotSlotCount(), std::memory_order_release);
