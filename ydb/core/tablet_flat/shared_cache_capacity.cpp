@@ -4,24 +4,27 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
-bool TCacheCapacity<TTraits>::PrepareTransition(const TSharedCacheCapacity& target, TTransition& transition) noexcept {
+EPrepareResult TCacheCapacity<TTraits>::PrepareTransition(
+    const TSharedCacheCapacity& target, TTransition& transition) noexcept {
+    Y_ABORT_UNLESS(transition.Phase() == ETransitionPhase::Idle);
     auto hotResizeGuard = Cache_.HotResize_.TryLock();
     if (!hotResizeGuard || !Cache_.HotResize_.ClaimCapacityTransition(transition)) {
-        return false;
+        return EPrepareResult::Rejected;
     }
     const ui64 currentStaticBytes = Cache_.Space_->CurrentConfiguration().StaticBytes;
     const ui64 staticDeltaBytes = target.StaticBytes > currentStaticBytes ? target.StaticBytes - currentStaticBytes : 0;
     if (staticDeltaBytes != 0) {
         Cache_.Memory_.PrepareStaticResize(staticDeltaBytes);
     }
-    if (Cache_.Space_->PrepareTransition(target, transition)) {
-        return true;
+    const EPrepareResult result = Cache_.Space_->PrepareTransition(target, transition);
+    if (result != EPrepareResult::Rejected) {
+        return result;
     }
     if (staticDeltaBytes != 0) {
         Cache_.Memory_.CancelStaticResize(staticDeltaBytes);
     }
     Cache_.HotResize_.ReleaseCapacityTransition(transition);
-    return false;
+    return EPrepareResult::Rejected;
 }
 
 template <class TTraits>
@@ -85,7 +88,7 @@ bool TCacheCapacity<TTraits>::StartTransition() noexcept {
         return false;
     }
     next.Limit = Cache_.Memory_.HardLimit();
-    return PrepareTransition(next, Transition_);
+    return PrepareTransition(next, Transition_) == EPrepareResult::Prepared;
 }
 
 template <class TTraits>
@@ -146,7 +149,8 @@ bool TCacheCapacity<TTraits>::AbandonTransition(TTransition& transition) noexcep
     if (!Cache_.Space_->AbandonTransition(transition)) {
         return false;
     }
-    if (phase == ETransitionPhase::Prepare || phase == ETransitionPhase::InitializeGrowth) {
+    if (phase == ETransitionPhase::Prepare || phase == ETransitionPhase::InitializeGrowth ||
+        phase == ETransitionPhase::CancelRetry) {
         if (targetStaticBytes > oldStaticBytes) {
             const ui64 delta = targetStaticBytes - oldStaticBytes;
             Cache_.Memory_.CancelStaticResize(delta);
@@ -250,6 +254,11 @@ bool TCacheCapacity<TTraits>::RunMaintenance() noexcept {
     switch (Transition_.Phase()) {
         case ETransitionPhase::Idle:
             return StartTransition();
+
+        case ETransitionPhase::CancelRetry:
+            // OS cleanup retries yield to periodic GC instead of scheduling themselves
+            AbandonTransition(Transition_);
+            return false;
 
         case ETransitionPhase::Prepare:
         case ETransitionPhase::InitializeGrowth:

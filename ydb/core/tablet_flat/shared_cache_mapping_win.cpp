@@ -30,6 +30,7 @@ public:
     }
 
     bool Prepare(size_t targetSize, void*& pointer) noexcept {
+        pointer = nullptr;
         if (targetSize == 0 || targetSize > ReservedSize_) {
             return false;
         }
@@ -40,10 +41,12 @@ public:
         return true;
     }
 
-    void Cancel(size_t targetSize) noexcept {
-        if (targetSize > CurrentSize_) {
-            Decommit(CurrentSize_, targetSize);
-        }
+    bool Cancel(size_t targetSize) noexcept {
+        return targetSize <= CurrentSize_ || Decommit(CurrentSize_, targetSize);
+    }
+
+    void SetTestHook(TTestHook hook) noexcept {
+        TestHook_ = hook;
     }
 
     void Publish(size_t size) noexcept {
@@ -80,10 +83,12 @@ private:
         const size_t pageSize = NSystemInfo::GetPageSize();
         const size_t begin = AlignUp(newSize, pageSize);
         const size_t end = AlignUp(oldSize, pageSize);
-        return begin == end || VirtualFree(static_cast<char*>(Base_) + begin, end - begin, MEM_DECOMMIT) != FALSE;
+        return begin == end || (TestHook_.Run(ETestStep::DiscardTail) &&
+                                   VirtualFree(static_cast<char*>(Base_) + begin, end - begin, MEM_DECOMMIT) != FALSE);
     }
 
 private:
+    TTestHook TestHook_;
     void* Base_ = nullptr;
     size_t CurrentSize_ = 0;
     size_t ReservedSize_ = 0;
@@ -104,10 +109,16 @@ bool TSharedCacheMapping::Prepare(size_t targetSize, void*& pointer) noexcept {
     return Impl_->Prepare(targetSize, pointer);
 }
 
-void TSharedCacheMapping::Cancel(void* pointer, size_t targetSize) noexcept {
-    if (pointer) {
-        Impl_->Cancel(targetSize);
+bool TSharedCacheMapping::Cancel(void*& pointer, size_t targetSize) noexcept {
+    if (!Impl_->Cancel(targetSize)) {
+        return false;
     }
+    pointer = nullptr;
+    return true;
+}
+
+void TSharedCacheMapping::SetTestHook(TTestHook hook) noexcept {
+    Impl_->SetTestHook(hook);
 }
 
 void TSharedCacheMapping::Publish(void*, size_t size) noexcept {

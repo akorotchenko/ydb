@@ -1,5 +1,8 @@
 #include <ydb/core/tablet_flat/shared_cache_thread_test.h>
 #include "shared_cache_space.h"
+#include "shared_cache_mapping_test.h"
+
+#include <util/generic/scope.h>
 
 #include <library/cpp/testing/unittest/registar.h>
 #include <util/generic/vector.h>
@@ -38,6 +41,10 @@ public:
 
     static const TSpaceView& CurrentView(const TSharedCacheSpace& space) noexcept {
         return space.SpaceView(space.CurrentSpaceState());
+    }
+
+    static TSharedCacheMapping& BucketsMapping(TSharedCacheSpace& space) noexcept {
+        return space.BucketsMapping_;
     }
 
     static TSpaceState CurrentSpaceState(const TSharedCacheSpace& space) noexcept {
@@ -129,8 +136,8 @@ public:
     }
 
     template <class TCallback>
-    static bool PrepareTransition(TSharedCacheSpace& space, const TSharedCacheCapacity& target, TTransition& transition,
-        TCallback& callback) noexcept {
+    static EPrepareResult PrepareTransition(TSharedCacheSpace& space, const TSharedCacheCapacity& target,
+        TTransition& transition, TCallback& callback) noexcept {
         return space.PrepareTransitionWithHook(target, transition,
             {
                 .Context = &callback,
@@ -539,7 +546,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
             before.Tiers[ECacheTier::Regular].ColdStorage.Slots[0].store(22);
             before.Tiers[ECacheTier::Keep].ColdStorage.Slots[0].store(33);
             TTransition transition;
-            UNIT_ASSERT(space->PrepareTransition(target, transition));
+            UNIT_ASSERT(space->PrepareTransition(target, transition) == EPrepareResult::Prepared);
             {
                 auto oldOperation = TSharedCacheSpaceTestAccess::BeginOnHazard(*space, 0);
                 UNIT_ASSERT(space->PublishMigrationView(transition));
@@ -596,13 +603,14 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
                 return mapping != stages[failure];
             };
             TTransition failed;
-            UNIT_ASSERT(!TSharedCacheSpaceTestAccess::PrepareTransition(*space, large, failed, prepare));
+            UNIT_ASSERT(TSharedCacheSpaceTestAccess::PrepareTransition(*space, large, failed, prepare) ==
+                        EPrepareResult::Rejected);
             UNIT_ASSERT(ordered);
             UNIT_ASSERT_VALUES_EQUAL(calls, failure + 1);
             UNIT_ASSERT(failed.Phase() == ETransitionPhase::Idle);
             UNIT_ASSERT(space->CurrentSpaceState() == state);
             TTransition retry;
-            UNIT_ASSERT(space->PrepareTransition(large, retry));
+            UNIT_ASSERT(space->PrepareTransition(large, retry) == EPrepareResult::Prepared);
             UNIT_ASSERT(space->AbandonTransition(retry));
             const auto& after = TSharedCacheSpaceTestAccess::CurrentView(*space);
             CheckLegacyMappings(after, small, small);
@@ -627,7 +635,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
             auto [threads, space] = TCacheThreadTestAccess::MakeSpace(large, large, 1);
             UNIT_ASSERT(space);
             TTransition transition;
-            UNIT_ASSERT(space->PrepareTransition(small, transition));
+            UNIT_ASSERT(space->PrepareTransition(small, transition) == EPrepareResult::Prepared);
             UNIT_ASSERT(space->PublishMigrationView(transition));
             UNIT_ASSERT(space->TryDrainTransition(transition));
             CompleteEmptyBucketResize(*space, small.AddressBits);
@@ -660,6 +668,169 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
 }
 
 Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
+    Y_UNIT_TEST(MappingCancellationRetainsPartialAliasAndBackingProgress) {
+        using EStep = TSharedCacheMappingTestAccess::EStep;
+        const size_t small = NSystemInfo::GetPageSize() * 2;
+        const size_t large = small * 2;
+        for (bool failAfterMap : { false, true }) {
+            TSharedCacheMapping mapping;
+            void* base = nullptr;
+            UNIT_ASSERT(mapping.Allocate(small, large, base));
+            static_cast<char*>(base)[0] = 17;
+            static_cast<char*>(base)[small - 1] = 29;
+            bool failUnmap = true;
+            bool failTruncate = true;
+            ui32 maps = 0;
+            ui32 unmaps = 0;
+            ui32 truncates = 0;
+            auto hook = [&](EStep step) noexcept {
+                switch (step) {
+                    case EStep::Map:
+                        ++maps;
+                        return failAfterMap;
+                    case EStep::AfterMap:
+                        return false;
+                    case EStep::Unmap:
+                        ++unmaps;
+                        return !failUnmap;
+                    case EStep::ShrinkBacking:
+                        ++truncates;
+                        return !failTruncate;
+                    default:
+                        return true;
+                }
+            };
+            TSharedCacheMappingTestAccess::SetHook(mapping, hook);
+            char* candidate = nullptr;
+            const bool prepared = mapping.Prepare(large, candidate);
+            Y_DEFER {
+                TSharedCacheMappingTestAccess::ClearHook(mapping);
+                mapping.Cancel(candidate, large);
+            };
+            if (maps == 0) {
+                // Stable reserved backends have no disposable aliases
+                continue;
+            }
+            UNIT_ASSERT(!prepared);
+            UNIT_ASSERT_VALUES_EQUAL(bool(candidate), failAfterMap);
+            const auto partial = candidate;
+            UNIT_ASSERT(!mapping.Cancel(candidate, large));
+            UNIT_ASSERT_VALUES_EQUAL(candidate, partial);
+            if (failAfterMap) {
+                UNIT_ASSERT_VALUES_EQUAL(unmaps, 1);
+                UNIT_ASSERT_VALUES_EQUAL(truncates, 0);
+                failUnmap = false;
+                UNIT_ASSERT(!mapping.Cancel(candidate, large));
+            }
+            UNIT_ASSERT(!candidate);
+            UNIT_ASSERT_VALUES_EQUAL(truncates, 1);
+            const ui32 completedUnmaps = unmaps;
+            failTruncate = false;
+            UNIT_ASSERT(mapping.Cancel(candidate, large));
+            UNIT_ASSERT_VALUES_EQUAL(unmaps, completedUnmaps);
+            UNIT_ASSERT_VALUES_EQUAL(truncates, 2);
+            UNIT_ASSERT_VALUES_EQUAL(static_cast<char*>(base)[0], 17);
+            UNIT_ASSERT_VALUES_EQUAL(static_cast<char*>(base)[small - 1], 29);
+            TSharedCacheMappingTestAccess::ClearHook(mapping);
+            UNIT_ASSERT(mapping.Prepare(large, candidate));
+            UNIT_ASSERT(mapping.Cancel(candidate, large));
+        }
+    }
+
+    Y_UNIT_TEST(SameSizeAndShrinkCancellationPreservePublishedMapping) {
+        const size_t small = NSystemInfo::GetPageSize() * 2;
+        const size_t large = small * 2;
+        for (auto mode : { TSharedCacheMapping::EAddressMode::Default, TSharedCacheMapping::EAddressMode::Stable }) {
+            TSharedCacheMapping mapping(mode);
+            void* base = nullptr;
+            UNIT_ASSERT(mapping.Allocate(large, large * 2, base));
+            auto* bytes = static_cast<char*>(base);
+            bytes[large - 1] = 53;
+            for (size_t target : { large, small }) {
+                void* candidate = nullptr;
+                UNIT_ASSERT(mapping.Prepare(target, candidate));
+                UNIT_ASSERT(mapping.Cancel(candidate, target));
+                UNIT_ASSERT(!candidate);
+                UNIT_ASSERT_VALUES_EQUAL(bytes[large - 1], 53);
+            }
+        }
+    }
+
+    Y_UNIT_TEST(StableMappingCancellationRetriesTailCleanup) {
+        using EStep = TSharedCacheMappingTestAccess::EStep;
+        const size_t small = NSystemInfo::GetPageSize() * 2;
+        const size_t large = small * 2;
+        TSharedCacheMapping mapping(TSharedCacheMapping::EAddressMode::Stable);
+        void* base = nullptr;
+        UNIT_ASSERT(mapping.Allocate(small, large, base));
+        static_cast<char*>(base)[small - 1] = 29;
+        void* candidate = nullptr;
+        UNIT_ASSERT(mapping.Prepare(large, candidate));
+        static_cast<char*>(candidate)[large - 1] = 41;
+        bool fail = true;
+        ui32 cleanups = 0;
+        auto hook = [&](EStep step) noexcept {
+            if (step == EStep::ShrinkBacking || step == EStep::DiscardTail) {
+                ++cleanups;
+                return !fail;
+            }
+            return true;
+        };
+        TSharedCacheMappingTestAccess::SetHook(mapping, hook);
+        Y_DEFER {
+            TSharedCacheMappingTestAccess::ClearHook(mapping);
+            mapping.Cancel(candidate, large);
+        };
+        UNIT_ASSERT(!mapping.Cancel(candidate, large));
+        UNIT_ASSERT_VALUES_EQUAL(cleanups, 1);
+        UNIT_ASSERT_VALUES_EQUAL(static_cast<char*>(base)[small - 1], 29);
+        fail = false;
+        UNIT_ASSERT(mapping.Cancel(candidate, large));
+        UNIT_ASSERT_VALUES_EQUAL(cleanups, 2);
+        UNIT_ASSERT(!candidate);
+        UNIT_ASSERT_VALUES_EQUAL(static_cast<char*>(base)[small - 1], 29);
+    }
+
+    Y_UNIT_TEST(CancellationAfterPartialInitializationRetainsItsCursor) {
+        using EStep = TSharedCacheMappingTestAccess::EStep;
+        TSharedCacheCapacity small;
+        TSharedCacheCapacity large;
+        // Bucket backing grows from 64 KiB to 128 KiB, crossing even 64 KiB OS pages
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(13, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(14, 4096, 0, 1, large));
+        auto [threads, space] = TCacheThreadTestAccess::MakeSpace(small, large, 1);
+        UNIT_ASSERT(space);
+        auto& mapping = TSharedCacheSpaceTestAccess::BucketsMapping(*space);
+        const auto state = space->CurrentSpaceState();
+        const auto before = TSharedCacheSpaceTestAccess::CurrentView(*space);
+        before.Buckets[0].store(17);
+        TTransition transition;
+        Y_DEFER {
+            TSharedCacheMappingTestAccess::ClearHook(mapping);
+            if (transition.Phase() != ETransitionPhase::Idle) {
+                space->AbandonTransition(transition);
+            }
+        };
+        UNIT_ASSERT(space->PrepareTransition(large, transition) == EPrepareResult::Prepared);
+        UNIT_ASSERT(space->PublishMigrationView(transition));
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::InitializeGrowth);
+        bool fail = true;
+        auto hook = [&](EStep step) noexcept {
+            return !fail || (step != EStep::Unmap && step != EStep::ShrinkBacking && step != EStep::DiscardTail);
+        };
+        TSharedCacheMappingTestAccess::SetHook(mapping, hook);
+        UNIT_ASSERT(!space->AbandonTransition(transition));
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::CancelRetry);
+        UNIT_ASSERT(transition.ReleaseStage() == ESpaceMap::Buckets);
+        UNIT_ASSERT(space->CurrentSpaceState() == state);
+        UNIT_ASSERT_VALUES_EQUAL(before.Buckets[0].load(), 17);
+        fail = false;
+        UNIT_ASSERT(space->AbandonTransition(transition));
+        UNIT_ASSERT(transition.Phase() == ETransitionPhase::Idle);
+        UNIT_ASSERT(space->CurrentSpaceState() == state);
+        UNIT_ASSERT_VALUES_EQUAL(before.Buckets[0].load(), 17);
+    }
+
     Y_UNIT_TEST(StableMappingCancellationAndRegrowthPreserveLivePrefix) {
         const size_t small = NSystemInfo::GetPageSize() * 2;
         const size_t large = small * 2;
@@ -674,7 +845,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT(mapping.Prepare(large, prepared));
         UNIT_ASSERT_VALUES_EQUAL(prepared, base);
         static_cast<char*>(prepared)[large - 1] = 41;
-        mapping.Cancel(prepared, large);
+        UNIT_ASSERT(mapping.Cancel(prepared, large));
         UNIT_ASSERT_VALUES_EQUAL(bytes[0], 17);
         UNIT_ASSERT_VALUES_EQUAL(bytes[small - 1], 29);
 
@@ -687,7 +858,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(bytes[small - 1], 29);
 
         UNIT_ASSERT(mapping.Prepare(small, prepared));
-        mapping.Cancel(prepared, small);
+        UNIT_ASSERT(mapping.Cancel(prepared, small));
         UNIT_ASSERT_VALUES_EQUAL(bytes[large - 1], 53);
 
         UNIT_ASSERT(mapping.Prepare(small, prepared));
@@ -907,7 +1078,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         TSharedCacheSpaceTestAccess::KeepColdSlots(*space)[large.KeepColdSlotCount() - 1].store(word);
 
         TTransition shrink;
-        UNIT_ASSERT(space->PrepareTransition(small, shrink));
+        UNIT_ASSERT(space->PrepareTransition(small, shrink) == EPrepareResult::Prepared);
         UNIT_ASSERT(space->PublishMigrationView(shrink));
         UNIT_ASSERT(space->TryDrainTransition(shrink));
         CompleteEmptyBucketResize(*space, small.AddressBits);
@@ -966,11 +1137,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT(space);
 
         TTransition transition;
-        UNIT_ASSERT(space->PrepareTransition(doubled, transition));
+        UNIT_ASSERT(space->PrepareTransition(doubled, transition) == EPrepareResult::Prepared);
         UNIT_ASSERT_VALUES_EQUAL(transition.ResizeDeltaBits(), 1);
         UNIT_ASSERT(space->AbandonTransition(transition));
 
-        UNIT_ASSERT(space->PrepareTransition(quadrupled, transition));
+        UNIT_ASSERT(space->PrepareTransition(quadrupled, transition) == EPrepareResult::Prepared);
         UNIT_ASSERT_VALUES_EQUAL(transition.ResizeDeltaBits(), 2);
         UNIT_ASSERT(space->AbandonTransition(transition));
     }
@@ -1301,11 +1472,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         const auto state = space->CurrentSpaceState();
         const auto* handles = TSharedCacheSpaceTestAccess::Handles(*space);
         TTransition transition;
-        UNIT_ASSERT(!space->PrepareTransition(changedEstimate, transition));
+        UNIT_ASSERT(space->PrepareTransition(changedEstimate, transition) == EPrepareResult::Rejected);
         UNIT_ASSERT(transition.Phase() == ETransitionPhase::Idle);
         UNIT_ASSERT(space->CurrentSpaceState() == state);
         UNIT_ASSERT(TSharedCacheSpaceTestAccess::Handles(*space) == handles);
-        UNIT_ASSERT(space->PrepareTransition(reserved, transition));
+        UNIT_ASSERT(space->PrepareTransition(reserved, transition) == EPrepareResult::Prepared);
         UNIT_ASSERT(space->AbandonTransition(transition));
     }
 
@@ -1487,7 +1658,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         smallHandles[2].Key0.store(17, std::memory_order_relaxed);
 
         TTransition growth;
-        UNIT_ASSERT(space->PrepareTransition(large, growth));
+        UNIT_ASSERT(space->PrepareTransition(large, growth) == EPrepareResult::Prepared);
         UNIT_ASSERT(growth.Phase() == ETransitionPhase::Prepare);
         UNIT_ASSERT_VALUES_EQUAL(growth.ResizeDeltaBits(), 1);
         {
@@ -1532,7 +1703,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::Handles(*space), smallHandles);
 
         TTransition shrink;
-        UNIT_ASSERT(space->PrepareTransition(small, shrink));
+        UNIT_ASSERT(space->PrepareTransition(small, shrink) == EPrepareResult::Prepared);
         THandle* largeHandles = TSharedCacheSpaceTestAccess::Handles(*space);
         UNIT_ASSERT(space->PublishMigrationView(shrink));
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).AllocationLimit, small.HandleCount());
@@ -1578,7 +1749,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         };
 
         TTransition transition;
-        UNIT_ASSERT(space->PrepareTransition(large, transition));
+        UNIT_ASSERT(space->PrepareTransition(large, transition) == EPrepareResult::Prepared);
         UNIT_ASSERT(space->PublishMigrationView(transition));
         UNIT_ASSERT(space->TryDrainTransition(transition));
         CompleteEmptyBucketResize(*space, large.AddressBits);
@@ -1620,7 +1791,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         };
 
         TTransition canceled;
-        UNIT_ASSERT(space->PrepareTransition(large, canceled));
+        UNIT_ASSERT(space->PrepareTransition(large, canceled) == EPrepareResult::Prepared);
         UNIT_ASSERT(space->PublishMigrationView(canceled));
         UNIT_ASSERT(canceled.Phase() == ETransitionPhase::InitializeGrowth);
         UNIT_ASSERT(space->AbandonTransition(canceled));
@@ -1628,7 +1799,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).HandleCount, small.HandleCount());
 
         TTransition transition;
-        UNIT_ASSERT(space->PrepareTransition(large, transition));
+        UNIT_ASSERT(space->PrepareTransition(large, transition) == EPrepareResult::Prepared);
         ui32 initializationCalls = 0;
         do {
             UNIT_ASSERT(space->PublishMigrationView(transition));
@@ -1682,7 +1853,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::FreeCount(*space), large.HandleCount() - 2);
 
         TTransition transition;
-        UNIT_ASSERT(space->PrepareTransition(small, transition));
+        UNIT_ASSERT(space->PrepareTransition(small, transition) == EPrepareResult::Prepared);
         UNIT_ASSERT(space->PublishMigrationView(transition));
         UNIT_ASSERT(space->TryDrainTransition(transition));
         CompleteEmptyBucketResize(*space, small.AddressBits);
@@ -1714,7 +1885,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT(space);
 
         TTransition transition;
-        UNIT_ASSERT(space->PrepareTransition(small, transition));
+        UNIT_ASSERT(space->PrepareTransition(small, transition) == EPrepareResult::Prepared);
         const ui64 generation = TSharedCacheSpaceTestAccess::CurrentSpaceState(*space).Generation();
         const TSpaceState publishedState =
             TSharedCacheSpaceTestAccess::CurrentSpaceState(*space).WithGeneration(generation + 1);
@@ -1745,7 +1916,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT(space);
 
         TTransition transition;
-        UNIT_ASSERT(space->PrepareTransition(small, transition));
+        UNIT_ASSERT(space->PrepareTransition(small, transition) == EPrepareResult::Prepared);
         UNIT_ASSERT(space->PublishMigrationView(transition));
         UNIT_ASSERT(space->TryDrainTransition(transition));
         CompleteEmptyBucketResize(*space, small.AddressBits);
@@ -1795,7 +1966,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         THandle* initialHandles = TSharedCacheSpaceTestAccess::Handles(*space);
 
         TTransition privateTransition;
-        UNIT_ASSERT(space->PrepareTransition(large, privateTransition));
+        UNIT_ASSERT(space->PrepareTransition(large, privateTransition) == EPrepareResult::Prepared);
         UNIT_ASSERT_VALUES_EQUAL(privateTransition.ResizeDeltaBits(), 1);
         UNIT_ASSERT(space->AbandonTransition(privateTransition));
         UNIT_ASSERT(privateTransition.Phase() == ETransitionPhase::Idle);
@@ -1803,7 +1974,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(TSharedCacheSpaceTestAccess::CurrentView(*space).HandleCount, small.HandleCount());
 
         TTransition publishedTransition;
-        UNIT_ASSERT(space->PrepareTransition(large, publishedTransition));
+        UNIT_ASSERT(space->PrepareTransition(large, publishedTransition) == EPrepareResult::Prepared);
         UNIT_ASSERT(space->PublishMigrationView(publishedTransition));
         const ui64 generation = TSharedCacheSpaceTestAccess::CurrentSpaceState(*space).Generation();
         UNIT_ASSERT(space->AbandonTransition(publishedTransition));
