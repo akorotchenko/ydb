@@ -43,6 +43,7 @@ bool TCacheEviction<TTraits>::SweepKeepCold() noexcept {
             for (ui64 index = 0; index < batch; ++index) {
                 const ui64 raw = spaceOp.KeepCold().Pop();
                 if (raw != 0) {
+                    spaceOp.View().Tiers[ECacheTier::Keep].Rings->RemoveColdEntry();
                     RouteKeepCold(spaceOp, TColdCacheItem::FromRaw(raw));
                 }
             }
@@ -84,6 +85,7 @@ bool TCacheEviction<TTraits>::TrimKeepCold(TSpaceOperation& spaceOp) noexcept {
         if (raw == 0) {
             continue;
         }
+        spaceOp.View().Tiers[ECacheTier::Keep].Rings->RemoveColdEntry();
         const TColdCacheItem coldItem = TColdCacheItem::FromRaw(raw);
         if (DemoteKeepCold(spaceOp, coldItem)) {
             progress = true;

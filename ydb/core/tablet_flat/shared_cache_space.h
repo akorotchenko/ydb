@@ -699,6 +699,10 @@ public:
         return ReservedCapacity_;
     }
 
+    ui64 ColdRingEntries(ECacheTier tier) const noexcept {
+        return S5FifoRings_->Tier(tier).ColdEntries();
+    }
+
     ui64 EffectiveHotSlots() const noexcept {
         return EffectiveHotSlots_.load(std::memory_order_acquire);
     }

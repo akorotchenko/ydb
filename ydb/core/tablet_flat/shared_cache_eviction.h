@@ -1,6 +1,7 @@
 #pragma once
 
 #include "shared_cache_hot_policy.h"
+#include "shared_cache_cold_policy.h"
 #include "shared_cache_memory.h"
 #include "shared_cache_space.h"
 #include "shared_cache_traits.h"
@@ -22,6 +23,7 @@ public:
     explicit TCacheEviction(TSharedCacheImpl<TTraits>& cache) noexcept
         : Cache_(cache)
         , HotPolicy_(cache)
+        , ColdPolicy_(cache)
     {}
 
     Y_FORCE_INLINE TOperation BindOperation(TSpaceOperation& spaceOp) noexcept {
@@ -72,6 +74,7 @@ public:
 private:
     friend class TCacheEvictionOperation<TTraits>;
     friend class TCacheHotPolicy<TTraits>;
+    friend class TCacheColdPolicy<TTraits>;
     friend class TSharedCacheTestAccess;
 
     // KeepCold routing
@@ -113,10 +116,21 @@ private:
     // Cold routing and reclamation
     void CompleteColdPageRelease(TOperationItemRef<TTraits>& ownerRef) noexcept;
     bool EraseCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
-    void RouteCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept;
-    bool ReclaimCold(TSpaceOperation& spaceOp) noexcept;
-    template <bool Preload>
-    bool ReclaimColdImpl(TSpaceOperation& spaceOp) noexcept;
+
+    Y_FORCE_INLINE void PublishCold(TSpaceOperation& spaceOp, TCacheItem nativeItem) noexcept {
+        ColdPolicy_.PublishCold(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular], nativeItem);
+    }
+
+    Y_FORCE_INLINE void RouteCold(TSpaceOperation& spaceOp, TColdCacheItem item) noexcept {
+        ColdPolicy_.RouteCold(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular], item);
+    }
+
+    Y_FORCE_INLINE bool ReclaimCold(TSpaceOperation& spaceOp) noexcept {
+        return ColdPolicy_.Reclaim(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular]);
+    }
+
+    bool TryEnqueueColdForPreload(TSpaceOperation& spaceOp, const TCacheTierView& tier, TColdCacheItem item,
+        THandle& handle, THandleState state) noexcept;
     bool DemoteKeepColdForSoftLimit(TSpaceOperation& spaceOp) noexcept;
     bool ReclaimKeepCold(TSpaceOperation& spaceOp) noexcept;
 
@@ -158,6 +172,7 @@ private:
     // Dependencies
     TSharedCacheImpl<TTraits>& Cache_;
     TCacheHotPolicy<TTraits> HotPolicy_;
+    TCacheColdPolicy<TTraits> ColdPolicy_;
 
     // Policy resizing state
     ui64 ColdByteBudget_ = Max<ui64>(); // Protected by the shared HotResize lock; watermark calculation input
@@ -242,6 +257,10 @@ public:
 
     Y_FORCE_INLINE void RouteCold(TColdCacheItem item) noexcept {
         Cache_.Eviction_.RouteCold(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE void PublishCold(TCacheItem nativeItem) noexcept {
+        Cache_.Eviction_.PublishCold(SpaceOp_, nativeItem);
     }
 
     Y_FORCE_INLINE bool ReclaimCold() noexcept {

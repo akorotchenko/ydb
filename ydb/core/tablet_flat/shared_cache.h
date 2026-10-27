@@ -345,7 +345,7 @@ public:
     }
 
     ui64 ColdRingEntries() const noexcept {
-        return Memory_.ColdRingEntries();
+        return Space_->ColdRingEntries(ECacheTier::Regular);
     }
 
     ui64 StickyPages() const noexcept {
@@ -465,6 +465,7 @@ private:
     friend class TCacheCollections<TTraits>;
     friend class TCacheEviction<TTraits>;
     friend class TCacheHotPolicy<TTraits>;
+    friend class TCacheColdPolicy<TTraits>;
     friend class TCacheCapacity<TTraits>;
     friend class TCacheOperation<TTraits>;
     friend class TCacheOperationView<TTraits>;

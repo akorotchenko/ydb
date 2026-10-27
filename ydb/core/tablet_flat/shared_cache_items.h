@@ -380,8 +380,7 @@ Y_FORCE_INLINE bool TCacheItems<TTraits>::TryReleaseItemRef(
         if (publishCold) {
             // Acquire membership updates carried by earlier reference releases after a refcount ABA
             std::atomic_thread_fence(std::memory_order_acquire);
-            const ui32 coldVersion = handle.ColdVersion.load(std::memory_order_acquire);
-            cacheOp.Eviction().RouteCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, cacheItem.Index()));
+            cacheOp.Eviction().PublishCold(cacheItem);
         } else if (lastKeepColdRef) {
             Cache_.InvokeHook(ESharedCacheHookPoint::AfterKeepColdRefReleased, cacheItem);
             // Check after releasing the final ref: a concurrent trim may have withdrawn this page's ring entry
