@@ -6338,8 +6338,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             CompleteBucketResize(*fixture.Cache, *fixture.Space);
             UNIT_ASSERT(TSharedCacheTestAccess::PublishFinalView(*fixture.Cache, transition));
 
+            auto commitLock = TSharedCacheTestAccess::LockHotResize(*fixture.Cache);
+            UNIT_ASSERT(commitLock);
             std::atomic<bool> ready = false;
             std::atomic<bool> done = false;
+            std::atomic<bool> policyValid = true;
             std::thread worker([&] {
                 Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
                 NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
@@ -6351,21 +6354,37 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                     do {
                         const auto policy = TSharedCacheTestAccess::HotPolicy(*fixture.Cache, spaceOp);
                         for (ui64 bound : policy) {
-                            UNIT_ASSERT(bound <= target.HotSlotCount());
+                            if (bound > target.HotSlotCount()) {
+                                policyValid.store(false, std::memory_order_relaxed);
+                            }
                         }
                         fixture.Cache->EnforceCurrentLimit();
                     } while (!done.load(std::memory_order_acquire));
                 });
             });
+            Y_DEFER {
+                done.store(true, std::memory_order_release);
+                if (worker.joinable()) {
+                    worker.join();
+                }
+            };
             while (!ready.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
             }
             UNIT_ASSERT(TSharedCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
             UNIT_ASSERT(TSharedCacheTestAccess::FinalDrain(*fixture.Cache, transition));
             UNIT_ASSERT(TSharedCacheTestAccess::TryReleaseTransition(*fixture.Cache, transition));
-            UNIT_ASSERT(TSharedCacheTestAccess::CommitTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(!TSharedCacheTestAccess::CommitTransition(*fixture.Cache, transition));
+            UNIT_ASSERT(transition.Phase() == ETransitionPhase::Commit);
+            commitLock = {};
+            const TInstant deadline = TInstant::Now() + TDuration::Seconds(10);
+            while (!TSharedCacheTestAccess::CommitTransition(*fixture.Cache, transition)) {
+                UNIT_ASSERT_C(TInstant::Now() < deadline, "Capacity commit did not finish while Hot policy ran");
+                std::this_thread::yield();
+            }
             done.store(true, std::memory_order_release);
             worker.join();
+            UNIT_ASSERT(policyValid.load(std::memory_order_relaxed));
         }
     }
 

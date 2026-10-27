@@ -1,27 +1,13 @@
 #pragma once
 
-#include "defs.h"
+#include <util/system/compiler.h>
+#include <util/system/types.h>
+#include <util/system/yassert.h>
 
-#include <array>
 #include <atomic>
 #include <utility>
 
 namespace NKikimr::NSharedCache {
-
-enum class ECacheTier : ui8 {
-    Regular,
-    Keep,
-};
-
-enum EHotLevel : ui32 {
-    L0,
-    L1,
-    L2,
-    L3,
-};
-
-inline constexpr ui32 CacheTierCount = 2;
-inline constexpr ui32 HotLevelCount = 4;
 
 struct TRingExchangeResult {
     std::atomic<ui64>* Slot = nullptr;
@@ -107,32 +93,6 @@ private:
 private:
     TCursor Head_;
     TCursor Tail_;
-};
-
-class TS5FifoRings {
-public:
-    Y_FORCE_INLINE TRingCursor& Hot(EHotLevel level) noexcept {
-        return Hot(ECacheTier::Regular, level);
-    }
-
-    Y_FORCE_INLINE TRingCursor& Hot(ECacheTier tier, EHotLevel level) noexcept {
-        const auto tierIndex = static_cast<ui32>(tier);
-        Y_DEBUG_ABORT_UNLESS(tierIndex < CacheTierCount && level < HotLevelCount);
-        return HotCursors_[tierIndex][level];
-    }
-
-    Y_FORCE_INLINE TRingCursor& Cold() noexcept {
-        return ColdCursor_;
-    }
-
-    Y_FORCE_INLINE TRingCursor& KeepCold() noexcept {
-        return KeepColdCursor_;
-    }
-
-private:
-    std::array<std::array<TRingCursor, HotLevelCount>, CacheTierCount> HotCursors_;
-    TRingCursor ColdCursor_;
-    TRingCursor KeepColdCursor_;
 };
 
 struct TRingView {
