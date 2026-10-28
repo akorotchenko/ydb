@@ -7,7 +7,7 @@
 #include <ydb/core/tablet/tablet_counters_aggregator.h>
 #include <ydb/core/testlib/actors/block_events.h>
 #include <ydb/core/testlib/actors/wait_events.h>
-#include "shared_cache.h"
+#include "cache.h"
 
 namespace NKikimr {
 namespace NTabletFlatExecutor {
@@ -591,8 +591,9 @@ public:
     }
 };
 
-THolder<TSharedPageCacheCounters> GetSharedPageCounters(TMyEnvBase& env) {
-    return MakeHolder<TSharedPageCacheCounters>(GetServiceCounters(env->GetDynamicCounters(), "tablets")->GetSubgroup("type", "S_CACHE"));
+THolder<TCacheCounters> GetSharedPageCounters(TMyEnvBase& env) {
+    return MakeHolder<TCacheCounters>(
+        GetServiceCounters(env->GetDynamicCounters(), "tablets")->GetSubgroup("type", "S_CACHE"));
 };
 
 void MinimizeSharedCache(TMyEnvBase &env) {
@@ -4051,8 +4052,8 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_Follower) {
         // Force metadata loads: direct core lookup can otherwise boot the follower without requests.
         auto* core = &NSharedCache::TSharedCache::Get();
         {
-            TSharedCacheCollectionRef collection;
-            UNIT_ASSERT(core->Find(collectionId, collection) == ESharedCacheResultStatus::Hit);
+            TCacheCollectionRef collection;
+            UNIT_ASSERT(core->Find(collectionId, collection) == ECacheResultStatus::Hit);
             UNIT_ASSERT(core->SetCollectionPagesCacheMode(collection.CacheItem(), ECacheMode::TryKeepInMemory));
             UNIT_ASSERT(core->SetCollectionPagesCacheMode(collection.CacheItem(), ECacheMode::Regular));
         }

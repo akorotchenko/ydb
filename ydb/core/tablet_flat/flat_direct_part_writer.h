@@ -10,7 +10,7 @@
 #include "flat_part_store.h"
 #include "flat_sausagecache.h"
 #include "flat_sausage_chop.h"
-#include "shared_cache.h"
+#include "cache.h"
 #include "shared_sausagecache.h"
 #include "util_fmt_abort.h"
 
@@ -252,7 +252,7 @@ namespace NTabletFlatExecutor {
             for (auto &res : Results) {
                 Y_ENSURE(res.PageCollections, "Direct write produced a part without page collections");
 
-                TVector<TSharedCacheCollectionRef> pageCollections;
+                TVector<TCacheCollectionRef> pageCollections;
                 auto& sharedCache = NSharedCache::TSharedCache::Get();
                 for (auto& pageCollection : res.PageCollections) {
                     auto resultingPageCollection = sharedCache.AdmitCollection(pageCollection.PageCollection);

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <ydb/core/tablet_flat/shared_cache_thread.h>
+#include <ydb/core/tablet_flat/cache_thread.h>
 
 #include <util/generic/ptr.h>
 
@@ -13,7 +13,7 @@ struct TActorSystemStub;
 }
 
 namespace NKikimr::NSharedCache {
-struct TSharedCacheCapacity;
+struct TCacheCapacityConfig;
 }
 
 namespace NKikimr::NTable::NTest {
@@ -21,7 +21,7 @@ namespace NKikimr::NTable::NTest {
 class TTableCacheContext {
 public:
     TTableCacheContext();
-    explicit TTableCacheContext(const NSharedCache::TSharedCacheCapacity& capacity);
+    explicit TTableCacheContext(const NSharedCache::TCacheCapacityConfig& capacity);
     ~TTableCacheContext();
 
     NActors::TActorSystem& ActorSystem() const noexcept;

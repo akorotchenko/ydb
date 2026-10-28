@@ -1,6 +1,6 @@
 #include "flat_bio_actor.h"
 #include "flat_bio_events.h"
-#include "shared_cache.h"
+#include "cache.h"
 #include "shared_cache_btree_walk.h"
 #include "shared_cache_events.h"
 #include "shared_sausagecache_state.h"
@@ -57,7 +57,7 @@ struct TRequest {
 };
 
 struct TRegisteredCollection {
-    TSharedCacheCollectionRef Ref;
+    TCacheCollectionRef Ref;
     mutable bool ReportedStats = false; // Already included in the owner's totals; not part of the set's key.
 
     struct THash {
@@ -127,7 +127,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     TActorId Owner;
     TIntrusivePtr<NMemory::IMemoryConsumer> MemoryConsumer;
     TSharedCacheConfig Config;
-    TSharedPageCacheCounters Counters;
+    TCacheCounters Counters;
     TIntrusivePtr<TSharedCache> Cache;
     TCacheBTreeWalkController Walks{ *this };
     TPendingInMemoryPages PendingInMemoryPages;
@@ -162,8 +162,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (!Cache) {
             return nullptr;
         }
-        TSharedCacheCollectionRef ref;
-        if (Cache->Find(id, ref) != ESharedCacheResultStatus::Hit || !ref->GetActorState()) {
+        TCacheCollectionRef ref;
+        if (Cache->Find(id, ref) != ECacheResultStatus::Hit || !ref->GetActorState()) {
             return nullptr;
         }
         return ref.Get();
@@ -194,8 +194,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (!collection.CacheItem) {
             return {};
         }
-        TSharedPageRef page;
-        if (Cache->Find(collection.CacheItem, static_cast<ui64>(offset), page) == ESharedCacheResultStatus::Hit) {
+        TCachePageRef page;
+        if (Cache->Find(collection.CacheItem, static_cast<ui64>(offset), page) == ECacheResultStatus::Hit) {
             return page.BuildSharedData();
         }
         return {};
@@ -227,7 +227,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         ui64 bytes = 0;
         locations.resize(AllowedFetchPageCount(locations, bytes));
         if (locations.size() > 1) {
-            const TSharedCacheHandleRequirement requirement{ collection.Id(), locations };
+            const TCacheHandleRequirement requirement{ collection.Id(), locations };
             // Independent residency can leave less room than the configured ceilings
             if (!Cache->CanReserve(bytes) || !Cache->CanAllocateHandles({ &requirement, 1 })) {
                 locations.resize(1);
@@ -301,12 +301,12 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         const ui32 hazardCount = threads->ThreadCount();
         // Small metadata pages can exhaust handles while the byte budget still has room.
         ui8 minimumAddressBits = Max<ui8>(MinSharedCacheAddressBits, MinimumAddressBits);
-        while (TSharedCacheCapacity{ .AddressBits = minimumAddressBits }.HotSlotCount() <
+        while (TCacheCapacityConfig{ .AddressBits = minimumAddressBits }.HotSlotCount() <
                SharedCachePolicyFor<TProdTraits>.MinHotSlots)
         {
             ++minimumAddressBits;
         }
-        TSharedCacheCapacity minimum;
+        TCacheCapacityConfig minimum;
         if (!TryCalculateSharedCacheFootprint(
                 minimumAddressBits, TSharedCache::ExpectedPageSize, 0, hazardCount, minimum))
         {
@@ -314,17 +314,17 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
         const ui64 targetLimit = GetTargetCacheHardLimitBytes();
         const ui64 allocationLimit = Max(targetLimit, minimum.TotalBytes);
-        TSharedCacheCapacity current;
+        TCacheCapacityConfig current;
         if (!TryCalculateSharedCacheCapacity(allocationLimit, TSharedCache::ExpectedPageSize, 0, hazardCount, current))
         {
             return false;
         }
-        TSharedCacheCapacity reserved;
+        TCacheCapacityConfig reserved;
         if (!TryCalculateSharedCacheCapacity(GetCacheReservationLimitBytes(allocationLimit),
                 TSharedCache::ExpectedPageSize, 0, hazardCount, reserved)) {
             return false;
         }
-        auto space = TSharedCacheSpace::Create(current, reserved, *threads);
+        auto space = TCacheSpace::Create(current, reserved, *threads);
         TProdTraits traits;
         traits.KeepEvictionActorSystem = TActivationContext::ActorSystem();
         traits.KeepEvictionActor = SelfId();
@@ -343,17 +343,17 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         Y_ENSURE(InitializeCache(), "Cannot initialize shared cache");
         const TCollectionLocation location{ .Id = pageCollectionId, .BackingSize = pageCollection->BackingSize() };
         TCollectionCacheItem inserted;
-        TSharedCacheCollectionRef ref;
+        TCacheCollectionRef ref;
         const auto status = Cache->FindOrInsert(location, inserted, ref);
-        if (status == ESharedCacheResultStatus::Miss || status == ESharedCacheResultStatus::Pending) {
+        if (status == ECacheResultStatus::Miss || status == ECacheResultStatus::Pending) {
             return nullptr;
         }
-        if (status == ESharedCacheResultStatus::Inserted) {
+        if (status == ECacheResultStatus::Inserted) {
             auto value = MakeHolder<TCollection>(pageCollection, inserted, ECacheMode::Regular);
             Y_ENSURE(Cache->MakeReady(inserted, std::move(value)));
-            Y_ENSURE(Cache->Find(pageCollectionId, ref) == ESharedCacheResultStatus::Hit);
+            Y_ENSURE(Cache->Find(pageCollectionId, ref) == ECacheResultStatus::Hit);
         } else {
-            Y_ENSURE(status == ESharedCacheResultStatus::Hit);
+            Y_ENSURE(status == ECacheResultStatus::Hit);
         }
         TCollection& collection = *ref;
         Y_ENSURE(collection.PageCollection()->Total() == pageCollection->Total(),
@@ -380,9 +380,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         return *collection;
     }
 
-    void UpdateKeepColdLimit() {
-        // The cache applies the live 50% ceiling after excluding Sticky bytes.
-        Y_ENSURE(Cache->UpdateKeepColdLimit(Min(TargetInMemoryBytes, Cache->HardLimit())));
+    void UpdateKeepLimit() {
+        // Sticky ownership reduces the budget available to Keep pages
+        Y_ENSURE(Cache->UpdateKeepLimit(Min(TargetInMemoryBytes, Cache->HardLimit())));
     }
 
     void ActualizeCacheSizeLimit() {
@@ -404,7 +404,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             }
             Y_ENSURE(Cache->UpdateCurrentLimit(currentLimit));
             UpdateSoftLimitOverride();
-            UpdateKeepColdLimit();
+            UpdateKeepLimit();
             Counters.ActiveLimitBytes->Set(currentLimit);
             if (limitsChanged) {
                 KeepPreloadRetryBlocked.clear();
@@ -437,12 +437,12 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             Send(SelfId(), new TKikimrEvents::TEvWakeup(ui64(EWakeupTag::DoLimitMaintenance)));
         }
             if (staticBytes != Cache->StaticBytes()) {
-                UpdateKeepColdLimit();
+                UpdateKeepLimit();
             }
 
-            Counters.ActivePages->Set(Cache->HotPages() + Cache->StickyPages() + Cache->KeepColdPages());
-            Counters.ActiveBytes->Set(Cache->HotBytes() + Cache->StickyBytes() + Cache->KeepColdBytes());
-            Counters.ActiveInMemoryBytes->Set(Cache->KeepActivePageBytes());
+            Counters.ActivePages->Set(Cache->HotPages() + Cache->StickyPages());
+            Counters.ActiveBytes->Set(Cache->HotBytes() + Cache->StickyBytes());
+            Counters.ActiveInMemoryBytes->Set(Cache->KeepReadyPageBytes());
             Counters.PassivePages->Set(Cache->ColdPages());
             Counters.PassiveBytes->Set(Cache->ColdBytes());
         }
@@ -541,8 +541,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             if (inserted) {
                 Counters.Owners->Inc();
             }
-            TSharedCacheCollectionRef ref;
-            Y_ENSURE(Cache->Find(collection.Id(), ref) == ESharedCacheResultStatus::Hit);
+            TCacheCollectionRef ref;
+            Y_ENSURE(Cache->Find(collection.Id(), ref) == ECacheResultStatus::Hit);
             Y_ENSURE(ownerIt->second.Collections.emplace(TRegisteredCollection{ .Ref = std::move(ref) }).second);
             Counters.PageCollectionOwners->Inc();
         }
@@ -762,9 +762,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             }
         }
 
-        TSharedCacheCollectionRef ownership;
+        TCacheCollectionRef ownership;
         {
-            Y_ENSURE(Cache->Find(pageCollectionId, ownership) == ESharedCacheResultStatus::Hit);
+            Y_ENSURE(Cache->Find(pageCollectionId, ownership) == ECacheResultStatus::Hit);
             if (ownership.IsSoleReference()) {
                 // Preserve writer Sticky pages through part handoff, and demote abandoned ones.
                 collection.DrainStickyPages();
@@ -887,7 +887,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             request.EventCookie != KeepPreloadResultCookie && request.EventCookie != WalkResultCookie;
         const bool keepPages = owner->GetCacheMode() == ECacheMode::TryKeepInMemory;
         const auto& locations = admission.Completion->Locations();
-        TVector<TSharedCachePageRequest> requests;
+        TVector<TCachePageRequest> requests;
         requests.reserve(admission.AdmissionIndices.size());
         for (const ui32 index : admission.AdmissionIndices) {
             requests.emplace_back(
@@ -901,8 +901,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
         // Optional work must not hold hits while waiting for missing handles or another request's admission
         const bool retryPreload = preload && AnyOf(requests, [](const auto& page) {
-            return page.Status() == ESharedCacheResultStatus::Miss ||
-                   page.Status() == ESharedCacheResultStatus::Pending;
+            return page.Status() == ECacheResultStatus::Miss || page.Status() == ECacheResultStatus::Pending;
         });
         if (retryPreload) {
             request.Cancelled = true;
@@ -914,7 +913,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         for (ui32 localIndex = 0; localIndex < requests.size(); ++localIndex) {
             auto& page = requests[localIndex];
             const ui32 index = admission.AdmissionIndices[localIndex];
-            if (page.Status() == ESharedCacheResultStatus::Miss) {
+            if (page.Status() == ECacheResultStatus::Miss) {
                 // A presence snapshot can become absent before candidate insertion.
                 unresolved.push_back(index);
                 continue;
@@ -925,19 +924,18 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 Counters.RequestedBytes->Add(bytes);
             }
             switch (page.Status()) {
-                case ESharedCacheResultStatus::Hit:
+                case ECacheResultStatus::Hit:
                     if (recordStats) {
                         Counters.CacheHitPages->Inc();
                         Counters.CacheHitBytes->Add(bytes);
                     }
                     admission.Completion->Complete(index, std::move(page.Page()), EPageFetchCompletion::Ready);
                     break;
-                case ESharedCacheResultStatus::Inserted:
+                case ECacheResultStatus::Inserted:
                     toFetch.push_back(std::move(page.Fetch()));
                     [[fallthrough]];
-                case ESharedCacheResultStatus::Pending:
-                    if (!QueueForPriority(admission.Priority) &&
-                        page.Status() == ESharedCacheResultStatus::Pending) {
+                case ECacheResultStatus::Pending:
+                    if (!QueueForPriority(admission.Priority) && page.Status() == ECacheResultStatus::Pending) {
                         if (TPageFetch promoted =
                                 TakeQueuedPage(admission.PageCollection->Label(), locations[index].Offset)) {
                             toFetch.push_back(std::move(promoted));
@@ -952,7 +950,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                         }
                     }
                     break;
-                case ESharedCacheResultStatus::Miss:
+                case ECacheResultStatus::Miss:
                     Y_UNREACHABLE();
             }
         }
@@ -1053,7 +1051,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     }
 
     bool PrepareAdmission(const TQueuedRequest& waiting) {
-        TVector<TSharedCacheHandleRequirement> requirements;
+        TVector<TCacheHandleRequirement> requirements;
         TVector<TPageLocation> locations;
         ui64 bytes = 0;
         if (waiting.WaitingTransaction) {
@@ -1096,7 +1094,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (!pad || pad->RetainedCollections.empty()) {
             return false;
         }
-        TVector<TSharedCacheHandleRequirement> requirements;
+        TVector<TCacheHandleRequirement> requirements;
         for (const auto& [id, pages] : pad->WorkingSetPages) {
             requirements.push_back({ id, pages });
         }
@@ -1278,9 +1276,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     void Handle(NSharedCache::TEvCollectionReleased::TPtr& ev, const TActorContext&) {
         const auto* msg = ev->Get();
-        TSharedCacheCollectionRef collection;
+        TCacheCollectionRef collection;
         const auto status = Cache->Find(msg->CollectionId, collection);
-        if (status == ESharedCacheResultStatus::Hit) {
+        if (status == ECacheResultStatus::Hit) {
             if (collection.CacheItem() == msg->CacheItem && collection->GetActorState()) {
                 if (collection->GetActorState()->Owners.empty() && collection.IsSoleReference()) {
                     collection->DrainStickyPages();
@@ -1290,7 +1288,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                     TryDropExpiredCollection(*collection);
                 }
             }
-        } else if (status == ESharedCacheResultStatus::Miss) {
+        } else if (status == ECacheResultStatus::Miss) {
             // A late release from an older generation must not remove a replacement's offsets.
             PendingInMemoryPages.erase(msg->CollectionId);
             KeepPreloadRetryBlocked.erase(msg->CollectionId);
@@ -1812,23 +1810,11 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             return;
         }
 
-    const ui64 keepColdLimit = Cache ? Cache->KeepColdLimit() : 0;
-    Y_ENSURE(LastKeepResidentBytes <= Max<ui64>() - KeepPreloadBytes);
-    const ui64 committedKeepBytes = LastKeepResidentBytes + KeepPreloadBytes;
-    const ui64 pendingKeepBytes = KeepPreloadBytes;
-        const ui64 protectedRoom = keepColdLimit > committedKeepBytes ? keepColdLimit - committedKeepBytes : 0;
-    const ui64 softLimit = Cache ? Cache->SoftLimit() : 0;
-    const ui64 usage = Cache ? Cache->RetainedBytes() : 0;
-    const ui64 freeRoom = softLimit > usage ? softLimit - usage : 0;
-        // Preload commits its future retained buffers; demand's transient loads do not consume this room.
-        const ui64 freePreloadRoom = freeRoom - Min(freeRoom, pendingKeepBytes);
-        const ui64 targetRoom =
-            TargetInMemoryBytes > committedKeepBytes ? TargetInMemoryBytes - committedKeepBytes : 0;
-    // KeepCold reserves protected space; Hot and Cold may hold more Keep pages when memory is free.
-    // Use the reclaim target for extra preload room so eviction does not immediately restart the same fetch.
-    ui64 remainingBytes = Min(KeepRemainingBytes(), Min(targetRoom, Max(protectedRoom, freePreloadRoom)));
-    ui64 remainingHandles = Cache->AvailableHandleCount();
-    THashSet<TLogoBlobID> waitingForInFlight;
+        const ui64 committedKeepBytes = LastKeepResidentBytes + KeepPreloadBytes;
+        const ui64 targetRoom = TargetInMemoryBytes > committedKeepBytes ? TargetInMemoryBytes - committedKeepBytes : 0;
+        ui64 remainingBytes = Min(KeepRemainingBytes(), targetRoom);
+        ui64 remainingHandles = Cache->AvailableHandleCount();
+        THashSet<TLogoBlobID> waitingForInFlight;
 
         while (PendingInMemoryPages) {
             auto it = PendingInMemoryPages.begin();
@@ -1863,29 +1849,33 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             const ui64 pageLimit =
                 Min<ui64>(MaxPreloadBatchLocations, Cache->TargetHandleCount() - TSharedCache::RequestHandleOverhead);
             TVector<TPageLocation> pagesToRequest;
+            ui64 requestBytes = 0;
             bool budgetBlocked = false;
             auto locationIt = pagesToLoad.begin();
             while (locationIt != pagesToLoad.end() && pagesToRequest.size() < pageLimit)
             {
                 const TPageLocation location = *locationIt;
-                ESharedCacheResultStatus status;
+                ECacheResultStatus status;
                 {
-                    TSharedPageRef page;
+                    TCachePageRef page;
                     status = Cache->Find(collection->CacheItem, static_cast<ui64>(location.Offset), page);
             }
-                if (status == ESharedCacheResultStatus::Hit) {
-                    locationIt = pagesToLoad.erase(locationIt);
-                    Walks.IndexPagesChanged(collectionId);
-                    ScheduleContinuation();
-                    continue;
-                }
-                if (status == ESharedCacheResultStatus::Pending || IsKeepPreloadInFlight(*collection, location.Offset))
+            if (status == ECacheResultStatus::Hit) {
+                locationIt = pagesToLoad.erase(locationIt);
+                Walks.IndexPagesChanged(collectionId);
+                ScheduleContinuation();
+                continue;
+            }
+            if (status == ECacheResultStatus::Pending || IsKeepPreloadInFlight(*collection, location.Offset))
             {
                     ++locationIt;
                     continue;
                 }
                 const ui64 pageBytes = KeepPageBytes(location);
-                if (pageBytes > remainingBytes) {
+                // Existing hits may acquire Keep credits; exclude this batch's unsubmitted promises
+                const auto room = Cache->KeepLoadRoom();
+                if (pageBytes > remainingBytes || pageBytes > room.Bytes - Min(room.Bytes, requestBytes) ||
+                    pagesToRequest.size() >= room.Pages) {
                     budgetBlocked = true;
                     break;
                 }
@@ -1903,8 +1893,19 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 }
                 remainingBytes -= pageBytes;
                 --remainingHandles;
+                requestBytes += pageBytes;
                 pagesToRequest.push_back(location);
                 locationIt = pagesToLoad.erase(locationIt);
+            }
+
+            // A trailing hit may have adopted a Keep page after the last missing-page probe
+            const auto room = Cache->KeepLoadRoom();
+            while (pagesToRequest.size() > room.Pages || requestBytes > room.Bytes) {
+                const auto location = pagesToRequest.back();
+                pagesToRequest.pop_back();
+                requestBytes -= KeepPageBytes(location);
+                pagesToLoad.emplace(location);
+                budgetBlocked = true;
             }
 
             const bool submitted = bool(pagesToRequest);

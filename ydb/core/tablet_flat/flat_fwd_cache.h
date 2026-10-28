@@ -18,7 +18,7 @@ namespace NFwd {
     template<size_t Capacity>
     class TLoadedPagesCircularBuffer {
     public:
-        const TSharedPageRef* Get(TPageOffset offset) const {
+        const TCachePageRef* Get(TPageOffset offset) const {
             if (!MaxSeenOffset.IsMax() && offset <= MaxSeenOffset) {
                 for (const auto& page : LoadedPages) {
                     if (page && page.GetOffset() == offset) {
@@ -60,7 +60,7 @@ namespace NFwd {
         }
 
     private:
-        std::array<TSharedPageRef, Capacity> LoadedPages;
+        std::array<TCachePageRef, Capacity> LoadedPages;
         ui32 Position = 0;
         ui64 DataSize = 0;
         TPageOffset MaxSeenOffset;
@@ -164,7 +164,7 @@ namespace NFwd {
             }
         }
 
-        void Fill(TSharedPageRef&& page, EPage type) override {
+        void Fill(TCachePageRef&& page, EPage type) override {
             const auto location = page.GetLocation();
             const ui64 loadedSize = location.Size;
             Stat.Saved += loadedSize;
@@ -381,7 +381,7 @@ namespace NFwd {
             }
         }
 
-        void Fill(TSharedPageRef&& page, EPage type) override {
+        void Fill(TCachePageRef&& page, EPage type) override {
             const auto location = page.GetLocation();
             const ui64 loadedSize = location.Size;
             Stat.Saved += loadedSize;

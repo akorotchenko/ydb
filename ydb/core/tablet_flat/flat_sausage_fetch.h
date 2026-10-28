@@ -8,7 +8,7 @@
 
 #include <util/generic/xrange.h>
 #include <util/generic/hash.h>
-#include "shared_cache.h"
+#include "cache.h"
 
 namespace NKikimr {
 namespace NPageCollection {

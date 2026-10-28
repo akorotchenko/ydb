@@ -168,7 +168,7 @@
 #include <ydb/core/tablet/tablet_list_renderer.h>
 #include <ydb/core/tablet/tablet_monitoring_proxy.h>
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
-#include <ydb/core/tablet_flat/shared_cache_thread.h>
+#include <ydb/core/tablet_flat/cache_thread.h>
 
 #include <ydb/core/tracing/tablet_info.h>
 

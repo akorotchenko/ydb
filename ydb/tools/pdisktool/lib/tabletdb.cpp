@@ -94,7 +94,7 @@ public:
         NSharedCache::TlsCacheHazard = &CacheThreads_.Hazard();
 
         try {
-            NSharedCache::TSharedCacheCapacity capacity;
+            NSharedCache::TCacheCapacityConfig capacity;
             constexpr ui32 hazards = 1;
             Y_ENSURE(NSharedCache::TryCalculateSharedCacheCapacity(
                 cacheBytes, NSharedCache::TSharedCache::ExpectedPageSize, 0, hazards, capacity));
@@ -104,7 +104,7 @@ public:
                     NSharedCache::TSharedCache::ExpectedPageSize, 0, hazards, capacity));
             }
             auto core = NSharedCache::TSharedCache::Create(
-                NSharedCache::TSharedCacheSpace::Create(capacity, capacity, CacheThreads_), cacheBytes);
+                NSharedCache::TCacheSpace::Create(capacity, capacity, CacheThreads_), cacheBytes);
             Y_ENSURE(core);
             Y_ENSURE(core->UpdateSoftLimitOverride(0));
         } catch (...) {
@@ -146,7 +146,7 @@ public:
         }
     }
 
-    TSharedCacheCollectionRef AdmitCollection(NPageCollection::TLargeGlobId id, TSharedData meta) {
+    TCacheCollectionRef AdmitCollection(NPageCollection::TLargeGlobId id, TSharedData meta) {
         auto& entry = Cache[id.Lead];
         if (!entry.Collection) {
             entry.Collection = TSharedCache::Get().AdmitCollection(
@@ -194,8 +194,7 @@ public:
         return {true, GetPage(collection, collection->PageCollection()->GetLocation(ref))};
     }
 
-    TSharedPageRef TryGetPage(const NTable::TPart* part, const TPageLocation& location, TGroupId groupId) override
-    {
+    TCachePageRef TryGetPage(const NTable::TPart* part, const TPageLocation& location, TGroupId groupId) override {
         const auto* partStore = dynamic_cast<const NTable::TPartStore*>(part);
         if (!partStore || groupId.Index >= partStore->PageCollections.size()) {
             return {};
@@ -203,14 +202,14 @@ public:
         return GetPage(partStore->PageCollections[groupId.Index].Get(), location);
     }
 
-    TSharedPageRef GetPage(const TCollection* collection, const TPageLocation& location) {
+    TCachePageRef GetPage(const TCollection* collection, const TPageLocation& location) {
         if (!collection || !collection->PageCollection()) {
             return {};
         }
         return GetPage(collection->Id(), collection->PageCollection(), location);
     }
 
-    TSharedPageRef GetPage(const TLogoBlobID& label,
+    TCachePageRef GetPage(const TLogoBlobID& label,
         const TIntrusiveConstPtr<NPageCollection::IPageCollection>& pageCollection, const TPageLocation& location)
     {
         auto& failed = Cache[label].FailedPages;
@@ -219,11 +218,11 @@ public:
         }
 
         auto& cache = TSharedCache::Get();
-        NSharedCache::TSharedCacheCollectionRef collection;
-        TSharedPageRef page;
-        if (cache.Find(label, collection) == NSharedCache::ESharedCacheResultStatus::Hit &&
+        NSharedCache::TCacheCollectionRef collection;
+        TCachePageRef page;
+        if (cache.Find(label, collection) == NSharedCache::ECacheResultStatus::Hit &&
             cache.Find(collection.CacheItem(), static_cast<ui64>(location.Offset), page) ==
-                NSharedCache::ESharedCacheResultStatus::Hit) {
+                NSharedCache::ECacheResultStatus::Hit) {
             return page;
         }
 
@@ -322,7 +321,7 @@ private:
     TTabletBootStats& Stats;
     TRepeatedIssues& Repeated;
     struct TCollectionEntry {
-        TSharedCacheCollectionRef Collection;
+        TCacheCollectionRef Collection;
         THashSet<TPageOffset> FailedPages;
     };
 
@@ -828,7 +827,7 @@ void TTabletBoot::TImpl::FoldSwitches() {
 }
 
 bool TTabletBoot::TImpl::LoadBundle(ui32 table, TSwitch::TBundle& bundle) {
-    TVector<TSharedCacheCollectionRef> collections;
+    TVector<TCacheCollectionRef> collections;
     for (auto& largeGlobId : bundle.LargeGlobIds) {
         if (largeGlobId.Group == NPageCollection::TLargeGlobId::InvalidGroup) {
             // Storage groups mean nothing without BlobStorage, but a page collection refuses to be

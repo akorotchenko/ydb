@@ -1,6 +1,6 @@
 #include "flat_executor_ut_common.h"
 
-#include <shared_cache.h>
+#include <cache.h>
 #include <shared_cache_counters.h>
 #include <util/system/sanitizers.h>
 #include <ydb/core/base/counters.h>
@@ -224,18 +224,19 @@ struct TTxTryKeepInMemory : public ITransaction {
     }
 };
 
-THolder<TSharedPageCacheCounters> GetSharedPageCounters(TMyEnvBase& env) {
-    return MakeHolder<TSharedPageCacheCounters>(GetServiceCounters(env->GetDynamicCounters(), "tablets")->GetSubgroup("type", "S_CACHE"));
+THolder<TCacheCounters> GetSharedPageCounters(TMyEnvBase& env) {
+    return MakeHolder<TCacheCounters>(
+        GetServiceCounters(env->GetDynamicCounters(), "tablets")->GetSubgroup("type", "S_CACHE"));
 };
 
-void LogCounters(THolder<TSharedPageCacheCounters>& counters) {
+void LogCounters(THolder<TCacheCounters>& counters) {
     Cerr << "Counters: Active:" << counters->ActiveBytes->Val() << "/" << counters->ActiveLimitBytes->Val()
         << ", Passive:" << counters->PassiveBytes->Val()
         << ", MemLimit:" << counters->MemLimitBytes->Val()
         << Endl;
 }
 
-void AssertBestEffortInMemory(const THolder<TSharedPageCacheCounters>& counters, ui64 targetBytes) {
+void AssertBestEffortInMemory(const THolder<TCacheCounters>& counters, ui64 targetBytes) {
     UNIT_ASSERT_GT(counters->ActiveInMemoryBytes->Val(), 0);
     UNIT_ASSERT_LE(counters->ActiveInMemoryBytes->Val(), static_cast<i64>(targetBytes));
 }
@@ -252,7 +253,7 @@ void AssertReadRetries(const TRetriedCounters& retried, ui32 requests) {
     }
 }
 
-void AssertMinimalCacheResidency(const THolder<TSharedPageCacheCounters>& counters) {
+void AssertMinimalCacheResidency(const THolder<TCacheCounters>& counters) {
     UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(1_MB));
     UNIT_ASSERT_LE(counters->PassiveBytes->Val(), static_cast<i64>(1_MB));
     UNIT_ASSERT_LE(counters->ActivePages->Val() + counters->PassivePages->Val(), 10);
@@ -313,7 +314,7 @@ void WakeupSharedCache(TMyEnvBase& env) {
     }).Wait(TDuration::Seconds(5));
 }
 
-void AssertResidentWithinLimit(TMyEnvBase& env, const THolder<TSharedPageCacheCounters>& counters, ui64 limit) {
+void AssertResidentWithinLimit(TMyEnvBase& env, const THolder<TCacheCounters>& counters, ui64 limit) {
     auto* core = &NSharedCache::TSharedCache::Get();
     UNIT_ASSERT(core);
     const i64 softBound = static_cast<i64>(limit + (limit ? 1_MB : 0));
@@ -329,7 +330,7 @@ void AssertResidentWithinLimit(TMyEnvBase& env, const THolder<TSharedPageCacheCo
 
 // Waits until the shared cache has nothing in flight, i.e. the in-memory preload (and the walk
 // feeding it) has finished.
-void WaitInFlyDrain(TMyEnvBase& env, THolder<TSharedPageCacheCounters>& counters) {
+void WaitInFlyDrain(TMyEnvBase& env, THolder<TCacheCounters>& counters) {
     for (ui32 i = 0; i < 400 && counters->LoadInFlyPages->Val() != 0; ++i) {
         WakeupSharedCache(env);
     }
@@ -1186,7 +1187,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Basics) {
     auto counters = GetSharedPageCounters(env);
 
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
-    constexpr ui64 softLimit = 10_MB;
+    constexpr ui64 softLimit = 30_MB;
     constexpr ui64 hardLimit = 32_MB;
     SetupSharedCache(env, hardLimit, true, 0, softLimit);
 
@@ -1238,7 +1239,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Basics) {
     UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 100);
     UNIT_ASSERT(retried.size() >= 2 && retried.size() <= 5);
     UNIT_ASSERT_GT(retried.at(1), 0);
-    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
+    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
 
@@ -1250,7 +1251,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Basics) {
 
     LogCounters(counters);
     AssertKeepReads(retried);
-    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
+    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissInMemoryBytes->Val(), 0);
@@ -1269,7 +1270,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Basics) {
     UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 100);
     UNIT_ASSERT(retried.size() >= 2 && retried.size() <= 5);
     UNIT_ASSERT_GE(retried.at(1), 50);
-    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
+    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
 
@@ -1280,7 +1281,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Basics) {
     }
     LogCounters(counters);
     AssertKeepReads(retried);
-    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
+    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissInMemoryBytes->Val() - keepMissBytesBeforeRestart, 0);
@@ -1295,12 +1296,12 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2) {
     env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndexV2(true);
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
     // Leave room for V2 index pages as well as the 10 MiB Keep working set and ordinary rings.
-    constexpr ui64 cacheLimit = 24_MB;
+    constexpr ui64 cacheLimit = 32_MB;
     SetupSharedCache(env, cacheLimit, true);
 
     auto writeAndCompact = [&](ui32 tableId, bool tryKeepInMemory) {
         env.SendSync(new NFake::TEvExecute{ new TTxInitSchema(tableId, tryKeepInMemory) });
-        const ui64 rowBytes = tryKeepInMemory ? 100_KB : 240_KB;
+        const ui64 rowBytes = tryKeepInMemory ? 100_KB : 400_KB;
         for (i64 key = 0; key < 100; ++key) {
             TString value(size_t(rowBytes), char('a' + key % 26));
             env.SendSync(new NFake::TEvExecute{ new TTxWriteRow(tableId, key, std::move(value)) });
@@ -1313,7 +1314,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2) {
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
 
-    // A cache-sized Regular table keeps the competition test under pressure at the larger limit.
+    // The Regular working set exceeds the current cache limit
     writeAndCompact(Table2Id, false);
 
     TRetriedCounters retried;
@@ -1360,7 +1361,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_Enabling) {
     env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndex(false);
     env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndexV2(true);
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
-    SetupSharedCache(env, 12_MB, true);
+    SetupSharedCache(env, 32_MB, true, 0, 30_MB);
 
     env.SendSync(new NFake::TEvExecute{ new TTxInitSchema(TableId, false) });
     // write 100 rows, each ~100KB (~10MB)
@@ -1372,7 +1373,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_Enabling) {
     env.WaitFor<NFake::TEvCompacted>();
 
     // Nothing of the part stays in the cache: the pages must be found by walking the tree.
-    RestartAndClearCache(env, 12_MB);
+    RestartAndClearCache(env, 30_MB);
     UNIT_ASSERT_DOUBLES_EQUAL(counters->ActiveInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
 
     env.SendSync(new NFake::TEvExecute{ new TTxTryKeepInMemory(TableId, true) });
@@ -1403,7 +1404,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_AltRoom) {
     env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndex(false);
     env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndexV2(true);
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
-    SetupSharedCache(env, 12_MB, true, 0, 12_MB);
+    SetupSharedCache(env, 32_MB, true, 0, 30_MB);
 
     env.SendSync(new NFake::TEvExecute{ new TTxInitSchema(TableId, false, {}, EValueRoom::InMemory) });
     // write 100 rows, each ~100KB (~10MB)
@@ -1415,7 +1416,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_AltRoom) {
     env.WaitFor<NFake::TEvCompacted>();
 
     // Drop everything the compaction left in the cache: the tree has to be discovered again.
-    RestartAndClearCache(env, 12_MB);
+    RestartAndClearCache(env, 30_MB);
     WaitInFlyDrain(env, counters);
 
     TRetriedCounters retried;
@@ -1432,7 +1433,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_AltRoom) {
     // because its index pages now have to be reloaded into the in-memory tier.
     env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0));
     WaitEvent(env, NMemory::EvConsumerLimit);
-    env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(12_MB));
+    env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(30_MB));
     WaitEvent(env, NMemory::EvConsumerLimit);
     env.SendSync(new NFake::TEvExecute{ new TTxTryKeepInMemory(TableId, true) });
     WakeupSharedCache(env);
@@ -1456,7 +1457,8 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_IndexOnly) {
     env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndex(false);
     env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndexV2(true);
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
-    SetupSharedCache(env, 12_MB, true);
+    // A proportional soft budget gives the small index working set enough tier slots
+    SetupSharedCache(env, 12_MB, true, 0, 64_KB);
 
     env.SendSync(new NFake::TEvExecute{ new TTxInitSchema(TableId, true, {}, EValueRoom::Regular) });
     // write 100 rows, each ~100KB (~10MB)
@@ -1468,7 +1470,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_IndexOnly) {
     env.WaitFor<NFake::TEvCompacted>();
 
     // Drop everything the compaction left in the cache: the trees have to be discovered again.
-    RestartAndClearCache(env, 12_MB);
+    RestartAndClearCache(env, 64_KB);
     WaitInFlyDrain(env, counters);
 
     TRetriedCounters retried;
@@ -1494,7 +1496,8 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_IndexOnlyEnabling) {
     env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndex(false);
     env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndexV2(true);
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
-    SetupSharedCache(env, 12_MB, true);
+    // A proportional soft budget gives the small index working set enough tier slots
+    SetupSharedCache(env, 12_MB, true, 0, 64_KB);
 
     env.SendSync(new NFake::TEvExecute{ new TTxInitSchema(TableId, false, {}, EValueRoom::Regular) });
     // write 100 rows, each ~100KB (~10MB)
@@ -1505,7 +1508,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_IndexOnlyEnabling) {
     env.SendSync(new NFake::TEvCompact(TableId));
     env.WaitFor<NFake::TEvCompacted>();
 
-    RestartAndClearCache(env, 12_MB);
+    RestartAndClearCache(env, 64_KB);
 
     // Keep the main family in memory; the value family stays in its own regular room.
     env.SendSync(new NFake::TEvExecute{ new TTxTryKeepInMemory(TableId, true) });
@@ -1527,7 +1530,8 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_IndexOnlyReenabling) {
     env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndex(false);
     env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndexV2(true);
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
-    SetupSharedCache(env, 12_MB, true);
+    // A proportional soft budget gives the small index working set enough tier slots
+    SetupSharedCache(env, 12_MB, true, 0, 64_KB);
 
     env.SendSync(new NFake::TEvExecute{ new TTxInitSchema(TableId, false, {}, EValueRoom::Regular) });
     for (i64 key = 0; key < 100; ++key) {
@@ -1536,7 +1540,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_IndexOnlyReenabling) {
     }
     env.SendSync(new NFake::TEvCompact(TableId));
     env.WaitFor<NFake::TEvCompacted>();
-    RestartAndClearCache(env, 12_MB);
+    RestartAndClearCache(env, 64_KB);
 
     env.SendSync(new NFake::TEvExecute{ new TTxTryKeepInMemory(TableId, true) });
     WakeupSharedCache(env);
@@ -1545,7 +1549,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_IndexOnlyReenabling) {
 
     env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0));
     WaitEvent(env, NMemory::EvConsumerLimit);
-    env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(10_MB));
+    env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(64_KB));
     WaitEvent(env, NMemory::EvConsumerLimit);
 
     env.SendSync(new NFake::TEvExecute{ new TTxTryKeepInMemory(TableId, true) });
@@ -1597,7 +1601,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_TinyInFlyLimit) {
     env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndex(false);
     env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndexV2(true);
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
-    SetupSharedCache(env, 12_MB, true, /*inMemoryInFlyLimit=*/160_KB);
+    SetupSharedCache(env, 32_MB, true, /*inMemoryInFlyLimit=*/160_KB);
 
     env.SendSync(new NFake::TEvExecute{ new TTxInitSchema(TableId, true) });
     // write 100 rows, each ~100KB (~10MB)
@@ -1609,7 +1613,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_BTreeIndex_V2_TinyInFlyLimit) {
     env.WaitFor<NFake::TEvCompacted>();
 
     watchFetches = true;
-    RestartAndClearCache(env, 12_MB);
+    RestartAndClearCache(env, 32_MB);
     WaitInFlyDrain(env, counters);
     UNIT_ASSERT(sawSequentialIndexBatch);
 
@@ -1708,7 +1712,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Enabling) {
     auto counters = GetSharedPageCounters(env);
 
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
-    constexpr ui64 softLimit = 10_MB;
+    constexpr ui64 softLimit = 30_MB;
     constexpr ui64 hardLimit = 32_MB;
     SetupSharedCache(env, hardLimit, true, 0, softLimit);
 
@@ -1763,7 +1767,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Enabling) {
     UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 100);
     UNIT_ASSERT(retried.size() >= 2 && retried.size() <= 5);
     UNIT_ASSERT_GT(retried.at(1), 0);
-    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
+    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
 
@@ -1775,7 +1779,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Enabling) {
 
     LogCounters(counters);
     AssertKeepReads(retried);
-    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
+    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissInMemoryBytes->Val(), 0);
@@ -1794,7 +1798,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Enabling) {
     UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 100);
     UNIT_ASSERT(retried.size() >= 2 && retried.size() <= 5);
     UNIT_ASSERT_GE(retried.at(1), 50);
-    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
+    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
 
@@ -1805,7 +1809,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Enabling) {
     }
     LogCounters(counters);
     AssertKeepReads(retried);
-    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
+    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(10_MB), static_cast<i64>(1_MB / 3));
     AssertBestEffortInMemory(counters, 10_MB);
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissInMemoryBytes->Val() - keepMissBytesBeforeRestart, 0);
@@ -1821,7 +1825,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Disabling) {
     auto counters = GetSharedPageCounters(env);
 
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
-    SetupSharedCache(env, 10_MB, true);
+    SetupSharedCache(env, 32_MB, true, 0, 30_MB);
 
     env.SendSync(new NFake::TEvExecute{ new TTxInitSchema(TableId, true) });
     // write 100 rows, each ~100KB (~10MB)
@@ -1850,9 +1854,9 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Disabling) {
 
     // make second table to try to preempt first table from cache
     env.SendSync(new NFake::TEvExecute{ new TTxInitSchema(Table2Id, false) });
-    // write 100 rows, each ~100KB (~10MB)
+    // The Regular working set exceeds the current cache limit
     for (i64 key = 0; key < 100; ++key) {
-        TString value(size_t(100 * 1024), char('a' + key % 26));
+        TString value(size_t(400 * 1024), char('a' + key % 26));
         env.SendSync(new NFake::TEvExecute{ new TTxWriteRow(Table2Id, key, std::move(value)) });
     }
     Cerr << "...compacting second table" << Endl;
@@ -1867,7 +1871,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Disabling) {
     LogCounters(counters);
     // Regular pages may be evicted while both tables compete for the cache budget
     AssertReadRetries(retried, 100);
-    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
+    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->ActiveInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
 
@@ -1884,13 +1888,13 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Disabling) {
     UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 100);
     UNIT_ASSERT(retried.size() >= 2 && retried.size() <= 5);
     UNIT_ASSERT_GT(retried.at(1), 0);
-    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
+    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->ActiveInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->CacheMissInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_VALUES_EQUAL(counters->CacheMissInMemoryPages->Val(), 0);
 
-    RestartAndClearCache(env, 10_MB);
+    RestartAndClearCache(env, 30_MB);
 
     retried = {};
     for (i64 key = 99; key >= 0; --key) {
@@ -1900,7 +1904,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Disabling) {
     UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 100);
     UNIT_ASSERT(retried.size() >= 2 && retried.size() <= 5);
     UNIT_ASSERT_GE(retried.at(1), 50);
-    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
+    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->ActiveInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
 
@@ -1912,7 +1916,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Disabling) {
     LogCounters(counters);
     UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 100);
     UNIT_ASSERT_LE(retried.size(), 5);
-    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(20_MB));
+    UNIT_ASSERT_LE(counters->ActiveBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->TargetInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->ActiveInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));
     UNIT_ASSERT_DOUBLES_EQUAL(counters->CacheMissInMemoryBytes->Val(), static_cast<i64>(0_MB), static_cast<i64>(1_MB / 3));

@@ -101,7 +101,7 @@ public:
         Y_ENSURE(false, "IPages::Locate(TPart*, ...) shouldn't be used here");
     }
 
-    TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         Y_ENSURE(groupId.IsMain(), "Unsupported column group");
 
         auto partStore = CheckedCast<const TPartStore*>(part);
@@ -197,7 +197,7 @@ private:
     }
 
     void CheckRetainedWorkingSet() const {
-        TVector<TSharedCacheHandleRequirement> requirements;
+        TVector<TCacheHandleRequirement> requirements;
         for (const auto& [id, pages] : RequestPad->WorkingSetPages) {
             requirements.push_back({ id, pages });
         }
@@ -227,7 +227,7 @@ private:
         CoroutineDeadline = GetCycleCountFast() + DurationToCycles(MaxCoroutineExecutionTime);
 
         THashSet<ui64> collections;
-        const auto retainCollection = [&](const TSharedCacheCollectionRef& collection) {
+        const auto retainCollection = [&](const TCacheCollectionRef& collection) {
             if (collection && collections.insert(collection.CacheItem().Raw()).second) {
                 RetainedCollections.push_back(collection.CacheItem());
             }

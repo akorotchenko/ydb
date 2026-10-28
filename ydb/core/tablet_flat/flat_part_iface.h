@@ -5,7 +5,7 @@
 #include "flat_table_stats.h"
 #include "flat_row_eggs.h"
 #include "util_basics.h"
-#include "shared_cache.h"
+#include "cache.h"
 
 #include <ydb/library/actors/util/shared_data.h>
 
@@ -72,11 +72,11 @@ namespace NTable {
                 new (&Data_) TSharedData(std::move(data));
             }
 
-            TResult(bool need, TSharedPageRef&& page)
+            TResult(bool need, TCachePageRef&& page)
                 : Need(need)
                 , Kind_(EKind::Page)
             {
-                new (&Page_) TSharedPageRef(std::move(page));
+                new (&Page_) TCachePageRef(std::move(page));
             }
 
             TResult(TResult&& other) noexcept
@@ -146,7 +146,7 @@ namespace NTable {
                         new (&Data_) TSharedData(std::move(other.Data_));
                         break;
                     case EKind::Page:
-                        new (&Page_) TSharedPageRef(std::move(other.Page_));
+                        new (&Page_) TCachePageRef(std::move(other.Page_));
                         break;
                 }
             }
@@ -159,7 +159,7 @@ namespace NTable {
                         Data_.~TSharedData();
                         break;
                     case EKind::Page:
-                        Page_.~TSharedPageRef();
+                        Page_.~TCachePageRef();
                         break;
                 }
             }
@@ -169,7 +169,7 @@ namespace NTable {
             union {
                 const TSharedData* BorrowedData_;
                 TSharedData Data_;
-                TSharedPageRef Page_;
+                TCachePageRef Page_;
             };
         };
 
@@ -177,7 +177,7 @@ namespace NTable {
 
         virtual TResult Locate(const TMemTable*, ui64 ref, ui32 tag) = 0;
         virtual TResult Locate(const TPart*, ui64 ref, ELargeObj lob) = 0;
-        virtual TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
+        virtual TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
 
         /**
          * Hook for cleaning up env on DB.RollbackChanges()

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "shared_cache.h"
+#include "cache.h"
 
 #include <variant>
 
@@ -454,14 +454,14 @@ namespace NKikimr::NTable::NPage {
             Parse();
         }
 
-        TBtreeIndexNode(TSharedPageRef&& ref, bool v2Format)
+        TBtreeIndexNode(TCachePageRef&& ref, bool v2Format)
             : Ref(std::move(ref))
             , IsV2Format(v2Format)
         {
             Parse();
         }
 
-        const TSharedPageRef& GetPageRef() const noexcept {
+        const TCachePageRef& GetPageRef() const noexcept {
             return Ref;
         }
 
@@ -495,7 +495,7 @@ namespace NKikimr::NTable::NPage {
         }
 
     public:
-        TSharedPageRef&& TakePageRef() noexcept {
+        TCachePageRef&& TakePageRef() noexcept {
             return std::move(Ref);
         }
 
@@ -824,7 +824,7 @@ namespace NKikimr::NTable::NPage {
         }
 
     private:
-        TSharedPageRef Ref;
+        TCachePageRef Ref;
         TSharedData Raw;
         const THeader* Header = nullptr;
         const void* Keys = nullptr;

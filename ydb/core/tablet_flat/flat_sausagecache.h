@@ -3,7 +3,7 @@
 #include "flat_page_iface.h"
 #include "flat_sausage_gut.h"
 #include "shared_cache_events.h"
-#include "shared_cache.h"
+#include "cache.h"
 
 namespace NKikimr::NTabletFlatExecutor {
 

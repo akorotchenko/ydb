@@ -1,5 +1,5 @@
 #include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
-#include "shared_cache.h"
+#include "cache.h"
 #include <ydb/core/tablet_flat/flat_sausage_align.h>
 #include <ydb/core/tablet_flat/flat_sausage_meta.h>
 #include <ydb/core/tablet_flat/flat_sausage_writer.h>
@@ -660,7 +660,7 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
                 Map[loc.Offset] = std::move(data);
             }
 
-            TSharedPageRef TryGetPage(const TPart*, const TPageLocation& location, TGroupId) override {
+            TCachePageRef TryGetPage(const TPart*, const TPageLocation& location, TGroupId) override {
                 auto it = Map.find(location.Offset);
                 if (it == Map.end()) {
                     return {};

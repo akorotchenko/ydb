@@ -4,7 +4,7 @@
 #include "flat_part_walker.h"
 #include "flat_sausagecache.h"
 #include "shared_cache_events.h"
-#include "shared_cache.h"
+#include "cache.h"
 #include "util_fmt_abort.h"
 #include <ydb/core/tablet_flat/protos/flat_table_part.pb.h>
 #include <ydb/core/util/pb.h>
@@ -37,7 +37,7 @@ namespace NTable {
         };
 
         struct TLoaderEnv : public IPages {
-            TLoaderEnv(TSharedCacheCollectionRef pageCollection)
+            TLoaderEnv(TCacheCollectionRef pageCollection)
                 : PageCollection(std::move(pageCollection))
             {
             }
@@ -58,7 +58,7 @@ namespace NTable {
                 Part = part;
             }
 
-            TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+            TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 Y_ENSURE(part == Part, "Unsupported part");
                 Y_ENSURE(groupId.Index == 0, "Unsupported column group");
 
@@ -126,7 +126,7 @@ namespace NTable {
             }
 
         private:
-            void AddSavedPage(TPageOffset offset, TSharedPageRef&& page)
+            void AddSavedPage(TPageOffset offset, TCachePageRef&& page)
             {
                 SavedPages[offset] = std::move(page);
             }
@@ -138,8 +138,8 @@ namespace NTable {
             };
 
             const TPart* Part = nullptr;
-            TSharedCacheCollectionRef PageCollection;
-            THashMap<TPageOffset, TSharedPageRef> SavedPages;
+            TCacheCollectionRef PageCollection;
+            THashMap<TPageOffset, TCachePageRef> SavedPages;
             // Dedup by offset — keep Size/Type for the fetch request
             THashSet<TPageLocation, NPage::TPageLocationByOffsetHash, TPageLocationByOffsetEq> NeedPages;
         };
@@ -154,7 +154,7 @@ namespace NTable {
             bool PreloadData = false;
         };
 
-        TLoader(TPartComponents components, TVector<TSharedCacheCollectionRef> prebuiltPageCollections = {});
+        TLoader(TPartComponents components, TVector<TCacheCollectionRef> prebuiltPageCollections = {});
         ~TLoader();
 
         TFetch Run(TRunOptions options)
@@ -274,7 +274,7 @@ namespace NTable {
         TFetch StagePreloadData();
 
     private:
-        TVector<TSharedCacheCollectionRef> PageCollections;
+        TVector<TCacheCollectionRef> PageCollections;
         TPartComponents Components;
         const TString Legacy;
         const TString Opaque;

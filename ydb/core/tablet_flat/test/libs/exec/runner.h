@@ -12,8 +12,8 @@
 #include <ydb/core/base/tablet_resolver.h>
 #include <ydb/core/tablet/resource_broker.h>
 #include <ydb/core/tablet_flat/shared_sausagecache.h>
-#include <ydb/core/tablet_flat/shared_cache.h>
-#include <ydb/core/tablet_flat/shared_cache_thread_test.h>
+#include <ydb/core/tablet_flat/cache.h>
+#include <ydb/core/tablet_flat/cache_thread_test.h>
 #include <ydb/library/services/services.pb.h>
 #include <library/cpp/time_provider/time_provider.h>
 

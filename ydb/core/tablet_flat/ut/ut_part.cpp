@@ -59,7 +59,7 @@ namespace {
     }
 
     struct TTouchEnv : public NTest::TTestEnv {
-        TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto pageId = ResolvePageId(part, location, groupId);
             if (PrechargePhase) {
                 Precharged[groupId].insert(pageId);

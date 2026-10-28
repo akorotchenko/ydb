@@ -3,7 +3,7 @@
 #include "flat_part_iface.h"
 #include "flat_sausage_fetch.h"
 #include "flat_fwd_misc.h"
-#include "shared_cache.h"
+#include "cache.h"
 #include "util_fmt_abort.h"
 
 namespace NKikimr {
@@ -51,7 +51,7 @@ namespace NFwd {
             return Offset < offset;
         }
 
-        ui32 Settle(TSharedPageRef&& page)
+        ui32 Settle(TCachePageRef&& page)
         {
             const auto was = std::exchange(Fetch, EFetch::Done);
 
@@ -70,7 +70,7 @@ namespace NFwd {
             return SharedPageRef.size();
         }
 
-        const TSharedPageRef* Touch(TPageOffset offset, TStat& stat)
+        const TCachePageRef* Touch(TPageOffset offset, TStat& stat)
         {
             if (Offset != offset || (!SharedPageRef && Fetch == EFetch::Done)) {
                 Y_TABLET_ERROR("Touching page that doesn't fit to this action");
@@ -105,7 +105,7 @@ namespace NFwd {
         const ui16 Tag  = Max<ui16>();
         EUsage Usage    = EUsage::None;
         EFetch Fetch    = EFetch::None;
-        TSharedPageRef SharedPageRef;
+        TCachePageRef SharedPageRef;
     };
 
 }

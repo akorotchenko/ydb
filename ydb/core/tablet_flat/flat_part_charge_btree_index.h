@@ -43,7 +43,7 @@ class TChargeBTreeIndex : public ICharge {
     };
 
     struct TNodeState : TChildState, TBtreeIndexNode {
-        TNodeState(TSharedPageRef&& data, TChildState child, bool v2Format)
+        TNodeState(TCachePageRef&& data, TChildState child, bool v2Format)
             : TChildState(std::move(child))
             , TBtreeIndexNode(std::move(data), v2Format)
         {
@@ -795,7 +795,7 @@ private:
     }
 
 private:
-    TSharedPageRef TryGetDataPage(const NPage::TPageLocation& location, TGroupId groupId) const {
+    TCachePageRef TryGetDataPage(const NPage::TPageLocation& location, TGroupId groupId) const {
         return Env->TryGetPage(Part, location, groupId);
     }
 

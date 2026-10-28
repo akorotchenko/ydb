@@ -53,7 +53,7 @@
 #include <util/generic/xrange.h>
 #include <util/generic/ymath.h>
 #include <util/random/random.h>
-#include "shared_cache.h"
+#include "cache.h"
 
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::LOCAL_DB_BACKUP
 
@@ -878,7 +878,7 @@ void TExecutor::AddPartStorePageCollections(const NTable::TPartView &partView, c
     }
 }
 
-void TExecutor::AddPageCollection(const TSharedCacheCollectionRef& pageCollection, ECacheMode cacheMode,
+void TExecutor::AddPageCollection(const TCacheCollectionRef& pageCollection, ECacheMode cacheMode,
     TVector<NSharedCache::TEvAttach::TBtreeSeed> btreeSeeds, bool replayStickyWalk)
 {
     auto* attach = new NSharedCache::TEvAttach(pageCollection->PageCollection(), cacheMode,
@@ -887,9 +887,9 @@ void TExecutor::AddPageCollection(const TSharedCacheCollectionRef& pageCollectio
     Send(MakeSharedPageCacheId(), attach);
 }
 
-TSharedCacheCollectionRef TExecutor::FindPageCollection(const TLogoBlobID& id) const {
+TCacheCollectionRef TExecutor::FindPageCollection(const TLogoBlobID& id) const {
     auto& cache = TSharedCache::Get();
-    TSharedCacheCollectionRef collection;
+    TCacheCollectionRef collection;
     cache.Find(id, collection);
     return collection;
 }

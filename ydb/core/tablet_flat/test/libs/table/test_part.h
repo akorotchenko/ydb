@@ -1,7 +1,7 @@
 #pragma once
 
 #include "test_store.h"
-#include <ydb/core/tablet_flat/shared_cache.h>
+#include <ydb/core/tablet_flat/cache.h>
 #include <ydb/core/tablet_flat/flat_fwd_blobs.h>
 #include <ydb/core/tablet_flat/flat_fwd_cache.h>
 #include <ydb/core/tablet_flat/flat_part_iface.h>
@@ -126,7 +126,7 @@ namespace NTest {
             return { true, TTestEnv::TryGetPage(part, collection->GetLocation(ref), TGroupId(room)) };
         }
 
-        TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto* storedPart = CheckedCast<const TPartStore*>(part);
             auto* data = storedPart->Store->GetPage(groupId.Index, location.Offset);
             auto* collection = storedPart->GetPageCollection(groupId.Index);

@@ -2,8 +2,8 @@
 
 #include "defs.h"
 #include "flat_bio_events.h"
-#include "shared_cache.h"
-#include "shared_cache_item.h"
+#include "cache.h"
+#include "cache_item.h"
 #include <ydb/core/protos/shared_cache.pb.h>
 
 #include <util/system/mutex.h>
@@ -145,12 +145,11 @@ namespace NKikimr::NSharedCache {
         TVector<TPageLocation> Pages;
         TCollectionCacheItem CacheItem;
 
-        Y_FORCE_INLINE TSharedPageRef AddPage(
-            TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
+        Y_FORCE_INLINE TCachePageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
             return AddPage(cachePages, std::move(page), sticky, TSharedCache::EPageAdmission::Bounded);
         }
 
-        Y_FORCE_INLINE TSharedPageRef AddWrittenPage(
+        Y_FORCE_INLINE TCachePageRef AddWrittenPage(
             TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
             return AddPage(cachePages, std::move(page), sticky, TSharedCache::EPageAdmission::Written);
         }
@@ -160,7 +159,7 @@ namespace NKikimr::NSharedCache {
         {}
 
     private:
-        TSharedPageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky,
+        TCachePageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky,
             TSharedCache::EPageAdmission admission);
     };
 
@@ -204,7 +203,7 @@ namespace NKikimr::NSharedCache {
         ui64 Bytes() const;
 
         struct TLoaded {
-            TLoaded(NTable::NPage::TPageOffset offset, size_t size, TSharedPageRef page)
+            TLoaded(NTable::NPage::TPageOffset offset, size_t size, TCachePageRef page)
                 : Offset(offset)
                 , Size(size)
                 , Page(std::move(page))
@@ -212,7 +211,7 @@ namespace NKikimr::NSharedCache {
 
             NTable::NPage::TPageOffset Offset;
             size_t Size;
-            TSharedPageRef Page;
+            TCachePageRef Page;
         };
 
         bool ResourcePressure = false;
@@ -248,7 +247,7 @@ namespace NKikimr::NSharedCache {
     public:
         explicit TRequestCompletion(TRequestCompletionParams&& params) noexcept;
 
-        void Complete(ui32 index, TSharedPageRef page, EPageFetchCompletion completion) noexcept;
+        void Complete(ui32 index, TCachePageRef page, EPageFetchCompletion completion) noexcept;
         void Cancel(bool replyImmediately = false) noexcept;
         void PostponeForResources() noexcept;
         void NotifyResourcesReady() noexcept;
@@ -295,7 +294,7 @@ namespace NKikimr::NSharedCache {
         const ui64 RequestId_;
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
         TVector<TPageLocation> Locations_;
-        TVector<TSharedPageRef> ReadyPages_;
+        TVector<TCachePageRef> ReadyPages_;
         TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad_;
         const ui64 Cookie_;
         const NActors::TActorId Notify_;

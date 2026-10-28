@@ -14,7 +14,7 @@
 #include "flat_comp.h"
 #include "flat_executor_misc.h"
 #include "flat_bio_stats.h"
-#include "shared_cache.h"
+#include "cache.h"
 #include "shared_sausagecache.h"
 #include "util_channel.h"
 
@@ -842,7 +842,7 @@ namespace NTabletFlatExecutor {
 
             for (auto &result : Results) {
                 Y_ENSURE(result.PageCollections, "Compaction produced a part without page collections");
-                TVector<TSharedCacheCollectionRef> resultingPageCollections;
+                TVector<TCacheCollectionRef> resultingPageCollections;
                 auto& sharedCache = NSharedCache::TSharedCache::Get();
                 for (auto& pageCollection : result.PageCollections) {
                     auto resultingPageCollection = sharedCache.AdmitCollection(pageCollection.PageCollection);

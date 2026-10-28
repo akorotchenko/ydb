@@ -129,7 +129,7 @@ namespace NFwd {
             return Pending == 0;
         }
 
-        TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto type = location.Type;
 
             if (groupId.IsMain() && IsIndexPage(type)) {
@@ -138,7 +138,7 @@ namespace NFwd {
             }
 
             auto got = Get(GetQueue(part, groupId), location.Offset, type);
-            return got.Page ? got.Page->Acquire() : TSharedPageRef();
+            return got.Page ? got.Page->Acquire() : TCachePageRef();
         }
 
         TResult Locate(const TMemTable *memTable, ui64 ref, ui32 tag) override

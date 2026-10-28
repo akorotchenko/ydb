@@ -89,24 +89,24 @@ SRCS(
     shared_cache_btree_walk.cpp
     shared_cache_btree_walk.h
     shared_sausagecache_state.h
-    shared_cache.cpp
-    shared_cache_capacity.cpp
-    shared_cache_collection.cpp
-    shared_cache_collections.cpp
+    cache.cpp
+    cache_capacity.cpp
+    cache_collection.cpp
+    cache_collections.cpp
     shared_cache_events.cpp
-    shared_cache_eviction.cpp
-    shared_cache_eviction_resize.cpp
-    shared_cache_fetches.cpp
-    shared_cache_hot_policy.cpp
-    shared_cache_cold_policy.cpp
-    shared_cache_items.cpp
-    shared_cache_memory.cpp
-    shared_cache_resize.cpp
-    shared_cache_space.cpp
-    shared_cache_space_resize.cpp
-    shared_cache_table.cpp
-    shared_cache_thread.cpp
-    shared_cache_table_resize.cpp
+    cache_eviction.cpp
+    cache_eviction_resize.cpp
+    cache_fetches.cpp
+    cache_hot_policy.cpp
+    cache_cold_policy.cpp
+    cache_items.cpp
+    cache_memory.cpp
+    cache_resize.cpp
+    cache_space.cpp
+    cache_space_resize.cpp
+    cache_table.cpp
+    cache_thread.cpp
+    cache_table_resize.cpp
     shared_sausagecache.cpp
     shared_sausagecache.h
     tablet_flat_executor.h
@@ -118,15 +118,15 @@ SRCS(
 
 IF (OS_LINUX OR OS_FREEBSD)
     SRCS(
-        shared_cache_mapping_memfd.cpp
+        cache_mapping_memfd.cpp
     )
 ELSEIF (OS_WINDOWS)
     SRCS(
-        shared_cache_mapping_win.cpp
+        cache_mapping_win.cpp
     )
 ELSE()
     SRCS(
-        shared_cache_mapping_reserved.cpp
+        cache_mapping_reserved.cpp
     )
 ENDIF()
 

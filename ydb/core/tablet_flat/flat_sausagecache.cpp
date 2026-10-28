@@ -1,22 +1,22 @@
 #include "flat_sausagecache.h"
-#include "shared_cache.h"
+#include "cache.h"
 
 #include <ydb/core/base/appdata_fwd.h>
 
 namespace NKikimr::NSharedCache {
 
-TSharedPageRef TCollection::TryGetPage(const NTable::NPage::TPageLocation& location, bool sticky) const {
+TCachePageRef TCollection::TryGetPage(const NTable::NPage::TPageLocation& location, bool sticky) const {
     auto* cache = TSharedCache::TryGet();
     if (!cache) {
         return {};
     }
-    TSharedCacheCollectionRef collection;
-    if (cache->Find(Id(), collection) != ESharedCacheResultStatus::Hit) {
+    TCacheCollectionRef collection;
+    if (cache->Find(Id(), collection) != ECacheResultStatus::Hit) {
         return {};
     }
     const TCollectionCacheItem item = collection.CacheItem();
-    TSharedPageRef page;
-    if (cache->Find(item, static_cast<ui64>(location.Offset), page) != ESharedCacheResultStatus::Hit) {
+    TCachePageRef page;
+    if (cache->Find(item, static_cast<ui64>(location.Offset), page) != ECacheResultStatus::Hit) {
         return {};
     }
     if (sticky && !page.IsSticky()) {
@@ -26,20 +26,19 @@ TSharedPageRef TCollection::TryGetPage(const NTable::NPage::TPageLocation& locat
             return {};
         }
         TCollectionCacheItem inserted;
-        TSharedCacheCollectionRef attached;
+        TCacheCollectionRef attached;
         const TCollectionLocation collectionLocation{ .Id = Id(), .BackingSize = PageCollection_->BackingSize() };
         const auto status = cache->FindOrInsert(collectionLocation, inserted, attached);
-        if (status == ESharedCacheResultStatus::Inserted) {
+        if (status == ECacheResultStatus::Inserted) {
             Y_ENSURE(
                 cache->MakeReady(inserted, MakeHolder<TCollection>(PageCollection_, inserted, ECacheMode::Regular)));
             return {};
         }
-        if (status != ESharedCacheResultStatus::Hit || attached.CacheItem() != item) {
+        if (status != ECacheResultStatus::Hit || attached.CacheItem() != item) {
             return {};
         }
-        TSharedCachePageRequest request(location, MakeIntrusive<TPageFetchWaiter>(), true);
-        if (!cache->FindOrInsertBatch(item, { &request, 1 }, false) ||
-            request.Status() != ESharedCacheResultStatus::Hit) {
+        TCachePageRequest request(location, MakeIntrusive<TPageFetchWaiter>(), true);
+        if (!cache->FindOrInsertBatch(item, { &request, 1 }, false) || request.Status() != ECacheResultStatus::Hit) {
             return {};
         }
         page = std::move(request.Page());

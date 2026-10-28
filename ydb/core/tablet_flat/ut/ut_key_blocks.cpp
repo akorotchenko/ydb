@@ -108,7 +108,7 @@ void ReplaceSlices(TPartView& view, TVector<TSlice> slices) {
 }
 
 struct TIndexOnlyEnv : TTestEnv {
-    TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         const auto type = location.Type;
         UNIT_ASSERT_C(type == NPage::EPage::FlatIndex || type == NPage::EPage::BTreeIndex ||
                           type == NPage::EPage::BTreeIndexV2, "key-block iterator fetched a data page");
@@ -120,7 +120,7 @@ struct TTrackingIndexEnv : TIndexOnlyEnv {
     using TPage = std::tuple<const TPart*, ui32, TPageOffset>;
     std::set<TPage> Pages;
 
-    TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         Pages.emplace(part, groupId.Raw(), location.Offset);
         return TIndexOnlyEnv::TryGetPage(part, location, groupId);
     }
@@ -130,7 +130,7 @@ struct TLoadOnRetryEnv : TTrackingIndexEnv {
     std::set<TPage> Requested;
     ui32 Faults = 0;
 
-    TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         if (Requested.emplace(part, groupId.Raw(), location.Offset).second) {
             ++Faults;
             return {};

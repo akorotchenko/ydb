@@ -2325,7 +2325,7 @@ Y_UNIT_TEST_SUITE_F(TBTreePartWalker, ::NKikimr::NTable::NTest::TTableCacheTest)
                 Y_TABLET_ERROR("Unused");
             }
 
-            TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+            TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 Y_UNUSED(part);
                 if (Loaded.count(location.GetByteOffset())) {
                     return NTest::TTestEnv::TryGetPage(Part, location, groupId);

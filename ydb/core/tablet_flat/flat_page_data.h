@@ -1,6 +1,6 @@
 #pragma once
 
-#include "shared_cache.h"
+#include "cache.h"
 
 #include "flat_page_base.h"
 #include "flat_page_label.h"
@@ -221,7 +221,7 @@ namespace NPage {
             Set(raw);
         }
 
-        explicit TDataPage(TSharedPageRef&& ref) {
+        explicit TDataPage(TCachePageRef&& ref) {
             Set(std::move(ref));
         }
 
@@ -250,7 +250,7 @@ namespace NPage {
             return Parse(raw ? *raw : TSharedData());
         }
 
-        TDataPage& Set(TSharedPageRef&& ref) {
+        TDataPage& Set(TCachePageRef&& ref) {
             TSharedData raw = ref ? ref.BuildSharedData() : TSharedData();
             ref.Drop();
             return Parse(std::move(raw));

@@ -145,7 +145,7 @@ namespace NBoot {
         TVector<NPageCollection::TLargeGlobId> LargeGlobIds;
         TVector<NTable::TPageCollectionComponents> Components;
         // Native metadata refs acquired directly from core for this bundle's slots.
-        TVector<TSharedCacheCollectionRef> Prebuilt;
+        TVector<TCacheCollectionRef> Prebuilt;
         TString Legacy;
         TString Opaque;
         TVector<TString> Deltas;

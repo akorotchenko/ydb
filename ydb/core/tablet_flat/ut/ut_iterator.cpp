@@ -183,7 +183,7 @@ Y_UNIT_TEST_SUITE_F(TIterator, ::NKikimr::NTable::NTest::TTableCacheTest) {
             return NTest::TTestEnv::Locate(part, ref, lob);
         }
 
-        TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto pageId = ResolvePageId(part, location, groupId);
             if (AutoLoad) {
                 if (Loaded[groupId].insert(pageId).second) {

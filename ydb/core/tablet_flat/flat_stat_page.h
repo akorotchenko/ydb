@@ -28,7 +28,7 @@ public:
 
     class TRegistration {
     public:
-        TRegistration(TPageTracker* tracker, const TSharedPageRef& page)
+        TRegistration(TPageTracker* tracker, const TCachePageRef& page)
             : Tracker_(page ? tracker : nullptr)
             , Page_(&page)
         {
@@ -54,7 +54,7 @@ public:
         friend class TPageTracker;
 
         TPageTracker* const Tracker_;
-        const TSharedPageRef* const Page_;
+        const TCachePageRef* const Page_;
         size_t Slot_ = 0;
     };
 
@@ -93,7 +93,7 @@ private:
 
 // Traversal-owned references are serialized, including across coroutine worker changes.
 struct TIndexPage final : TRefCounted<TIndexPage, TExplicitSimpleCounter> {
-    explicit TIndexPage(TSharedPageRef page, bool v2Format, TPageTracker* tracker = nullptr)
+    explicit TIndexPage(TCachePageRef page, bool v2Format, TPageTracker* tracker = nullptr)
         : Node(std::move(page), v2Format)
         , Registration(tracker, Node.GetPageRef())
     {}

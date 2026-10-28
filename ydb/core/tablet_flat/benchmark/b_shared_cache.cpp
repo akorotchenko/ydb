@@ -1,6 +1,6 @@
 #include <benchmark/benchmark.h>
 
-#include <ydb/core/tablet_flat/shared_cache.h>
+#include <ydb/core/tablet_flat/cache.h>
 #include <ydb/core/tablet_flat/test/libs/table/shared_cache_context.h>
 #include <ydb/library/actors/core/defs.h>
 
@@ -26,15 +26,15 @@ namespace {
     constexpr ui64 AccessSeed = 20261023;
 
     struct TKeyHash {
-        size_t operator()(const TSharedCacheKey& key) const noexcept {
+        size_t operator()(const TCacheKey& key) const noexcept {
             return key.Hash();
         }
     };
 
-    using TStdRawMap = std::unordered_map<TSharedCacheKey, TCacheItem, TKeyHash>;
-    using TYdbRawMap = THashMap<TSharedCacheKey, TCacheItem, TKeyHash>;
-    using TStdOwnedMap = std::unordered_map<TSharedCacheKey, NActors::TSharedData, TKeyHash>;
-    using TYdbOwnedMap = THashMap<TSharedCacheKey, NActors::TSharedData, TKeyHash>;
+    using TStdRawMap = std::unordered_map<TCacheKey, TCacheItem, TKeyHash>;
+    using TYdbRawMap = THashMap<TCacheKey, TCacheItem, TKeyHash>;
+    using TStdOwnedMap = std::unordered_map<TCacheKey, NActors::TSharedData, TKeyHash>;
+    using TYdbOwnedMap = THashMap<TCacheKey, NActors::TSharedData, TKeyHash>;
 
     class TBenchmarkCollection final : public NPageCollection::IPageCollection {
     public:
@@ -100,7 +100,7 @@ namespace {
             PageCount_ = static_cast<ui32>(state.range(0));
             Y_ENSURE(PageCount_ && !(PageCount_ & (PageCount_ - 1)));
             const ui8 addressBits = static_cast<ui8>(std::bit_width(ui64(PageCount_) * BucketsPerPage - 1));
-            TSharedCacheCapacity capacity;
+            TCacheCapacityConfig capacity;
             Y_ENSURE(TryCalculateSharedCacheFootprint(addressBits, PageSize, 0, NActors::MaxWorkers, capacity));
             Context_ = MakeHolder<NTable::NTest::TTableCacheContext>(capacity);
             Cache_ = &TSharedCache::Get();
@@ -116,7 +116,7 @@ namespace {
             }
             for (ui32 page = 0; page < PageCount_; ++page) {
                 const auto location = PageCollection_->GetLocation(page);
-                const auto key = TSharedCacheKey::Page(Collection_.CacheItem(), static_cast<ui64>(location.Offset));
+                const auto key = TCacheKey::Page(Collection_.CacheItem(), static_cast<ui64>(location.Offset));
                 auto data = NActors::TSharedData::Uninitialized(PageSize);
                 std::memset(data.mutable_data(), page & 0xff, PageSize);
                 auto shared = data;
@@ -132,9 +132,9 @@ namespace {
                 }
             }
             for (ui32 page = 0; page < PageCount_; ++page) {
-                TSharedPageRef ref;
+                TCachePageRef ref;
                 if (Cache_->Find(Collection_.CacheItem(), static_cast<ui64>(TPageOffset::FromPageIndex(page)), ref) !=
-                    ESharedCacheResultStatus::Hit) {
+                    ECacheResultStatus::Hit) {
                     state.SkipWithError("Cache does not retain the complete comparison working set");
                     return;
                 }
@@ -144,7 +144,7 @@ namespace {
             std::mt19937_64 random(AccessSeed);
             std::shuffle(Order_.begin(), Order_.end(), random);
             state.counters["LookupValueMiB"] =
-                double(PageCount_) * sizeof(std::pair<const TSharedCacheKey, TCacheItem>) / (1024 * 1024);
+                double(PageCount_) * sizeof(std::pair<const TCacheKey, TCacheItem>) / (1024 * 1024);
             state.counters["PageBytes"] = PageSize;
             state.counters["CacheHandles"] = capacity.HandleCount();
             state.counters["CacheBuckets"] = capacity.BucketCount();
@@ -157,7 +157,7 @@ namespace {
             TYdbRawMap().swap(YdbRaw_);
             TStdOwnedMap().swap(StdOwned_);
             TYdbOwnedMap().swap(YdbOwned_);
-            TVector<TSharedPageRef>().swap(Pinned_);
+            TVector<TCachePageRef>().swap(Pinned_);
             TVector<ui32>().swap(Order_);
             Collection_.Drop();
             PageCollection_.Drop();
@@ -168,7 +168,7 @@ namespace {
     protected:
         template <class TLookup>
         void RunLookups(benchmark::State& state, bool miss, TLookup&& lookup) {
-            const auto expected = miss ? ESharedCacheResultStatus::Miss : ESharedCacheResultStatus::Hit;
+            const auto expected = miss ? ECacheResultStatus::Miss : ECacheResultStatus::Hit;
             ui32 cursor = 0;
             for (auto _ : state) {
                 const ui32 page = Order_[cursor] + (miss ? PageCount_ : 0);
@@ -183,21 +183,21 @@ namespace {
         }
 
         template <class TMap>
-        ESharedCacheResultStatus LookupRaw(TMap& map, ui64 offset) {
-            const auto it = map.find(TSharedCacheKey::Page(Collection_.CacheItem(), offset));
+        ECacheResultStatus LookupRaw(TMap& map, ui64 offset) {
+            const auto it = map.find(TCacheKey::Page(Collection_.CacheItem(), offset));
             if (it == map.end()) {
-                return ESharedCacheResultStatus::Miss;
+                return ECacheResultStatus::Miss;
             }
             ui64 value = it->second.Raw();
             benchmark::DoNotOptimize(value);
-            return ESharedCacheResultStatus::Hit;
+            return ECacheResultStatus::Hit;
         }
 
         template <bool Read, class TMap>
-        ESharedCacheResultStatus LookupOwned(TMap& map, ui64 offset) {
-            const auto it = map.find(TSharedCacheKey::Page(Collection_.CacheItem(), offset));
+        ECacheResultStatus LookupOwned(TMap& map, ui64 offset) {
+            const auto it = map.find(TCacheKey::Page(Collection_.CacheItem(), offset));
             if (it == map.end()) {
-                return ESharedCacheResultStatus::Miss;
+                return ECacheResultStatus::Miss;
             }
             auto data = it->second;
             if constexpr (Read) {
@@ -207,14 +207,14 @@ namespace {
                 auto* value = data.data();
                 benchmark::DoNotOptimize(value);
             }
-            return ESharedCacheResultStatus::Hit;
+            return ECacheResultStatus::Hit;
         }
 
-        ESharedCacheResultStatus LookupTable(ui64 offset) {
+        ECacheResultStatus LookupTable(ui64 offset) {
             auto operation = Cache_->BeginOperation();
             TCacheItem item;
-            const auto status = operation.Find(TSharedCacheKey::Page(Collection_.CacheItem(), offset), item);
-            if (status == ESharedCacheResultStatus::Hit) {
+            const auto status = operation.Find(TCacheKey::Page(Collection_.CacheItem(), offset), item);
+            if (status == ECacheResultStatus::Hit) {
                 ui64 value = item.Raw();
                 benchmark::DoNotOptimize(value);
             }
@@ -222,10 +222,10 @@ namespace {
         }
 
         template <bool Read>
-        ESharedCacheResultStatus LookupCache(ui64 offset) {
-            TSharedPageRef page;
+        ECacheResultStatus LookupCache(ui64 offset) {
+            TCachePageRef page;
             const auto status = Cache_->Find(Collection_.CacheItem(), offset, page);
-            if (status == ESharedCacheResultStatus::Hit) {
+            if (status == ECacheResultStatus::Hit) {
                 if constexpr (Read) {
                     char value = page.data()[0];
                     benchmark::DoNotOptimize(value);
@@ -240,12 +240,12 @@ namespace {
         THolder<NTable::NTest::TTableCacheContext> Context_;
         TSharedCache* Cache_ = nullptr;
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
-        TSharedCacheCollectionRef Collection_;
+        TCacheCollectionRef Collection_;
         TStdRawMap StdRaw_;
         TYdbRawMap YdbRaw_;
         TStdOwnedMap StdOwned_;
         TYdbOwnedMap YdbOwned_;
-        TVector<TSharedPageRef> Pinned_;
+        TVector<TCachePageRef> Pinned_;
         TVector<ui32> Order_;
         ui32 PageCount_ = 0;
     };
