@@ -86,13 +86,17 @@ bool TCacheCapacity<TTraits>::StartTransition() noexcept {
         return false;
     }
     TierRebalanceRequested_.exchange(false, std::memory_order_acq_rel);
+    const bool keepActive = Cache_.Eviction_.HasKeepWork();
+    TargetKeepActive_.store(keepActive, std::memory_order_relaxed);
+    const auto minimums = Cache_.Policy_.HotMinimums(keepActive);
     const auto& current = Cache_.Space_->CurrentConfiguration();
     const ui64 budget = Cache_.Eviction_.EvictableByteBudget();
     const double share =
         budget ? static_cast<double>(Min(budget, Cache_.Eviction_.KeepLimit())) / static_cast<double>(budget) : 0.0;
     const ui64 hot = Target_.HotSlotCount();
     const ui64 cold = Target_.HandleCount();
-    const ui64 keepHot = std::clamp<ui64>(static_cast<ui64>(hot * share), HotLevelCount, hot - HotLevelCount);
+    const ui64 keepHot = std::clamp<ui64>(
+        static_cast<ui64>(hot * share), minimums[ECacheTier::Keep], hot - minimums[ECacheTier::Regular]);
     const ui64 keepCold = std::clamp<ui64>(static_cast<ui64>(cold * share), 1, cold - 1);
     Target_.Tiers = { TCacheTierCapacity{ hot - keepHot, cold - keepCold }, TCacheTierCapacity{ keepHot, keepCold } };
     if (current.AddressBits == Target_.AddressBits) {

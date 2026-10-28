@@ -2,6 +2,9 @@
 
 #include "cache_item.h"
 #include "cache_thread.h"
+#include "cache_tier.h"
+
+#include <array>
 
 namespace NActors {
 class TActorSystem;
@@ -115,8 +118,10 @@ struct TCachePolicy {
     double Grow = 0.30;
     double KeepMaxShare = 0.40;
     double ResizeStep = 0.05;
-    ui32 MinHotSlots = 128;
+    ui32 MinHotSlots = 128; // Shared minimum for active tiers
     ui32 MinResizeStep = 256;
+
+    constexpr std::array<ui32, CacheTierCount> HotMinimums(bool keepActive) const noexcept;
 };
 
 template <class TTraits>
@@ -130,6 +135,14 @@ inline constexpr TCachePolicy SharedCachePolicyFor<TTestTraits>{
 };
 
 // Inline implementations
+
+inline constexpr std::array<ui32, CacheTierCount> TCachePolicy::HotMinimums(bool keepActive) const noexcept {
+    if (!keepActive) {
+        return { MinHotSlots, HotLevelCount };
+    }
+    const ui32 keep = Max<ui32>(HotLevelCount, MinHotSlots / CacheTierCount);
+    return { Max<ui32>(HotLevelCount, MinHotSlots - keep), keep };
+}
 
 inline void TTestTraits::Invoke(ECacheHookPoint point, TCacheItem cacheItem) const noexcept {
     if (Function) {

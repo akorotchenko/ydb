@@ -37,7 +37,8 @@ public:
         return Transition_.Phase() != ETransitionPhase::Idle ||
                Cache_.Space_->CurrentConfiguration().HandleCount() != TargetHandleCount() ||
                Cache_.Space_->CurrentConfiguration().Tiers != Target_.Tiers ||
-               TierRebalanceRequested_.load(std::memory_order_acquire);
+               TierRebalanceRequested_.load(std::memory_order_acquire) ||
+               TargetKeepActive_.load(std::memory_order_relaxed) != Cache_.Eviction_.HasKeepWork();
     }
 
     ui64 TargetHandleCount() const noexcept {
@@ -83,6 +84,7 @@ private:
     TCacheCapacityConfig Target_;
     TTransition Transition_;
     std::atomic<bool> TierRebalanceRequested_{ true };
+    std::atomic<bool> TargetKeepActive_{ false };
 };
 
 } // namespace NKikimr::NSharedCache
