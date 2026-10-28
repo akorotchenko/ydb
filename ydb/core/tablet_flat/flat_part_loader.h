@@ -4,7 +4,7 @@
 #include "flat_part_walker.h"
 #include "flat_sausagecache.h"
 #include "shared_cache_events.h"
-#include "shared_cache.h"
+#include "cache.h"
 #include "util_fmt_abort.h"
 #include <ydb/core/tablet_flat/protos/flat_table_part.pb.h>
 #include <ydb/core/util/pb.h>
@@ -37,7 +37,7 @@ namespace NTable {
         };
 
         struct TLoaderEnv : public IPages {
-            TLoaderEnv(TVector<TSharedCacheCollectionRef> pageCollections, TPartSlots slots)
+            TLoaderEnv(TVector<TCacheCollectionRef> pageCollections, TPartSlots slots)
                 : PageCollections(std::move(pageCollections))
                 , Slots(slots)
                 , SavedPages(Slots.SlotsCount())
@@ -62,12 +62,12 @@ namespace NTable {
                 Part = part;
             }
 
-            TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+            TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 Y_ENSURE(part == Part, "Unsupported part");
                 return TryGetSlotPage(Slots.DataSlot(groupId), location);
             }
 
-            TSharedPageRef TryGetIndexPage(
+            TCachePageRef TryGetIndexPage(
                 const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 Y_ENSURE(part == Part, "Unsupported part");
                 return TryGetSlotPage(Slots.IndexSlot(groupId), location);
@@ -76,7 +76,7 @@ namespace NTable {
             /**
              * Loads a page of the page collection, the outer page collection is not supported
              */
-            TSharedPageRef TryGetSlotPage(ui32 slot, const TPageLocation& location)
+            TCachePageRef TryGetSlotPage(ui32 slot, const TPageLocation& location)
             {
                 Y_ENSURE(slot < Slots.SlotsCount(), "Unsupported page collection " << slot);
 
@@ -153,7 +153,7 @@ namespace NTable {
             }
 
         private:
-            void AddSavedPage(ui32 slot, TPageOffset offset, TSharedPageRef&& page)
+            void AddSavedPage(ui32 slot, TPageOffset offset, TCachePageRef&& page)
             {
                 SavedPages[slot][offset] = std::move(page);
             }
@@ -165,9 +165,9 @@ namespace NTable {
             };
 
             const TPart* Part = nullptr;
-            const TVector<TSharedCacheCollectionRef> PageCollections;
+            const TVector<TCacheCollectionRef> PageCollections;
             const TPartSlots Slots;
-            TVector<THashMap<TPageOffset, TSharedPageRef>> SavedPages;
+            TVector<THashMap<TPageOffset, TCachePageRef>> SavedPages;
             // Dedup by offset — keep Size/Type for the fetch request
             TVector<THashSet<TPageLocation, NPage::TPageLocationByOffsetHash, TPageLocationByOffsetEq>> NeedPages;
             ui32 FetchSlot = Max<ui32>(); // page collection of the last fetch
@@ -183,7 +183,7 @@ namespace NTable {
             bool PreloadData = false;
         };
 
-        TLoader(TPartComponents components, TVector<TSharedCacheCollectionRef> prebuiltPageCollections = {});
+        TLoader(TPartComponents components, TVector<TCacheCollectionRef> prebuiltPageCollections = {});
         ~TLoader();
 
         TFetch Run(TRunOptions options)
@@ -308,7 +308,7 @@ namespace NTable {
         TFetch StagePreloadData();
 
     private:
-        TVector<TSharedCacheCollectionRef> PageCollections;
+        TVector<TCacheCollectionRef> PageCollections;
         TPartComponents Components;
         const TString Legacy;
         const TString Opaque;

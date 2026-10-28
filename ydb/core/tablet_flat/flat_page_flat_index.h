@@ -1,6 +1,6 @@
 #pragma once
 
-#include "shared_cache.h"
+#include "cache.h"
 
 #include "flat_page_base.h"
 #include "flat_page_label.h"
@@ -69,13 +69,13 @@ namespace NPage {
             Parse();
         }
 
-        explicit TFlatIndex(TSharedPageRef&& ref)
+        explicit TFlatIndex(TCachePageRef&& ref)
             : Ref(std::move(ref))
         {
             Parse();
         }
 
-        const TSharedPageRef& GetPageRef() const noexcept {
+        const TCachePageRef& GetPageRef() const noexcept {
             return Ref;
         }
 
@@ -288,7 +288,7 @@ namespace NPage {
         }
 
     private:
-        TSharedPageRef Ref;
+        TCachePageRef Ref;
         TSharedData Raw;
         TBlock Page;
         const TRecord* LastKey;

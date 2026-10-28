@@ -170,17 +170,17 @@ public:
         return pages;
     }
 
-    static TArrayRef<const TSharedCacheCollectionRef> Storages(const TPartView &partView)
+    static TArrayRef<const TCacheCollectionRef> Storages(const TPartView& partView)
     {
         auto *part = partView.As<TPartStore>();
 
         Y_ENSURE(!partView || part, "Got an unexpected type of TPart part");
 
-        return part ? part->PageCollections : TArrayRef<const TSharedCacheCollectionRef>{ };
+        return part ? part->PageCollections : TArrayRef<const TCacheCollectionRef>{};
     }
 
-    TVector<TSharedCacheCollectionRef> PageCollections;
-    TSharedCacheCollectionRef Pseudo;    /* Cache for NPage::TBlobs */
+    TVector<TCacheCollectionRef> PageCollections;
+    TCacheCollectionRef Pseudo; /* Cache for NPage::TBlobs */
 };
 
 class TTxStatusPartStore : public TTxStatusPart, public IBorrowBundle {

@@ -24,7 +24,7 @@ namespace {
     using namespace NTest;
 
     struct TTouchEnv : public NTest::TTestEnv {
-        TSharedPageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
+        TCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
         {
             auto type = location.Type;
             if (type == EPage::Undef && location.Offset.IsPageIndex()) {
@@ -33,7 +33,7 @@ namespace {
             return Touch(part, location, groupId, type, NTest::TTestEnv::TryGetPage(part, location, groupId));
         }
 
-        TSharedPageRef TryGetIndexPage(
+        TCachePageRef TryGetIndexPage(
             const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto type = location.Type;
             if (type == EPage::Undef && location.Offset.IsPageIndex()) {
@@ -43,8 +43,8 @@ namespace {
             return Touch(part, location, TGroupId(part->IndexSlot(groupId)), type, NTest::TTestEnv::TryGetIndexPage(part, location, groupId));
         }
 
-        TSharedPageRef Touch(
-            const TPart* part, const TPageLocation& location, TGroupId groupId, EPage type, TSharedPageRef page)
+        TCachePageRef Touch(
+            const TPart* part, const TPageLocation& location, TGroupId groupId, EPage type, TCachePageRef page)
         {
             bool newTouch = Touched[{part, groupId}].insert(location.Offset).second;
 
@@ -162,7 +162,7 @@ Y_UNIT_TEST_SUITE_F(BuildStatsPageLifetime, ::NKikimr::NTable::NTest::TTableCach
 
     class TStatsPageEnv : public TTestEnv {
     public:
-        TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             if (StopAfterPages && Touched.size() >= StopAfterPages) {
                 throw TStopTraversal{};
             }
@@ -277,9 +277,8 @@ Y_UNIT_TEST_SUITE_F(BuildStatsPageLifetime, ::NKikimr::NTable::NTest::TTableCach
                     UNIT_ASSERT_VALUES_EQUAL(workingSet.Bytes, pageSize + TSharedData::OverheadSize);
                     UNIT_ASSERT_VALUES_EQUAL(workingSet.TotalBytes, workingSet.Bytes);
                 }
-                NSharedCache::TSharedCacheCollectionRef collectionRef;
-                UNIT_ASSERT(
-                    cache.Find(collection->Label(), collectionRef) == NSharedCache::ESharedCacheResultStatus::Hit);
+                NSharedCache::TCacheCollectionRef collectionRef;
+                UNIT_ASSERT(cache.Find(collection->Label(), collectionRef) == NSharedCache::ECacheResultStatus::Hit);
                 UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collectionRef.CacheItem(), NPage::ECacheMode::Sticky));
                 auto stickyPage = referenceEnv.TryGetPage(part.Get(), root, {});
                 UNIT_ASSERT(stickyPage.IsSticky());
@@ -361,7 +360,7 @@ Y_UNIT_TEST_SUITE_F(BuildStatsPageLifetime, ::NKikimr::NTable::NTest::TTableCach
                 : Tracker(tracker)
             {}
 
-            TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+            TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 const auto workingSet = Tracker.WorkingSet();
                 SawRetainedIndex |= workingSet.Pages != 0;
                 return TTestEnv::TryGetPage(part, location, groupId);

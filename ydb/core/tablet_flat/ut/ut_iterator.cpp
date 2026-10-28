@@ -183,14 +183,14 @@ Y_UNIT_TEST_SUITE_F(TIterator, ::NKikimr::NTable::NTest::TTableCacheTest) {
             return NTest::TTestEnv::Locate(part, ref, lob);
         }
 
-        TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             if (Touch(groupId, ResolvePageId(part, location, part->DataSlot(groupId)))) {
                 return NTest::TTestEnv::TryGetPage(part, location, groupId);
             }
             return {};
         }
 
-        TSharedPageRef TryGetIndexPage(
+        TCachePageRef TryGetIndexPage(
             const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             // index pages are tracked as pages of their page collection
             const ui32 slot = part->IndexSlot(groupId);

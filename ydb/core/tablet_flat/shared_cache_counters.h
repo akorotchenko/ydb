@@ -4,7 +4,7 @@
 
 namespace NKikimr::NSharedCache {
 
-struct TSharedPageCacheCounters final : public TAtomicRefCount<TSharedPageCacheCounters> {
+struct TCacheCounters final : public TAtomicRefCount<TCacheCounters> {
     using TCounterPtr = ::NMonitoring::TDynamicCounters::TCounterPtr;
 
     const TIntrusivePtr<::NMonitoring::TDynamicCounters> Counters;
@@ -42,7 +42,7 @@ struct TSharedPageCacheCounters final : public TAtomicRefCount<TSharedPageCacheC
     const TCounterPtr SucceedRequests;
     const TCounterPtr FailedRequests;
 
-    explicit TSharedPageCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters);
+    explicit TCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters);
 };
 
 } // namespace NKikimr::NSharedCache

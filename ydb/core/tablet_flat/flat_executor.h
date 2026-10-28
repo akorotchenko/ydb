@@ -575,11 +575,11 @@ class TExecutor
     void AddPartStorePageCollections(const NTable::TPartView& partView,
         const THashMap<NTable::TTag, ECacheMode>& cacheModes, const THashSet<NTable::TTag>& stickyColumns,
         bool replayStickyWalks = false);
-    void AddPageCollection(const TSharedCacheCollectionRef& pageCollection, ECacheMode cacheMode,
+    void AddPageCollection(const TCacheCollectionRef& pageCollection, ECacheMode cacheMode,
         TVector<NSharedCache::TEvAttach::TBtreeSeed> btreeSeeds = {}, bool replayStickyWalk = false);
     void DropPartStorePageCollections(const NTable::TPart &part);
     void DropPageCollection(const TLogoBlobID& pageCollectionId);
-    TSharedCacheCollectionRef FindPageCollection(const TLogoBlobID& id) const;
+    TCacheCollectionRef FindPageCollection(const TLogoBlobID& id) const;
     TVector<ECacheMode> GetPartStoreCacheModes(const NTable::TPartView& partView,
         const THashMap<NTable::TTag, ECacheMode>& cacheModes, const THashSet<NTable::TTag>& stickyColumns) const;
     TPageCollectionStats GetPageCollectionStats() const;

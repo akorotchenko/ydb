@@ -1,4 +1,4 @@
-#include <ydb/core/tablet_flat/shared_cache_thread_test.h>
+#include <ydb/core/tablet_flat/cache_thread_test.h>
 #include "helpers.h"
 #include "storage.h"
 #include "appdata.h"

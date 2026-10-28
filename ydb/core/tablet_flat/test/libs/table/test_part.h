@@ -1,7 +1,7 @@
 #pragma once
 
 #include "test_store.h"
-#include <ydb/core/tablet_flat/shared_cache.h>
+#include <ydb/core/tablet_flat/cache.h>
 #include <ydb/core/tablet_flat/flat_fwd_blobs.h>
 #include <ydb/core/tablet_flat/flat_fwd_cache.h>
 #include <ydb/core/tablet_flat/flat_part_iface.h>
@@ -122,13 +122,13 @@ namespace NTest {
             return { true, TryGetSlotPage(part, collection->GetLocation(ref), room) };
         }
 
-        TSharedPageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
+        TCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
         {
             Y_ENSURE(!NPage::IsIndexPage(location.Type), "Index page " << location << " is requested as a data page");
             return TryGetSlotPage(part, location, part->DataSlot(groupId));
         }
 
-        TSharedPageRef TryGetIndexPage(
+        TCachePageRef TryGetIndexPage(
             const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             Y_ENSURE(location.Type == EPage::Undef || NPage::IsIndexPage(location.Type),
                 "Page " << location << " is requested as an index page");
@@ -136,7 +136,7 @@ namespace NTest {
         }
 
     protected:
-        TSharedPageRef TryGetSlotPage(const TPart* part, const TPageLocation& location, ui32 slot) {
+        TCachePageRef TryGetSlotPage(const TPart* part, const TPageLocation& location, ui32 slot) {
             auto* storedPart = CheckedCast<const TPartStore*>(part);
             auto* data = storedPart->Store->GetPage(slot, location.Offset);
             auto* collection = storedPart->GetPageCollection(slot);

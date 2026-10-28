@@ -127,20 +127,20 @@ namespace NFwd {
             return Pending == 0;
         }
 
-        TSharedPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
+        TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
         {
             Y_ENSURE(!IsIndexPage(location.Type), "Index page " << location << " is requested as a data page");
             auto got = Get(GetQueue(part, groupId), location.Offset, location.Type);
-            return got.Page ? got.Page->Acquire() : TSharedPageRef();
+            return got.Page ? got.Page->Acquire() : TCachePageRef();
         }
 
-        TSharedPageRef TryGetIndexPage(
+        TCachePageRef TryGetIndexPage(
             const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             Y_ENSURE(location.Type == EPage::Undef || IsIndexPage(location.Type),
                 "Page " << location << " is requested as an index page");
             // the group queue loads both index and data pages of the group
             auto got = Get(GetQueue(part, groupId), location.Offset, location.Type);
-            return got.Page ? got.Page->Acquire() : TSharedPageRef();
+            return got.Page ? got.Page->Acquire() : TCachePageRef();
         }
 
         TResult Locate(const TMemTable *memTable, ui64 ref, ui32 tag) override

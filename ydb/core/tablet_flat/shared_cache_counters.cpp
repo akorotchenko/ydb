@@ -2,7 +2,7 @@
 
 namespace NKikimr::NSharedCache {
 
-TSharedPageCacheCounters::TSharedPageCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters)
+TCacheCounters::TCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters)
     : Counters(counters)
     // page counters:
     , MemLimitBytes(counters->GetCounter("MemLimitBytes"))

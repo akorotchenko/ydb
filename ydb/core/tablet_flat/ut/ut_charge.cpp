@@ -54,7 +54,7 @@ namespace {
             , Sticky(std::move(sticky))
             { }
 
-        TSharedPageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
+        TCachePageRef TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
         {
             if (Touch(groupId, ResolvePageId(part, location, part->DataSlot(groupId)))) {
                 return NTest::TTestEnv::TryGetPage(part, location, groupId);
@@ -62,7 +62,7 @@ namespace {
             return {};
         }
 
-        TSharedPageRef TryGetIndexPage(
+        TCachePageRef TryGetIndexPage(
             const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             // index pages are tracked as pages of their page collection
             const ui32 slot = part->IndexSlot(groupId);

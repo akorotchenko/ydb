@@ -1,4 +1,4 @@
-#include "shared_cache.h"
+#include "cache.h"
 #include "shared_cache_events.h"
 
 #include <ydb/library/actors/core/actorsystem.h>
@@ -8,31 +8,31 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
-TSharedCacheCollectionRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitCollection(
+TCacheCollectionRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitCollection(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection)
     requires std::is_same_v<TTraits, TProdTraits>
 {
     const TCollectionLocation location{ .Id = collection->Label(), .BackingSize = collection->BackingSize() };
     TCollectionCacheItem inserted;
-    TSharedCacheCollectionRefImpl<TTraits> hit;
+    TCacheCollectionRefImpl<TTraits> hit;
     auto status = FindOrInsert(location, inserted, hit);
-    while (status == ESharedCacheResultStatus::Pending) {
+    while (status == ECacheResultStatus::Pending) {
         // A concurrent metadata publisher completes synchronously; share its ready collection.
         std::this_thread::yield();
         status = FindOrInsert(location, inserted, hit);
     }
-    if (status == ESharedCacheResultStatus::Inserted) {
+    if (status == ECacheResultStatus::Inserted) {
         Y_ENSURE(MakeReady(inserted, MakeHolder<TCollection>(std::move(collection), inserted, ECacheMode::Regular)));
-        Y_ENSURE(Find(location.Id, hit) == ESharedCacheResultStatus::Hit);
+        Y_ENSURE(Find(location.Id, hit) == ECacheResultStatus::Hit);
     } else {
-        Y_ENSURE(status == ESharedCacheResultStatus::Hit);
+        Y_ENSURE(status == ECacheResultStatus::Hit);
         hit->SetSkipBTreeIndexV1Shadow(collection->SkipBTreeIndexV1Shadow());
     }
     return hit;
 }
 
 template <class TTraits>
-TSharedPageRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitPage(
+TCachePageRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitPage(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, NTable::NPage::TPageLocation location,
     NActors::TSharedData&& data, bool sticky)
     requires std::is_same_v<TTraits, TProdTraits>
@@ -49,10 +49,10 @@ public:
         Y_ABORT_UNLESS(TSharedCache::Get().AcquirePage(item, Page));
     }
 
-    TSharedPageRef Page;
+    TCachePageRef Page;
 };
 
-TSharedPageRef TEvSaveCompactedPages::AddPage(
+TCachePageRef TEvSaveCompactedPages::AddPage(
     TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky, TSharedCache::EPageAdmission admission) {
     if (!CacheItem) {
         auto collection = cachePages.AdmitCollection(PageCollection);
@@ -60,7 +60,7 @@ TSharedPageRef TEvSaveCompactedPages::AddPage(
     }
     Pages.push_back(page.Location);
     auto waiter = MakeIntrusive<TCompactedPageWaiter>();
-    TSharedCachePageRequest request(page.Location, waiter, sticky);
+    TCachePageRequest request(page.Location, waiter, sticky);
     const bool admitted = admission == TSharedCache::EPageAdmission::Written
                               ? cachePages.FindOrInsertWrittenBatch(CacheItem, { &request, 1 })
                               : cachePages.FindOrInsertBatch(CacheItem, { &request, 1 }, false);
@@ -68,10 +68,10 @@ TSharedPageRef TEvSaveCompactedPages::AddPage(
         Y_ENSURE(!sticky, "Cannot admit Sticky compacted page " << page.Location.Offset);
         return {};
     }
-    if (request.Status() == ESharedCacheResultStatus::Hit) {
+    if (request.Status() == ECacheResultStatus::Hit) {
         return std::move(request.Page());
     }
-    Y_ENSURE(request.Status() == ESharedCacheResultStatus::Inserted);
+    Y_ENSURE(request.Status() == ECacheResultStatus::Inserted);
     Y_ENSURE(request.Fetch().MakeReady(std::move(page.Data)));
     return std::move(waiter->Page);
 }
@@ -99,10 +99,10 @@ TRequestCompletion::TRequestCompletion(TRequestCompletionParams&& params) noexce
     }
 }
 
-void TRequestCompletion::Complete(ui32 index, TSharedPageRef page, EPageFetchCompletion completion) noexcept {
+void TRequestCompletion::Complete(ui32 index, TCachePageRef page, EPageFetchCompletion completion) noexcept {
     Y_DEBUG_ABORT_UNLESS(index < Locations_.size());
     Y_DEBUG_ABORT_UNLESS(completion != EPageFetchCompletion::Pending);
-    TVector<TSharedPageRef> releasedPages;
+    TVector<TCachePageRef> releasedPages;
     THolder<TEvResult> result;
     {
         TGuard<TMutex> guard(Mutex_);
@@ -129,7 +129,7 @@ void TRequestCompletion::Complete(ui32 index, TSharedPageRef page, EPageFetchCom
 }
 
 void TRequestCompletion::Cancel(bool replyImmediately) noexcept {
-    TVector<TSharedPageRef> releasedPages;
+    TVector<TCachePageRef> releasedPages;
     THolder<TEvResult> result;
     {
         TGuard<TMutex> guard(Mutex_);
@@ -143,7 +143,7 @@ void TRequestCompletion::Cancel(bool replyImmediately) noexcept {
 }
 
 void TRequestCompletion::PostponeForResources() noexcept {
-    TVector<TSharedPageRef> releasedPages;
+    TVector<TCachePageRef> releasedPages;
     THolder<TEvResult> result;
     {
         TGuard<TMutex> guard(Mutex_);
@@ -201,9 +201,9 @@ void TRequestCompletion::SendResult(THolder<TEvResult> result) noexcept {
 }
 
 void TRequestPageWaiter::Complete(TPageCacheItem page, EPageFetchCompletion completion) noexcept {
-    TSharedPageRef result;
+    TCachePageRef result;
     if (completion == EPageFetchCompletion::Ready) {
-        TSharedPageRef cachePage;
+        TCachePageRef cachePage;
         if (TSharedCache* cache = TSharedCache::TryGet()) {
             if (cache->AcquirePage(page, cachePage)) {
                 result = std::move(cachePage);
@@ -218,9 +218,9 @@ void TRequestPageWaiter::Complete(TPageCacheItem page, EPageFetchCompletion comp
     Completion_.Drop();
 }
 
-template TSharedCacheCollectionRef TSharedCacheImpl<TProdTraits>::AdmitCollection(
+template TCacheCollectionRef TSharedCacheImpl<TProdTraits>::AdmitCollection(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection);
-template TSharedPageRef TSharedCacheImpl<TProdTraits>::AdmitPage(
+template TCachePageRef TSharedCacheImpl<TProdTraits>::AdmitPage(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, NTable::NPage::TPageLocation location,
     NActors::TSharedData&& data, bool sticky);
 

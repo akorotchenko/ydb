@@ -233,11 +233,11 @@ class TDryRunExecutor
         TResult Locate(const NTable::TPart*, ui64, NTable::ELargeObj) override { Y_TABLET_ERROR("Not supported");
         }
 
-        TSharedPageRef TryGetPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
+        TCachePageRef TryGetPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
             Y_TABLET_ERROR("Not supported");
         }
 
-        TSharedPageRef TryGetIndexPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
+        TCachePageRef TryGetIndexPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
             Y_TABLET_ERROR("Not supported");
         }
     };

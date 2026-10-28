@@ -6,7 +6,7 @@
 #include <library/cpp/testing/unittest/registar.h>
 #include "flat_database.h"
 #include "util_fmt_abort.h"
-#include "shared_cache.h"
+#include "cache.h"
 #include "shared_cache_events.h"
 
 #include <util/system/sanitizers.h>

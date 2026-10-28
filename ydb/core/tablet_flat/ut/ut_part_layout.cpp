@@ -480,7 +480,7 @@ namespace {
             for (const auto& location : fetch.Pages) {
                 auto* data = pages[slot].FindPtr(location.Offset);
                 UNIT_ASSERT_C(data, "Fetch of an unknown page " << location << " of page collection " << slot);
-                loaded.emplace_back(location.Offset, location.Size, NSharedCache::TSharedPageRef::MakePrivate(*data));
+                loaded.emplace_back(location.Offset, location.Size, NSharedCache::TCachePageRef::MakePrivate(*data));
             }
             loader.Save(std::move(loaded));
         }
@@ -615,7 +615,7 @@ Y_UNIT_TEST_SUITE(TPartLayoutLoader) {
                     for (const auto& location : fetch.Pages) {
                         auto* data = indexPages.FindPtr(location.Offset);
                         UNIT_ASSERT(data);
-                        env.Save({ location.Offset, location.Size, NSharedCache::TSharedPageRef::MakePrivate(*data) });
+                        env.Save({ location.Offset, location.Size, NSharedCache::TCachePageRef::MakePrivate(*data) });
                     }
                     ++indexFetches;
                 }

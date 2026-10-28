@@ -2325,17 +2325,17 @@ Y_UNIT_TEST_SUITE_F(TBTreePartWalker, ::NKikimr::NTable::NTest::TTableCacheTest)
                 Y_TABLET_ERROR("Unused");
             }
 
-            TSharedPageRef TryGetPage(
+            TCachePageRef TryGetPage(
                 const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 return TryGetSlotPage(location, part->DataSlot(groupId));
             }
 
-            TSharedPageRef TryGetIndexPage(
+            TCachePageRef TryGetIndexPage(
                 const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 return TryGetSlotPage(location, part->IndexSlot(groupId));
             }
 
-            TSharedPageRef TryGetSlotPage(const TPageLocation& location, ui32 slot) {
+            TCachePageRef TryGetSlotPage(const TPageLocation& location, ui32 slot) {
                 if (Loaded.count(location.GetByteOffset())) {
                     return NTest::TTestEnv::TryGetSlotPage(Part, location, slot);
                 }

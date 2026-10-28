@@ -218,11 +218,11 @@ struct TSourceDb {
             return {true, nullptr};
         }
 
-        TSharedPageRef TryGetPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
+        TCachePageRef TryGetPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
             return {};
         }
 
-        TSharedPageRef TryGetIndexPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
+        TCachePageRef TryGetIndexPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
             return {};
         }
     };

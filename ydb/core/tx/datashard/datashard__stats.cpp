@@ -101,11 +101,11 @@ public:
         Y_ENSURE(false, "IPages::Locate(TPart*, ...) shouldn't be used here");
     }
 
-    TSharedPageRef TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
+    TCachePageRef TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
         Y_ENSURE(false, "IPages::TryGetPage(...) shouldn't be used here");
     }
 
-    TSharedPageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+    TCachePageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         auto partStore = CheckedCast<const TPartStore*>(part);
         auto info = partStore->PageCollections.at(part->IndexSlot(groupId)).Get();
         Y_ENSURE(NPage::IsIndexPage(location.Type));
@@ -198,7 +198,7 @@ private:
     }
 
     void CheckRetainedWorkingSet() const {
-        TVector<TSharedCacheHandleRequirement> requirements;
+        TVector<TCacheHandleRequirement> requirements;
         for (const auto& [id, pages] : RequestPad->WorkingSetPages) {
             requirements.push_back({ id, pages });
         }
@@ -228,7 +228,7 @@ private:
         CoroutineDeadline = GetCycleCountFast() + DurationToCycles(MaxCoroutineExecutionTime);
 
         THashSet<ui64> collections;
-        const auto retainCollection = [&](const TSharedCacheCollectionRef& collection) {
+        const auto retainCollection = [&](const TCacheCollectionRef& collection) {
             if (collection && collections.insert(collection.CacheItem().Raw()).second) {
                 RetainedCollections.push_back(collection.CacheItem());
             }

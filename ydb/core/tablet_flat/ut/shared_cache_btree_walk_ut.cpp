@@ -5,7 +5,7 @@
 
 #include <flat_page_btree_index_writer.h>
 #include <shared_cache_btree_walk.h>
-#include <shared_cache.h>
+#include <cache.h>
 #include <shared_sausagecache_state.h>
 
 namespace NKikimr::NSharedCache {
@@ -64,7 +64,7 @@ namespace {
 
     class TWalkHostMock final : public ICacheBTreeWalkHost {
     public:
-        TSharedCacheCollectionRef Collection;
+        TCacheCollectionRef Collection;
         TPendingInMemoryPages PendingInMemoryPages;
         THashMap<TPageOffset, TSharedData> CorePages;
         TVector<TVector<TPageLocation>> StickyBatches;

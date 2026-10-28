@@ -9,7 +9,7 @@
 namespace NKikimr {
 namespace NTable {
 
-TLoader::TLoader(TPartComponents components, TVector<TSharedCacheCollectionRef> prebuiltPageCollections)
+TLoader::TLoader(TPartComponents components, TVector<TCacheCollectionRef> prebuiltPageCollections)
     : PageCollections(std::move(prebuiltPageCollections))
     , Components(std::move(components))
     , Legacy(std::move(Components.Legacy))
@@ -252,7 +252,7 @@ void TLoader::StageParseMeta()
         PageCollections[slots.IndexSlot(groupId)]->SetSkipBTreeIndexV1Shadow(true);
     }
 
-    TVector<TSharedCacheCollectionRef> loaderCollections;
+    TVector<TCacheCollectionRef> loaderCollections;
     loaderCollections.reserve(PageCollections.size());
     for (const auto& collection : PageCollections) {
         loaderCollections.push_back(collection.Acquire());
@@ -268,15 +268,15 @@ TLoader::TFetch TLoader::StageCreatePartView(bool preloadIndex)
     const auto slots = GetSlots();
 
     // Root, bloom, frames, globs and stats pages
-    auto getPage = [&](TPageId pageId) -> TSharedPageRef {
+    auto getPage = [&](TPageId pageId) -> TCachePageRef {
         const ui32 slot = slots.DescriptorSlot();
         return pageId == Max<TPageId>()
-                   ? TSharedPageRef()
+                   ? TCachePageRef()
                    : LoaderEnv->TryGetSlotPage(slot, PageCollections[slot]->PageCollection()->GetLocation(pageId));
     };
-    auto getIndexPage = [&](TPageId pageId, NPage::TGroupId groupId) -> TSharedPageRef {
+    auto getIndexPage = [&](TPageId pageId, NPage::TGroupId groupId) -> TCachePageRef {
         return pageId == Max<TPageId>()
-                   ? TSharedPageRef()
+                   ? TCachePageRef()
                    : LoaderEnv->TryGetIndexPage(nullptr,
                          PageCollections[slots.IndexSlot(groupId)]->PageCollection()->GetLocation(pageId), groupId);
     };

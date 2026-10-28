@@ -1,6 +1,6 @@
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
 #include <ydb/core/tablet_flat/flat_cxx_database.h>
-#include <ydb/core/tablet_flat/shared_cache_thread.h>
+#include <ydb/core/tablet_flat/cache_thread.h>
 #include <ydb/core/testlib/tablet_helpers.h>
 #include <ydb/core/base/statestorage.h>
 #include <ydb/library/actors/core/hfunc.h>
