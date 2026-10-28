@@ -97,7 +97,12 @@ bool TCacheCapacity<TTraits>::StartTransition() noexcept {
     const ui64 cold = Target_.HandleCount();
     const ui64 keepHot = std::clamp<ui64>(
         static_cast<ui64>(hot * share), minimums[ECacheTier::Keep], hot - minimums[ECacheTier::Regular]);
-    const ui64 keepCold = std::clamp<ui64>(static_cast<ui64>(cold * share), 1, cold - 1);
+    // Cold must also accommodate Hot demotion from the admitted Keep working set
+    const ui64 keepPages = Min(Cache_.Memory_.KeepOwnedPages(),
+        Cache_.Memory_.Hot(ECacheTier::Keep).Pages() + Cache_.Memory_.Cold(ECacheTier::Keep).Pages() +
+            Cache_.Memory_.Tier(ECacheTier::Keep).Pending.Pages());
+    const ui64 maximumKeepCold = std::clamp<ui64>(static_cast<ui64>(cold * Cache_.Policy_.KeepMaxShare), 1, cold - 1);
+    const ui64 keepCold = std::clamp<ui64>(Max(static_cast<ui64>(cold * share), keepPages), 1, maximumKeepCold);
     Target_.Tiers = { TCacheTierCapacity{ hot - keepHot, cold - keepCold }, TCacheTierCapacity{ keepHot, keepCold } };
     if (current.AddressBits == Target_.AddressBits) {
         return current.Tiers != Target_.Tiers && PrepareTransition(Target_, Transition_) == EPrepareResult::Prepared;

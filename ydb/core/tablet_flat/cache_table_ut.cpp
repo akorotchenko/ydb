@@ -160,6 +160,10 @@ public:
         return cache.TryReserve(spaceOp, bytes);
     }
 
+    static TKeepReservation ReserveKeepCandidate(TTestSharedCache& cache, ui64 bytes) noexcept {
+        return cache.Memory_.TryReserveKeep(bytes, cache.KeepLimit());
+    }
+
     static void ReleaseReservation(TTestSharedCache& cache, ui64 bytes) noexcept {
         cache.ReleaseReservation(bytes);
     }
@@ -8939,6 +8943,54 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 }
             }
             UNIT_ASSERT_VALUES_EQUAL(found, 1);
+        }
+    }
+
+    Y_UNIT_TEST(PairedColdTargetCountsReadyAndAdmittedPendingPages) {
+        TFixture fixture(8);
+        constexpr ui32 size = 128;
+        constexpr ui64 bytes = size + NActors::TSharedData::OverheadSize;
+        constexpr ui64 limit = 16 * bytes;
+        UNIT_ASSERT(ConfigureKeep(*fixture.Cache, limit));
+        const auto collection = CreateModeCollection(
+            *fixture.Cache, fixture.Registry, TLogoBlobID(195, 196, 58), ECacheMode::TryKeepInMemory);
+        TVector<TTestCachePageRequest> requests;
+        for (ui32 offset = 0; offset < 4; ++offset) {
+            requests.emplace_back(MakePageLocation(offset, size), MakeIntrusive<TPageFetchWaiter>());
+        }
+        UNIT_ASSERT(fixture.Cache->FindOrInsertBatch(collection, requests));
+        TVector<TKeepReservation> speculative;
+        for (ui32 index = 0; index < 3; ++index) {
+            auto candidate = TCacheTestAccess::ReserveKeepCandidate(*fixture.Cache, bytes);
+            UNIT_ASSERT(candidate);
+            speculative.push_back(std::move(candidate));
+        }
+        const auto first = requests.front().Fetch().CacheItem();
+        UNIT_ASSERT(requests.front().Fetch().MakeReady(MakePageData(first.Index(), size)));
+        UNIT_ASSERT(ConfigureKeep(*fixture.Cache, limit));
+        TCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& op) {
+            const auto& tiers = op.View().Tiers;
+            UNIT_ASSERT_VALUES_EQUAL(tiers[ECacheTier::Keep].ColdStorage.SlotCount, 4);
+            UNIT_ASSERT_VALUES_EQUAL(tiers[ECacheTier::Regular].ColdStorage.SlotCount +
+                                         tiers[ECacheTier::Keep].ColdStorage.SlotCount, fixture.Capacity.HandleCount());
+        });
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepOwnedPages(), 7);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepPendingBytes(), 3 * bytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepLimit(), limit);
+        speculative.clear();
+        for (ui32 index = 1; index < requests.size(); ++index) {
+            const auto page = requests[index].Fetch().CacheItem();
+            UNIT_ASSERT(requests[index].Fetch().MakeReady(MakePageData(page.Index(), size)));
+        }
+        UNIT_ASSERT(ConfigureKeep(*fixture.Cache, limit));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepOwnedPages(), 4);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepPendingBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepLimit(), limit);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->TargetHandleCount(), fixture.Capacity.HandleCount());
+        for (ui32 offset = 0; offset < requests.size(); ++offset) {
+            TTestCachePageRef page;
+            UNIT_ASSERT(fixture.Cache->Find(collection, offset, page) == ECacheResultStatus::Hit);
+            UNIT_ASSERT_VALUES_EQUAL(page.size(), size);
         }
     }
 

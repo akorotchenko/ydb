@@ -102,6 +102,7 @@ bool TCacheEviction<TTraits>::ReconcilePageImpl(TSpaceOperation& spaceOp, TCache
             source.TransferPageTo(destination, EItemKind::Page);
             if (desiredTier == ECacheTier::Keep) {
                 incoming.Commit();
+                Cache_.Capacity_.RequestTierRebalance();
             } else {
                 Cache_.Memory_.ReleaseKeep(bytes);
                 Cache_.NotifyResourcesAvailable();
@@ -222,6 +223,7 @@ bool TCacheEviction<TTraits>::PromoteCold(TSpaceOperation& spaceOp, TCacheItem i
             if (before.Tier() != tier) {
                 if (tier == ECacheTier::Keep) {
                     incoming.Commit();
+                    Cache_.Capacity_.RequestTierRebalance();
                 } else {
                     Cache_.Memory_.ReleaseKeep(bytes);
                     Cache_.NotifyResourcesAvailable();
