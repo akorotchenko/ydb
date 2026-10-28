@@ -437,6 +437,7 @@ void TSharedCache::MakeReadyState(TSpaceOperation& spaceOp, TCacheItem item, EHa
         }
         if (useKeep) {
             keep.Commit();
+            Capacity_.RequestTierRebalance();
         } else {
             keep.Reset();
         }

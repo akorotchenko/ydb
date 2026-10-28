@@ -4232,27 +4232,49 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             config.SetMemoryLimit(1_MB);
             config.SetInMemoryInFlyLimit(1_MB);
             TSharedPageCacheMock sharedCache(config);
+            // Keep byte budget admits three pages
+            sharedCache.SetLimit(8 * PAGE_TOTAL_SIZE);
             auto& cache = TSharedCache::Get();
             sharedCache.Collection1 = MakeIntrusiveConst<TPageCollectionMock>(1ul, 4u);
-            sharedCache.Collection2 =
-                MakeIntrusiveConst<TPageCollectionMock>(2ul, static_cast<ui32>(cache.TargetHandleCount()));
+            const ui32 regularPages = static_cast<ui32>(cache.TargetHandleCount() / 2);
+            sharedCache.Collection2 = MakeIntrusiveConst<TPageCollectionMock>(2ul, regularPages);
             sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular);
             sharedCache.Attach(sharedCache.Sender2, sharedCache.Collection2, ECacheMode::Regular);
             auto retained =
                 cache.AdmitPage(sharedCache.Collection1, _P(adoptedOffset), TSharedData::Copy(TString(10, 'x')));
             UNIT_ASSERT(retained);
-            retained.Drop();
-            for (ui32 page = 0; cache.AvailableHandleCount() != 0; ++page) {
+            for (ui32 page = 0; page < regularPages; ++page) {
                 auto regular = cache.AdmitPage(sharedCache.Collection2, _P(page), TSharedData::Copy(TString(10, 'x')));
                 UNIT_ASSERT(regular);
             }
+            // A Cold hit adopts the existing page before fresh-page admission
+            UNIT_ASSERT(cache.UpdateSoftLimitOverride(PAGE_TOTAL_SIZE));
+            for (ui32 step = 0; step < 16 && cache.RetainedBytes() > PAGE_TOTAL_SIZE; ++step) {
+                cache.EnforceCurrentLimit();
+            }
+            {
+                auto operation = cache.BeginOperation();
+                const auto state = THandleState::FromRaw(
+                    operation.Handles()[retained.CacheItem().Index()].State.load(std::memory_order_acquire));
+                UNIT_ASSERT(state.IsCold());
+            }
+            sharedCache.SetLimit(8 * PAGE_TOTAL_SIZE);
+            retained.Drop();
+            TVector<TCacheCollectionRef> heldCollections;
+            for (ui64 id = 100; cache.AvailableHandleCount() != 0; ++id) {
+                auto held = cache.AdmitCollection(MakeIntrusiveConst<TPageCollectionMock>(id, 1u));
+                UNIT_ASSERT(held);
+                heldCollections.push_back(std::move(held));
+            }
+            UNIT_ASSERT_VALUES_EQUAL(cache.AvailableHandleCount(), 0);
             ui32 keepEvictions = 0;
             TBlockEvents<TEvKeepPageEvicted> observer(sharedCache.Runtime, [&](const auto&) {
                 ++keepEvictions;
                 return false;
             });
             sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-            // The adopted hit consumes one of the three slots available to fresh Keep pages
+            UNIT_ASSERT(cache.KeepLimit() >= 3 * PAGE_TOTAL_SIZE && cache.KeepLimit() < 4 * PAGE_TOTAL_SIZE);
+            // The adopted hit consumes one of the three pages covered by the byte budget
             TVector<TPageLocation> missing;
             for (ui32 page = 0; page < 4 && missing.size() < 2; ++page) {
                 if (page != adoptedOffset) {
