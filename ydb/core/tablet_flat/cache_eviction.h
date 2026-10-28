@@ -51,6 +51,10 @@ public:
         return Cache_.Memory_.KeepOverLimit(KeepLimit());
     }
 
+    bool HasKeepWork() const noexcept {
+        return KeepRequestedBytes_.load(std::memory_order_relaxed) != 0 || Cache_.Memory_.KeepOwnedPages() != 0;
+    }
+
     ui64 EvictableByteBudget() const noexcept {
         const ui64 softLimit = Cache_.Memory_.SoftLimit();
         return softLimit - Min(softLimit, Cache_.Memory_.Sticky().Bytes());
@@ -135,8 +139,8 @@ private:
     bool Reclaim(TSpaceOperation& spaceOp, ui64 bytes = 0) noexcept;
     bool ReclaimToLimits(TSpaceOperation& spaceOp, ui64 softLimit, ui32 step, ui64 bytes = 0) noexcept;
 
-    Y_FORCE_INLINE ui32 MinimumHotSlots() const noexcept {
-        return Cache_.Policy_.MinHotSlots;
+    Y_FORCE_INLINE ui32 MinimumHotSlots(ECacheTier tier) const noexcept {
+        return Cache_.Policy_.HotMinimums(HasKeepWork())[tier];
     }
 
     ui32 ShrinkHotTarget(ui32 effectiveHotSlots, ui32 step, ui32 minimum) const noexcept;

@@ -286,10 +286,11 @@ bool TCacheEviction<TTraits>::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64
             const bool high = headroom > FractionCeil(EvictableByteBudget(), Cache_.Policy_.Grow) &&
                               freeHandles > (usable * 3 + 9) / 10;
             const bool pressure = ExceedsLimit(physical, limit, bytes) || forceShrinkHot || softPressure;
+            const auto minimums = Cache_.Policy_.HotMinimums(HasKeepWork());
             for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
                 const ui32 slots = static_cast<ui32>(current.View().Tiers[tier].EffectiveHotSlotCount());
-                const ui32 minimum = static_cast<ui32>(
-                    Min<ui64>(Cache_.Policy_.MinHotSlots, current.View().Tiers[tier].HotStorage.SlotCount));
+                const ui32 minimum =
+                    static_cast<ui32>(Min<ui64>(minimums[tier], current.View().Tiers[tier].HotStorage.SlotCount));
                 const ui32 step = HotResizeStep(slots);
                 ui32 target = 0;
                 if (slots < minimum) {
