@@ -547,6 +547,40 @@ struct TSharedPageCacheMock {
 };
 
 Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
+    Y_UNIT_TEST(CollectionReadyHintUsesPublishedKeyAndIdentity) {
+        TSharedPageCacheMock sharedCache;
+        auto& cache = TSharedCache::Get();
+        auto source = MakeIntrusiveConst<TPageCollectionMock>(ui64{ 19801 }, ui32{ 0 });
+        const TLogoBlobID id = source->Label();
+        ui32 notifications = 0;
+        bool ready = false;
+        TCollectionCacheItem notified;
+        NActors::TTestActorRuntimeBase::TEventFilter previousFilter;
+        previousFilter = sharedCache.Runtime.SetEventFilter(
+            [&](NActors::TTestActorRuntimeBase& runtime, TAutoPtr<IEventHandle>& event) {
+                if (event->GetRecipientRewrite() == sharedCache.ActorId &&
+                    event->GetTypeRewrite() == TEvCollectionReady::EventType) {
+                    ++notifications;
+                    const auto* msg = event->Get<TEvCollectionReady>();
+                    notified = msg->CacheItem;
+                    TCacheCollectionRef published;
+                    ready = msg->CollectionId == id &&
+                            cache.FindCollection(id, published) == ECacheCollectionLookupStatus::Hit &&
+                            published.CacheItem() == notified && published->PageCollection().Get() == source.Get();
+                    return true;
+                }
+                return previousFilter(runtime, event);
+            });
+        Y_DEFER {
+            sharedCache.Runtime.SetEventFilter(std::move(previousFilter));
+        };
+        auto collection = cache.AdmitCollection(source);
+        UNIT_ASSERT(ready && collection.CacheItem() == notified);
+        auto joined = cache.AdmitCollection(source);
+        UNIT_ASSERT(joined.Get() == collection.Get());
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+    }
+
     void CheckInitialCollectionMode(ECacheMode ownerMode, bool actorCreates) {
         TSharedPageCacheMock sharedCache;
         auto& cache = TSharedCache::Get();

@@ -9,6 +9,13 @@ enum class ECacheResultStatus {
     Hit,
 };
 
+enum class ECacheCollectionLookupStatus {
+    Miss,
+    Pending, // A synchronous native publisher owns the unfinished collection
+    Retry, // Lookup or registry interference; retry without parking
+    Hit,
+};
+
 struct TProdTraits;
 template <class TTraits>
 class TSharedCacheImpl;

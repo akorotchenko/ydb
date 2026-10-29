@@ -60,6 +60,13 @@ void TProdTraits::NotifyCollectionReleased(
     }
 }
 
+void TProdTraits::NotifyCollectionReady(
+    const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem) const noexcept {
+    if (KeepEvictionActorSystem && KeepEvictionActor) {
+        KeepEvictionActorSystem->Send(KeepEvictionActor, new TEvCollectionReady(collectionId, cacheItem), 0, 0);
+    }
+}
+
 void TProdTraits::NotifyCollectionBytesChanged(
     const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem) const noexcept {
     if (KeepEvictionActorSystem && KeepEvictionActor) {
@@ -338,6 +345,7 @@ bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* regi
     Y_DEBUG_ABORT_UNLESS(LoadSharedCacheKey(handle, EItemKind::Collection) == TCacheKey::Collection(value->Id()));
     Y_DEBUG_ABORT_UNLESS(handle.Metadata.PayloadBytes == value->AccountedBytes());
 
+    const TLogoBlobID id = value->Id();
     const ui64 bytes = handle.Metadata.PayloadBytes;
     Memory_.AddCollection(bytes);
     handle.Body.Collection = value.Get();
@@ -351,6 +359,7 @@ bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* regi
     }
     cacheOp.MakeReadyState(cacheItem);
     Y_UNUSED(value.Release());
+    TTraits::NotifyCollectionReady(id, TCollectionCacheItem::FromValidated(cacheItem));
     NotifyResourcesAvailable();
     return true;
 }
@@ -571,6 +580,45 @@ ECacheResultStatus TSharedCache::Find(const TLogoBlobID& id, TCacheCollectionRef
         collection = cacheOp.BuildCollectionRef(ref.Take());
     }
     return status;
+}
+
+SHARED_CACHE_TEMPLATE
+ECacheCollectionLookupStatus TSharedCache::FindCollection(
+    TCollectionRegistry& registry, const TLogoBlobID& id, TCacheCollectionRef& collection) noexcept {
+    collection.Drop();
+    auto cacheOp = BeginOperation();
+    TCacheItem item;
+    if (cacheOp.Find(TCacheKey::Collection(id), item) == ECacheResultStatus::Miss) {
+        return ECacheCollectionLookupStatus::Miss;
+    }
+    InvokeHook(ECacheHookPoint::BeforeCollectionRefAcquired, item);
+    TOperationItemRef ref(cacheOp);
+    switch (cacheOp.TryAcquire(item, false, ref.Get())) {
+        case EAcquireStatus::Stale:
+            return ECacheCollectionLookupStatus::Retry;
+        case EAcquireStatus::Pending:
+            return ECacheCollectionLookupStatus::Pending;
+        case EAcquireStatus::Ready:
+            if (!cacheOp.AttachCollection(registry, ref.Get())) {
+                return ECacheCollectionLookupStatus::Retry;
+            }
+            collection = cacheOp.BuildCollectionRef(ref.Take());
+            return ECacheCollectionLookupStatus::Hit;
+    }
+    Y_UNREACHABLE();
+}
+
+SHARED_CACHE_TEMPLATE
+bool TSharedCache::AttachCollection(
+    TSpaceOperation& spaceOp, TCollectionRegistry& registry, const TCacheItemRef& ref) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
+    const TCacheItem item = ref.CacheItem();
+    THandle& handle = spaceOp.Handles()[item.Index()];
+    TCollectionRegistry* owner = handle.Body.Collection->Registry_.load(std::memory_order_acquire);
+    if (owner && owner != &registry && !cacheOp.Collections().MoveRegistry(*owner, registry, item)) {
+        return false;
+    }
+    return cacheOp.Collections().Attach(registry, item);
 }
 
 SHARED_CACHE_TEMPLATE
@@ -951,16 +999,8 @@ ECacheResultStatus TSharedCache::FindOrInsertCollection(TSpaceOperation& spaceOp
     if (status == ECacheResultStatus::Inserted) {
         inserted = TCollectionCacheItem::FromValidated(ref.CacheItem());
     } else if (status == ECacheResultStatus::Hit) {
-        if (registry) {
-            THandle& handle = spaceOp.Handles()[ref.CacheItem().Index()];
-            TCollectionRegistry* owner = handle.Body.Collection->Registry_.load(std::memory_order_acquire);
-            if (owner && owner != registry && !cacheOp.Collections().MoveRegistry(*owner, *registry, ref.CacheItem()))
-            {
-                return ECacheResultStatus::Pending;
-            }
-            if (!cacheOp.Collections().Attach(*registry, ref.CacheItem())) {
-                return ECacheResultStatus::Pending;
-            }
+        if (registry && !cacheOp.AttachCollection(*registry, ref.Get())) {
+            return ECacheResultStatus::Pending;
         }
         hit = cacheOp.BuildCollectionRef(ref.Take());
     }

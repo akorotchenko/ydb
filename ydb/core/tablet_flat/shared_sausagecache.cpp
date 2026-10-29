@@ -2022,6 +2022,8 @@ public:
 
             HFunc(NMemory::TEvConsumerRegistered, Handle);
             HFunc(NMemory::TEvConsumerLimit, Handle);
+            case NSharedCache::TEvCollectionReady::EventType:
+                return; // Collection-load waiters are wired in the next unit
         }
 
         // Advance is a no-op without new work; FinishReady only checks runs whose state changed.

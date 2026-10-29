@@ -198,6 +198,12 @@ public:
 
     ECacheResultStatus Find(const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept;
 
+    // Finds and attaches a Ready collection without inserting on a miss
+    Y_FORCE_INLINE ECacheCollectionLookupStatus FindCollection(
+        const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept {
+        return FindCollection(Collections_.Registry(), id, collection);
+    }
+
     // The callback may detach the current collection. Registry mutations remain serialized by its owner.
     Y_FORCE_INLINE void ForEachCollection(TFunctionRef<void(TCollection&)> callback) noexcept {
         auto cacheOp = BeginOperation();
@@ -569,6 +575,11 @@ private:
 
     ECacheResultStatus Find(TOperationView& cacheOp, const TCacheKey& key, TCacheItemRefImpl<TTraits>& ref) noexcept;
 
+    ECacheCollectionLookupStatus FindCollection(
+        TCollectionRegistry& registry, const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept;
+    bool AttachCollection(
+        TSpaceOperation& spaceOp, TCollectionRegistry& registry, const TCacheItemRefImpl<TTraits>& ref) noexcept;
+
     Y_FORCE_INLINE ECacheResultStatus FindOrInsert(
         TSpaceOperation& spaceOp, TCacheItem candidate, TCacheItemRefImpl<TTraits>& ref) noexcept {
         auto cacheOp = BindOperation(spaceOp);
@@ -921,6 +932,11 @@ public: // Cache helpers
         const TCollectionLocation& collection, TCollectionCacheItem& inserted,
         TCacheCollectionRefImpl<TTraits>& hit) noexcept {
         return Cache_.FindOrInsertCollection(SpaceOp_, registry, collection, inserted, hit);
+    }
+
+    Y_FORCE_INLINE bool AttachCollection(
+        TCollectionRegistry& registry, const TCacheItemRefImpl<TTraits>& ref) noexcept {
+        return Cache_.AttachCollection(SpaceOp_, registry, ref);
     }
 
     template <class TKeyedCandidate>

@@ -65,6 +65,8 @@ enum class ECacheHookPoint {
     AfterCollectionOwnerReferenceDropped, // Payload is the collection after its owner count is decremented.
     BeforeCollectionAttachClaim, // Payload is the collection before its transition claim CAS.
     BeforeCollectionAttachPublished, // Payload is the collection before its attached-state CAS.
+    BeforeCollectionRefAcquired, // Collection found in the table, before acquiring its native reference
+    CollectionReady, // Collection published and its constructor holder released
 };
 
 struct TProdTraits {
@@ -76,6 +78,7 @@ struct TProdTraits {
 
     void NotifyResourcesAvailable() const noexcept;
     void NotifyCollectionReleased(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem) const noexcept;
+    void NotifyCollectionReady(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem) const noexcept;
     void NotifyCollectionBytesChanged(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem) const noexcept;
 
     void NotifyKeepPageEviction(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem, ui64 generation,
@@ -99,6 +102,10 @@ struct TTestTraits {
     }
 
     void NotifyCollectionReleased(const TLogoBlobID&, TCollectionCacheItem) const noexcept {}
+
+    void NotifyCollectionReady(const TLogoBlobID&, TCollectionCacheItem cacheItem) const noexcept {
+        Invoke(ECacheHookPoint::CollectionReady, cacheItem.CacheItem());
+    }
 
     void NotifyCollectionBytesChanged(const TLogoBlobID&, TCollectionCacheItem) const noexcept {}
 
