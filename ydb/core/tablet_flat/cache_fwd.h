@@ -11,8 +11,7 @@ enum class ECacheResultStatus {
 
 enum class ECacheCollectionLookupStatus {
     Miss,
-    Pending, // A synchronous native publisher owns the unfinished collection
-    Retry, // Lookup or registry interference; retry without parking
+    Pending, // A native publisher or attach/detach transition will notify on completion
     Hit,
 };
 
