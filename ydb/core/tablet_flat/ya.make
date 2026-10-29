@@ -90,6 +90,7 @@ SRCS(
     flat_update_op.h
     probes.cpp
     shared_cache_counters.cpp
+    shared_cache_collection_load.cpp
     shared_cache_btree_walk.cpp
     shared_cache_btree_walk.h
     shared_sausagecache_state.h
