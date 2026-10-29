@@ -90,6 +90,28 @@ void TCollectionLoadController::Update(const TCollectionRequest& request) {
     }
 }
 
+void TCollectionLoadController::CancelRequests(const TActorId& owner, const TLogoBlobID& collectionId) {
+    const auto cancel = [&](auto& loads) {
+        for (auto& [_, load] : loads) {
+            if (collectionId && load.Descriptor.Lead != collectionId) {
+                continue;
+            }
+            bool matched = false;
+            for (auto& waiter : load.Waiters) {
+                if (waiter.Sender == owner) {
+                    Reply(waiter, NKikimrProto::RACE, {}, "Collection metadata request cancelled by owner");
+                    matched = true;
+                }
+            }
+            if (matched) {
+                Queue(load);
+            }
+        }
+    };
+    cancel(Loads_);
+    cancel(Retained_);
+}
+
 void TCollectionLoadController::Ready(const TLogoBlobID& id) {
     Queue(id);
 }
