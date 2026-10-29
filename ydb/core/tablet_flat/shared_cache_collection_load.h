@@ -3,12 +3,86 @@
 #include "flat_sausage_solid.h"
 #include "shared_cache_events.h"
 
+#include <atomic>
+
 namespace NKikimr::NSharedCache {
 
 enum class ECollectionLoadKind {
     Unknown,
     Regular,
     Outer,
+};
+
+// Cancellation and role resolution may precede delivery of the request event
+class TCollectionRequest : public TThrRefBase {
+public:
+    explicit TCollectionRequest(const NPageCollection::TLargeGlobId& descriptor,
+        ECollectionLoadKind kind = ECollectionLoadKind::Unknown) noexcept
+        : Descriptor(descriptor)
+        , Kind_(kind)
+    {}
+
+    ECollectionLoadKind Kind() const noexcept {
+        return Kind_.load(std::memory_order_acquire);
+    }
+
+    // Send TEvCollectionRequestUpdate after Resolve or Cancel to wake a joined load
+    bool Resolve(ECollectionLoadKind kind) noexcept;
+
+    void Cancel() noexcept {
+        Cancelled_.store(true, std::memory_order_release);
+    }
+
+    bool IsActive() const noexcept {
+        return !Cancelled_.load(std::memory_order_acquire) && !Completed_.load(std::memory_order_acquire);
+    }
+
+    const NPageCollection::TLargeGlobId Descriptor;
+
+private:
+    friend class TCollectionLoadController;
+
+    bool TryComplete() noexcept;
+
+    std::atomic<ECollectionLoadKind> Kind_;
+    std::atomic<bool> Cancelled_ = false;
+    std::atomic<bool> Completed_ = false;
+    bool Joined_ = false; // Cache actor only
+};
+
+struct TEvCollectionRequest : public TEventLocal<TEvCollectionRequest, EvCollectionRequest> {
+    TIntrusivePtr<TCollectionRequest> Request;
+    const EPriority Priority;
+
+    explicit TEvCollectionRequest(
+        TIntrusivePtr<TCollectionRequest> request, EPriority priority = EPriority::Fast) noexcept
+        : Request(std::move(request))
+        , Priority(priority)
+    {}
+};
+
+// A hint to re-read the request's durable cancellation/role state
+struct TEvCollectionRequestUpdate : public TEventLocal<TEvCollectionRequestUpdate, EvCollectionRequestUpdate> {
+    TIntrusivePtr<TCollectionRequest> Request;
+
+    explicit TEvCollectionRequestUpdate(TIntrusivePtr<TCollectionRequest> request) noexcept
+        : Request(std::move(request))
+    {}
+};
+
+struct TEvCollectionResult : public TEventLocal<TEvCollectionResult, EvCollectionResult> {
+    TIntrusivePtr<TCollectionRequest> Request;
+    const NKikimrProto::EReplyStatus Status;
+    TCacheCollectionRef Collection;
+    const TString Error;
+
+    TEvCollectionResult(TIntrusivePtr<TCollectionRequest> request, NKikimrProto::EReplyStatus status,
+        TCacheCollectionRef collection = {}, TString error = {}) noexcept
+        : Request(std::move(request))
+        , Status(status)
+        , Collection(std::move(collection))
+        , Error(std::move(error))
+    {}
 };
 
 struct TEvCollectionRawReady : public TEventLocal<TEvCollectionRawReady, EvCollectionRawReady> {
@@ -22,41 +96,28 @@ struct TEvCollectionRawReady : public TEventLocal<TEvCollectionRawReady, EvColle
 };
 
 // The owner grants parsing only after the representation and parser slot are available
-struct TEvParseCollection : public TEventLocal<TEvParseCollection, EvParseCollection> {
+struct TEvCollectionParse : public TEventLocal<TEvCollectionParse, EvCollectionParse> {
     const ECollectionLoadKind Kind;
 
-    explicit TEvParseCollection(ECollectionLoadKind kind) noexcept
+    explicit TEvCollectionParse(ECollectionLoadKind kind) noexcept
         : Kind(kind)
     {}
 };
 
-struct TEvCollectionLoaded : public TEventLocal<TEvCollectionLoaded, EvCollectionLoaded> {
-    const ui64 LoadId;
+struct TEvCollectionData : public TEventLocal<TEvCollectionData, EvCollectionData> {
+    using EStatus = NKikimrProto::EReplyStatus;
+
+    const EStatus Status;
     TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
-
-    TEvCollectionLoaded(ui64 loadId, TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection) noexcept
-        : LoadId(loadId)
-        , PageCollection(std::move(pageCollection))
-    {}
-};
-
-struct TEvCollectionLoadFailed : public TEventLocal<TEvCollectionLoadFailed, EvCollectionLoadFailed> {
     const ui64 LoadId;
-    const NKikimrProto::EReplyStatus Status;
     const TString Error;
 
-    TEvCollectionLoadFailed(ui64 loadId, NKikimrProto::EReplyStatus status, TString error) noexcept
-        : LoadId(loadId)
-        , Status(status)
+    TEvCollectionData(EStatus status, TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, ui64 loadId,
+        TString error = {}) noexcept
+        : Status(status)
+        , PageCollection(std::move(pageCollection))
+        , LoadId(loadId)
         , Error(std::move(error))
-    {}
-};
-
-struct TEvCollectionLoadStopped : public TEventLocal<TEvCollectionLoadStopped, EvCollectionLoadStopped> {
-    const ui64 LoadId;
-
-    explicit TEvCollectionLoadStopped(ui64 loadId) noexcept
-        : LoadId(loadId)
     {}
 };
 

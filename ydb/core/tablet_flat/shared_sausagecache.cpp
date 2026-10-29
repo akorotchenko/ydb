@@ -2,6 +2,7 @@
 #include "flat_bio_events.h"
 #include "cache.h"
 #include "shared_cache_btree_walk.h"
+#include "shared_cache_collections.h"
 #include "shared_cache_events.h"
 #include "shared_sausagecache_state.h"
 #include "shared_cache_counters.h"
@@ -129,6 +130,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     TSharedCacheConfig Config;
     TCacheCounters Counters;
     TIntrusivePtr<TSharedCache> Cache;
+    THolder<TCollectionLoadController> CollectionLoads;
     TCacheBTreeWalkController Walks{ *this };
     TPendingInMemoryPages PendingInMemoryPages;
     THashMap<ui64, TLogoBlobID> WalkRequests;
@@ -336,6 +338,40 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         return bool(Cache);
     }
 
+    TCollectionLoadController& EnsureCollectionLoads() {
+        if (!CollectionLoads) {
+            Y_ENSURE(InitializeCache(), "Cannot initialize shared cache");
+            CollectionLoads = MakeHolder<TCollectionLoadController>(*Cache, SelfId());
+        }
+        return *CollectionLoads;
+    }
+
+    void Handle(TEvCollectionRequest::TPtr& ev, const TActorContext&) {
+        EnsureCollectionLoads().Request(ev->Sender, ev->Cookie, *ev->Get());
+        RetryResourceWaits();
+    }
+
+    void Handle(TEvCollectionRequestUpdate::TPtr& ev, const TActorContext&) {
+        if (CollectionLoads) {
+            CollectionLoads->Update(*ev->Get()->Request);
+            RetryResourceWaits();
+        }
+    }
+
+    void Handle(TEvCollectionRawReady::TPtr& ev, const TActorContext&) {
+        if (CollectionLoads) {
+            CollectionLoads->RawReady(ev->Sender, *ev->Get());
+            RetryResourceWaits();
+        }
+    }
+
+    void Handle(TEvCollectionData::TPtr& ev, const TActorContext&) {
+        if (CollectionLoads) {
+            CollectionLoads->Data(ev->Sender, *ev->Get());
+            RetryResourceWaits();
+        }
+    }
+
     TCollection* TryEnsureCollection(
         TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, const TActorId& owner) {
         const TLogoBlobID& pageCollectionId = pageCollection->Label();
@@ -506,6 +542,10 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     void TakePoison(const TActorContext& ctx) {
         LOG_NOTICE_S(ctx, NKikimrServices::TABLET_SAUSAGECACHE, "Poison shared cache");
+        if (CollectionLoads) {
+            CollectionLoads->Stop();
+            CollectionLoads.Reset();
+        }
         for (auto& [_, request] : Requests) {
             request.Completion->Cancel();
         }
@@ -1102,13 +1142,13 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     }
 
     void RetryResourceWaits() {
-        if (!Cache || ResourceWaits.empty()) {
-            if (Cache) {
-                Cache->DisarmResourceWait();
-            }
+        if (!Cache) {
             return;
         }
         const ui64 generation = Cache->AdmissionGeneration();
+        if (CollectionLoads) {
+            CollectionLoads->Pump();
+        }
         const size_t count = ResourceWaits.size();
         // Demand promotion during admission can remove another waiting entry
         for (size_t index = 0; index < count && !ResourceWaits.empty(); ++index) {
@@ -1179,7 +1219,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 }
             }
         }
-        if (ResourceWaits.empty()) {
+        if (ResourceWaits.empty() && (!CollectionLoads || !CollectionLoads->HasResourceWaits())) {
             Cache->DisarmResourceWait();
         } else {
             // Arm after observing the generation before reservation attempts; a concurrent release wakes us.
@@ -2002,6 +2042,10 @@ public:
         }
         switch (ev->GetTypeRewrite()) {
             HFunc(NSharedCache::TEvCacheReadyRequest, Handle);
+            HFunc(NSharedCache::TEvCollectionRequest, Handle);
+            HFunc(NSharedCache::TEvCollectionRequestUpdate, Handle);
+            HFunc(NSharedCache::TEvCollectionRawReady, Handle);
+            HFunc(NSharedCache::TEvCollectionData, Handle);
             HFunc(NSharedCache::TEvAttach, Handle);
             HFunc(NSharedCache::TEvSaveCompactedPages, Handle);
             HFunc(NSharedCache::TEvRequest, Handle);
@@ -2023,7 +2067,12 @@ public:
             HFunc(NMemory::TEvConsumerRegistered, Handle);
             HFunc(NMemory::TEvConsumerLimit, Handle);
             case NSharedCache::TEvCollectionReady::EventType:
-                return; // Collection-load waiters are wired in the next unit
+                if (!CollectionLoads) {
+                    return;
+                }
+                CollectionLoads->Ready(ev->Get<TEvCollectionReady>()->CollectionId);
+                RetryResourceWaits();
+                break;
         }
 
         // Advance is a no-op without new work; FinishReady only checks runs whose state changed.
