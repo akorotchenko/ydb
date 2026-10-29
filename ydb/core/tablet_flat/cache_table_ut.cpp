@@ -6423,6 +6423,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TTestCacheCollectionRef found;
         UNIT_ASSERT(fixture.Cache->FindOrInsert({ .Id = id }, original, found) == ECacheResultStatus::Inserted);
         UNIT_ASSERT(fixture.Cache->MakeReady(original, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->DetachCollection(original));
 
         struct TObservation {
             TTestSharedCache* Cache;
