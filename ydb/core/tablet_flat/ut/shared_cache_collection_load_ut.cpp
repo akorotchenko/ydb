@@ -1,6 +1,7 @@
 #include <ydb/core/tablet_flat/shared_cache_collection_load.h>
 #include <ydb/core/tablet_flat/flat_sausage_packet.h>
 #include <ydb/core/tablet_flat/flat_sausage_record.h>
+#include <ydb/core/base/blobstorage.h>
 #include <ydb/core/testlib/basics/appdata.h>
 #include <ydb/core/testlib/basics/runtime.h>
 #include <ydb/core/testlib/actors/test_runtime.h>
