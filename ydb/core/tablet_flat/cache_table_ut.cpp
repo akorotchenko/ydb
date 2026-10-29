@@ -6381,7 +6381,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TCacheTestAccess::DetachCollection(*fixture.Cache, destination, item));
     }
 
-    Y_UNIT_TEST(FindCollectionRetriesDuringAttachment) {
+    void CheckFindCollectionTransitionWait(bool attaching, bool armBeforeCompletion) {
         TFixture fixture;
         const TLogoBlobID id(207, 208, 5);
         TCollectionCacheItem item;
@@ -6389,34 +6389,76 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->FindOrInsert({ .Id = id }, item, held) == ECacheResultStatus::Inserted);
         UNIT_ASSERT(fixture.Cache->MakeReady(item, MakeCollection(id)));
         UNIT_ASSERT(fixture.Cache->Find(id, held) == ECacheResultStatus::Hit);
-        UNIT_ASSERT(fixture.Cache->DetachCollection(item));
+        if (attaching) {
+            UNIT_ASSERT(fixture.Cache->DetachCollection(item));
+        } else {
+            const auto page = AllocatePage(*fixture.Cache, TCacheKey::Page(item, 1), 4096,
+                NTable::NPage::EPage::DataPage, 0, EStickyState::Sticky);
+            UNIT_ASSERT(page && fixture.Cache->MakeReady(page, MakePageData(page.Index())));
+        }
         TSharedCacheGate gate;
-        gate.Slots[0].Arm(ECacheHookPoint::BeforeCollectionAttachPublished, item.CacheItem());
-        TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
-        ECacheCollectionLookupStatus status = ECacheCollectionLookupStatus::Miss;
+        gate.Slots[0].Arm(attaching ? ECacheHookPoint::BeforeCollectionAttachPublished
+                                    : ECacheHookPoint::AfterStickyPageListDetached, item.CacheItem());
+
+        struct TObservation {
+            TSharedCacheGate& Gate;
+            std::atomic<ui32> Notifications = 0;
+        } observation{ gate };
+
+        TTestTraits hooks{ &observation, [](void* context, ECacheHookPoint point, TCacheItem cacheItem) noexcept {
+                              auto& observation = *static_cast<TObservation*>(context);
+                              observation.Gate.Hooks.Invoke(point, cacheItem);
+                              if (point == ECacheHookPoint::ResourcesAvailable) {
+                                  observation.Notifications.fetch_add(1, std::memory_order_relaxed);
+                              }
+                          } };
+        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+        bool completed = false;
         TTestCacheCollectionRef attached;
-        TGateThread attacher(gate, [&] {
+        TGateThread worker(gate, [&] {
             Y_ABORT_UNLESS(!TlsCacheHazard);
             TlsCacheHazard = &TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
             Y_DEFER {
                 TlsCacheHazard = nullptr;
             };
-            status = fixture.Cache->FindCollection(id, attached);
+            completed = attaching ? fixture.Cache->FindCollection(id, attached) == ECacheCollectionLookupStatus::Hit
+                                  : fixture.Cache->DetachCollection(item);
         });
         gate.Slots[0].Wait();
         const ui64 generation = fixture.Cache->AdmissionGeneration();
         TTestCacheCollectionRef found;
-        UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Retry);
+        UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Pending);
         UNIT_ASSERT(!found);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        if (armBeforeCompletion) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), 0);
         gate.Slots[0].Release();
-        attacher.Join();
-        UNIT_ASSERT(status == ECacheCollectionLookupStatus::Hit);
+        worker.Join();
+        UNIT_ASSERT(completed);
+        UNIT_ASSERT(fixture.Cache->AdmissionGeneration() > generation);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), armBeforeCompletion ? 1 : 0);
+        if (!armBeforeCompletion) {
+            fixture.Cache->ArmResourceWait(generation);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), 1);
+        fixture.Cache->DisarmResourceWait();
         UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Hit);
         UNIT_ASSERT(found.Get() == held.Get());
     }
 
-    Y_UNIT_TEST(FindCollectionRetriesAfterIdentityChanges) {
+    Y_UNIT_TEST(FindCollectionWaitsDuringAttachment) {
+        CheckFindCollectionTransitionWait(true, true);
+        CheckFindCollectionTransitionWait(true, false);
+    }
+
+    Y_UNIT_TEST(FindCollectionWaitsDuringDetachment) {
+        CheckFindCollectionTransitionWait(false, true);
+        CheckFindCollectionTransitionWait(false, false);
+    }
+
+    Y_UNIT_TEST(FindCollectionFollowsConcurrentReplacement) {
         TFixture fixture;
         const TLogoBlobID id(207, 208, 6);
         TCollectionCacheItem original;
@@ -6447,10 +6489,36 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 }
             } };
         TSharedCacheHookGuard guard(*fixture.Cache, hooks);
-        UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Retry);
-        UNIT_ASSERT(!found && observation.Replaced && observation.Replacement != original);
         UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Hit);
+        UNIT_ASSERT(observation.Replaced && observation.Replacement != original);
         UNIT_ASSERT(found.CacheItem() == observation.Replacement);
+    }
+
+    Y_UNIT_TEST(FindCollectionReturnsMissAfterConcurrentErase) {
+        TFixture fixture;
+        const TLogoBlobID id(207, 208, 8);
+        TCollectionCacheItem item;
+        TTestCacheCollectionRef found;
+        UNIT_ASSERT(fixture.Cache->FindOrInsert({ .Id = id }, item, found) == ECacheResultStatus::Inserted);
+        UNIT_ASSERT(fixture.Cache->MakeReady(item, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->DetachCollection(item));
+
+        struct TObservation {
+            TTestSharedCache* Cache;
+            TCollectionCacheItem Item;
+            bool Erased = false;
+        } observation{ fixture.Cache.Get(), item };
+
+        TTestTraits hooks{ &observation, [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
+                              auto& observation = *static_cast<TObservation*>(context);
+                              if (point == ECacheHookPoint::BeforeCollectionRefAcquired && !observation.Erased) {
+                                  observation.Erased = true;
+                                  Y_ABORT_UNLESS(observation.Cache->EraseCollection(observation.Item));
+                              }
+                          } };
+        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+        UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Miss);
+        UNIT_ASSERT(observation.Erased && !found);
     }
 
     Y_UNIT_TEST(CollectionReadyHintFollowsOwnershipTransfer) {

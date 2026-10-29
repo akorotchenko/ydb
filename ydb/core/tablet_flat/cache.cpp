@@ -587,25 +587,33 @@ ECacheCollectionLookupStatus TSharedCache::FindCollection(
     TCollectionRegistry& registry, const TLogoBlobID& id, TCacheCollectionRef& collection) noexcept {
     collection.Drop();
     auto cacheOp = BeginOperation();
-    TCacheItem item;
-    if (cacheOp.Find(TCacheKey::Collection(id), item) == ECacheResultStatus::Miss) {
-        return ECacheCollectionLookupStatus::Miss;
+    for (;;) {
+        TCacheItem item;
+        if (cacheOp.Find(TCacheKey::Collection(id), item) == ECacheResultStatus::Miss) {
+            return ECacheCollectionLookupStatus::Miss;
+        }
+        InvokeHook(ECacheHookPoint::BeforeCollectionRefAcquired, item);
+        TOperationItemRef ref(cacheOp);
+        switch (cacheOp.TryAcquire(item, false, ref.Get())) {
+            case EAcquireStatus::Stale:
+                continue;
+            case EAcquireStatus::Pending:
+                return ECacheCollectionLookupStatus::Pending;
+            case EAcquireStatus::Ready:
+                if (!cacheOp.AttachCollection(registry, ref.Get())) {
+                    const auto state = THandleState::FromRaw(
+                        cacheOp.SpaceOperation().Handles()[item.Index()].State.load(std::memory_order_acquire));
+                    if (item.Matches(state) && state.IsCollectionKind() && state.IsReady() &&
+                        state.IsTransitionField()) {
+                        return ECacheCollectionLookupStatus::Pending;
+                    }
+                    continue;
+                }
+                collection = cacheOp.BuildCollectionRef(ref.Take());
+                return ECacheCollectionLookupStatus::Hit;
+        }
+        Y_UNREACHABLE();
     }
-    InvokeHook(ECacheHookPoint::BeforeCollectionRefAcquired, item);
-    TOperationItemRef ref(cacheOp);
-    switch (cacheOp.TryAcquire(item, false, ref.Get())) {
-        case EAcquireStatus::Stale:
-            return ECacheCollectionLookupStatus::Retry;
-        case EAcquireStatus::Pending:
-            return ECacheCollectionLookupStatus::Pending;
-        case EAcquireStatus::Ready:
-            if (!cacheOp.AttachCollection(registry, ref.Get())) {
-                return ECacheCollectionLookupStatus::Retry;
-            }
-            collection = cacheOp.BuildCollectionRef(ref.Take());
-            return ECacheCollectionLookupStatus::Hit;
-    }
-    Y_UNREACHABLE();
 }
 
 SHARED_CACHE_TEMPLATE
