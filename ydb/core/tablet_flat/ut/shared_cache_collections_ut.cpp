@@ -72,19 +72,20 @@ namespace {
             return { descriptor, std::move(raw) };
         }
 
-        void Send(IEventBase* event, ui64 cookie = 0) {
-            Runtime.Send(new IEventHandle(CacheActor, Client, event, 0, cookie), 0, true);
+        void Send(IEventBase* event, ui64 cookie = 0, TActorId sender = {}) {
+            Runtime.Send(new IEventHandle(CacheActor, sender ? sender : Client, event, 0, cookie), 0, true);
         }
 
         TIntrusivePtr<TCollectionRequest> Load(
-            const TMetadata& metadata, ECollectionLoadKind kind = ECollectionLoadKind::Regular, ui64 cookie = 1) {
+            const TMetadata& metadata, ECollectionLoadKind kind = ECollectionLoadKind::Regular, ui64 cookie = 1,
+            TActorId sender = {}) {
             auto request = MakeIntrusive<TCollectionRequest>(metadata.Descriptor, kind);
-            Send(new TEvCollectionRequest(request), cookie);
+            Send(new TEvCollectionRequest(request), cookie, sender);
             return request;
         }
 
-        void Update(const TIntrusivePtr<TCollectionRequest>& request) {
-            Send(new TEvCollectionRequestUpdate(request));
+        void Update(const TIntrusivePtr<TCollectionRequest>& request, TActorId sender = {}) {
+            Send(new TEvCollectionRequestUpdate(request), 0, sender);
         }
 
         TEvBlobStorage::TEvGet::TPtr Read(const TMetadata& metadata) {
@@ -120,8 +121,10 @@ namespace {
             Runtime.Send(new IEventHandle(request->Sender, Proxy, response.Release()), 0, true);
         }
 
-        TEvCollectionResult::TPtr Result(NKikimrProto::EReplyStatus status = NKikimrProto::OK) {
-            auto result = Runtime.GrabEdgeEvent<TEvCollectionResult>(Client, TDuration::Seconds(5));
+        TEvCollectionResult::TPtr Result(
+            NKikimrProto::EReplyStatus status = NKikimrProto::OK, TActorId recipient = {}) {
+            auto result =
+                Runtime.GrabEdgeEvent<TEvCollectionResult>(recipient ? recipient : Client, TDuration::Seconds(5));
             UNIT_ASSERT(result->Sender == CacheActor);
             UNIT_ASSERT(result->Get()->Status == status);
             UNIT_ASSERT(bool(result->Get()->Collection) == (status == NKikimrProto::OK));
@@ -568,6 +571,141 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         fixture.Runtime.WaitFor("byte credit after acknowledgment", [&] {
             return fixture.ReadWorkers.size() == 3;
         }, TDuration::Seconds(5));
+    }
+
+    Y_UNIT_TEST(UnregisterCancelsRequestsBeforeCollectionRegistration) {
+        TCollectionFixture fixture;
+        const auto a = fixture.Metadata(1);
+        const auto b = fixture.Metadata(2);
+        auto first = fixture.Load(a);
+        auto second = fixture.Load(b, ECollectionLoadKind::Unknown, 2);
+        auto oldRead = fixture.Read(a);
+        fixture.Read(b);
+        TBlockEvents<TEvCollectionData> stopped(fixture.Runtime, [](const auto& ev) {
+            return ev->Get()->Status == NKikimrProto::RACE;
+        });
+        fixture.Send(new TEvUnregister);
+        auto cancelledA = fixture.Result(NKikimrProto::RACE);
+        auto cancelledB = fixture.Result(NKikimrProto::RACE);
+        UNIT_ASSERT(cancelledA->Get()->Request != cancelledB->Get()->Request);
+        UNIT_ASSERT(!first->IsActive() && !second->IsActive());
+        fixture.Runtime.WaitFor("stopped owner reads", [&] {
+            return stopped.size() == 2;
+        }, TDuration::Seconds(5));
+        stopped.Unblock();
+        fixture.Drain();
+        auto fresh = fixture.Load(a, ECollectionLoadKind::Regular, 3);
+        auto read = fixture.Read(a);
+        UNIT_ASSERT(read->Sender != oldRead->Sender);
+        fixture.Reply(read, a);
+        auto result = fixture.Result();
+        UNIT_ASSERT(result->Get()->Request == fresh);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.ReadWorkers.size(), 3);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.ParseWorkers.size(), 1);
+    }
+
+    Y_UNIT_TEST(UnregisterPreservesAnotherOwnersSharedLoad) {
+        TCollectionFixture fixture;
+        const auto metadata = fixture.Metadata();
+        const auto other = fixture.Runtime.AllocateEdgeActor();
+        auto removed = fixture.Load(metadata);
+        auto read = fixture.Read(metadata);
+        auto kept = fixture.Load(metadata, ECollectionLoadKind::Regular, 2, other);
+        fixture.Send(new TEvUnregister);
+        auto cancelled = fixture.Result(NKikimrProto::RACE);
+        UNIT_ASSERT(cancelled->Get()->Request == removed);
+        UNIT_ASSERT(kept->IsActive());
+        fixture.Reply(read, metadata);
+        auto result = fixture.Result(NKikimrProto::OK, other);
+        UNIT_ASSERT(result->Get()->Request == kept);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.ReadWorkers.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.ParseWorkers.size(), 1);
+    }
+
+    Y_UNIT_TEST(DetachCancelsOnlyTheOwnersMatchingCollection) {
+        TCollectionFixture fixture;
+        const auto a = fixture.Metadata(1);
+        const auto b = fixture.Metadata(2);
+        const auto other = fixture.Runtime.AllocateEdgeActor();
+        auto removed = fixture.Load(a);
+        auto shared = fixture.Load(a, ECollectionLoadKind::Regular, 2, other);
+        auto independent = fixture.Load(b, ECollectionLoadKind::Regular, 3);
+        auto readA = fixture.Read(a);
+        auto readB = fixture.Read(b);
+        fixture.Send(new TEvDetach(a.Descriptor.Lead));
+        auto cancelled = fixture.Result(NKikimrProto::RACE);
+        UNIT_ASSERT(cancelled->Get()->Request == removed);
+        UNIT_ASSERT(shared->IsActive() && independent->IsActive());
+        fixture.Reply(readA, a);
+        fixture.Reply(readB, b);
+        auto resultA = fixture.Result(NKikimrProto::OK, other);
+        auto resultB = fixture.Result();
+        UNIT_ASSERT(resultA->Get()->Request == shared);
+        UNIT_ASSERT(resultB->Get()->Request == independent);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.ReadWorkers.size(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.ParseWorkers.size(), 2);
+    }
+
+    Y_UNIT_TEST(UnregisterRetainedOwnerPreservesANewLoadsWait) {
+        TCollectionFixture fixture;
+        const auto metadata = fixture.Metadata();
+        const auto other = fixture.Runtime.AllocateEdgeActor();
+        auto retained = fixture.Load(metadata, ECollectionLoadKind::Unknown);
+        auto known = fixture.Load(metadata, ECollectionLoadKind::Regular, 2, other);
+        fixture.Reply(fixture.Read(metadata), metadata);
+        auto old = fixture.Result(NKikimrProto::OK, other);
+        const auto item = old->Get()->Collection.CacheItem();
+        UNIT_ASSERT(TSharedCache::Get().DetachCollection(item));
+        UNIT_ASSERT(TSharedCache::Get().EraseCollection(item));
+        old.Reset();
+
+        TCollectionCacheItem replacement;
+        TCacheCollectionRef found;
+        UNIT_ASSERT(TSharedCache::Get().FindOrInsert({ .Id = metadata.Descriptor.Lead }, replacement, found) ==
+                    ECacheResultStatus::Inserted);
+        TVector<TEvCollectionReady::TPtr> hints;
+        auto hintObserver = fixture.Runtime.AddObserver<TEvCollectionReady>([&hints](TEvCollectionReady::TPtr& event) {
+            hints.push_back(std::move(event));
+        });
+        auto fresh = fixture.Load(metadata, ECollectionLoadKind::Regular, 3, other);
+        fixture.Drain();
+        fixture.Send(new TEvUnregister);
+        auto cancelled = fixture.Result(NKikimrProto::RACE);
+        UNIT_ASSERT(cancelled->Get()->Request == retained);
+        UNIT_ASSERT(!retained->IsActive() && fresh->IsActive());
+        auto packet =
+            MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
+        UNIT_ASSERT(TSharedCache::Get().MakeReady(replacement, MakeHolder<TCollection>(packet)));
+        auto result = fixture.Result(NKikimrProto::OK, other);
+        UNIT_ASSERT(result->Get()->Request == fresh);
+        UNIT_ASSERT(result->Get()->Collection.CacheItem() == replacement);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.ReadWorkers.size(), 1);
+        UNIT_ASSERT(!hints.empty());
+        hintObserver.Remove();
+        for (auto& hint : hints) {
+            fixture.Runtime.Send(hint.Release(), 0, true);
+        }
+    }
+
+    Y_UNIT_TEST(OwnerRemovalPreservesAQueuedSuccessfulReply) {
+        TCollectionFixture fixture;
+        const auto metadata = fixture.Metadata();
+        TBlockEvents<TEvCollectionResult> replies(fixture.Runtime);
+        auto request = fixture.Load(metadata);
+        fixture.Reply(fixture.Read(metadata), metadata);
+        fixture.Runtime.WaitFor("queued result", [&] {
+            return replies.size() == 1;
+        }, TDuration::Seconds(5));
+        const auto item = replies.front()->Get()->Collection.CacheItem();
+        fixture.Send(new TEvUnregister);
+        fixture.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(replies.size(), 1);
+        UNIT_ASSERT(TSharedCache::Get().DetachCollection(item));
+        UNIT_ASSERT(TSharedCache::Get().EraseCollection(item));
+        replies.Unblock();
+        auto result = fixture.Result();
+        UNIT_ASSERT(result->Get()->Request == request);
+        UNIT_ASSERT(result->Get()->Collection->Id() == metadata.Descriptor.Lead);
     }
 
     Y_UNIT_TEST(RequiredKnownJobLargerThanTheNormalAllowanceCanStart) {

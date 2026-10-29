@@ -21,6 +21,7 @@ public:
 
     void Request(const TActorId& sender, ui64 cookie, const TEvCollectionRequest& message);
     void Update(const TCollectionRequest& request);
+    void CancelRequests(const TActorId& owner, const TLogoBlobID& collectionId = {});
     void Ready(const TLogoBlobID& id);
     void RawReady(const TActorId& sender, const TEvCollectionRawReady& result);
     void Data(const TActorId& sender, TEvCollectionData& result);

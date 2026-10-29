@@ -21,6 +21,7 @@
 #include <util/system/getpid.h>
 #include <util/generic/algorithm.h>
 #include <util/generic/set.h>
+#include <util/generic/scope.h>
 
 namespace NKikimr::NSharedCache {
 
@@ -1374,6 +1375,14 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     }
 
     void Handle(NSharedCache::TEvUnregister::TPtr &ev, const TActorContext& ctx) {
+        Y_DEFER {
+            if (CollectionLoads) {
+                RetryResourceWaits();
+            }
+        };
+        if (CollectionLoads) {
+            CollectionLoads->CancelRequests(ev->Sender);
+        }
         CancelRequests({}, ev->Sender);
         auto ownerIt = Owners.find(ev->Sender);
         if (ownerIt == Owners.end()) {
@@ -1404,6 +1413,14 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     void Handle(NSharedCache::TEvDetach::TPtr &ev, const TActorContext& ctx) {
         const TLogoBlobID collectionId = ev->Get()->PageCollectionId;
+        Y_DEFER {
+            if (CollectionLoads) {
+                RetryResourceWaits();
+            }
+        };
+        if (CollectionLoads) {
+            CollectionLoads->CancelRequests(ev->Sender, collectionId);
+        }
         CancelRequests(collectionId, ev->Sender);
         auto* collection = FindCollection(collectionId);
 
