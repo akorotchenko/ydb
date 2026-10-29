@@ -235,7 +235,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         TCacheCollectionRef found;
         UNIT_ASSERT(TSharedCache::Get().FindOrInsert({ .Id = metadata.Descriptor.Lead }, replacement, found) ==
                     ECacheResultStatus::Inserted);
-        TBlockEvents<TEvCollectionReady> hints(fixture.Runtime);
+        TVector<TEvCollectionReady::TPtr> hints;
+        auto hintObserver = fixture.Runtime.AddObserver<TEvCollectionReady>([&hints](TEvCollectionReady::TPtr& event) {
+            hints.push_back(std::move(event));
+        });
         auto fresh = fixture.Load(metadata, ECollectionLoadKind::Regular, 3);
         fixture.Drain();
         unknown->Cancel();
@@ -250,7 +253,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         UNIT_ASSERT(result->Get()->Request == fresh);
         UNIT_ASSERT(result->Get()->Collection.CacheItem() == replacement);
         UNIT_ASSERT_VALUES_EQUAL(fixture.ReadWorkers.size(), 1);
-        hints.Unblock();
+        UNIT_ASSERT(!hints.empty());
+        hintObserver.Remove();
+        for (auto& hint : hints) {
+            fixture.Runtime.Send(hint.Release(), 0, true);
+        }
     }
 
     Y_UNIT_TEST(QueuedSuccessfulReplyKeepsOwnershipAfterCancellation) {
@@ -431,7 +438,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         TCacheCollectionRef found;
         UNIT_ASSERT(TSharedCache::Get().FindOrInsert({ .Id = metadata.Descriptor.Lead }, item, found) ==
                     ECacheResultStatus::Inserted);
-        TBlockEvents<TEvCollectionReady> hints(fixture.Runtime);
+        TVector<TEvCollectionReady::TPtr> hints;
+        auto hintObserver = fixture.Runtime.AddObserver<TEvCollectionReady>([&hints](TEvCollectionReady::TPtr& event) {
+            hints.push_back(std::move(event));
+        });
         auto request = fixture.Load(metadata);
         fixture.Drain();
         UNIT_ASSERT_VALUES_EQUAL(fixture.Results, 0);
@@ -442,7 +452,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         UNIT_ASSERT(result->Get()->Request == request);
         UNIT_ASSERT(result->Get()->Collection.CacheItem() == item);
         UNIT_ASSERT(fixture.ReadWorkers.empty() && fixture.ParseWorkers.empty());
-        hints.Unblock();
+        UNIT_ASSERT(!hints.empty());
+        hintObserver.Remove();
+        for (auto& hint : hints) {
+            fixture.Runtime.Send(hint.Release(), 0, true);
+        }
         fixture.Drain();
         UNIT_ASSERT_VALUES_EQUAL(fixture.Results, 1);
     }
