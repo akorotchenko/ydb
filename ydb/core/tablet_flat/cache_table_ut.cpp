@@ -85,6 +85,11 @@ public:
         return cache.FindOrInsert(registry, collection, inserted, hit);
     }
 
+    static ECacheCollectionLookupStatus FindCollection(TTestSharedCache& cache, TCollectionRegistry& registry,
+        const TLogoBlobID& id, TTestCacheCollectionRef& collection) noexcept {
+        return cache.FindCollection(registry, id, collection);
+    }
+
     static bool MakeReadyUnregistered(
         TTestSharedCache& cache, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept {
         return cache.MakeReady(nullptr, collection, std::move(value));
@@ -6288,6 +6293,202 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::FreeCount(*fixture.Cache), freeBefore - 2);
         hitCollection.Drop();
     }
+    Y_UNIT_TEST(FindCollectionMissAndPendingDoNotAllocate) {
+        TFixture fixture;
+        const TLogoBlobID id(207, 208, 1);
+        TTestCacheCollectionRef found;
+        const ui64 freeBefore = AvailableFreeHandles(*fixture.Cache);
+        UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Miss);
+        UNIT_ASSERT(!found);
+        UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), freeBefore);
+
+        TCollectionCacheItem item;
+        UNIT_ASSERT(fixture.Cache->FindOrInsert({ .Id = id }, item, found) == ECacheResultStatus::Inserted);
+        const ui64 freePending = AvailableFreeHandles(*fixture.Cache);
+        UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Pending);
+        UNIT_ASSERT(!found);
+        UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), freePending);
+        UNIT_ASSERT(fixture.Cache->MakeReady(item, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Hit);
+        UNIT_ASSERT(found.CacheItem() == item);
+        UNIT_ASSERT(
+            fixture.Cache->FindCollection(TLogoBlobID(207, 208, 2), found) == ECacheCollectionLookupStatus::Miss);
+        UNIT_ASSERT(!found);
+        UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), freePending);
+    }
+
+    Y_UNIT_TEST(FindCollectionAttachesUnregisteredAndDetachedReady) {
+        for (bool unregistered : { false, true }) {
+            TFixture fixture;
+            const TLogoBlobID id(207, 208, 3);
+            TCollectionCacheItem item;
+            TTestCacheCollectionRef held;
+            UNIT_ASSERT(TCacheTestAccess::FindOrInsertUnregistered(*fixture.Cache, { .Id = id }, item, held) ==
+                        ECacheResultStatus::Inserted);
+            auto value = MakeCollection(id);
+            auto* canonical = value.Get();
+            value->PageCollection()->SetSkipBTreeIndexV1Shadow(true);
+            UNIT_ASSERT(TCacheTestAccess::MakeReadyUnregistered(*fixture.Cache, item, std::move(value)));
+            UNIT_ASSERT(fixture.Cache->Find(id, held) == ECacheResultStatus::Hit);
+            if (!unregistered) {
+                TTestCacheCollectionRef attached;
+                UNIT_ASSERT(fixture.Cache->FindCollection(id, attached) == ECacheCollectionLookupStatus::Hit);
+                UNIT_ASSERT(fixture.Cache->DetachCollection(item));
+            }
+            UNIT_ASSERT_VALUES_EQUAL(
+                TCacheTestAccess::CollectionReferences(*fixture.Cache, item), unregistered ? 1 : 0);
+            const ui64 freeBefore = AvailableFreeHandles(*fixture.Cache);
+            TTestCacheCollectionRef found;
+            UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Hit);
+            UNIT_ASSERT(found.Get() == canonical && found.CacheItem() == item);
+            UNIT_ASSERT(found->PageCollection()->SkipBTreeIndexV1Shadow());
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionReferences(*fixture.Cache, item), 1);
+            UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), freeBefore);
+            ui32 attached = 0;
+            fixture.Cache->ForEachCollection([&](TCollection& collection) {
+                UNIT_ASSERT(&collection == canonical);
+                ++attached;
+            });
+            UNIT_ASSERT_VALUES_EQUAL(attached, 1);
+            TTestCacheCollectionRef joined;
+            UNIT_ASSERT(fixture.Cache->FindCollection(id, joined) == ECacheCollectionLookupStatus::Hit);
+            UNIT_ASSERT(joined.Get() == canonical);
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionReferences(*fixture.Cache, item), 1);
+        }
+    }
+
+    Y_UNIT_TEST(FindCollectionMovesRegistryAndPreservesStickyPages) {
+        TFixture fixture;
+        TCollectionRegistry destination;
+        const TLogoBlobID id(207, 208, 4);
+        TCollectionCacheItem item;
+        TTestCacheCollectionRef found;
+        UNIT_ASSERT(TCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, { .Id = id }, item, found) ==
+                    ECacheResultStatus::Inserted);
+        UNIT_ASSERT(TCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, item, MakeCollection(id)));
+        const auto page = AllocatePage(
+            *fixture.Cache, TCacheKey::Page(item, 1), 4096, NTable::NPage::EPage::DataPage, 0, EStickyState::Sticky);
+        UNIT_ASSERT(page && fixture.Cache->MakeReady(page, MakePageData(page.Index())));
+        const ui64 references = TCacheTestAccess::CollectionReferences(*fixture.Cache, item);
+        UNIT_ASSERT(TCacheTestAccess::FindCollection(*fixture.Cache, destination, id, found) ==
+                    ECacheCollectionLookupStatus::Hit);
+        UNIT_ASSERT(found.CacheItem() == item);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionListHead(fixture.Registry), 0);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionListHead(destination), item.Index());
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionReferences(*fixture.Cache, item), references);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::StickyPageListHead(*fixture.Cache, item), page.Index());
+        UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsSticky());
+        UNIT_ASSERT(TCacheTestAccess::DetachCollection(*fixture.Cache, destination, item));
+    }
+
+    Y_UNIT_TEST(FindCollectionRetriesDuringAttachment) {
+        TFixture fixture;
+        const TLogoBlobID id(207, 208, 5);
+        TCollectionCacheItem item;
+        TTestCacheCollectionRef held;
+        UNIT_ASSERT(fixture.Cache->FindOrInsert({ .Id = id }, item, held) == ECacheResultStatus::Inserted);
+        UNIT_ASSERT(fixture.Cache->MakeReady(item, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->Find(id, held) == ECacheResultStatus::Hit);
+        UNIT_ASSERT(fixture.Cache->DetachCollection(item));
+        TSharedCacheGate gate;
+        gate.Slots[0].Arm(ECacheHookPoint::BeforeCollectionAttachPublished, item.CacheItem());
+        TSharedCacheHookGuard guard(*fixture.Cache, gate.Hooks);
+        ECacheCollectionLookupStatus status = ECacheCollectionLookupStatus::Miss;
+        TTestCacheCollectionRef attached;
+        TGateThread attacher(gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazard);
+            TlsCacheHazard = &TCacheThreadTestAccess::Hazard(*fixture.Cache, 0);
+            Y_DEFER {
+                TlsCacheHazard = nullptr;
+            };
+            status = fixture.Cache->FindCollection(id, attached);
+        });
+        gate.Slots[0].Wait();
+        const ui64 generation = fixture.Cache->AdmissionGeneration();
+        TTestCacheCollectionRef found;
+        UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Retry);
+        UNIT_ASSERT(!found);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
+        gate.Slots[0].Release();
+        attacher.Join();
+        UNIT_ASSERT(status == ECacheCollectionLookupStatus::Hit);
+        UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Hit);
+        UNIT_ASSERT(found.Get() == held.Get());
+    }
+
+    Y_UNIT_TEST(FindCollectionRetriesAfterIdentityChanges) {
+        TFixture fixture;
+        const TLogoBlobID id(207, 208, 6);
+        TCollectionCacheItem original;
+        TTestCacheCollectionRef found;
+        UNIT_ASSERT(fixture.Cache->FindOrInsert({ .Id = id }, original, found) == ECacheResultStatus::Inserted);
+        UNIT_ASSERT(fixture.Cache->MakeReady(original, MakeCollection(id)));
+
+        struct TObservation {
+            TTestSharedCache* Cache;
+            TLogoBlobID Id;
+            TCollectionCacheItem Original;
+            TCollectionCacheItem Replacement = {};
+            bool Replaced = false;
+        } observation{ fixture.Cache.Get(), id, original };
+
+        TTestTraits hooks{ &observation,
+            [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
+                auto& observation = *static_cast<TObservation*>(context);
+                if (point == ECacheHookPoint::BeforeCollectionRefAcquired && !observation.Replaced) {
+                    observation.Replaced = true;
+                    Y_ABORT_UNLESS(observation.Cache->EraseCollection(observation.Original));
+                    TTestCacheCollectionRef duplicate;
+                    Y_ABORT_UNLESS(observation.Cache->FindOrInsert({ .Id = observation.Id }, observation.Replacement,
+                                       duplicate) == ECacheResultStatus::Inserted);
+                    Y_ABORT_UNLESS(
+                        observation.Cache->MakeReady(observation.Replacement, MakeCollection(observation.Id)));
+                }
+            } };
+        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+        UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Retry);
+        UNIT_ASSERT(!found && observation.Replaced && observation.Replacement != original);
+        UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Hit);
+        UNIT_ASSERT(found.CacheItem() == observation.Replacement);
+    }
+
+    Y_UNIT_TEST(CollectionReadyHintFollowsOwnershipTransfer) {
+        TFixture fixture;
+        const TLogoBlobID id(207, 208, 7);
+        TCollectionCacheItem item;
+        TTestCacheCollectionRef found;
+        UNIT_ASSERT(fixture.Cache->FindOrInsert({ .Id = id }, item, found) == ECacheResultStatus::Inserted);
+        auto value = MakeCollection(id);
+
+        struct TObservation {
+            TTestSharedCache* Cache;
+            THolder<TCollection>* ConstructorOwner;
+            TLogoBlobID Id;
+            TCollectionCacheItem Item;
+            ui32 Notifications = 0;
+            bool Released = false;
+            bool Ready = false;
+        } observation{ fixture.Cache.Get(), &value, id, item };
+
+        TTestTraits hooks{ &observation, [](void* context, ECacheHookPoint point, TCacheItem item) noexcept {
+                              if (point == ECacheHookPoint::CollectionReady) {
+                                  auto& observation = *static_cast<TObservation*>(context);
+                                  ++observation.Notifications;
+                                  observation.Released = !*observation.ConstructorOwner;
+                                  TTestCacheCollectionRef found;
+                                  observation.Ready = item == observation.Item.CacheItem() &&
+                                                      observation.Cache->FindCollection(observation.Id, found) ==
+                                                          ECacheCollectionLookupStatus::Hit &&
+                                                      found.CacheItem() == observation.Item;
+                              }
+                          } };
+        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+        UNIT_ASSERT(fixture.Cache->MakeReady(item, std::move(value)));
+        UNIT_ASSERT(observation.Released && observation.Ready);
+        UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Hit);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+    }
+
     Y_UNIT_TEST(UnattachedCollectionAttachesWithoutTemporaryRegistry) {
         TFixture fixture;
         const TCollectionLocation location{ .Id = TLogoBlobID(5, 6, 8) };

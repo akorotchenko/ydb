@@ -45,6 +45,7 @@ namespace NKikimr::NSharedCache {
         EvCollectionBytesChanged,
         EvCacheReadyRequest,
         EvCacheReady,
+        EvCollectionReady,
 
         EvEnd
 
@@ -308,6 +309,16 @@ namespace NKikimr::NSharedCache {
     };
 
     struct TEvResourcesAvailable : public TEventLocal<TEvResourcesAvailable, EvResourcesAvailable> {};
+
+    struct TEvCollectionReady : public TEventLocal<TEvCollectionReady, EvCollectionReady> {
+        const TLogoBlobID CollectionId;
+        const TCollectionCacheItem CacheItem;
+
+        TEvCollectionReady(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem) noexcept
+            : CollectionId(collectionId)
+            , CacheItem(cacheItem)
+        {}
+    };
 
     struct TEvRequestAnswered : public TEventLocal<TEvRequestAnswered, EvRequestAnswered> {
         explicit TEvRequestAnswered(ui64 status, ui64 completionId = 0) noexcept
