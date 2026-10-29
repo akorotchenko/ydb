@@ -27,6 +27,7 @@ SRCS(
     flat_test_db_helpers.h
     shared_cache_btree_walk_ut.cpp
     shared_cache_collection_load_ut.cpp
+    shared_cache_collections_ut.cpp
     cache_cyclic_buffer_ut.cpp
     cache_item_ut.cpp
     cache_space_ut.cpp

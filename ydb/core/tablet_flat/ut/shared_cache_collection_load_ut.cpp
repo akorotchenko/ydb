@@ -38,14 +38,14 @@ namespace {
                             case TEvCollectionRawReady::EventType:
                                 ++RawEvents;
                                 break;
-                            case TEvCollectionLoaded::EventType:
-                                ++LoadedEvents;
-                                break;
-                            case TEvCollectionLoadFailed::EventType:
-                                ++FailedEvents;
-                                break;
-                            case TEvCollectionLoadStopped::EventType:
-                                ++StoppedEvents;
+                            case TEvCollectionData::EventType:
+                                if (event->Get<TEvCollectionData>()->Status == NKikimrProto::OK) {
+                                    ++DataEvents;
+                                } else if (event->Get<TEvCollectionData>()->Status == NKikimrProto::RACE) {
+                                    ++StoppedEvents;
+                                } else {
+                                    ++FailedEvents;
+                                }
                                 break;
                         }
                     }
@@ -91,28 +91,31 @@ namespace {
         }
 
         void Grant(ECollectionLoadKind kind, TActorId sender = {}) {
-            Runtime.Send(new IEventHandle(Worker, sender ? sender : Owner, new TEvParseCollection(kind)), 0, true);
+            Runtime.Send(new IEventHandle(Worker, sender ? sender : Owner, new TEvCollectionParse(kind)), 0, true);
         }
 
-        TEvCollectionLoaded::TPtr Loaded() {
-            auto event = Runtime.GrabEdgeEvent<TEvCollectionLoaded>(Owner, TDuration::Seconds(5));
+        TEvCollectionData::TPtr Data() {
+            auto event = Runtime.GrabEdgeEvent<TEvCollectionData>(Owner, TDuration::Seconds(5));
             UNIT_ASSERT(event->Sender == Worker);
             UNIT_ASSERT_VALUES_EQUAL(event->Get()->LoadId, LoadId);
+            UNIT_ASSERT(event->Get()->Status == NKikimrProto::OK);
             UNIT_ASSERT(event->Get()->PageCollection);
             UNIT_ASSERT(event->Get()->PageCollection->Label() == Descriptor.Lead);
             UNIT_ASSERT_VALUES_EQUAL(event->Get()->PageCollection->Total(), 1);
-            UNIT_ASSERT_VALUES_EQUAL(LoadedEvents, 1);
+            UNIT_ASSERT_VALUES_EQUAL(DataEvents, 1);
             UNIT_ASSERT_VALUES_EQUAL(FailedEvents, 0);
             return event;
         }
 
         void Stop() {
             Runtime.Send(new IEventHandle(Worker, Owner, new TEvents::TEvPoison), 0, true);
-            auto stopped = Runtime.GrabEdgeEvent<TEvCollectionLoadStopped>(Owner, TDuration::Seconds(5));
+            auto stopped = Runtime.GrabEdgeEvent<TEvCollectionData>(Owner, TDuration::Seconds(5));
             UNIT_ASSERT(stopped->Sender == Worker);
             UNIT_ASSERT_VALUES_EQUAL(stopped->Get()->LoadId, LoadId);
+            UNIT_ASSERT(stopped->Get()->Status == NKikimrProto::RACE);
+            UNIT_ASSERT(!stopped->Get()->PageCollection);
             UNIT_ASSERT_VALUES_EQUAL(StoppedEvents, 1);
-            UNIT_ASSERT_VALUES_EQUAL(LoadedEvents, 0);
+            UNIT_ASSERT_VALUES_EQUAL(DataEvents, 0);
             UNIT_ASSERT_VALUES_EQUAL(FailedEvents, 0);
         }
 
@@ -124,7 +127,7 @@ namespace {
         NPageCollection::TLargeGlobId Descriptor;
         TTestActorRuntimeBase::TEventFilter PreviousFilter;
         ui32 RawEvents = 0;
-        ui32 LoadedEvents = 0;
+        ui32 DataEvents = 0;
         ui32 FailedEvents = 0;
         ui32 StoppedEvents = 0;
     };
@@ -137,9 +140,9 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollectionLoad) {
         fixture.Start();
         fixture.Read();
         UNIT_ASSERT_VALUES_EQUAL(fixture.RawEvents, 1);
-        UNIT_ASSERT_VALUES_EQUAL(fixture.LoadedEvents, 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.DataEvents, 0);
         fixture.Grant(ECollectionLoadKind::Regular);
-        auto event = fixture.Loaded();
+        auto event = fixture.Data();
         const auto* packet = dynamic_cast<const NPageCollection::TPageCollection*>(event->Get()->PageCollection.Get());
         UNIT_ASSERT(packet && !dynamic_cast<const NPageCollection::TOuterPageCollection*>(packet));
         UNIT_ASSERT(packet->LargeGlobId == fixture.Descriptor);
@@ -151,9 +154,9 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollectionLoad) {
         TCollectionLoadFixture fixture;
         fixture.Start();
         fixture.Read();
-        UNIT_ASSERT_VALUES_EQUAL(fixture.LoadedEvents, 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.DataEvents, 0);
         fixture.Grant(ECollectionLoadKind::Outer);
-        auto event = fixture.Loaded();
+        auto event = fixture.Data();
         const auto* packet =
             dynamic_cast<const NPageCollection::TOuterPageCollection*>(event->Get()->PageCollection.Get());
         UNIT_ASSERT(packet && packet->LargeGlobId == fixture.Descriptor);
@@ -165,7 +168,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollectionLoad) {
         fixture.Start();
         fixture.Grant(ECollectionLoadKind::Regular);
         fixture.Read();
-        auto event = fixture.Loaded();
+        auto event = fixture.Data();
         UNIT_ASSERT(
             dynamic_cast<const NPageCollection::TOuterPageCollection*>(event->Get()->PageCollection.Get()) == nullptr);
     }
@@ -178,7 +181,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollectionLoad) {
         fixture.Reply(request);
         fixture.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
         UNIT_ASSERT_VALUES_EQUAL(fixture.RawEvents, 0);
-        UNIT_ASSERT_VALUES_EQUAL(fixture.LoadedEvents, 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.DataEvents, 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.FailedEvents, 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.StoppedEvents, 1);
     }
@@ -194,11 +197,12 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollectionLoad) {
         TCollectionLoadFixture fixture(16);
         fixture.Start();
         fixture.Reply(fixture.ReadRequest(), NKikimrProto::NODATA);
-        auto event = fixture.Runtime.GrabEdgeEvent<TEvCollectionLoadFailed>(fixture.Owner, TDuration::Seconds(5));
+        auto event = fixture.Runtime.GrabEdgeEvent<TEvCollectionData>(fixture.Owner, TDuration::Seconds(5));
         UNIT_ASSERT_VALUES_EQUAL(event->Get()->LoadId, fixture.LoadId);
         UNIT_ASSERT(event->Get()->Status == NKikimrProto::NODATA);
+        UNIT_ASSERT(!event->Get()->PageCollection);
         UNIT_ASSERT_VALUES_EQUAL(fixture.RawEvents, 0);
-        UNIT_ASSERT_VALUES_EQUAL(fixture.LoadedEvents, 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.DataEvents, 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.FailedEvents, 1);
     }
 
@@ -208,10 +212,11 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollectionLoad) {
         fixture.Start();
         fixture.Read();
         fixture.Grant(ECollectionLoadKind::Regular);
-        auto event = fixture.Runtime.GrabEdgeEvent<TEvCollectionLoadFailed>(fixture.Owner, TDuration::Seconds(5));
+        auto event = fixture.Runtime.GrabEdgeEvent<TEvCollectionData>(fixture.Owner, TDuration::Seconds(5));
         UNIT_ASSERT(event->Get()->Status == NKikimrProto::CORRUPTED);
+        UNIT_ASSERT(!event->Get()->PageCollection);
         UNIT_ASSERT_VALUES_EQUAL(fixture.FailedEvents, 1);
-        UNIT_ASSERT_VALUES_EQUAL(fixture.LoadedEvents, 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.DataEvents, 0);
     }
 
     Y_UNIT_TEST(IgnoresParseGrantFromAnotherActor) {
@@ -220,7 +225,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollectionLoad) {
         fixture.Read();
         fixture.Grant(ECollectionLoadKind::Outer, fixture.Proxy);
         fixture.Grant(ECollectionLoadKind::Regular);
-        auto event = fixture.Loaded();
+        auto event = fixture.Data();
         UNIT_ASSERT(
             dynamic_cast<const NPageCollection::TOuterPageCollection*>(event->Get()->PageCollection.Get()) == nullptr);
     }

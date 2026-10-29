@@ -47,10 +47,11 @@ namespace NKikimr::NSharedCache {
         EvCacheReady,
         EvCollectionReady,
         EvCollectionRawReady,
-        EvParseCollection,
-        EvCollectionLoaded,
-        EvCollectionLoadFailed,
-        EvCollectionLoadStopped,
+        EvCollectionParse,
+        EvCollectionData,
+        EvCollectionRequest,
+        EvCollectionRequestUpdate,
+        EvCollectionResult,
 
         EvEnd
 

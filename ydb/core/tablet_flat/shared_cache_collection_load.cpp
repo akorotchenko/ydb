@@ -22,7 +22,7 @@ namespace {
     private:
         void StateWork(TAutoPtr<NActors::IEventHandle>& ev);
         void Handle(TEvBlobStorage::TEvGetResult::TPtr& ev);
-        void Handle(TEvParseCollection::TPtr& ev);
+        void Handle(TEvCollectionParse::TPtr& ev);
         void OnBlobLoaded(const TLogoBlobID& id, TString body, uintptr_t cookie) override;
         void TryParse();
         void ClearBuffers();
@@ -81,7 +81,7 @@ namespace {
     STFUNC(TCollectionLoadActor::StateWork) {
         switch (ev->GetTypeRewrite()) {
             hFunc(TEvBlobStorage::TEvGetResult, Handle);
-            hFunc(TEvParseCollection, Handle);
+            hFunc(TEvCollectionParse, Handle);
             cFunc(NActors::TEvents::TSystem::PoisonPill, Stop);
             case NActors::TEvents::TEvUndelivered::EventType:
                 Fail(NKikimrProto::UNKNOWN, "Collection metadata read was not delivered");
@@ -128,7 +128,7 @@ namespace {
         TryParse();
     }
 
-    void TCollectionLoadActor::Handle(TEvParseCollection::TPtr& ev) {
+    void TCollectionLoadActor::Handle(TEvCollectionParse::TPtr& ev) {
         if (ev->Sender != Owner_) {
             return;
         }
@@ -164,7 +164,7 @@ namespace {
             return;
         }
         // The outcome owns the parsed buffer until the coordinator publishes or discards it
-        Send(Owner_, new TEvCollectionLoaded(LoadId_, std::move(candidate)));
+        Send(Owner_, new TEvCollectionData(NKikimrProto::OK, std::move(candidate), LoadId_));
         PassAway();
     }
 
@@ -176,13 +176,13 @@ namespace {
 
     void TCollectionLoadActor::Fail(NKikimrProto::EReplyStatus status, TString error) {
         ClearBuffers();
-        Send(Owner_, new TEvCollectionLoadFailed(LoadId_, status, std::move(error)));
+        Send(Owner_, new TEvCollectionData(status, {}, LoadId_, std::move(error)));
         PassAway();
     }
 
     void TCollectionLoadActor::Stop() {
         ClearBuffers();
-        Send(Owner_, new TEvCollectionLoadStopped(LoadId_));
+        Send(Owner_, new TEvCollectionData(NKikimrProto::RACE, {}, LoadId_, "Collection metadata worker stopped"));
         PassAway();
     }
 
