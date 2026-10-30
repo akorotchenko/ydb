@@ -3475,7 +3475,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         }
     }
 
-    void CheckSparePublication(bool recycle, bool armBeforePublication) {
+    void CheckSparePublication(bool recycle, bool armBeforePublication, EItemKind kind = EItemKind::Collection) {
         struct TObservation {
             TTestSharedCache* Cache = nullptr;
             ui32 Notifications = 0;
@@ -3484,20 +3484,31 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         } observation;
 
         TFixture fixture(5, 1);
-        TCollectionCacheItem candidate;
+        TCacheItem candidate;
         Y_DEFER {
             TCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
             fixture.Cache->DisarmResourceWait();
-            if (candidate) {
-                TCacheTestAccess::DiscardCandidate(*fixture.Cache, candidate);
+            if (!candidate.IsNull()) {
+                if (kind == EItemKind::Page) {
+                    TCacheTestAccess::DiscardCandidate(*fixture.Cache, TPageCacheItem::FromValidated(candidate));
+                } else {
+                    TCacheTestAccess::DiscardCandidate(*fixture.Cache, TCollectionCacheItem::FromValidated(candidate));
+                }
             }
         };
         if (recycle) {
             auto cacheOp = fixture.Cache->BeginOperation();
-            const auto item = cacheOp.Allocate();
-            UNIT_ASSERT(!item.IsNull());
-            cacheOp.Items().InitializeCollection(item, TLogoBlobID(235, 236, 1), 0);
-            candidate = TCollectionCacheItem::FromValidated(item);
+            if (kind == EItemKind::Page) {
+                constexpr ui64 size = 64;
+                candidate = cacheOp.TryAllocateReservedItem(size + TSharedData::OverheadSize, 1);
+                UNIT_ASSERT(!candidate.IsNull());
+                cacheOp.Items().InitializePage(
+                    candidate, {}, 1, size, NTable::NPage::EPage::DataPage, 0, EStickyState::None, true, false);
+            } else {
+                candidate = cacheOp.Allocate();
+                UNIT_ASSERT(!candidate.IsNull());
+                cacheOp.Items().InitializeCollection(candidate, TLogoBlobID(235, 236, 1), 0);
+            }
         }
         observation.Cache = fixture.Cache.Get();
         TTestTraits hooks{ &observation, [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
@@ -3521,18 +3532,19 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         {
             auto cacheOp = fixture.Cache->BeginOperation();
             if (recycle) {
-                cacheOp.RecycleCandidate(candidate.CacheItem());
+                cacheOp.RecycleCandidate(candidate);
                 candidate = {};
             } else {
                 cacheOp.RefillSpareItem();
             }
         }
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? (recycle ? 2 : 1) : 0);
+        const bool refundsReservation = recycle && kind == EItemKind::Page;
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? (refundsReservation ? 2 : 1) : 0);
         if (!armBeforePublication) {
             fixture.Cache->ArmResourceWait(generation);
         }
         UNIT_ASSERT(observation.Published);
-        UNIT_ASSERT_VALUES_EQUAL(observation.RearmedBeforeStore, recycle && armBeforePublication);
+        UNIT_ASSERT_VALUES_EQUAL(observation.RearmedBeforeStore, refundsReservation && armBeforePublication);
         const ui32 notifications = observation.Notifications;
         const ui64 afterPublication = fixture.Cache->AdmissionGeneration();
         fixture.Cache->ArmResourceWait(afterPublication);
@@ -3548,6 +3560,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::FreeCount(*fixture.Cache), fixture.Capacity.HandleCount() - 2);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedPages(), 0);
     }
 
     Y_UNIT_TEST(SpareRefillNotifiesAfterPublication) {
@@ -3557,8 +3570,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
     }
 
     Y_UNIT_TEST(SpareRecycleNotifiesAfterPublication) {
-        for (bool armed : { false, true }) {
-            CheckSparePublication(true, armed);
+        for (auto kind : { EItemKind::Collection, EItemKind::Page }) {
+            for (bool armed : { false, true }) {
+                CheckSparePublication(true, armed, kind);
+            }
         }
     }
 
