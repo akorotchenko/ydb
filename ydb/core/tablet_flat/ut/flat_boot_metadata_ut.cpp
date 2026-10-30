@@ -114,7 +114,7 @@ namespace {
     private:
         void Start(TBootMetadataState& state, const TVector<TIntrusivePtr<TCollectionRequest>>& requests) {
             Current = &state;
-            Logic = MakeHolder<TExecutorBootLogic>(this, SelfId(), Attempt, Info.Get(), 1_MB);
+            Logic.Reset(new TExecutorBootLogic(this, SelfId(), Attempt, Info.Get(), 1_MB));
             TBootMetadataTestAccess::Prepare(*Logic);
             TBootMetadataTestAccess::Queue(*Logic, state, requests, Fail);
             if (!Queued) {
