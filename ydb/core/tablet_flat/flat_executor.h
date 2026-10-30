@@ -22,6 +22,7 @@
 #include "flat_fwd_sieve.h"
 #include "flat_sausage_grind.h"
 #include "shared_cache_events.h"
+#include "shared_cache_collection_load.h"
 #include "util_fmt_logger.h"
 
 #include <ydb/core/control/lib/immediate_control_board_wrapper.h>
@@ -88,44 +89,25 @@ struct TPendingPartSwitch {
         }
     };
 
-    using TLargeGlobLoaders = TList<TLargeGlobLoader>;
-
     struct TMetaStage {
-        NTable::TPartComponents PartComponents;
-        TLargeGlobLoaders Loaders;
+        TVector<NPageCollection::TLargeGlobId> Descriptors;
+        TVector<bool> RawPresent;
+        TVector<TIntrusivePtr<NSharedCache::TCollectionRequest>> Requests;
+        size_t Pending = 0;
+        bool Started = false;
+        bool RootReady = false;
 
-        explicit TMetaStage(NTable::TPartComponents&& pc)
-            : PartComponents(std::move(pc))
-        {
-            for (size_t idx = 0; idx < PartComponents.PageCollectionComponents.size(); ++idx) {
-                if (!PartComponents.PageCollectionComponents[idx].RawMeta) {
-                    Loaders.emplace_back(idx, PartComponents.PageCollectionComponents[idx].LargeGlobId);
-                }
+        explicit TMetaStage(const NTable::TPartComponents& pc) {
+            for (const auto& component : pc.PageCollectionComponents) {
+                Descriptors.push_back(component.LargeGlobId);
+                RawPresent.push_back(bool(component.RawMeta));
             }
-        }
-
-        bool Finished() const {
-            return !Loaders;
-        }
-
-        bool Accept(TLargeGlobLoaders::iterator it, const TLogoBlobID& id, TString body) {
-            if (it->Accept(id, std::move(body))) {
-                PartComponents.PageCollectionComponents[it->Index].RawMeta = it->Finish();
-                Loaders.erase(it);
-                return !Loaders;
-            }
-
-            return false;
+            Requests.resize(Descriptors.size());
         }
     };
 
     struct TLoaderStage {
-        NTable::TLoader Loader;
         const NPageCollection::IPageCollection* Fetching = nullptr;
-
-        explicit TLoaderStage(NTable::TPartComponents&& pc)
-            : Loader(std::move(pc))  // constructs PageCollections in StageParseMeta from components
-        { }
     };
 
     struct TResultStage {
@@ -138,9 +120,11 @@ struct TPendingPartSwitch {
 
     struct TNewBundle {
         std::variant<TMetaStage, TLoaderStage, TResultStage> Stage;
+        std::optional<NTable::TLoader> Loader;
 
         explicit TNewBundle(NTable::TPartComponents pc)
-            : Stage(std::in_place_type<TMetaStage>, std::move(pc))
+            : Stage(std::in_place_type<TMetaStage>, pc)
+            , Loader(std::in_place, std::move(pc))
         { }
 
         template<class T>
@@ -218,39 +202,12 @@ struct TPendingPartSwitch {
         ui32 SourceTable = Max<ui32>();
     };
 
-    struct TNewBundleWaiter {
-        TNewBundle* Bundle;
-        TLargeGlobLoaders::iterator Loader;
-
-        explicit TNewBundleWaiter(TNewBundle* bundle, TLargeGlobLoaders::iterator loader)
-            : Bundle(bundle)
-            , Loader(loader)
-        { }
-    };
-
-    struct TNewTxStatusWaiter {
+    struct TBlobWaiter {
         TNewTxStatus* TxStatus;
 
-        explicit TNewTxStatusWaiter(TNewTxStatus* txStatus)
-            : TxStatus(txStatus)
-        { }
-    };
-
-    struct TBlobWaiter : public std::variant<TNewBundleWaiter, TNewTxStatusWaiter> {
-        using TBase = std::variant<TNewBundleWaiter, TNewTxStatusWaiter>;
-
-        explicit TBlobWaiter(TNewBundle* bundle, TLargeGlobLoaders::iterator loader)
-            : TBase(std::in_place_type<TNewBundleWaiter>, bundle, loader)
-        { }
-
         explicit TBlobWaiter(TNewTxStatus* txStatus)
-            : TBase(std::in_place_type<TNewTxStatusWaiter>, txStatus)
-        { }
-
-        template<class T>
-        inline T* GetWaiter() {
-            return std::get_if<T>(static_cast<TBase*>(this));
-        }
+            : TxStatus(txStatus)
+        {}
     };
 
     using TPendingBlobs = THashMultiMap<TLogoBlobID, TBlobWaiter>;
@@ -263,6 +220,7 @@ struct TPendingPartSwitch {
     TVector<TIntrusiveConstPtr<NTable::TColdPart>> NewColdParts;
     TPendingBlobs PendingBlobs;
     size_t PendingLoads = 0;
+    size_t PendingCollections = 0;
 
     TVector<TChangedBundle> Changed;
     TVector<TBundleDelta> Deltas;
@@ -510,6 +468,16 @@ class TExecutor
     TDeque<TPendingPartSwitch> PendingPartSwitches;
     size_t ReadyPartSwitches = 0;
 
+    struct TPendingCollectionLoad {
+        TIntrusivePtr<NSharedCache::TCollectionRequest> Request;
+        TPendingPartSwitch* Switch;
+        TPendingPartSwitch::TNewBundle* Bundle;
+        ui32 Slot;
+    };
+
+    THashMap<const NSharedCache::TCollectionRequest*, TPendingCollectionLoad> PendingCollectionLoads;
+    NActors::TActorSystem* CollectionActorSystem = nullptr;
+
     ui64 UsedTabletMemory = 0;
     ui64 TransactionPagesMemory = 0;
 
@@ -545,6 +513,8 @@ class TExecutor
     void UtilizeSubset(const NTable::TSubset&, TLogCommit *commit);
     bool PrepareExternalPart(TPendingPartSwitch &partSwitch, NTable::TPartComponents &&pc);
     bool PrepareExternalPart(TPendingPartSwitch &partSwitch, TPendingPartSwitch::TNewBundle &bundle);
+    void PrepareRawCollection(TPendingPartSwitch::TNewBundle& bundle, ui32 slot);
+    void CancelPendingCollectionLoads();
     bool PrepareExternalTxStatus(TPendingPartSwitch &partSwitch, const NPageCollection::TLargeGlobId &dataId, NTable::TEpoch epoch, const TString &data);
     bool PrepareExternalTxStatus(TPendingPartSwitch &partSwitch, TPendingPartSwitch::TNewTxStatus &txStatus);
     void OnBlobLoaded(const TLogoBlobID& id, TString body, uintptr_t cookie) override;
@@ -625,6 +595,7 @@ class TExecutor
     void Handle(TEvBlobStorage::TEvCollectGarbageResult::TPtr&);
     void Handle(TEvPrivate::TEvRetryGcRequest::TPtr &ev, const TActorContext &ctx);
     void Handle(NSharedCache::TEvResult::TPtr &ev);
+    void Handle(NSharedCache::TEvCollectionResult::TPtr& ev);
     void Handle(NResourceBroker::TEvResourceBroker::TEvResourceAllocated::TPtr&);
     void Handle(NOps::TEvScanStat::TPtr &ev, const TActorContext &ctx);
     void Handle(NOps::TEvResult::TPtr &ev);

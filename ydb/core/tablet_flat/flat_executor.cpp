@@ -161,6 +161,7 @@ TExecutor::TExecutor(
 {}
 
 TExecutor::~TExecutor() {
+    CancelPendingCollectionLoads();
 }
 
 bool TExecutor::OnUnhandledException(const std::exception& e) {
@@ -215,6 +216,7 @@ void TExecutor::Registered(TActorSystem *sys, const TActorId&)
 }
 
 void TExecutor::PassAway() {
+    CancelPendingCollectionLoads();
     if (auto logl = Logger->Log(ELnLev::Info)) {
         auto *waste = LogicSnap ? &LogicSnap->Waste() : nullptr;
 
@@ -967,6 +969,7 @@ TExecutorCaches TExecutor::CleanupState() {
     BootLogic.Destroy();
     PendingBlobQueue.Clear();
     PostponedFollowerUpdates.clear();
+    CancelPendingCollectionLoads();
     PendingPartSwitches.clear();
     ReadyPartSwitches = 0;
     Y_ENSURE(!LogicRedo);
@@ -1428,6 +1431,80 @@ void TExecutor::AddFollowerPartSwitch(
     }
 }
 
+void TExecutor::PrepareRawCollection(TPendingPartSwitch::TNewBundle& bundle, ui32 slot) {
+    auto* stage = bundle.GetStage<TPendingPartSwitch::TMetaStage>();
+    TCacheCollectionRef ref;
+    const auto& descriptor = stage->Descriptors.at(slot);
+    if (TSharedCache::Get().FindCollection(descriptor.Lead, ref) != NSharedCache::ECacheCollectionLookupStatus::Hit) {
+        return;
+    }
+    const auto* packet = dynamic_cast<const NPageCollection::TPageCollection*>(ref->PageCollection().Get());
+    const bool outer = slot && slot + 1 == stage->Descriptors.size() && bundle.Loader->HasOuterCollection();
+    Y_ENSURE(packet && packet->LargeGlobId == descriptor &&
+                 bool(dynamic_cast<const NPageCollection::TOuterPageCollection*>(packet)) == outer,
+        "Cached collection does not match supplied metadata at slot " << slot);
+    bundle.Loader->SetPageCollection(slot, std::move(ref));
+}
+
+void TExecutor::CancelPendingCollectionLoads() {
+    for (const auto& [_, load] : PendingCollectionLoads) {
+        if (load.Request->IsActive()) {
+            load.Request->Cancel();
+            CollectionActorSystem->Send(new IEventHandle(
+                MakeSharedPageCacheId(), SelfId(), new NSharedCache::TEvCollectionRequestUpdate(load.Request)));
+        }
+    }
+    PendingCollectionLoads.clear();
+}
+
+void TExecutor::Handle(NSharedCache::TEvCollectionResult::TPtr& ev) {
+    auto* msg = ev->Get();
+    auto it = PendingCollectionLoads.find(msg->Request.Get());
+    if (it == PendingCollectionLoads.end()) {
+        return;
+    }
+    auto load = std::move(it->second);
+    PendingCollectionLoads.erase(it);
+    auto* stage = load.Bundle->GetStage<TPendingPartSwitch::TMetaStage>();
+    Y_ENSURE(
+        stage && stage->Pending && load.Switch->PendingCollections && stage->Requests.at(load.Slot) == msg->Request);
+    --stage->Pending;
+    --load.Switch->PendingCollections;
+    if (msg->Status != NKikimrProto::OK) {
+        if (msg->Status == NKikimrProto::NODATA) {
+            GetServiceCounters(AppData()->Counters, "tablets")->GetCounter("alerts_pending_nodata", true)->Inc();
+        }
+        CancelPendingCollectionLoads();
+        return Broken(EBrokenReason::Storage);
+    }
+    try {
+        load.Bundle->Loader->SetPageCollection(load.Slot, std::move(msg->Collection));
+        if (load.Slot == 0) {
+            load.Bundle->Loader->PrepareRoot();
+            stage->RootReady = true;
+            if (stage->Requests.size() > 1) {
+                if (stage->RawPresent.back()) {
+                    PrepareRawCollection(*load.Bundle, stage->Requests.size() - 1);
+                } else {
+                    const auto kind = load.Bundle->Loader->HasOuterCollection()
+                                          ? NSharedCache::ECollectionLoadKind::Outer
+                                          : NSharedCache::ECollectionLoadKind::Regular;
+                    Y_ENSURE(stage->Requests.back()->Resolve(kind));
+                    CollectionActorSystem->Send(new IEventHandle(MakeSharedPageCacheId(), SelfId(),
+                        new NSharedCache::TEvCollectionRequestUpdate(stage->Requests.back())));
+                }
+            }
+        }
+        stage->Requests[load.Slot].Reset();
+        if (!stage->Pending && !PrepareExternalPart(*load.Switch, *load.Bundle)) {
+            AdvancePendingPartSwitches();
+        }
+    } catch (const yexception&) {
+        CancelPendingCollectionLoads();
+        return Broken(EBrokenReason::Storage);
+    }
+}
+
 bool TExecutor::PrepareExternalPart(TPendingPartSwitch &partSwitch, NTable::TPartComponents &&pc) {
     Y_ENSURE(pc);
 
@@ -1459,27 +1536,47 @@ bool TExecutor::PrepareExternalPart(TPendingPartSwitch &partSwitch, NTable::TPar
 
 bool TExecutor::PrepareExternalPart(TPendingPartSwitch &partSwitch, TPendingPartSwitch::TNewBundle &bundle) {
     if (auto* stage = bundle.GetStage<TPendingPartSwitch::TMetaStage>()) {
-        if (!stage->Finished()) {
-            // N.B. this should only happen at most once per bundle
-            for (auto it = stage->Loaders.begin(); it != stage->Loaders.end(); ++it) {
-                auto group = it->LargeGlobId.Group;
-                for (const TLogoBlobID& id : it->State.GetBlobs()) {
-                    if (partSwitch.AddPendingBlob(id, TPendingPartSwitch::TBlobWaiter{ &bundle, it })) {
-                        // First time we see this blob, enqueue the fetch operation
-                        PendingBlobQueue.Enqueue(id, group, this, reinterpret_cast<uintptr_t>(&partSwitch));
-                    }
-                }
+        if (!stage->Started) {
+            stage->Started = true;
+            if (stage->RawPresent.front()) {
+                PrepareRawCollection(bundle, 0);
+                bundle.Loader->PrepareRoot();
+                stage->RootReady = true;
             }
-            PendingBlobQueue.SendRequests(SelfId());
+            for (ui32 slot = 0; slot < stage->Descriptors.size(); ++slot) {
+                if (stage->RawPresent[slot]) {
+                    if (slot && (slot + 1 < stage->Descriptors.size() || stage->RootReady)) {
+                        PrepareRawCollection(bundle, slot);
+                    }
+                    continue;
+                }
+                auto kind = NSharedCache::ECollectionLoadKind::Regular;
+                if (slot && slot + 1 == stage->Descriptors.size()) {
+                    kind = stage->RootReady
+                               ? (bundle.Loader->HasOuterCollection() ? NSharedCache::ECollectionLoadKind::Outer
+                                                                      : NSharedCache::ECollectionLoadKind::Regular)
+                               : NSharedCache::ECollectionLoadKind::Unknown;
+                }
+                auto request = MakeIntrusive<NSharedCache::TCollectionRequest>(stage->Descriptors[slot], kind);
+                CollectionActorSystem = TActivationContext::ActorSystem();
+                Y_ENSURE(PendingCollectionLoads
+                             .emplace(request.Get(), TPendingCollectionLoad{ request, &partSwitch, &bundle, slot })
+                             .second);
+                stage->Requests[slot] = request;
+                ++stage->Pending;
+                ++partSwitch.PendingCollections;
+                Send(MakeSharedPageCacheId(), new NSharedCache::TEvCollectionRequest(std::move(request)));
+            }
+        }
+        if (stage->Pending) {
             return true;
         }
-
-        auto pc = std::move(stage->PartComponents);
-        bundle.Stage.emplace<TPendingPartSwitch::TLoaderStage>(std::move(pc));
+        bundle.Stage.emplace<TPendingPartSwitch::TLoaderStage>();
     }
 
     if (auto* stage = bundle.GetStage<TPendingPartSwitch::TLoaderStage>()) {
-        if (auto fetch = stage->Loader.Run({.PreloadIndex = true, .PreloadData = PreloadTablesData.contains(partSwitch.TableId)})) {
+        if (auto fetch = bundle.Loader->Run(
+                { .PreloadIndex = true, .PreloadData = PreloadTablesData.contains(partSwitch.TableId) })) {
             stage->Fetching = fetch.PageCollection.Get();
 
             Send(MakeSharedPageCacheId(), new NSharedCache::TEvRequest(
@@ -1490,7 +1587,8 @@ bool TExecutor::PrepareExternalPart(TPendingPartSwitch &partSwitch, TPendingPart
             return true;
         }
 
-        auto partView = stage->Loader.Result();
+        auto partView = bundle.Loader->Result();
+        bundle.Loader.reset();
         bundle.Stage.emplace<TPendingPartSwitch::TResultStage>(std::move(partView));
         return false;
     }
@@ -1545,27 +1643,12 @@ void TExecutor::OnBlobLoaded(const TLogoBlobID& id, TString body, uintptr_t cook
     bool waiting = false;
 
     for (auto& waiter : waiters) {
-        if (auto* r = waiter.GetWaiter<TPendingPartSwitch::TNewBundleWaiter>()) {
-            auto* stage = r->Bundle->GetStage<TPendingPartSwitch::TMetaStage>();
-            Y_ENSURE(stage && !stage->Finished(),
-                "Loaded blob " << id << " for a bundle in an unexpected state");
-            if (stage->Accept(r->Loader, id, body)) {
-                Y_ENSURE(stage->Finished());
-                waiting |= PrepareExternalPart(partSwitch, *r->Bundle);
-            }
-            continue;
+        auto* txStatus = waiter.TxStatus;
+        auto* stage = txStatus->GetStage<TPendingPartSwitch::TTxStatusLoadStage>();
+        Y_ENSURE(stage && !stage->Finished(), "Loaded blob for tx status in an unexpected state");
+        if (stage->Accept(id, body)) {
+            waiting |= PrepareExternalTxStatus(partSwitch, *txStatus);
         }
-        if (auto* r = waiter.GetWaiter<TPendingPartSwitch::TNewTxStatusWaiter>()) {
-            auto* stage = r->TxStatus->GetStage<TPendingPartSwitch::TTxStatusLoadStage>();
-            Y_ENSURE(stage && !stage->Finished(),
-                "Loaded blob " << id << " for a tx status in an unexpected state");
-            if (stage->Accept(id, body)) {
-                Y_ENSURE(stage->Finished());
-                waiting |= PrepareExternalTxStatus(partSwitch, *r->TxStatus);
-            }
-            continue;
-        }
-        Y_TABLET_ERROR("Loaded blob " << id << " for an unsupported waiter");
     }
 
     PendingBlobQueue.SendRequests(SelfId());
@@ -1617,7 +1700,8 @@ bool TExecutor::ApplyReadyPartSwitches() {
     while (PendingPartSwitches) {
         auto step = PendingPartSwitches.front().Step;
         auto last = PendingPartSwitches.begin() + ReadyPartSwitches;
-        while (last != PendingPartSwitches.end() && !last->PendingBlobs && !last->PendingLoads) {
+        while (last != PendingPartSwitches.end() && !last->PendingBlobs && !last->PendingLoads &&
+               !last->PendingCollections) {
             ++ReadyPartSwitches;
             ++last;
         }
@@ -3411,7 +3495,7 @@ void TExecutor::Handle(NSharedCache::TEvResult::TPtr &ev) {
             }
 
             Y_ENSURE(msg->Cookie == 0);
-            foundStage->Loader.Save(std::move(msg->Pages));
+            foundBundle->Loader->Save(std::move(msg->Pages));
             foundSwitch->PendingLoads--;
 
             if (PrepareExternalPart(*foundSwitch, *foundBundle)) {
@@ -4687,6 +4771,7 @@ STFUNC(TExecutor::StateWork) {
         HFunc(TEvents::TEvWakeup, Wakeup);
         hFunc(TEvents::TEvFlushLog, Handle);
         hFunc(NSharedCache::TEvResult, Handle);
+        hFunc(NSharedCache::TEvCollectionResult, Handle);
         HFunc(TEvTablet::TEvDropLease, Handle);
         HFunc(TEvTablet::TEvCommitResult, Handle);
         HFunc(TEvTablet::TEvSnapshotConfirmed, Handle);
@@ -4722,6 +4807,7 @@ STFUNC(TExecutor::StateFollower) {
         CFunc(TEvPrivate::EvUpdateCounters, UpdateCounters);
         HFunc(TEvents::TEvWakeup, Wakeup);
         hFunc(NSharedCache::TEvResult, Handle);
+        hFunc(NSharedCache::TEvCollectionResult, Handle);
         HFunc(TEvBlobStorage::TEvGetResult, Handle);
         hFunc(TEvResourceBroker::TEvResourceAllocated, Handle);
         HFunc(NOps::TEvScanStat, Handle);

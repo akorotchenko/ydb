@@ -3983,17 +3983,9 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_Follower) {
 
         // Loan snapshot while metadata loading is blocked
         Cerr << "... loaning snapshot" << Endl;
-        TBlockEvents<TEvBlobStorage::TEvGet> blockedMetadata(env.Env,
+        TBlockEvents<NSharedCache::TEvCollectionResult> blockedMetadata(env.Env,
             [tablet = env.Tablet - 1](const auto& ev) {
-                auto* msg = ev->Get();
-                for (ui32 i = 0; i < msg->QuerySize; ++i) {
-                    const auto& id = msg->Queries[i].Id;
-                    Cerr << "get blob " << id << Endl;
-                    if (id.TabletID() == tablet && (id.Cookie() >> 12) == /* Pack */ 3) {
-                        return true;
-                    }
-                }
-                return false;
+                return ev->Get()->Request->Descriptor.Lead.TabletID() == tablet;
             });
         env.SendSync(new NFake::TEvExecute{ new TTxLoanSnapshot(snapBody) });
         env->WaitFor("blocked metadata", [&]{ return blockedMetadata.size() >= 1; });
