@@ -1383,6 +1383,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             waiter.Wait();
             auto& core = TSharedCache::Get();
             UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
+            if (!retainPartOwnership) {
+                sharedCache.Runtime.WaitFor("saved event ownership released", [&] {
+                    return !page.IsSticky();
+                });
+            }
             UNIT_ASSERT_VALUES_EQUAL(page.IsSticky(), retainPartOwnership);
 
             sharedCache.Runtime.SimulateSleep(TDuration::Minutes(2));
