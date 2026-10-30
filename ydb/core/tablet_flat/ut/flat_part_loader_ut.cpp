@@ -71,9 +71,8 @@ namespace {
     }
 
     TPartComponents Components(const TBundle::TResult& written, bool rawMetadata = false) {
-        TPartComponents components;
+        TPartComponents components{ .Epoch = TEpoch::Zero() };
         components.Opaque = written.Overlay;
-        components.Epoch = TEpoch::Zero();
         for (const auto& collection : written.PageCollections) {
             const auto* packet = dynamic_cast<const NPageCollection::TPageCollection*>(collection.PageCollection.Get());
             UNIT_ASSERT(packet);
@@ -180,11 +179,10 @@ Y_UNIT_TEST_SUITE_F(TPartLoaderRoot, NTest::TTableCacheTest) {
     Y_UNIT_TEST(PreservesRawAndFullyPrebuiltRunPaths) {
         for (bool prebuilt : { false, true }) {
             auto written = WritePart({ .Step = prebuilt ? 2u : 1u });
-            TPartComponents components;
+            TPartComponents components{ .Epoch = TEpoch::Zero() };
             TVector<TCacheCollectionRef> collections;
             if (prebuilt) {
                 components.Opaque = written.Overlay;
-                components.Epoch = TEpoch::Zero();
                 for (ui32 slot = 0; slot < written.PageCollections.size(); ++slot) {
                     collections.push_back(AdmitCollection(written, slot));
                 }
