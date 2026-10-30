@@ -115,7 +115,9 @@ private:
 
     bool SetPagesCacheMode(TSpaceOperation& spaceOp, TCollection& collection, ECacheMode mode) noexcept;
     bool TryBeginDetach(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item) noexcept;
+    void FinishDetach(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item) noexcept;
     bool Detach(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item) noexcept;
+    bool DetachReleased(TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem item) noexcept;
 
     bool TryClaimDeletion(TSpaceOperation& spaceOp, TCollectionRegistry* expectedRegistry, TCacheItem item,
         THandleState& sourceState, TCacheItemRefImpl<TTraits>& owner) noexcept;
@@ -205,6 +207,10 @@ public:
 
     Y_FORCE_INLINE bool Detach(TCollectionRegistry& registry, TCacheItem item) noexcept {
         return Cache_.Collections_.Detach(SpaceOp_, registry, item);
+    }
+
+    Y_FORCE_INLINE bool DetachReleased(TCollectionRegistry& registry, TCacheItem item) noexcept {
+        return Cache_.Collections_.DetachReleased(SpaceOp_, registry, item);
     }
 
     Y_FORCE_INLINE bool Erase(TCollectionRegistry* expectedRegistry, TCacheItem item) noexcept {

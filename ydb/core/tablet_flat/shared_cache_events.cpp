@@ -22,8 +22,8 @@ TCacheCollectionRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitCollection(
         status = FindOrInsert(location, inserted, hit);
     }
     if (status == ECacheResultStatus::Inserted) {
-        Y_ENSURE(MakeReady(inserted, MakeHolder<TCollection>(std::move(collection), inserted, ECacheMode::Regular)));
-        Y_ENSURE(Find(location.Id, hit) == ECacheResultStatus::Hit);
+        Y_ENSURE(
+            MakeReady(inserted, MakeHolder<TCollection>(std::move(collection), inserted, ECacheMode::Regular), hit));
     } else {
         Y_ENSURE(status == ECacheResultStatus::Hit);
         hit->SetSkipBTreeIndexV1Shadow(collection->SkipBTreeIndexV1Shadow());
@@ -54,9 +54,9 @@ public:
 
 TCachePageRef TEvSaveCompactedPages::AddPage(
     TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky, TSharedCache::EPageAdmission admission) {
-    if (!CacheItem) {
-        auto collection = cachePages.AdmitCollection(PageCollection);
-        CacheItem = collection.CacheItem();
+    if (!Collection_) {
+        Collection_ = cachePages.AdmitCollection(PageCollection);
+        CacheItem = Collection_.CacheItem();
     }
     Pages.push_back(page.Location);
     auto waiter = MakeIntrusive<TCompactedPageWaiter>();

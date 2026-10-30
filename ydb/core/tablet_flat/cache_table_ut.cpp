@@ -1371,6 +1371,64 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(published->GetCacheMode() == ECacheMode::Sticky);
     }
 
+    Y_UNIT_TEST(CollectionLastReleaseTracksDetachEpoch) {
+        for (bool detachAndReattach : { false, true }) {
+            TFixture fixture;
+            const TLogoBlobID id(111, 112, 151);
+            TCollectionCacheItem item;
+            TTestCacheCollectionRef owner;
+            UNIT_ASSERT(fixture.Cache->FindOrInsert({ .Id = id }, item, owner) == ECacheResultStatus::Inserted);
+            UNIT_ASSERT(fixture.Cache->MakeReady(item, MakeCollection(id), owner));
+            owner->EnsureActorState();
+
+            struct TObservation {
+                TTestSharedCache* Cache;
+                TCollection* Collection;
+                TLogoBlobID Id;
+                TCollectionCacheItem Item;
+                bool DetachAndReattach;
+                bool Changed = false;
+                bool RestoredState = false;
+                ui32 Notifications = 0;
+            } observation{ fixture.Cache.Get(), owner.Get(), id, item, detachAndReattach };
+
+            TTestTraits hooks{ &observation, [](void* context, ECacheHookPoint point, TCacheItem item) noexcept {
+                                  auto& state = *static_cast<TObservation*>(context);
+                                  if (item != state.Item.CacheItem()) {
+                                      return;
+                                  }
+                                  if (point == ECacheHookPoint::CollectionReleased) {
+                                      ++state.Notifications;
+                                  } else if (point == ECacheHookPoint::BeforeLastCollectionRefRelease &&
+                                             state.DetachAndReattach && !state.Changed) {
+                                      state.Changed = true;
+                                      const auto before = TCacheTestAccess::HandleState(*state.Cache, item.Index());
+                                      state.Collection->ResetActorState();
+                                      Y_ABORT_UNLESS(state.Cache->DetachCollection(state.Item));
+                                      TTestCacheCollectionRef joined;
+                                      Y_ABORT_UNLESS(state.Cache->FindCollection(state.Id, joined) ==
+                                                     ECacheCollectionLookupStatus::Hit);
+                                      joined.Drop();
+                                      state.RestoredState =
+                                          TCacheTestAccess::HandleState(*state.Cache, item.Index()).Raw() ==
+                                          before.Raw();
+                                  }
+                              } };
+            TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+            owner.Drop();
+            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, detachAndReattach ? 1 : 0);
+            UNIT_ASSERT_VALUES_EQUAL(observation.Changed, detachAndReattach);
+            UNIT_ASSERT_VALUES_EQUAL(observation.RestoredState, detachAndReattach);
+
+            TTestCacheCollectionRef cleanup;
+            UNIT_ASSERT(fixture.Cache->Find(id, cleanup) == ECacheResultStatus::Hit);
+            cleanup->ResetActorState();
+            UNIT_ASSERT(fixture.Cache->TryDetachReleasedCollection(cleanup));
+            cleanup.Drop();
+            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, detachAndReattach ? 1 : 0);
+        }
+    }
+
     TCacheKey ReviewKeyForBucket(
         TCollectionCacheItem collection, ui32 mask, ui32 bucket, ui64 startOffset, const TCacheKey* after = nullptr) {
         for (ui64 offset = startOffset; offset - startOffset < (1u << 20); ++offset) {

@@ -834,7 +834,52 @@ bool TCacheCollections<TTraits>::Detach(
     if (!TryBeginDetach(spaceOp, registry, collectionItem)) {
         return false;
     }
+    FinishDetach(spaceOp, registry, collectionItem);
+    return true;
+}
+
+template <class TTraits>
+bool TCacheCollections<TTraits>::DetachReleased(
+    TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collectionItem) noexcept {
     THandle& handle = spaceOp.Handles()[collectionItem.Index()];
+    ui64 raw = handle.State.load(std::memory_order_acquire);
+    for (;;) {
+        const auto state = THandleState::FromRaw(raw);
+        if (!collectionItem.Matches(state) || !state.IsCollectionKind() || !state.IsSticky() ||
+            !state.IsStickyField() || state.Refs() != 1 ||
+            handle.Body.Collection->Registry_.load(std::memory_order_acquire) != &registry) {
+            return false;
+        }
+        const auto claimed = state.WithSticky(EStickyState::Transition);
+        if (handle.State.compare_exchange_weak(
+                raw, claimed.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+    if (handle.Body.Collection->GetActorState()) {
+        // Actor-owned collections finish through their registration and request lifecycle
+        raw = handle.State.load(std::memory_order_relaxed);
+        for (;;) {
+            const auto state = THandleState::FromRaw(raw);
+            const auto restored = state.WithSticky(EStickyState::Sticky);
+            if (handle.State.compare_exchange_weak(
+                    raw, restored.Raw(), std::memory_order_release, std::memory_order_relaxed)) {
+                break;
+            }
+        }
+        Cache_.NotifyResourcesAvailable();
+        return false;
+    }
+    FinishDetach(spaceOp, registry, collectionItem);
+    return true;
+}
+
+template <class TTraits>
+void TCacheCollections<TTraits>::FinishDetach(
+    TSpaceOperation& spaceOp, TCollectionRegistry& registry, TCacheItem collectionItem) noexcept {
+    THandle& handle = spaceOp.Handles()[collectionItem.Index()];
+    // Invalidate last-owner notification snapshots across detach/reattach
+    Cache_.AdvanceColdMembership(handle);
     TCollection& value = *handle.Body.Collection;
     const ECacheMode previousMode = value.CacheMode_.exchange(ECacheMode::Regular, std::memory_order_acq_rel);
     PublishKeepPageBytes(value);
@@ -863,7 +908,6 @@ bool TCacheCollections<TTraits>::Detach(
         PublishCollectionForReclaim(spaceOp, collectionItem);
     }
     Cache_.NotifyResourcesAvailable();
-    return true;
 }
 
 template <class TTraits>

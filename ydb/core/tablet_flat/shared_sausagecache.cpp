@@ -1320,14 +1320,20 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         TCacheCollectionRef collection;
         const auto status = Cache->Find(msg->CollectionId, collection);
         if (status == ECacheResultStatus::Hit) {
-            if (collection.CacheItem() == msg->CacheItem && collection->GetActorState()) {
-                if (collection->GetActorState()->Owners.empty() && collection.IsSoleReference()) {
-                    collection->DrainStickyPages();
+            if (collection.CacheItem() != msg->CacheItem) {
+                return;
+            }
+            if (!collection->GetActorState()) {
+                // Metadata-only readers do not register an actor owner
+                Cache->TryDetachReleasedCollection(collection);
+                return;
+            }
+            if (collection->GetActorState()->Owners.empty() && collection.IsSoleReference()) {
+                collection->DrainStickyPages();
             }
 
             if (!collection->HasPageItems()) {
-                    TryDropExpiredCollection(*collection);
-                }
+                TryDropExpiredCollection(*collection);
             }
         } else if (status == ECacheResultStatus::Miss) {
             // A late release from an older generation must not remove a replacement's offsets.

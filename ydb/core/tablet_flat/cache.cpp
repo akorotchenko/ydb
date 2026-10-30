@@ -334,6 +334,28 @@ bool TSharedCache::WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheIte
 }
 
 SHARED_CACHE_TEMPLATE
+bool TSharedCache::MakeReady(
+    TCollectionCacheItem collection, THolder<TCollection>&& value, TCacheCollectionRef& ready) noexcept {
+    auto cacheOp = BeginOperation();
+    TOperationItemRef publisher(cacheOp, cacheOp.TryAcquireStructural(collection.CacheItem()));
+    Y_DEBUG_ABORT_UNLESS(publisher);
+    if (!cacheOp.MakeReady(&Collections_.Registry(), collection.CacheItem(), std::move(value))) {
+        return false;
+    }
+    ready = cacheOp.BuildCollectionRef(publisher.Take());
+    return true;
+}
+
+SHARED_CACHE_TEMPLATE
+bool TSharedCache::TryDetachReleasedCollection(const TCacheCollectionRef& collection) noexcept {
+    if (!collection) {
+        return false;
+    }
+    auto cacheOp = BeginOperation();
+    return cacheOp.Collections().DetachReleased(Collections_.Registry(), collection.CacheItem().CacheItem());
+}
+
+SHARED_CACHE_TEMPLATE
 bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* registry, TCacheItem cacheItem,
     THolder<TCollection>&& value) noexcept {
     auto cacheOp = BindOperation(spaceOp);

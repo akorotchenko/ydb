@@ -135,6 +135,14 @@ namespace {
             Runtime.SimulateSleep(TDuration::MilliSeconds(1));
         }
 
+        ui64 RegisteredCollections() {
+            ui64 count = 0;
+            TSharedCache::Get().ForEachCollection([&](TCollection&) {
+                ++count;
+            });
+            return count;
+        }
+
         TTestBasicRuntime Runtime;
         TActorId Client;
         TActorId Proxy;
@@ -179,6 +187,128 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         UNIT_ASSERT(hit->Get()->Collection.Get() == a->Get()->Collection.Get());
         UNIT_ASSERT_VALUES_EQUAL(fixture.ReadWorkers.size(), 1);
         UNIT_ASSERT_VALUES_EQUAL(fixture.ParseWorkers.size(), 1);
+    }
+
+    Y_UNIT_TEST(MetadataOnlyCollectionReleasesItsRegistryHold) {
+        TCollectionFixture fixture;
+        const auto metadata = fixture.Metadata();
+        auto request = fixture.Load(metadata);
+        fixture.Reply(fixture.Read(metadata), metadata);
+        auto result = fixture.Result();
+        auto retained = std::move(result->Get()->Collection);
+        result.Reset();
+        fixture.Send(new TEvUnregister);
+        fixture.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.RegisteredCollections(), 1);
+
+        retained.Drop();
+        fixture.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.RegisteredCollections(), 0);
+    }
+
+    Y_UNIT_TEST(LateMetadataReleasePreservesANewNativeOwner) {
+        TCollectionFixture fixture;
+        const auto metadata = fixture.Metadata();
+        auto request = fixture.Load(metadata);
+        fixture.Reply(fixture.Read(metadata), metadata);
+        auto result = fixture.Result();
+        TVector<TEvCollectionReleased::TPtr> releases;
+        auto observer = fixture.Runtime.AddObserver<TEvCollectionReleased>([&](TEvCollectionReleased::TPtr& event) {
+            releases.push_back(std::move(event));
+        });
+        result.Reset();
+        fixture.Runtime.WaitFor("metadata release", [&] {
+            return !releases.empty();
+        }, TDuration::Seconds(5));
+
+        TCacheCollectionRef retained;
+        UNIT_ASSERT(TSharedCache::Get().FindCollection(metadata.Descriptor.Lead, retained) ==
+                    ECacheCollectionLookupStatus::Hit);
+        observer.Remove();
+        for (auto& release : releases) {
+            fixture.Runtime.Send(release.Release(), 0, true);
+        }
+        fixture.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.RegisteredCollections(), 1);
+        retained.Drop();
+        fixture.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.RegisteredCollections(), 0);
+    }
+
+    Y_UNIT_TEST(LastMetadataOwnerReleaseUnblocksHandleAdmission) {
+        TCollectionFixture fixture;
+        const auto metadata = fixture.Metadata();
+        auto request = fixture.Load(metadata);
+        fixture.Reply(fixture.Read(metadata), metadata);
+        auto result = fixture.Result();
+        auto retained = std::move(result->Get()->Collection);
+        result.Reset();
+
+        auto& cache = TSharedCache::Get();
+        TVector<TCacheCollectionRef> held;
+        for (ui32 cookie = 100; cache.AvailableHandleCount() != 0; ++cookie) {
+            auto item = fixture.Metadata(cookie);
+            auto packet = MakeIntrusiveConst<NPageCollection::TPageCollection>(item.Descriptor, std::move(item.Raw));
+            held.push_back(cache.AdmitCollection(std::move(packet)));
+        }
+
+        const auto waitingMetadata = fixture.Metadata(1000000);
+        auto waiting = fixture.Load(waitingMetadata);
+        fixture.Reply(fixture.Read(waitingMetadata), waitingMetadata);
+        fixture.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.ParseWorkers.size(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Results, 1);
+
+        retained.Drop();
+        auto admitted = fixture.Result();
+        UNIT_ASSERT(admitted->Get()->Request == waiting);
+        UNIT_ASSERT_VALUES_EQUAL(admitted->Get()->Collection->Id(), waitingMetadata.Descriptor.Lead);
+    }
+
+    Y_UNIT_TEST(WriterRetainsMetadataAcrossAnUnsuccessfulPageAdmission) {
+        TCollectionFixture fixture;
+        const auto metadata = fixture.Metadata();
+        auto packet =
+            MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
+        const auto location = packet->GetLocation(0);
+        auto& cache = TSharedCache::Get();
+        TEvSaveCompactedPages writer(packet);
+        UNIT_ASSERT(cache.UpdateCurrentLimit(1));
+        UNIT_ASSERT(
+            !writer.AddPage(cache, NPageCollection::TPageData(location, TSharedData::Copy(TString(64, 'x'))), false));
+        fixture.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.RegisteredCollections(), 1);
+
+        UNIT_ASSERT(cache.UpdateCurrentLimit(8_MB));
+        auto page =
+            writer.AddPage(cache, NPageCollection::TPageData(location, TSharedData::Copy(TString(64, 'x'))), false);
+        UNIT_ASSERT(page);
+    }
+
+    Y_UNIT_TEST(LastWriterOwnerDetachPreservesAHeldPage) {
+        TCollectionFixture fixture;
+        const auto metadata = fixture.Metadata();
+        auto packet =
+            MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
+        const auto location = packet->GetLocation(0);
+        TCachePageRef page;
+        {
+            TEvSaveCompactedPages writer(packet);
+            page = writer.AddWrittenPage(
+                TSharedCache::Get(), NPageCollection::TPageData(location, TSharedData::Copy(TString(64, 'x'))), true);
+            UNIT_ASSERT(page);
+            fixture.Drain();
+            UNIT_ASSERT_VALUES_EQUAL(fixture.RegisteredCollections(), 1);
+            TCacheCollectionRef retained;
+            UNIT_ASSERT(TSharedCache::Get().FindCollection(metadata.Descriptor.Lead, retained) ==
+                        ECacheCollectionLookupStatus::Hit);
+            UNIT_ASSERT(!TSharedCache::Get().TryDetachReleasedCollection(retained));
+            UNIT_ASSERT(page.IsSticky());
+        }
+        fixture.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.RegisteredCollections(), 0);
+        UNIT_ASSERT(!page.IsSticky());
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(page.data(), page.size()), TString(64, 'x'));
     }
 
     Y_UNIT_TEST(RetainsCanonicalOwnerForAnEarlierUnresolvedSubscriber) {
