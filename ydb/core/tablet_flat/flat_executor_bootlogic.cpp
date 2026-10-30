@@ -16,6 +16,7 @@
 #include <ydb/core/base/counters.h>
 #include <ydb/core/util/pb.h>
 #include <ydb/library/actors/core/monotonic_provider.h>
+#include <ydb/library/actors/core/actorsystem.h>
 
 
 namespace NKikimr {
@@ -44,6 +45,7 @@ TExecutorBootLogic::TExecutorBootLogic(IOps *ops, const TActorId &self, ui64 boo
 
 TExecutorBootLogic::~TExecutorBootLogic()
 {
+    CancelCollectionLoads();
     LoadBlobQueue.Clear();
 
     Loads.clear();
@@ -196,6 +198,41 @@ void TExecutorBootLogic::LoadEntry(TIntrusivePtr<NBoot::TLoadBlobs> entry) {
     }
 }
 
+NBoot::TSpawned TExecutorBootLogic::LoadCollection(
+    NBoot::IStep* step, ui32 slot, TIntrusivePtr<NSharedCache::TCollectionRequest> request) {
+    if (Cancelled) {
+        request->Cancel();
+        return NBoot::TSpawned(false);
+    }
+    ActorSystem = TActivationContext::ActorSystem();
+    Y_ENSURE(CollectionLoads.emplace(request.Get(), TCollectionLoad{ request, TIntrusivePtr<NBoot::IStep>(step), slot })
+                 .second);
+    TVector<TLogoBlobID> blobs;
+    request->Descriptor.MaterializeTo(blobs);
+    for (const auto& blob : blobs) {
+        SeenBlob(blob);
+    }
+    Ops->Send(NSharedCache::MakeSharedPageCacheId(), new NSharedCache::TEvCollectionRequest(std::move(request)), 0,
+        BootAttempt);
+    return NBoot::TSpawned(true);
+}
+
+void TExecutorBootLogic::UpdateCollection(const TIntrusivePtr<NSharedCache::TCollectionRequest>& request) {
+    ActorSystem->Send(new IEventHandle(
+        NSharedCache::MakeSharedPageCacheId(), SelfId, new NSharedCache::TEvCollectionRequestUpdate(request)));
+}
+
+void TExecutorBootLogic::CancelCollectionLoads() {
+    Cancelled = true;
+    for (const auto& [_, load] : CollectionLoads) {
+        if (load.Request->IsActive()) {
+            load.Request->Cancel();
+            UpdateCollection(load.Request);
+        }
+    }
+    CollectionLoads.clear();
+}
+
 NBoot::TSpawned TExecutorBootLogic::LoadPages(NBoot::IStep *step, NTable::TLoader::TFetch&& fetch) {
     auto success = Loads.insert(std::make_pair(fetch.PageCollection.Get(), step)).second;
 
@@ -305,6 +342,30 @@ TExecutorBootLogic::EOpResult TExecutorBootLogic::Receive(::NActors::IEventHandl
             return OpResultBroken;
         }
 
+    } else if (auto* msg = ev.CastAsLocal<NSharedCache::TEvCollectionResult>()) {
+        if (Cancelled || ev.Cookie != BootAttempt) {
+            return OpResultUnhandled;
+        }
+        auto it = CollectionLoads.find(msg->Request.Get());
+        if (it == CollectionLoads.end()) {
+            return OpResultUnhandled;
+        }
+        auto load = std::move(it->second);
+        CollectionLoads.erase(it);
+        if (msg->Status == NKikimrProto::NODATA) {
+            GetServiceCounters(AppData()->Counters, "tablets")->GetCounter("alerts_boot_nodata", true)->Inc();
+        }
+        try {
+            if (!load.Step->HandleCollection(load.Slot, *msg)) {
+                CancelCollectionLoads();
+                return OpResultBroken;
+            }
+        } catch (...) {
+            CancelCollectionLoads();
+            throw;
+        }
+        load.Step.Drop();
+        Steps->Execute();
     } else if (auto *msg = ev.CastAsLocal<NSharedCache::TEvResult>()) {
         if (ERequestTypeCookie(ev.Cookie) != ERequestTypeCookie::BootLogic) {
             return OpResultUnhandled;
@@ -377,6 +438,7 @@ TAutoPtr<NBoot::TResult> TExecutorBootLogic::ExtractState() {
 }
 
 void TExecutorBootLogic::Cancel() {
+    CancelCollectionLoads();
     if (LeaseWaiter) {
         Ops->Send(LeaseWaiter, new TEvents::TEvPoison);
     }

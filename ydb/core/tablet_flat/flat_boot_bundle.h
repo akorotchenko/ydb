@@ -2,7 +2,6 @@
 
 #include "flat_boot_iface.h"
 #include "flat_boot_back.h"
-#include "flat_boot_blobs.h"
 #include "flat_bio_events.h"
 #include "flat_sausage_packet.h"
 #include "flat_part_loader.h"
@@ -36,20 +35,29 @@ namespace NBoot {
     private: /* IStep, boot logic DSL actor interface   */
         void Start() override
         {
-            Prebuilt.resize(LargeGlobIds.size());
-            Components.resize(LargeGlobIds.size());
-
-            auto* cache = TSharedCache::TryGet();
-            for (auto slot: xrange(LargeGlobIds.size())) {
-                if (cache) {
-                    cache->Find(LargeGlobIds[slot].Lead, Prebuilt[slot]);
-                }
-                if (!Prebuilt[slot]) {
-                    LeftMetas += Spawn<TLoadBlobs>(LargeGlobIds[slot], slot);
-                }
+            if (Logic->Cancelled) {
+                return;
             }
-
-            TryLoad();
+            TVector<NTable::TPageCollectionComponents> components(LargeGlobIds.size());
+            for (ui32 slot = 0; slot < LargeGlobIds.size(); ++slot) {
+                components[slot].LargeGlobId = LargeGlobIds[slot];
+            }
+            NTable::TPartComponents parts{
+                .PageCollectionComponents = std::move(components),
+                .Legacy = std::move(Legacy),
+                .Opaque = std::move(Opaque),
+                .Deltas = std::move(Deltas),
+                .Epoch = Epoch,
+            };
+            Loader = new NTable::TLoader(std::move(parts));
+            Requests.resize(LargeGlobIds.size());
+            for (ui32 slot = 0; slot < LargeGlobIds.size(); ++slot) {
+                const auto kind = slot == 0 || slot + 1 < LargeGlobIds.size()
+                                      ? NSharedCache::ECollectionLoadKind::Regular
+                                      : NSharedCache::ECollectionLoadKind::Unknown;
+                Requests[slot] = MakeIntrusive<NSharedCache::TCollectionRequest>(LargeGlobIds[slot], kind);
+                LeftMetas += Logic->LoadCollection(this, slot, Requests[slot]);
+            }
         }
 
         bool HandleBio(NSharedCache::TEvResult &msg) override
@@ -72,44 +80,35 @@ namespace NBoot {
             return msg.Status == NKikimrProto::OK;
         }
 
-        void HandleStep(TIntrusivePtr<IStep> step) override
+        bool HandleCollection(ui32 slot, NSharedCache::TEvCollectionResult& msg) override
         {
-            auto *load = step->ConsumeAs<TLoadBlobs>(LeftMetas);
-
-            if (Loader) {
-                Y_TABLET_ERROR("Got an unexpected load blobs result");
-            } else if (load->Cookie >= LargeGlobIds.size()) {
-                Y_TABLET_ERROR("Got blobs load step with an invalid cookie");
-            } else if (Prebuilt[load->Cookie]) {
-                Y_TABLET_ERROR("Page collection is already loaded at room " << load->Cookie);
-            } else {
-                // StageParseMeta constructs both NPageCollection::TPageCollection and TCollection
-                Components[load->Cookie].LargeGlobId = load->LargeGlobId;
-                Components[load->Cookie].RawMeta = load->PlainData();
+            Y_ENSURE(slot < Requests.size() && Requests[slot] == msg.Request, "Unexpected collection metadata result");
+            if (msg.Status != NKikimrProto::OK) {
+                if (auto logl = Env->Logger()->Log(ELnLev::Error)) {
+                    logl << NFmt::Do(*Back) << " Collection metadata load failed for " << LargeGlobIds[slot].Lead
+                         << ": " << msg.Error;
+                }
+                return false;
             }
-
-            TryLoad();
+            Loader->SetPageCollection(slot, std::move(msg.Collection));
+            if (slot == 0) {
+                Loader->PrepareRoot();
+                if (Requests.size() > 1) {
+                    const auto kind = Loader->HasOuterCollection() ? NSharedCache::ECollectionLoadKind::Outer
+                                                                   : NSharedCache::ECollectionLoadKind::Regular;
+                    Y_ENSURE(Requests.back()->Resolve(kind));
+                    Logic->UpdateCollection(Requests.back());
+                }
+            }
+            Requests[slot].Reset();
+            LeftMetas -= 1;
+            if (!LeftMetas) {
+                TryFinalize();
+            }
+            return true;
         }
 
     private:
-        void TryLoad()
-        {
-            if (!LeftMetas) {
-                NTable::TPartComponents parts{
-                    .PageCollectionComponents = std::move(Components),
-                    .Legacy = std::move(Legacy),
-                    .Opaque = std::move(Opaque),
-                    .Deltas = std::move(Deltas),
-                    .Epoch = Epoch,
-                };
-
-                // Pass pre-built collections — StageParseMeta fills null slots from components
-                Loader = new NTable::TLoader(std::move(parts), std::move(Prebuilt));
-
-                TryFinalize();
-            }
-        }
-
         void TryFinalize()
         {
             if (!LeftReads) {
@@ -143,9 +142,7 @@ namespace NBoot {
 
         TAutoPtr<NTable::TLoader> Loader;
         TVector<NPageCollection::TLargeGlobId> LargeGlobIds;
-        TVector<NTable::TPageCollectionComponents> Components;
-        // Native metadata refs acquired directly from core for this bundle's slots.
-        TVector<TCacheCollectionRef> Prebuilt;
+        TVector<TIntrusivePtr<NSharedCache::TCollectionRequest>> Requests;
         TString Legacy;
         TString Opaque;
         TVector<TString> Deltas;

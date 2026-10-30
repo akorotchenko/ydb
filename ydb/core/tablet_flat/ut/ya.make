@@ -23,6 +23,7 @@ SRCS(
     flat_row_versions_ut.cpp
     flat_table_part_ut.cpp
     flat_part_loader_ut.cpp
+    flat_boot_metadata_ut.cpp
     flat_test_db.h
     flat_test_db.cpp
     flat_test_db_helpers.h
