@@ -160,17 +160,17 @@ public:
         return cache.Capacity_.AdvanceBucketResize();
     }
 
-    static bool TryReserve(TTestSharedCache& cache, ui64 bytes) noexcept {
+    static bool TryReserve(TTestSharedCache& cache, ui64 bytes, ui64 pages = 0) noexcept {
         auto spaceOp = cache.BeginOperation();
-        return cache.TryReserve(spaceOp, bytes);
+        return cache.TryReserve(spaceOp, bytes, pages);
     }
 
     static TKeepReservation ReserveKeepCandidate(TTestSharedCache& cache, ui64 bytes) noexcept {
         return cache.Memory_.TryReserveKeep(bytes, cache.KeepLimit());
     }
 
-    static void ReleaseReservation(TTestSharedCache& cache, ui64 bytes) noexcept {
-        cache.ReleaseReservation(bytes);
+    static void ReleaseReservation(TTestSharedCache& cache, ui64 bytes, ui64 pages = 0) noexcept {
+        cache.ReleaseReservation(bytes, pages);
     }
 
     static TCacheMapping& BucketsMapping(TTestSharedCache& cache) noexcept {
@@ -2315,6 +2315,27 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
         fixture.Cache->DisarmResourceWait();
         TCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
+    }
+
+    Y_UNIT_TEST(EmptyReservationRefundDoesNotWakeAdmissionWaiter) {
+        TFixture fixture;
+        ui32 notifications = 0;
+        TTestTraits hooks{ &notifications, [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
+                              if (point == ECacheHookPoint::ResourcesAvailable) {
+                                  ++*static_cast<ui32*>(context);
+                              }
+                          } };
+        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+        ui32 expected = 0;
+        for (auto [bytes, pages] : { std::pair<ui64, ui64>{ 0, 0 }, { 1, 0 }, { 0, 1 } }) {
+            const ui64 generation = fixture.Cache->AdmissionGeneration();
+            fixture.Cache->ArmResourceWait(generation);
+            UNIT_ASSERT(TCacheTestAccess::TryReserve(*fixture.Cache, bytes, pages));
+            TCacheTestAccess::ReleaseReservation(*fixture.Cache, bytes, pages);
+            expected += bytes != 0 || pages != 0;
+            UNIT_ASSERT_VALUES_EQUAL(notifications, expected);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + (bytes != 0 || pages != 0));
+        }
     }
 
     Y_UNIT_TEST(CollectionReadinessNotifiesAdmissionWaiter) {

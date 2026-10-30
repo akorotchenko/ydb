@@ -674,6 +674,9 @@ private:
     }
 
     Y_FORCE_INLINE void ReleaseReservation(ui64 bytes, ui64 pages = 0) noexcept {
+        if (bytes == 0 && pages == 0) {
+            return;
+        }
         Memory_.ReleaseReservation(bytes, pages);
         NotifyResourcesAvailable();
     }
