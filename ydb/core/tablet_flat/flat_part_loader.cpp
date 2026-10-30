@@ -20,14 +20,29 @@ TLoader::TLoader(TPartComponents components, TVector<TCacheCollectionRef> prebui
     if (PageCollections.empty() && Components.PageCollectionComponents.empty()) {
         Y_TABLET_ERROR("Cannot load TPart from " << PageCollections.size() << " page collections");
     }
+    if (PageCollections.size() < Components.PageCollectionComponents.size()) {
+        PageCollections.resize(Components.PageCollectionComponents.size());
+    }
 }
 
 TLoader::~TLoader() { }
 
-void TLoader::StageParseMeta()
+void TLoader::SetPageCollection(ui32 slot, TCacheCollectionRef collection)
 {
-    if (PageCollections.size() < Components.PageCollectionComponents.size()) {
-        PageCollections.resize(Components.PageCollectionComponents.size());
+    Y_ENSURE(Stage == EStage::Meta, "Part metadata loading has already completed");
+    Y_ENSURE(collection && slot < PageCollections.size() && !PageCollections[slot],
+        "Invalid or duplicate page collection at slot " << slot);
+    if (slot < Components.PageCollectionComponents.size()) {
+        Y_ENSURE(collection->Id() == Components.PageCollectionComponents[slot].LargeGlobId.Lead,
+            "Page collection does not match slot " << slot);
+    }
+    PageCollections[slot] = std::move(collection);
+}
+
+void TLoader::PrepareRoot()
+{
+    if (RootPrepared) {
+        return;
     }
 
     // Build slot 0 first — its meta is needed for the full layout parse
@@ -193,7 +208,14 @@ void TLoader::StageParseMeta()
     MaxRowVersion.Step = Root.GetMaxRowVersion().GetStep();
     MaxRowVersion.TxId = Root.GetMaxRowVersion().GetTxId();
 
-    bool isOuterSlot = (SmallId != Max<TPageId>());
+    RootPrepared = true;
+}
+
+void TLoader::StageParseMeta()
+{
+    PrepareRoot();
+    const ui32 metaPages = PageCollections[0]->PageCollection()->MetaPages();
+    bool isOuterSlot = HasOuterCollection();
 
     for (ui32 i = 1; i < PageCollections.size() - isOuterSlot; i++) {
         if (PageCollections[i]) {
@@ -220,13 +242,13 @@ void TLoader::StageParseMeta()
 
     LoaderEnv = MakeHolder<TLoaderEnv>(PageCollections[0].Acquire());
 
-    if (!HasBasics() || (Rooted && SchemeId != meta.TotalPages() - 1)
+    if (!HasBasics() || (Rooted && SchemeId != metaPages - 1)
         || (LargeId == Max<TPageId>()) != (GlobsId == Max<TPageId>())
         || (Max(BTreeGroupIndexes.size(), FlatGroupIndexes.size()) + (SmallId == Max<TPageId>() ? 0 : 1)) != PageCollections.size())
     {
         Y_TABLET_ERROR("Part " << PageCollections[0]->PageCollection()->Label() << " has"
             << " invalid layout : " << (Rooted ? "rooted" : "legacy")
-            << " " << PageCollections.size() << "s " << meta.TotalPages() << "pg"
+            << " " << PageCollections.size() << "s " << metaPages << "pg"
             << ", Scheme " << SchemeId
             << ", FlatIndex " << (FlatGroupIndexes.size() ? FlatGroupIndexes[0] : Max<TPageId>())
             << ", BTreeIndex " << (BTreeGroupIndexes.size() ? BTreeGroupIndexes[0].RootV1PageId() : Max<TPageId>())

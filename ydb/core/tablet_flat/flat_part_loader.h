@@ -157,6 +157,15 @@ namespace NTable {
         TLoader(TPartComponents components, TVector<TCacheCollectionRef> prebuiltPageCollections = {});
         ~TLoader();
 
+        void SetPageCollection(ui32 slot, TCacheCollectionRef collection);
+        // Prepare the part layout from slot 0 before other collection metadata arrives
+        void PrepareRoot();
+
+        bool HasOuterCollection() const {
+            Y_ENSURE(RootPrepared, "Root metadata must be prepared before resolving collection roles");
+            return SmallId != Max<TPageId>();
+        }
+
         TFetch Run(TRunOptions options)
         {
             while (Stage < EStage::Result) {
@@ -281,6 +290,7 @@ namespace NTable {
         const TVector<TString> Deltas;
         const TEpoch Epoch;
         EStage Stage = EStage::Meta;
+        bool RootPrepared = false;
         bool Rooted = false; /* Has full topology metablob */
         TPageId SchemeId = Max<TPageId>();
         TPageId GlobsId = Max<TPageId>();
