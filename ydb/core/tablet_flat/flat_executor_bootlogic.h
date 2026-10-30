@@ -5,6 +5,7 @@
 #include "flat_boot_util.h"
 #include "flat_load_blob_queue.h"
 #include "flat_part_loader.h"
+#include "shared_cache_collection_load.h"
 
 namespace NKikimr {
 namespace NTabletFlatExecutor {
@@ -44,6 +45,7 @@ namespace NBoot {
 class TExecutorBootLogic
     : private ILoadBlob
 {
+    friend class TBootMetadataTestAccess;
     friend class NBoot::TBundleLoadStep;
     friend class NBoot::TRedo;
     friend class NBoot::TStages;
@@ -89,6 +91,16 @@ private:
     THashMap<TLogoBlobID, TIntrusivePtr<NBoot::TLoadBlobs>> EntriesToLoad;
     THashMap<const NPageCollection::IPageCollection*, TIntrusivePtr<NBoot::IStep>> Loads;
 
+    struct TCollectionLoad {
+        TIntrusivePtr<NSharedCache::TCollectionRequest> Request;
+        TIntrusivePtr<NBoot::IStep> Step;
+        ui32 Slot;
+    };
+
+    THashMap<const NSharedCache::TCollectionRequest*, TCollectionLoad> CollectionLoads;
+    NActors::TActorSystem* ActorSystem = nullptr;
+    bool Cancelled = false;
+
     ui32 GroupResolveCachedChannel;
     ui32 GroupResolveCachedGeneration;
     ui32 GroupResolveCachedGroup;
@@ -102,6 +114,9 @@ private:
     ui32 GetBSGroupID(ui32 channel, ui32 generation);
     void LoadEntry(TIntrusivePtr<NBoot::TLoadBlobs>);
     NBoot::TSpawned LoadPages(NBoot::IStep*, NTable::TLoader::TFetch&& fetch);
+    NBoot::TSpawned LoadCollection(NBoot::IStep*, ui32 slot, TIntrusivePtr<NSharedCache::TCollectionRequest> request);
+    void UpdateCollection(const TIntrusivePtr<NSharedCache::TCollectionRequest>& request);
+    void CancelCollectionLoads();
 
     void OnBlobLoaded(const TLogoBlobID& id, TString body, uintptr_t cookie) override;
     void SeenBlob(const TLogoBlobID& id);

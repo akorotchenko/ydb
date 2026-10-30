@@ -3,6 +3,7 @@
 #include "flat_boot_util.h"
 #include "flat_bio_events.h"
 #include "shared_cache_events.h"
+#include "shared_cache_collection_load.h"
 #include "util_fmt_logger.h"
 #include "util_fmt_desc.h"
 #include "util_basics.h"
@@ -80,6 +81,11 @@ namespace NBoot {
         virtual void HandleStep(TIntrusivePtr<IStep>)
         {
             Y_TABLET_ERROR("Boot IStep got an unhandled child step result");
+        }
+
+        virtual bool HandleCollection(ui32, NSharedCache::TEvCollectionResult&)
+        {
+            Y_TABLET_ERROR("Boot IStep got an unhandled collection metadata result");
         }
 
         template<typename TStep, typename ... TArgs>
