@@ -1371,6 +1371,76 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(published->GetCacheMode() == ECacheMode::Sticky);
     }
 
+    Y_UNIT_TEST(ColdTicketCannotReviveAfterPhysicalShrinkAndRegrowth) {
+        TFixture fixture(10, 2);
+        auto& cache = *fixture.Cache;
+        TCacheCapacityConfig small;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(9, 4096, 0, 2, small));
+        UNIT_ASSERT(cache.UpdateSoftLimitOverride(4 * (64 + TSharedData::OverheadSize)));
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 152), ECacheMode::Regular);
+        UNIT_ASSERT_VALUES_EQUAL(collection.Index(), 2);
+        TVector<TCollectionCacheItem> candidates;
+        Y_DEFER {
+            for (auto item : candidates) {
+                TCacheTestAccess::DiscardCandidate(cache, item);
+            }
+        };
+        for (ui64 index = 3; index < small.HandleCount(); ++index) {
+            const auto item = AllocateCollection(cache, TCacheKey::Collection(TLogoBlobID(111, 113, index)));
+            UNIT_ASSERT_VALUES_EQUAL(item.Index(), index);
+            candidates.push_back(item);
+        }
+        TTestCachePageRef oldOwner;
+        const auto old = InsertOwnedSizedPage(cache, collection, 1, 64, 'a', oldOwner);
+        UNIT_ASSERT_VALUES_EQUAL(old.Index(), small.HandleCount());
+        oldOwner.Drop();
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, old));
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, old.Index()).IsCold());
+        const auto oldTicket = MakeColdItem(cache, old.Index());
+        const auto firstColdWord = [&] {
+            auto operation = cache.BeginOperation();
+            return operation.SpaceOperation().View().Tiers[ECacheTier::Regular].ColdStorage.Slots[0].load();
+        };
+        UNIT_ASSERT_VALUES_EQUAL(firstColdWord(), oldTicket.Raw());
+        const auto resize = [&](const TCacheCapacityConfig& target) {
+            if (cache.CurrentLimit() > target.Limit) {
+                UNIT_ASSERT(cache.UpdateCurrentLimit(target.Limit));
+            }
+            UNIT_ASSERT(cache.UpdateHardLimit(target.Limit));
+            for (ui32 step = 0; step < 10000 && cache.NeedsCapacityMaintenance(); ++step) {
+                cache.RunMaintenance();
+            }
+            UNIT_ASSERT(!cache.NeedsCapacityMaintenance());
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleCount(cache), target.HandleCount());
+        };
+        resize(small);
+        UNIT_ASSERT_VALUES_EQUAL(cache.StaticBytes(), small.StaticBytes);
+        UNIT_ASSERT_VALUES_EQUAL(firstColdWord(), 0);
+        TCacheTestAccess::DiscardCandidate(cache, candidates.front());
+        candidates.erase(candidates.begin());
+        TTestCachePageRef olderOwner;
+        const auto older = InsertOwnedSizedPage(cache, collection, 2, 64, 'b', olderOwner);
+        UNIT_ASSERT(older.Index() < small.HandleCount());
+        olderOwner.Drop();
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, older));
+        resize(fixture.Capacity);
+        UNIT_ASSERT_VALUES_EQUAL(cache.StaticBytes(), fixture.Capacity.StaticBytes);
+        UNIT_ASSERT_VALUES_EQUAL(firstColdWord(), 0);
+        TTestCachePageRef newOwner;
+        const auto newer = InsertOwnedSizedPage(cache, collection, 3, 64, 'c', newOwner);
+        UNIT_ASSERT_VALUES_EQUAL(newer.Index(), old.Index());
+        newOwner.Drop();
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, newer));
+        UNIT_ASSERT_VALUES_EQUAL(MakeColdItem(cache, newer.Index()).ColdVersion(), oldTicket.ColdVersion());
+        UNIT_ASSERT(cache.ReclaimCold());
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, older.Index()).IsFree());
+        auto found = FindPage(cache, TCacheKey::Page(collection, 3));
+        UNIT_ASSERT(found.Status == ECacheResultStatus::Hit);
+        UNIT_ASSERT_VALUES_EQUAL(found.Ref.data()[0], 'c');
+        UNIT_ASSERT_VALUES_EQUAL(newer.Version(), old.Version());
+    }
+
     Y_UNIT_TEST(CollectionLastReleaseTracksDetachEpoch) {
         for (bool detachAndReattach : { false, true }) {
             TFixture fixture;

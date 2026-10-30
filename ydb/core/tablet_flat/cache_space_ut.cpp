@@ -1077,6 +1077,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
     }
 
     Y_UNIT_TEST(TierMappingsKeepLogicalBoundsAcrossGrowthAndShrink) {
+        const ui64 keepWord = TColdCacheItem::Make(33, 3).Raw();
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
         UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, small));
@@ -1090,7 +1091,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
             CheckDefaultMappings(before, current, current);
             before.Tiers[ECacheTier::Regular].HotStorage.Slots[0].store(11);
             before.Tiers[ECacheTier::Regular].ColdStorage.Slots[0].store(22);
-            before.Tiers[ECacheTier::Keep].ColdStorage.Slots[0].store(33);
+            before.Tiers[ECacheTier::Keep].ColdStorage.Slots[0].store(keepWord);
             TTransition transition;
             UNIT_ASSERT(space->PrepareTransition(target, transition) == EPrepareResult::Prepared);
             {
@@ -1122,11 +1123,12 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
             UNIT_ASSERT(before.Tiers[ECacheTier::Keep].Rings == after.Tiers[ECacheTier::Keep].Rings);
             UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Regular].HotStorage.Slots[0].load(), 11);
             UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Regular].ColdStorage.Slots[0].load(), 22);
-            UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Keep].ColdStorage.Slots[0].load(), 33);
+            UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Keep].ColdStorage.Slots[0].load(), keepWord);
         }
     }
 
     Y_UNIT_TEST(PartialPreparationKeepsThePublishedTierMappings) {
+        const ui64 keepWord = TColdCacheItem::Make(33, 3).Raw();
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
         UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, small));
@@ -1140,7 +1142,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
             const auto before = TCacheSpaceTestAccess::CurrentView(*space);
             before.Tiers[ECacheTier::Regular].HotStorage.Slots[0].store(11);
             before.Tiers[ECacheTier::Regular].ColdStorage.Slots[0].store(22);
-            before.Tiers[ECacheTier::Keep].ColdStorage.Slots[0].store(33);
+            before.Tiers[ECacheTier::Keep].ColdStorage.Slots[0].store(keepWord);
             ui32 calls = 0;
             bool ordered = true;
             auto prepare = [&](ESpaceMap mapping) noexcept {
@@ -1168,7 +1170,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
                 after.Tiers[ECacheTier::Keep].ColdStorage.Slots == before.Tiers[ECacheTier::Keep].ColdStorage.Slots);
             UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Regular].HotStorage.Slots[0].load(), 11);
             UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Regular].ColdStorage.Slots[0].load(), 22);
-            UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Keep].ColdStorage.Slots[0].load(), 33);
+            UNIT_ASSERT_VALUES_EQUAL(after.Tiers[ECacheTier::Keep].ColdStorage.Slots[0].load(), keepWord);
         }
     }
 
@@ -1653,6 +1655,128 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
             }));
         UNIT_ASSERT_VALUES_EQUAL(drained, word);
         UNIT_ASSERT(shrink.Phase() == ETransitionPhase::Release);
+    }
+
+    Y_UNIT_TEST(PhysicalShrinkCleansAssignedPrefixesWithoutMovingLowWords) {
+        for (bool replaceKeepPrefix : { false, true }) {
+            TCacheCapacityConfig small;
+            TCacheCapacityConfig large;
+            UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 2, small));
+            UNIT_ASSERT(TryCalculateSharedCacheFootprint(8, 4096, 0, 2, large));
+            for (auto* capacity : { &small, &large }) {
+                capacity->Tiers = { TCacheTierCapacity{ capacity->HotSlotCount() / 2, capacity->HandleCount() / 2 },
+                    TCacheTierCapacity{ capacity->HotSlotCount() / 2, capacity->HandleCount() / 2 } };
+                UNIT_ASSERT(capacity->HasValidTierCapacity());
+            }
+            auto [threads, space] = TCacheThreadTestAccess::MakeSpace(large, large, 2);
+            UNIT_ASSERT(space);
+            const auto before = TCacheSpaceTestAccess::CurrentView(*space);
+            const ui32 highIndex = static_cast<ui32>(small.HandleCount());
+            const auto lowHot = TCacheItem::Make(11, 2);
+            const auto highHot = TCacheItem::Make(13, highIndex);
+            const auto tailHot = TCacheItem::Make(17, highIndex);
+            const auto lowCold = TColdCacheItem::Make(19, 2);
+            const auto highCold = TColdCacheItem::Make(23, highIndex);
+            const auto tailCold = TColdCacheItem::Make(29, highIndex);
+            const auto replacementHot = TCacheItem::Make(31, 3);
+            const auto replacementCold = TColdCacheItem::Make(37, 3);
+            constexpr ui64 cursorProbeCapacity = 7;
+            for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+                const auto& ring = before.Tiers[tier];
+                ring.EffectiveHotSlots->store(HotLevelCount);
+                const auto hotEnd = small.Tiers[tier].HotSlots;
+                const auto coldEnd = small.Tiers[tier].ColdSlots;
+                ring.HotStorage.Slots[0].store(lowHot.Raw());
+                ring.HotStorage.Slots[hotEnd - 1].store(highHot.Raw());
+                ring.ColdStorage.Slots[0].store(lowCold.Raw());
+                ring.ColdStorage.Slots[coldEnd - 1].store(highCold.Raw());
+                ring.Rings->AddColdEntry();
+                ring.Rings->AddColdEntry();
+                // Probe counters without exchanging any words; the pass must leave them unchanged
+                for (auto level : { EHotLevel::L0, EHotLevel::L1, EHotLevel::L2, EHotLevel::L3 }) {
+                    UNIT_ASSERT(ring.Rings->Hot(level).SelectPopSlot(ring.HotStorage.Slots, cursorProbeCapacity) ==
+                                ring.HotStorage.Slots);
+                    UNIT_ASSERT(ring.Rings->Hot(level).SelectPushSlot(ring.HotStorage.Slots, cursorProbeCapacity) ==
+                                ring.HotStorage.Slots);
+                }
+                UNIT_ASSERT(ring.Rings->Cold().SelectPopSlot(ring.ColdStorage.Slots, cursorProbeCapacity) ==
+                            ring.ColdStorage.Slots);
+                UNIT_ASSERT(ring.Rings->Cold().SelectPushSlot(ring.ColdStorage.Slots, cursorProbeCapacity) ==
+                            ring.ColdStorage.Slots);
+            }
+            TTransition shrink;
+            UNIT_ASSERT(space->PrepareTransition(small, shrink) == EPrepareResult::Prepared);
+            UNIT_ASSERT(space->PublishMigrationView(shrink));
+            UNIT_ASSERT(space->TryDrainTransition(shrink));
+            CompleteEmptyBucketResize(*space, small.AddressBits);
+            {
+                auto oldPublisher = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+                UNIT_ASSERT(space->PublishFinalView(shrink));
+                for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+                    const auto& old = oldPublisher.View().Tiers[tier];
+                    old.HotStorage.Slots[small.Tiers[tier].HotSlots + 1].store(tailHot.Raw());
+                    old.Rings->AddColdEntry();
+                    old.ColdStorage.Slots[small.Tiers[tier].ColdSlots + 1].store(tailCold.Raw());
+                }
+                UNIT_ASSERT(!space->TryDrainTransition(shrink));
+                UNIT_ASSERT(!TCacheSpaceTestAccess::FinalDrain(*space, shrink));
+            }
+            UNIT_ASSERT(space->TryDrainTransition(shrink));
+            std::array<ui32, CacheTierCount> hotCleared{};
+            std::array<ui32, CacheTierCount> coldCleared{};
+            const auto hot = [&](ECacheTier tier, EHotLevel, ui64 raw) {
+                UNIT_ASSERT(TCacheItem::FromRaw(raw).Index() >= small.HandleCount());
+                ++hotCleared[tier];
+                if (replaceKeepPrefix && tier == ECacheTier::Keep && raw == tailHot.Raw()) {
+                    TCacheSpaceTestAccess::CurrentView(*space)
+                        .Tiers[tier]
+                        .HotStorage.Slots[small.Tiers[tier].HotSlots - 1]
+                        .store(replacementHot.Raw());
+                }
+            };
+            const auto cold = [&](ECacheTier tier, ui64 raw) {
+                UNIT_ASSERT(TColdCacheItem::FromRaw(raw).Index() >= small.HandleCount());
+                auto& ring = TCacheSpaceTestAccess::CurrentView(*space).Tiers[tier];
+                ring.Rings->RemoveColdEntry();
+                ++coldCleared[tier];
+                if (replaceKeepPrefix && tier == ECacheTier::Keep && raw == tailCold.Raw()) {
+                    ring.ColdStorage.Slots[small.Tiers[tier].ColdSlots - 1].store(replacementCold.Raw());
+                }
+            };
+            UNIT_ASSERT(space->FinalDrain(shrink, hot, cold));
+            UNIT_ASSERT(shrink.Phase() == ETransitionPhase::FinalDrain);
+            while (shrink.Phase() == ETransitionPhase::FinalDrain) {
+                UNIT_ASSERT(space->FinalDrain(shrink, hot, cold));
+            }
+            UNIT_ASSERT(shrink.Phase() == ETransitionPhase::Release);
+            UNIT_ASSERT(space->TryReleaseTransition(shrink));
+            UNIT_ASSERT(space->CommitTransition(shrink));
+            const auto& after = TCacheSpaceTestAccess::CurrentView(*space);
+            for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+                const bool replaced = replaceKeepPrefix && tier == ECacheTier::Keep;
+                const auto& ring = after.Tiers[tier];
+                UNIT_ASSERT_VALUES_EQUAL(hotCleared[tier], replaced ? 1 : 2);
+                UNIT_ASSERT_VALUES_EQUAL(coldCleared[tier], replaced ? 1 : 2);
+                UNIT_ASSERT_VALUES_EQUAL(ring.HotStorage.Slots[0].load(), lowHot.Raw());
+                UNIT_ASSERT_VALUES_EQUAL(ring.ColdStorage.Slots[0].load(), lowCold.Raw());
+                UNIT_ASSERT_VALUES_EQUAL(
+                    ring.HotStorage.Slots[ring.HotStorage.SlotCount - 1].load(), replaced ? replacementHot.Raw() : 0);
+                UNIT_ASSERT_VALUES_EQUAL(ring.ColdStorage.Slots[ring.ColdStorage.SlotCount - 1].load(),
+                    replaced ? replacementCold.Raw() : 0);
+                UNIT_ASSERT_VALUES_EQUAL(ring.Rings->ColdEntries(), replaced ? 2 : 1);
+                UNIT_ASSERT(!ring.IsAllowedHotSlot(ring.HotStorage.Slots + ring.HotStorage.SlotCount - 1));
+                for (auto level : { EHotLevel::L0, EHotLevel::L1, EHotLevel::L2, EHotLevel::L3 }) {
+                    UNIT_ASSERT(ring.Rings->Hot(level).SelectPopSlot(ring.HotStorage.Slots, cursorProbeCapacity) ==
+                                ring.HotStorage.Slots + 1);
+                    UNIT_ASSERT(ring.Rings->Hot(level).SelectPushSlot(ring.HotStorage.Slots, cursorProbeCapacity) ==
+                                ring.HotStorage.Slots + 1);
+                }
+                UNIT_ASSERT(ring.Rings->Cold().SelectPopSlot(ring.ColdStorage.Slots, cursorProbeCapacity) ==
+                            ring.ColdStorage.Slots + 1);
+                UNIT_ASSERT(ring.Rings->Cold().SelectPushSlot(ring.ColdStorage.Slots, cursorProbeCapacity) ==
+                            ring.ColdStorage.Slots + 1);
+            }
+        }
     }
 
     Y_UNIT_TEST(FootprintRejectsInvalidInput) {
