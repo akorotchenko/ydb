@@ -11,7 +11,8 @@
 #include "util_fmt_desc.h"
 #include "shared_sausagecache.h"
 #include "flat_part_store.h"
-#include "flat_load_blob_queue.h"
+#include "shared_cache_collection_load.h"
+#include <ydb/library/actors/core/actorsystem.h>
 
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/counters.h>
@@ -30,8 +31,9 @@ namespace NOps {
             , public IActorExceptionHandler
             , private NTable::TFeed
             , private NTable::IDriver
-            , private ILoadBlob
     {
+        friend class TColdPartLoadTestAccess;
+
     public:
         using TSubset = NTable::TSubset;
         using TPartView = NTable::TPartView;
@@ -84,30 +86,8 @@ namespace NOps {
     private:
         struct TEvPrivate {
             enum EEv {
-                EvLoadBlob = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
-                EvBlobLoaded,
-                EvPartLoaded,
+                EvPartLoaded = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
                 EvPartFailed,
-            };
-
-            struct TEvLoadBlob : public TEventLocal<TEvLoadBlob, EvLoadBlob> {
-                TLogoBlobID BlobId;
-                ui32 Group;
-
-                TEvLoadBlob(const TLogoBlobID& blobId, ui32 group)
-                    : BlobId(blobId)
-                    , Group(group)
-                { }
-            };
-
-            struct TEvBlobLoaded : public TEventLocal<TEvBlobLoaded, EvBlobLoaded> {
-                TLogoBlobID BlobId;
-                TString Body;
-
-                TEvBlobLoaded(const TLogoBlobID& blobId, TString body)
-                    : BlobId(blobId)
-                    , Body(std::move(body))
-                { }
             };
 
             struct TEvPartLoaded : public TEventLocal<TEvPartLoaded, EvPartLoaded> {
@@ -136,60 +116,90 @@ namespace NOps {
                 , ReadPriority(readPriority)
             { }
 
+            ~TColdPartLoader() override {
+                CancelCollectionRequests();
+            }
+
             void Bootstrap() {
-                PageCollectionLoaders.reserve(Part->LargeGlobIds.size());
-                for (ui64 slot = 0; slot < Part->LargeGlobIds.size(); ++slot) {
-                    const ui32 group = Part->LargeGlobIds[slot].Group;
-                    auto& loader = PageCollectionLoaders.emplace_back(Part->LargeGlobIds[slot]);
-                    for (const auto& blobId : loader.GetBlobs()) {
-                        Send(Owner, new TEvPrivate::TEvLoadBlob(blobId, group), 0, slot);
-                    }
+                CacheSystem = TActivationContext::ActorSystem();
+                Requester = SelfId();
+                TVector<NTable::TPageCollectionComponents> components(Part->LargeGlobIds.size());
+                for (ui32 slot = 0; slot < components.size(); ++slot) {
+                    components[slot].LargeGlobId = Part->LargeGlobIds[slot];
                 }
-                Components.resize(PageCollectionLoaders.size());
-                // Copy LargeGlobId into each component now (filled in Handle when blob is loaded)
-                for (ui64 slot = 0; slot < Part->LargeGlobIds.size(); ++slot) {
-                    Components[slot].LargeGlobId = Part->LargeGlobIds[slot];
-                }
-                ComponentsLeft = Components.size();
+                Loader.emplace(NTable::TPartComponents{
+                    .PageCollectionComponents = std::move(components),
+                    .Legacy = Part->Legacy,
+                    .Opaque = Part->Opaque,
+                    .Epoch = Part->Epoch,
+                });
+                Requests.resize(Part->LargeGlobIds.size());
+                CollectionsLeft = Requests.size();
                 Become(&TThis::StateLoadPageCollections);
+                for (ui32 slot = 0; slot < Requests.size(); ++slot) {
+                    const auto kind = slot == 0 || slot + 1 < Requests.size()
+                                          ? NSharedCache::ECollectionLoadKind::Regular
+                                          : NSharedCache::ECollectionLoadKind::Unknown;
+                    Requests[slot] = MakeIntrusive<NSharedCache::TCollectionRequest>(Part->LargeGlobIds[slot], kind);
+                    Send(MakeSharedPageCacheId(), new NSharedCache::TEvCollectionRequest(Requests[slot], ReadPriority),
+                        0, slot);
+                }
             }
 
         private:
             STRICT_STFUNC(StateLoadPageCollections, {
                 sFunc(TEvents::TEvPoison, PassAway);
-                hFunc(TEvPrivate::TEvBlobLoaded, Handle);
+                hFunc(NSharedCache::TEvCollectionResult, Handle);
             });
 
-            void Handle(TEvPrivate::TEvBlobLoaded::TPtr& ev) {
-                auto* msg = ev->Get();
-                ui64 slot = ev->Cookie;
-                Y_ENSURE(slot < Components.size());
-                Y_ENSURE(slot < PageCollectionLoaders.size());
-                Y_ENSURE(!Components[slot].RawMeta);
-                auto& loader = PageCollectionLoaders[slot];
-                if (loader.Apply(msg->BlobId, std::move(msg->Body))) {
-                    Components[slot].RawMeta = loader.ExtractSharedData();
-                    Y_ENSURE(ComponentsLeft > 0);
-                    if (0 == --ComponentsLeft) {
-                        PageCollectionLoaders.clear();
-                        StartLoader();
+            void UpdateCollection(const TIntrusivePtr<NSharedCache::TCollectionRequest>& request) {
+                CacheSystem->Send(new IEventHandle(
+                    MakeSharedPageCacheId(), Requester, new NSharedCache::TEvCollectionRequestUpdate(request)));
+            }
+
+            void CancelCollectionRequests() {
+                for (const auto& request : Requests) {
+                    if (request && request->IsActive()) {
+                        request->Cancel();
+                        UpdateCollection(request);
                     }
                 }
             }
 
-        private:
-            void StartLoader() {
-                Y_ENSURE(!Loader);
-                NTable::TPartComponents parts{
-                    .PageCollectionComponents = std::move(Components),
-                    .Legacy = Part->Legacy,
-                    .Opaque = Part->Opaque,
-                    .Epoch = Part->Epoch,
-                };
-                Loader.emplace(std::move(parts));
-                Become(&TThis::StateLoadPart);
+            void Fail() {
+                Send(Owner, new TEvPrivate::TEvPartFailed(Part->Label));
+                PassAway();
+            }
 
-                RunLoader();
+            void Handle(NSharedCache::TEvCollectionResult::TPtr& ev) {
+                auto* msg = ev->Get();
+                const ui64 slot = ev->Cookie;
+                if (slot >= Requests.size() || Requests[slot] != msg->Request) {
+                    return;
+                }
+                if (msg->Status != NKikimrProto::OK) {
+                    return Fail();
+                }
+                try {
+                    Loader->SetPageCollection(slot, std::move(msg->Collection));
+                    if (slot == 0) {
+                        Loader->PrepareRoot();
+                        if (Requests.size() > 1) {
+                            const auto kind = Loader->HasOuterCollection() ? NSharedCache::ECollectionLoadKind::Outer
+                                                                           : NSharedCache::ECollectionLoadKind::Regular;
+                            Y_ENSURE(Requests.back()->Resolve(kind));
+                            UpdateCollection(Requests.back());
+                        }
+                    }
+                    Requests[slot].Reset();
+                    Y_ENSURE(CollectionsLeft > 0);
+                    if (--CollectionsLeft == 0) {
+                        Become(&TThis::StateLoadPart);
+                        RunLoader();
+                    }
+                } catch (const yexception&) {
+                    Fail();
+                }
             }
 
             void RunLoader() {
@@ -214,8 +224,7 @@ namespace NOps {
             void Handle(NSharedCache::TEvResult::TPtr& ev) {
                 auto* msg = ev->Get();
                 if (msg->Status != NKikimrProto::OK) {
-                    Send(Owner, new TEvPrivate::TEvPartFailed(Part->Label));
-                    return PassAway();
+                    return Fail();
                 }
 
                 Y_ENSURE(ReadsLeft > 0);
@@ -236,6 +245,7 @@ namespace NOps {
             }
 
             void PassAway() override {
+                CancelCollectionRequests();
                 Send(MakeSharedPageCacheId(), new NSharedCache::TEvUnregister);
                 TActorBootstrapped::PassAway();
             }
@@ -244,9 +254,10 @@ namespace NOps {
             TActorId Owner;
             TIntrusiveConstPtr<TColdPartStore> Part;
             EPriority ReadPriority;
-            TVector<NTable::TPageCollectionComponents> Components;
-            TVector<NPageCollection::TLargeGlobIdRestoreState> PageCollectionLoaders;
-            size_t ComponentsLeft = 0;
+            TVector<TIntrusivePtr<NSharedCache::TCollectionRequest>> Requests;
+            TActorSystem* CacheSystem = nullptr;
+            TActorId Requester;
+            size_t CollectionsLeft = 0;
             std::optional<NTable::TLoader> Loader;
             size_t ReadsLeft = 0;
         };
@@ -275,21 +286,7 @@ namespace NOps {
 
             Cache = new TEnv(conf, Subset);
 
-            BlobQueue.Config.TabletID = Args.Tablet;
 
-            switch (Args.ReadPrio) {
-                case NBlockIO::EPriority::None:
-                case NBlockIO::EPriority::Fast:
-                    BlobQueue.Config.ReadPrio = NKikimrBlobStorage::FastRead;
-                    break;
-                case NBlockIO::EPriority::Bulk:
-                case NBlockIO::EPriority::Bkgr: /* switch to LowRead in the future */
-                    BlobQueue.Config.ReadPrio = NKikimrBlobStorage::AsyncRead;
-                    break;
-                case NBlockIO::EPriority::Low:
-                    BlobQueue.Config.ReadPrio = NKikimrBlobStorage::LowRead;
-                    break;
-            }
         }
 
         NTable::IPages* MakeEnv() override
@@ -369,8 +366,6 @@ namespace NOps {
 
         STRICT_STFUNC(StateWork, {
             hFunc(TEvContinue, Handle);
-            hFunc(TEvPrivate::TEvLoadBlob, Handle);
-            hFunc(TEvBlobStorage::TEvGetResult, Handle);
             hFunc(NBlockIO::TEvStat, Handle);
             hFunc(TEvPrivate::TEvPartLoaded, Handle);
             hFunc(TEvPrivate::TEvPartFailed, Handle);
@@ -539,44 +534,6 @@ namespace NOps {
             }
         }
 
-        void Handle(TEvPrivate::TEvLoadBlob::TPtr& ev)
-        {
-            Y_ENSURE(ev->Sender);
-            auto* msg = ev->Get();
-
-            auto& req = BlobQueueRequests.emplace_back();
-            req.Sender = ev->Sender;
-            req.Cookie = ev->Cookie;
-            ui64 reqId = BlobQueueRequestsOffset + BlobQueueRequests.size() - 1;
-
-            BlobQueue.Enqueue(msg->BlobId, msg->Group, this, reqId);
-            BlobQueue.SendRequests(SelfId());
-        }
-
-        void Handle(TEvBlobStorage::TEvGetResult::TPtr& ev)
-        {
-            if (!BlobQueue.ProcessResult(ev->Get())) {
-                return Terminate(EStatus::StorageError);
-            }
-
-            BlobQueue.SendRequests(SelfId());
-        }
-
-        void OnBlobLoaded(const TLogoBlobID& id, TString body, uintptr_t cookie) override
-        {
-            Y_ENSURE(cookie >= BlobQueueRequestsOffset);
-            size_t idx = cookie - BlobQueueRequestsOffset;
-            Y_ENSURE(idx < BlobQueueRequests.size());
-            auto& req = BlobQueueRequests[idx];
-            Y_ENSURE(req.Sender);
-            Send(req.Sender, new TEvPrivate::TEvBlobLoaded(id, std::move(body)), 0, req.Cookie);
-            req.Sender = {};
-            while (!BlobQueueRequests.empty() && !BlobQueueRequests.front().Sender) {
-                BlobQueueRequests.pop_front();
-                ++BlobQueueRequestsOffset;
-            }
-        }
-
         void Handle(NBlockIO::TEvStat::TPtr& ev)
         {
             ev->Rewrite(ev->GetTypeRewrite(), Owner);
@@ -733,12 +690,6 @@ namespace NOps {
         }
 
     private:
-        struct TBlobQueueRequest {
-            TActorId Sender;
-            ui64 Cookie;
-        };
-
-    private:
         const ui64 Serial = 0;
         const NOps::TConf Args;
         TAutoPtr<NUtil::ILogger> Logger;
@@ -752,10 +703,6 @@ namespace NOps {
 
         THashMap<TLogoBlobID, TActorId> ColdPartLoaders;
         THashMap<TLogoBlobID, TPartView> ColdPartLoaded;
-
-        TLoadBlobQueue BlobQueue;
-        TDeque<TBlobQueueRequest> BlobQueueRequests;
-        ui64 BlobQueueRequestsOffset = 0;
 
         bool ContinueInFly = false;
 
