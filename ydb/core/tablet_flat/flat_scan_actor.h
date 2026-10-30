@@ -5,6 +5,7 @@
 #include "flat_scan_eggs.h"
 #include "flat_scan_spent.h"
 #include "flat_bio_events.h"
+#include "flat_bio_stats.h"
 #include "flat_fwd_env.h"
 #include "util_fmt_abort.h"
 #include "util_fmt_logger.h"
