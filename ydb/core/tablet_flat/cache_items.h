@@ -372,20 +372,34 @@ Y_FORCE_INLINE bool TCacheItems<TTraits>::TryReleaseItemRef(
     const ECacheTier coldTier = publishCold ? expected.Tier() : ECacheTier::Regular;
     const ui64 coldBytes = publishCold ? PayloadBytes(handle, expected.Kind()) : 0;
     // Capture while the native ref protects the payload; detach/reclaim may follow the final CAS.
-    const bool notifyCollectionRelease =
-        expected.IsCollectionKind() && expected.IsSticky() && expected.Refs() == 1 && expected.IsStickyField() &&
-        handle.Body.Collection->GetActorState() &&
-        handle.Body.Collection->StickyPageListHead.load(std::memory_order_acquire) != 0;
-    const TLogoBlobID collectionId = notifyCollectionRelease ? handle.Body.Collection->Id() : TLogoBlobID{};
+    const bool lastCollectionRef =
+        expected.IsCollectionKind() && expected.IsSticky() && expected.Refs() == 1 && expected.IsStickyField();
+    ui32 collectionEpoch = 0;
+    bool notifyCollectionRelease = false;
+    if (lastCollectionRef) {
+        collectionEpoch = handle.ColdVersion.load(std::memory_order_acquire);
+        const auto& collection = *handle.Body.Collection;
+        notifyCollectionRelease =
+            !collection.GetActorState() || collection.StickyPageListHead.load(std::memory_order_acquire) != 0;
+    }
+    const TLogoBlobID collectionId = lastCollectionRef ? handle.Body.Collection->Id() : TLogoBlobID{};
     const THandleState desired = expected.DecrementRefs();
     if (publishCold) {
         Cache_.InvokeHook(ECacheHookPoint::BeforeLastColdRefRelease, cacheItem);
     }
+    if (lastCollectionRef) {
+        Cache_.InvokeHook(ECacheHookPoint::BeforeLastCollectionRefRelease, cacheItem);
+    }
     if (handle.State.compare_exchange_weak(
             expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
     {
+        if (lastCollectionRef) {
+            // Relay detach epochs across refcount ABA without touching the released payload
+            std::atomic_thread_fence(std::memory_order_acquire);
+            notifyCollectionRelease |= handle.ColdVersion.load(std::memory_order_relaxed) != collectionEpoch;
+        }
         if (notifyCollectionRelease) {
-            // No native metadata owner remains to hand these writer-held Sticky pages to an executor.
+            // No native owner remains to use the metadata or hand writer-held Sticky pages to an executor
             Cache_.NotifyCollectionReleased(collectionId, TCollectionCacheItem::FromValidated(cacheItem));
         }
         Cache_.UpdateColdReclaimable(coldBytes, expected, desired);

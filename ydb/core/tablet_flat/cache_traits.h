@@ -40,6 +40,7 @@ enum class ECacheHookPoint {
     BeforeHotExchange, // Payload is the Hot item; the target slot has been reserved but not exchanged.
     AfterHotEvictionPublished, // Payload is the evicted item, before category accounting.
     BeforeLastColdRefRelease, // Native identity, before the final Cold reference CAS
+    BeforeLastCollectionRefRelease, // Collection, after sampling final-release notification eligibility
     BeforeColdExchange, // Payload is the Cold membership after occupancy accounting, before ring publication.
     BeforeColdRingPop, // No item payload; an occupied Cold ring is about to be probed.
     AfterGrowthBucketPublished, // Payload is the resize marker.
@@ -67,6 +68,7 @@ enum class ECacheHookPoint {
     BeforeCollectionAttachPublished, // Payload is the collection before its attached-state CAS.
     BeforeCollectionRefAcquired, // Collection found in the table, before acquiring its native reference
     CollectionReady, // Collection published and its constructor holder released
+    CollectionReleased, // Collection identity after an enabling ownership release
 };
 
 struct TProdTraits {
@@ -101,7 +103,9 @@ struct TTestTraits {
         Invoke(ECacheHookPoint::ResourcesAvailable, {});
     }
 
-    void NotifyCollectionReleased(const TLogoBlobID&, TCollectionCacheItem) const noexcept {}
+    void NotifyCollectionReleased(const TLogoBlobID&, TCollectionCacheItem cacheItem) const noexcept {
+        Invoke(ECacheHookPoint::CollectionReleased, cacheItem.CacheItem());
+    }
 
     void NotifyCollectionReady(const TLogoBlobID&, TCollectionCacheItem cacheItem) const noexcept {
         Invoke(ECacheHookPoint::CollectionReady, cacheItem.CacheItem());

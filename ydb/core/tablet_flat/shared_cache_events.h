@@ -166,6 +166,8 @@ namespace NKikimr::NSharedCache {
         {}
 
     private:
+        TCacheCollectionRef Collection_;
+
         TCachePageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky,
             TSharedCache::EPageAdmission admission);
     };

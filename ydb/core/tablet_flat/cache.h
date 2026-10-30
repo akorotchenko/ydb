@@ -173,6 +173,12 @@ public:
         return MakeReady(Collections_.Registry(), collection, std::move(value));
     }
 
+    bool MakeReady(TCollectionCacheItem collection, THolder<TCollection>&& value,
+        TCacheCollectionRefImpl<TTraits>& ready) noexcept;
+
+    // The cleanup lookup must be the sole remaining native reference
+    bool TryDetachReleasedCollection(const TCacheCollectionRefImpl<TTraits>& collection) noexcept;
+
     Y_FORCE_INLINE bool DetachCollection(TCollectionCacheItem collection) noexcept {
         return DetachCollection(Collections_.Registry(), collection);
     }

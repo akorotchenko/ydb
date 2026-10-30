@@ -250,7 +250,7 @@ void TCollectionLoadController::Advance(TLoad& load) {
     switch (Cache_.FindOrInsert(location, inserted, canonical)) {
         case ECacheResultStatus::Inserted: {
             // The holder was allocated before inserting the short-lived native publisher
-            Y_ENSURE(Cache_.MakeReady(inserted, std::move(job.Candidate)));
+            Y_ENSURE(Cache_.MakeReady(inserted, std::move(job.Candidate), load.Canonical));
             const auto worker = std::exchange(load.Worker, {});
             ReleaseJob(worker);
             Queue(load);
