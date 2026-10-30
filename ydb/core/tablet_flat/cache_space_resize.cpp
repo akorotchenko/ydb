@@ -598,7 +598,9 @@ bool TCacheSpace::PublishFinalView(TTransition& transition) noexcept {
         return AppendFreeHandles(transition);
     }
 
-    transition.NextWorkIndex_ = retiredView.Tiers[ECacheTier::Regular].HotStorage.SlotCount;
+    const bool shrinkHandles =
+        transition.TargetConfiguration_.HandleCount() < transition.OldConfiguration_.HandleCount();
+    transition.NextWorkIndex_ = shrinkHandles ? 0 : retiredView.Tiers[ECacheTier::Regular].HotStorage.SlotCount;
     transition.FinalDrainStage_ = growing ? ESpaceMap::Done : ESpaceMap::RegularHot;
     transition.Phase_ = ETransitionPhase::FinalDrain;
     return true;

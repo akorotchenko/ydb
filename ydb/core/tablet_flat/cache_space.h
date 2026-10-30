@@ -1101,10 +1101,30 @@ inline bool TCacheSpace::FinalDrain(
             case ESpaceMap::KeepCold: {
                 const auto mapping = transition.FinalDrainStage_;
                 auto& old = RingStorage(*transition.OldView_, mapping);
+                auto& current = RingStorage(*NewestViewOwner_, mapping);
                 const auto tier = MappingTier(mapping);
+                const bool shrinkHandles = targetHandleCount < oldHandleCount;
+                const ui64 cutSlots = old.SlotCount - current.SlotCount;
                 while (remainingSlots != 0 && transition.NextWorkIndex_ < old.SlotCount) {
-                    const ui64 slot = transition.NextWorkIndex_++;
-                    const ui64 raw = old.Slots[slot].exchange(0, std::memory_order_acquire);
+                    const ui64 workIndex = transition.NextWorkIndex_++;
+                    ui64 slot;
+                    ui64 raw = 0;
+                    if (shrinkHandles && workIndex >= cutSlots) {
+                        slot = workIndex - cutSlots;
+                        auto& entry = current.Slots[slot];
+                        ui64 expected = entry.load(std::memory_order_acquire);
+                        const ui32 index = IsHotMapping(mapping) ? TCacheItem::FromRaw(expected).Index()
+                                                                 : TColdCacheItem::FromRaw(expected).Index();
+                        // Old publishers are drained; preserve low-index words and FIFO cursors
+                        if (expected != 0 && index >= targetHandleCount &&
+                            entry.compare_exchange_strong(
+                                expected, 0, std::memory_order_acquire, std::memory_order_relaxed)) {
+                            raw = expected;
+                        }
+                    } else {
+                        slot = shrinkHandles ? current.SlotCount + workIndex : workIndex;
+                        raw = old.Slots[slot].exchange(0, std::memory_order_acquire);
+                    }
                     if (raw != 0) {
                         if (IsHotMapping(mapping)) {
                             hotRouter(tier, HotLevelForSlot(slot, old.SlotCount), raw);
@@ -1123,7 +1143,7 @@ inline bool TCacheSpace::FinalDrain(
                     } else if (transition.FinalDrainStage_ != ESpaceMap::Free) {
                         const auto next = transition.FinalDrainStage_;
                         const auto& targetRing = RingStorage(*NewestViewOwner_, next);
-                        transition.NextWorkIndex_ = targetRing.SlotCount;
+                        transition.NextWorkIndex_ = targetHandleCount < oldHandleCount ? 0 : targetRing.SlotCount;
                     }
                 }
                 break;
