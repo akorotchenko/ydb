@@ -1,11 +1,30 @@
 #include <ydb/core/tablet_flat/flat_part_loader.h>
 #include <ydb/core/tablet_flat/flat_part_writer.h>
 #include <ydb/core/tablet_flat/flat_writer_bundle.h>
+#include <ydb/core/tablet_flat/flat_scan_actor.h>
+#include <ydb/core/tablet_flat/cache_thread_test.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
 #include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/base/appdata.h>
+#include <ydb/core/base/blobstorage.h>
+#include <ydb/core/testlib/basics/appdata.h>
+#include <ydb/core/testlib/basics/runtime.h>
 
 #include <library/cpp/testing/unittest/registar.h>
+
+namespace NKikimr::NTabletFlatExecutor::NOps {
+
+class TColdPartLoadTestAccess {
+public:
+    using TEvLoaded = TDriver::TEvPrivate::TEvPartLoaded;
+    using TEvFailed = TDriver::TEvPrivate::TEvPartFailed;
+
+    static NActors::IActor* Create(TActorId owner, TIntrusiveConstPtr<NTable::TColdPartStore> part) {
+        return new TDriver::TColdPartLoader(owner, std::move(part), NBlockIO::EPriority::Fast);
+    }
+};
+
+} // namespace NKikimr::NTabletFlatExecutor::NOps
 
 namespace NKikimr::NTable {
 namespace {
@@ -118,6 +137,169 @@ namespace {
     }
 
 } // anonymous namespace
+
+namespace {
+
+    using TColdAccess = NTabletFlatExecutor::NOps::TColdPartLoadTestAccess;
+
+    struct TColdFixture {
+        TColdFixture() {
+            NSharedCache::TCacheThreadTestAccess::Setup(Runtime);
+            TAutoPtr<TAppPrepare> app = new TAppPrepare;
+            Runtime.Initialize(app->Unwrap());
+            First = Runtime.AllocateEdgeActor();
+            Second = Runtime.AllocateEdgeActor();
+            Proxy = Runtime.AllocateEdgeActor();
+            Runtime.RegisterService(MakeBlobStorageProxyID(0), Proxy);
+            NSharedCache::TSharedCacheConfig config;
+            config.SetMemoryLimit(16_MB);
+            Cache = Runtime.Register(NSharedCache::CreateSharedPageCache(config, Runtime.GetDynamicCounters()));
+            Runtime.RegisterService(NSharedCache::MakeSharedPageCacheId(), Cache);
+            Runtime.Send(new NActors::IEventHandle(Cache, First, new NSharedCache::TEvCacheReadyRequest), 0, true);
+            Runtime.GrabEdgeEvent<NSharedCache::TEvCacheReady>(First, TDuration::Seconds(5));
+            PreviousFilter = Runtime.SetEventFilter(
+                [this](NActors::TTestActorRuntimeBase& runtime, TAutoPtr<NActors::IEventHandle>& event) {
+                    switch (event->GetTypeRewrite()) {
+                        case NSharedCache::TEvCollectionRequest::EventType:
+                            ++Requests;
+                            break;
+                        case TColdAccess::TEvFailed::EventType:
+                            ++Failures;
+                            break;
+                        case TEvBlobStorage::TEvGet::EventType:
+                            ReadWorkers.insert(event->Sender);
+                            break;
+                    }
+                    return PreviousFilter(runtime, event);
+                });
+        }
+
+        ~TColdFixture() {
+            Runtime.Send(new NActors::IEventHandle(Cache, First, new NActors::TEvents::TEvPoison), 0, true);
+            Drain();
+            Runtime.SetEventFilter(std::move(PreviousFilter));
+        }
+
+        TIntrusiveConstPtr<TColdPartStore> Cold(const TBundle::TResult& written) {
+            TVector<NPageCollection::TLargeGlobId> descriptors;
+            for (const auto& collection : written.PageCollections) {
+                const auto* packet =
+                    dynamic_cast<const NPageCollection::TPageCollection*>(collection.PageCollection.Get());
+                UNIT_ASSERT(packet);
+                descriptors.push_back(packet->LargeGlobId);
+            }
+            return MakeIntrusiveConst<TColdPartStore>(
+                std::move(descriptors), TString{}, written.Overlay, TEpoch::Zero());
+        }
+
+        void Warm(const TBundle::TResult& written) {
+            auto& cache = NSharedCache::TSharedCache::Get();
+            for (const auto& collection : written.PageCollections) {
+                auto metadata = cache.AdmitCollection(collection.PageCollection);
+                for (const auto* group : { &collection.StickyPages, &collection.RegularPages }) {
+                    for (const auto& data : *group) {
+                        auto page =
+                            cache.AdmitPage(collection.PageCollection, data.Location, TSharedData(data.Data), true);
+                        UNIT_ASSERT(page);
+                    }
+                }
+            }
+        }
+
+        TActorId Start(TActorId owner, const TIntrusiveConstPtr<TColdPartStore>& part) {
+            return Runtime.Register(TColdAccess::Create(owner, part));
+        }
+
+        TEvBlobStorage::TEvGet::TPtr ReadRoot(const TBundle::TResult& written) {
+            const auto& label = written.PageCollections.front().PageCollection->Label();
+            for (;;) {
+                auto read = Runtime.GrabEdgeEvent<TEvBlobStorage::TEvGet>(Proxy, TDuration::Seconds(5));
+                for (ui32 index = 0; index < read->Get()->QuerySize; ++index) {
+                    if (read->Get()->Queries[index].Id == label) {
+                        return read;
+                    }
+                }
+            }
+        }
+
+        void NoData(const TEvBlobStorage::TEvGet::TPtr& read) {
+            Runtime.Send(new NActors::IEventHandle(read->Sender, Proxy,
+                             new TEvBlobStorage::TEvGetResult(NKikimrProto::NODATA, 0, 0)), 0, true);
+        }
+
+        void Drain() {
+            Runtime.SimulateSleep(TDuration::MilliSeconds(1));
+        }
+
+        NActors::TTestBasicRuntime Runtime;
+        TActorId First;
+        TActorId Second;
+        TActorId Proxy;
+        TActorId Cache;
+        NActors::TTestActorRuntimeBase::TEventFilter PreviousFilter;
+        THashSet<TActorId> ReadWorkers;
+        ui32 Requests = 0;
+        ui32 Failures = 0;
+    };
+
+} // anonymous namespace
+
+Y_UNIT_TEST_SUITE(TColdPartCollectionMetadata) {
+    Y_UNIT_TEST(ConcurrentReadersReuseCanonicalMetadataAndOuterCollection) {
+        TColdFixture fixture;
+        auto written = WritePart({ .Outer = true });
+        fixture.Warm(written);
+        auto cold = fixture.Cold(written);
+        fixture.Start(fixture.First, cold);
+        fixture.Start(fixture.Second, cold);
+        auto a = fixture.Runtime.GrabEdgeEvent<TColdAccess::TEvLoaded>(fixture.First, TDuration::Seconds(5));
+        auto b = fixture.Runtime.GrabEdgeEvent<TColdAccess::TEvLoaded>(fixture.Second, TDuration::Seconds(5));
+        const auto* first = a->Get()->Part.As<TPartStore>();
+        const auto* second = b->Get()->Part.As<TPartStore>();
+        UNIT_ASSERT(first && second && first->Small && second->Small);
+        UNIT_ASSERT(first->PageCollections[0].Get() == second->PageCollections[0].Get());
+        const auto* one =
+            dynamic_cast<const NPageCollection::TPageCollection*>(first->PageCollections[0]->PageCollection().Get());
+        const auto* two =
+            dynamic_cast<const NPageCollection::TPageCollection*>(second->PageCollections[0]->PageCollection().Get());
+        UNIT_ASSERT(one && two && &one->Meta == &two->Meta);
+        UNIT_ASSERT(dynamic_cast<const NPageCollection::TOuterPageCollection*>(
+            first->PageCollections.back()->PageCollection().Get()));
+        UNIT_ASSERT(first->PageCollections.back().Get() == second->PageCollections.back().Get());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Requests, 4);
+        UNIT_ASSERT(fixture.ReadWorkers.empty());
+    }
+
+    Y_UNIT_TEST(MetadataFailureReportsPartFailure) {
+        TColdFixture fixture;
+        auto written = WritePart();
+        fixture.Start(fixture.First, fixture.Cold(written));
+        fixture.NoData(fixture.ReadRoot(written));
+        auto failed = fixture.Runtime.GrabEdgeEvent<TColdAccess::TEvFailed>(fixture.First, TDuration::Seconds(5));
+        UNIT_ASSERT(failed->Get()->Label == written.PageCollections.front().PageCollection->Label());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Failures, 1);
+    }
+
+    Y_UNIT_TEST(PoisoningOneReaderPreservesAnotherReadersPendingLoad) {
+        TColdFixture fixture;
+        auto written = WritePart();
+        auto cold = fixture.Cold(written);
+        const auto first = fixture.Start(fixture.First, cold);
+        fixture.Start(fixture.Second, cold);
+        auto read = fixture.ReadRoot(written);
+        fixture.Runtime.WaitFor("both metadata readers", [&] {
+            return fixture.Requests == 2;
+        }, TDuration::Seconds(5));
+        fixture.Runtime.Send(new NActors::IEventHandle(first, fixture.First, new NActors::TEvents::TEvPoison), 0, true);
+        fixture.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Failures, 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.ReadWorkers.size(), 1);
+        fixture.NoData(read);
+        auto failed = fixture.Runtime.GrabEdgeEvent<TColdAccess::TEvFailed>(fixture.Second, TDuration::Seconds(5));
+        UNIT_ASSERT(failed->Get()->Label == cold->Label);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Failures, 1);
+    }
+}
 
 Y_UNIT_TEST_SUITE_F(TPartLoaderRoot, NTest::TTableCacheTest) {
     Y_UNIT_TEST(PrepareRootBeforeOuterCollectionArrives) {
