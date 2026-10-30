@@ -1,4 +1,5 @@
 #include <ydb/core/tablet_flat/flat_part_loader.h>
+#include <ydb/core/tablet_flat/flat_executor.h>
 #include <ydb/core/tablet_flat/flat_part_writer.h>
 #include <ydb/core/tablet_flat/flat_writer_bundle.h>
 #include <ydb/core/tablet_flat/flat_scan_actor.h>
@@ -373,6 +374,45 @@ Y_UNIT_TEST_SUITE_F(TPartLoaderRoot, NTest::TTableCacheTest) {
             }
             TLoader loader(std::move(components), std::move(collections));
             auto result = Finish(loader, written);
+            UNIT_ASSERT_VALUES_EQUAL(result.Part->Stat.Rows, 128);
+        }
+    }
+
+    Y_UNIT_TEST(RuntimeSwitchKeepsOneLoaderAcrossMetadataPhase) {
+        auto written = WritePart({ .Outer = true });
+        NTabletFlatExecutor::TPendingPartSwitch::TNewBundle bundle(Components(written));
+        auto* original = &*bundle.Loader;
+        bundle.Loader->SetPageCollection(0, AdmitCollection(written, 0));
+        bundle.Loader->PrepareRoot();
+        UNIT_ASSERT(bundle.Loader->HasOuterCollection());
+        bundle.Loader->SetPageCollection(1, AdmitCollection(written, 1));
+        bundle.Stage.emplace<NTabletFlatExecutor::TPendingPartSwitch::TLoaderStage>();
+        UNIT_ASSERT(&*bundle.Loader == original);
+        auto result = Finish(*bundle.Loader, written);
+        bundle.Loader.reset();
+        bundle.Stage.emplace<NTabletFlatExecutor::TPendingPartSwitch::TResultStage>(std::move(result));
+        UNIT_ASSERT(!bundle.Loader);
+        UNIT_ASSERT_VALUES_EQUAL(
+            bundle.GetStage<NTabletFlatExecutor::TPendingPartSwitch::TResultStage>()->PartView.Part->Stat.Rows, 128);
+    }
+
+    Y_UNIT_TEST(RuntimeSwitchPreservesMixedRawMetadataInputs) {
+        for (bool rootRaw : { false, true }) {
+            auto written = WritePart({ .Outer = true, .Step = rootRaw ? 2u : 1u });
+            auto components = Components(written, true);
+            components.PageCollectionComponents[rootRaw ? 1 : 0].RawMeta = {};
+            NTabletFlatExecutor::TPendingPartSwitch::TNewBundle bundle(std::move(components));
+            if (!rootRaw) {
+                bundle.Loader->SetPageCollection(0, AdmitCollection(written, 0));
+            }
+            bundle.Loader->PrepareRoot();
+            UNIT_ASSERT(bundle.Loader->HasOuterCollection());
+            if (rootRaw) {
+                bundle.Loader->SetPageCollection(1, AdmitCollection(written, 1));
+            }
+            bundle.Stage.emplace<NTabletFlatExecutor::TPendingPartSwitch::TLoaderStage>();
+            auto result = Finish(*bundle.Loader, written);
+            UNIT_ASSERT(result.Part->Small);
             UNIT_ASSERT_VALUES_EQUAL(result.Part->Stat.Rows, 128);
         }
     }
