@@ -8,6 +8,7 @@
 #include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/blobstorage.h>
+#include <ydb/core/base/memory_controller_iface.h>
 #include <ydb/core/testlib/basics/appdata.h>
 #include <ydb/core/testlib/basics/runtime.h>
 #include <ydb/core/testlib/actors/block_events.h>
@@ -314,30 +315,69 @@ Y_UNIT_TEST_SUITE(TColdPartCollectionMetadata) {
         };
 
         TActorId loader;
-        // R37 separately covers teardown after the transient loader unregisters
         TBlockEvents<NSharedCache::TEvUnregister> unregister(fixture.Runtime, [&](const auto& event) {
             return event->Sender == loader;
         });
         loader = fixture.Start(fixture.First, fixture.Cold(written, false));
-        auto loaded = fixture.Runtime.GrabEdgeEvent<TColdAccess::TEvLoaded>(fixture.First, TDuration::Seconds(5));
-        const auto* part = loaded->Get()->Part.As<TPartStore>();
-        UNIT_ASSERT(part && part->PageCollections.size() == metadata.size());
-        metadata.clear();
-        UNIT_ASSERT(reads != 0);
-        ui32 required = 0;
-        ui32 optional = 0;
-        for (const auto& entry : seen) {
-            TCacheCollectionRef collection;
-            UNIT_ASSERT(cache.Find(entry.Id, collection) == NSharedCache::ECacheResultStatus::Hit);
-            TCachePageRef page;
-            UNIT_ASSERT(cache.Find(collection.CacheItem(), static_cast<ui64>(entry.Location.Offset), page) ==
-                        NSharedCache::ECacheResultStatus::Hit);
-            UNIT_ASSERT_VALUES_EQUAL(page.IsSticky(), entry.Sticky);
-            required += entry.Sticky;
-            optional += !entry.Sticky;
+        TVector<TCachePageRef> retainedPages;
+        {
+            auto loaded = fixture.Runtime.GrabEdgeEvent<TColdAccess::TEvLoaded>(fixture.First, TDuration::Seconds(5));
+            const auto* part = loaded->Get()->Part.As<TPartStore>();
+            UNIT_ASSERT(part && part->PageCollections.size() == metadata.size());
+            metadata.clear();
+            UNIT_ASSERT(reads != 0);
+            ui32 required = 0;
+            ui32 optional = 0;
+            for (const auto& entry : seen) {
+                TCacheCollectionRef collection;
+                UNIT_ASSERT(cache.Find(entry.Id, collection) == NSharedCache::ECacheResultStatus::Hit);
+                TCachePageRef page;
+                UNIT_ASSERT(cache.Find(collection.CacheItem(), static_cast<ui64>(entry.Location.Offset), page) ==
+                            NSharedCache::ECacheResultStatus::Hit);
+                UNIT_ASSERT_VALUES_EQUAL(page.IsSticky(), entry.Sticky);
+                required += entry.Sticky;
+                optional += !entry.Sticky;
+                if (entry.Sticky) {
+                    retainedPages.push_back(std::move(page));
+                }
+            }
+            UNIT_ASSERT(required != 0 && optional != 0);
+            unregister.Stop().Unblock();
+            fixture.Runtime.Send(new NActors::IEventHandle(
+                                     fixture.Cache, fixture.First, new NSharedCache::TEvCacheReadyRequest), 0, true);
+            fixture.Runtime.GrabEdgeEvent<NSharedCache::TEvCacheReady>(fixture.First, TDuration::Seconds(5));
+            for (const auto& page : retainedPages) {
+                UNIT_ASSERT(page.IsSticky());
+            }
+            // The completed part is the remaining real metadata owner
         }
-        UNIT_ASSERT(required != 0 && optional != 0);
-        unregister.Stop().Unblock();
+        fixture.Runtime.WaitFor("last part owner releases Sticky policy", [&] {
+            for (const auto& page : retainedPages) {
+                if (page.IsSticky()) {
+                    return false;
+                }
+            }
+            return true;
+        }, TDuration::Seconds(5));
+        retainedPages.clear();
+        fixture.Runtime.Send(
+            new NActors::IEventHandle(fixture.Cache, fixture.First, new NMemory::TEvConsumerLimit(0)), 0, true);
+        ui64 registered = 0;
+        for (ui32 step = 0; step < 400; ++step) {
+            fixture.Drain();
+            registered = 0;
+            cache.ForEachCollection([&](NSharedCache::TCollection&) {
+                ++registered;
+            });
+            if (!cache.PayloadUsage() && !registered) {
+                break;
+            }
+            fixture.Runtime.Send(
+                new NActors::IEventHandle(fixture.Cache, fixture.First,
+                    new TKikimrEvents::TEvWakeup(ui64(NSharedCache::EWakeupTag::DoGCManual))), 0, true);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(registered, 0);
     }
 
     Y_UNIT_TEST(ConcurrentReadersReuseCanonicalMetadataAndOuterCollection) {
