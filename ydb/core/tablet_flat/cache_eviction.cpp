@@ -270,6 +270,8 @@ bool TCacheEviction<TTraits>::EraseCold(
     TOperationItemRef<TTraits> ownerRef(spaceOp);
     THandleState expected = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
     for (;;) {
+        // Acquire the State observation, including failed-CAS retries, before validating its separate Cold epoch
+        std::atomic_thread_fence(std::memory_order_acquire);
         if (!expected.IsColdInTier(expectedTier) || !expected.IsStickyNoneField() ||
             (handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion) != coldItem.ColdVersion()) {
             return false;
