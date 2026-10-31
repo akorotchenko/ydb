@@ -277,6 +277,17 @@ EShrinkCutStatus TSharedCache::ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui3
             }
         }
     }
+    if (state.IsCollectionKind() && state.IsSticky() && state.IsStickyNoneField() && state.Refs() == 0) {
+        // Cached low pages can keep detached metadata above the shrink boundary alive
+        if (Eviction_.SweepModes() || DrainHotResize() || cacheOp.Eviction().ReclaimCold() ||
+            cacheOp.Eviction().ProcessHotAtMinimum()) {
+            return EShrinkCutStatus::Progress;
+        }
+        // Empty bounded batches must continue while settled Regular Hot pages remain
+        if (Memory_.Hot(ECacheTier::Regular).Pages() != 0) {
+            return EShrinkCutStatus::Progress;
+        }
+    }
     return EShrinkCutStatus::Blocked;
 }
 
