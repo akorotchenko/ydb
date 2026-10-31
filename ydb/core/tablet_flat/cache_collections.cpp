@@ -474,8 +474,9 @@ void TCacheCollections<TTraits>::DrainStickyPages(TSpaceOperation& spaceOp, TCol
             }
 
             if (!pending) {
-                Cache_.Memory_.Sticky().TransferBytesTo(Cache_.Memory_.Hot(), bytes);
-                Cache_.Memory_.Sticky().TransferPageTo(Cache_.Memory_.Hot(), EItemKind::Page);
+                auto& hot = Cache_.Memory_.Hot(desired.Tier());
+                Cache_.Memory_.Sticky().TransferBytesTo(hot, bytes);
+                Cache_.Memory_.Sticky().TransferPageTo(hot, EItemKind::Page);
             }
             Cache_.Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, bytes);
             if (!pending) {
