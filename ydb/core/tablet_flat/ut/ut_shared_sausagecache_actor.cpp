@@ -313,7 +313,7 @@ struct TSharedPageCacheMock {
         return *this;
     }
 
-    void ReclaimUnusedCollections(ui64 expectedCollections) {
+    void ReclaimUnusedCollections(i64 expectedCollections) {
         SetLimit(0);
         for (ui32 step = 0; step < 400; ++step) {
             Wakeup();
