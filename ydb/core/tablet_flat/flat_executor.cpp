@@ -1579,9 +1579,10 @@ bool TExecutor::PrepareExternalPart(TPendingPartSwitch &partSwitch, TPendingPart
                 { .PreloadIndex = true, .PreloadData = PreloadTablesData.contains(partSwitch.TableId) })) {
             stage->Fetching = fetch.PageCollection.Get();
 
-            Send(MakeSharedPageCacheId(), new NSharedCache::TEvRequest(
-                NBlockIO::EPriority::Fast, std::move(fetch.PageCollection), std::move(fetch.Pages)),
-                0, ui64(ERequestTypeCookie::PendingInit));
+            auto* request = new NSharedCache::TEvRequest(
+                NBlockIO::EPriority::Fast, std::move(fetch.PageCollection), std::move(fetch.Pages));
+            request->Sticky = std::move(fetch.Sticky);
+            Send(MakeSharedPageCacheId(), request, 0, ui64(ERequestTypeCookie::PendingInit));
 
             ++partSwitch.PendingLoads;
             return true;

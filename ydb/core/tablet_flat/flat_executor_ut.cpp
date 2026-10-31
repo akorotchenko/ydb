@@ -1,5 +1,6 @@
 #include "flat_dbase_sz_env.h"
 #include "flat_executor_ut_common.h"
+#include "flat_part_loader.h"
 #include "util_fmt_abort.h"
 #include "shared_cache_counters.h"
 #include <ydb/core/base/counters.h>
@@ -4381,6 +4382,84 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_Cold) {
             ctx.Send(ctx.SelfID, new NFake::TEvReturn);
         }
     };
+
+    Y_UNIT_TEST(RuntimePartSwitchPreservesLoaderStickyHints) {
+        TMyEnvBase env;
+        TRowsModel rows;
+        auto& flags = env->GetAppData().FeatureFlags;
+        flags.SetEnableLocalDBBtreeIndex(false);
+        flags.SetEnableLocalDBFlatIndex(true);
+        env.FireTablet(env.Edge, env.Tablet, [&env](const TActorId& tablet, TTabletStorageInfo* info) {
+            return new TTestFlatTablet(env.Edge, tablet, info);
+        });
+        env.WaitForWakeUp();
+        env.SendSync(rows.MakeScheme(new TCompactionPolicy()));
+        env.SendSync(rows.MakeRows(100, 0, 100));
+        env.SendSync(new NFake::TEvCompact(TRowsModel::TableId));
+        env.WaitFor<NFake::TEvCompacted>();
+        TString body;
+        {
+            env.SendSync(new NFake::TEvExecute{ new TTxMakeSnapshot });
+            auto snapshot = env.GrabEdgeEvent<TEvTestFlatTablet::TEvSnapshotComplete>();
+            env.SendSync(
+                new NFake::TEvExecute{ new TTxBorrowSnapshot(body, snapshot->Get()->SnapContext, env.Tablet + 1) });
+        }
+        const ui64 sourceTablet = env.Tablet;
+        env.SendSync(new TEvents::TEvPoison, false, true);
+        env.WaitForGone();
+        auto& cache = NSharedCache::TSharedCache::Get();
+        SetSharedCacheSize(env, 0);
+        for (ui32 step = 0; step < 400 && cache.PayloadUsage(); ++step) {
+            WakeupSharedCache(env);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
+        SetSharedCacheSize(env, 8_MB);
+
+        ++env.Tablet;
+        env.FireTablet(env.Edge, env.Tablet, [&env](const TActorId& tablet, TTabletStorageInfo* info) {
+            return new TTestFlatTablet(env.Edge, tablet, info);
+        });
+        env.WaitForWakeUp();
+        env.SendSync(rows.MakeScheme(new TCompactionPolicy()));
+
+        struct TSeen {
+            TLogoBlobID Id;
+            NTable::NPage::TPageLocation Location;
+        };
+
+        TVector<TSeen> requiredPages;
+        auto observer = env->AddObserver<NSharedCache::TEvRequest>([&](const auto& event) {
+            const auto* request = event->Get();
+            if (event->Cookie != ui64(ERequestTypeCookie::PendingInit) ||
+                request->PageCollection->Label().TabletID() != sourceTablet) {
+                return;
+            }
+            UNIT_ASSERT_VALUES_EQUAL(request->Sticky.size(), request->Pages.size());
+            for (ui32 index = 0; index < request->Pages.size(); ++index) {
+                const auto& location = request->Pages[index];
+                const bool required =
+                    NTable::TLoader::NeedIn(location.Type) || location.Type == NTable::NPage::EPage::FlatIndex;
+                UNIT_ASSERT_VALUES_EQUAL(request->Sticky[index], required);
+                if (required) {
+                    requiredPages.push_back({ request->PageCollection->Label(), location });
+                }
+            }
+        });
+        env.SendSync(new NFake::TEvExecute{ new TTxLoanSnapshot(body) });
+        env.SendAsync(new TEvTestFlatTablet::TEvQueueScan(rows.Rows()));
+        env.WaitFor<TEvTestFlatTablet::TEvScanFinished>();
+        UNIT_ASSERT(!requiredPages.empty());
+        for (const auto& entry : requiredPages) {
+            NSharedCache::TCacheCollectionRef collection;
+            UNIT_ASSERT(cache.Find(entry.Id, collection) == NSharedCache::ECacheResultStatus::Hit);
+            NSharedCache::TCachePageRef page;
+            UNIT_ASSERT(cache.Find(collection.CacheItem(), static_cast<ui64>(entry.Location.Offset), page) ==
+                        NSharedCache::ECacheResultStatus::Hit);
+            UNIT_ASSERT(page.IsSticky());
+        }
+        env.SendSync(new TEvents::TEvPoison, false, true);
+        env.WaitForGone();
+    }
 
     Y_UNIT_TEST(ColdBorrowScan) {
         TMyEnvBase env;
