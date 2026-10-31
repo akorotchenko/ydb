@@ -313,6 +313,18 @@ struct TSharedPageCacheMock {
         return *this;
     }
 
+    void ReclaimUnusedCollections(ui64 expectedCollections) {
+        SetLimit(0);
+        for (ui32 step = 0; step < 400; ++step) {
+            Wakeup();
+            Runtime.SimulateSleep(TDuration::MilliSeconds(1));
+            if (Counters->PageCollections->Val() == expectedCollections) {
+                return;
+            }
+        }
+        UNIT_ASSERT_VALUES_EQUAL(Counters->PageCollections->Val(), expectedCollections);
+    }
+
     void PrepareKeepStorage(ui64 bytes) {
         Runtime.SimulateSleep(TDuration::MilliSeconds(1));
         auto& cache = TSharedCache::Get();
@@ -1175,12 +1187,17 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             });
             UNIT_ASSERT(collection->GetActorState()->Owners.contains(sharedCache.Sender1));
             sharedCache.Detach(sharedCache.Sender1, sharedCache.Collection1);
-            UNIT_ASSERT(!collection->GetActorState());
-            // The original fetch still owns its native item after actor bookkeeping is removed.
+            UNIT_ASSERT(collection->GetActorState());
+            UNIT_ASSERT(collection->GetActorState()->Owners.empty());
+            UNIT_ASSERT_VALUES_EQUAL(collection->GetActorState()->PendingRequests, 0);
+            // The original fetch keeps bookkeeping until its page item is reclaimed
             sharedCache.Provide(sharedCache.Collection1, { page }, CORE_FETCH_COOKIE);
             sharedCache.Runtime.WaitFor("late fetch completed", [&] {
                 return sharedCache.Counters->LoadInFlyPages->Val() == 0;
             });
+            UNIT_ASSERT(collection->GetActorState());
+            UNIT_ASSERT(collection->GetActorState()->KeepPreloadRequests.empty());
+            sharedCache.ReclaimUnusedCollections(0);
             UNIT_ASSERT(!collection->GetActorState());
         }
     }
@@ -1575,13 +1592,17 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true);
         sharedCache.Detach(sharedCache.Sender1, sharedCache.Collection1);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
         TCachePageRef pinned = std::move(heldPages.at(1));
         UNIT_ASSERT_VALUES_EQUAL(pinned.BuildSharedData().size(), 10);
 
         heldPages.clear();
-        sharedCache.Wakeup();
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 0);
+        sharedCache.SetLimit(0).Wakeup();
+        sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(pinned.BuildSharedData().size(), 10);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
+        pinned.Drop();
+        sharedCache.ReclaimUnusedCollections(0);
     }
     Y_UNIT_TEST(CoreSharedPageRefStickyQueryTracksModeChanges) {
         TSharedPageCacheMock sharedCache;
@@ -1781,9 +1802,14 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             results.pop_front();
         }
         sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection2, { _P(0) } } });
-        UNIT_ASSERT(!collection->GetActorState());
+        UNIT_ASSERT(collection->GetActorState());
+        UNIT_ASSERT(collection->GetActorState()->KeepPreloadRequests.empty());
+        UNIT_ASSERT_VALUES_EQUAL(collection->GetActorState()->PendingRequests, 0);
         sharedCache.Provide(sharedCache.Collection2, { _P(0) });
         sharedCache.CheckFetches({});
+        sharedCache.Detach(sharedCache.Sender2, sharedCache.Collection2);
+        sharedCache.ReclaimUnusedCollections(0);
+        UNIT_ASSERT(!collection->GetActorState());
     }
 
     Y_UNIT_TEST(CoreKeepIgnoresEvictionFromRecreatedCollection) {
@@ -3366,9 +3392,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Detach(sharedCache.Sender1, sharedCache.Collection1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 0);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 0);
+        sharedCache.ReclaimUnusedCollections(0);
     }
 
     Y_UNIT_TEST(Detach_InFly) {
@@ -3495,9 +3522,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Unregister(sharedCache.Sender1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 0);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 0);
+        sharedCache.ReclaimUnusedCollections(0);
     }
 
     Y_UNIT_TEST(Unregister_InFly) {
@@ -3527,7 +3555,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 1);
 
@@ -3544,9 +3572,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 1);
+        sharedCache.ReclaimUnusedCollections(1);
     }
 
     Y_UNIT_TEST(Unregister_Queued) {
@@ -3600,7 +3629,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 1);
 
@@ -3613,7 +3642,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 1);
 
@@ -3624,9 +3653,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->FailedRequests->Val(), 2);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 1);
+        sharedCache.ReclaimUnusedCollections(1);
     }
 
     Y_UNIT_TEST(InMemory_Basics) {
