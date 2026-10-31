@@ -205,7 +205,10 @@ namespace NOps {
 
             void RunLoader() {
                 if (auto fetch = Loader->Run({.PreloadIndex = false, .PreloadData = false})) {
-                    Send(MakeSharedPageCacheId(), new NSharedCache::TEvRequest(ReadPriority, std::move(fetch.PageCollection), std::move(fetch.Pages)));
+                    auto* request = new NSharedCache::TEvRequest(
+                        ReadPriority, std::move(fetch.PageCollection), std::move(fetch.Pages));
+                    request->Sticky = std::move(fetch.Sticky);
+                    Send(MakeSharedPageCacheId(), request);
                     ++ReadsLeft;
                 }
 

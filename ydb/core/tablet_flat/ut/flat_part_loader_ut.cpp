@@ -10,6 +10,7 @@
 #include <ydb/core/base/blobstorage.h>
 #include <ydb/core/testlib/basics/appdata.h>
 #include <ydb/core/testlib/basics/runtime.h>
+#include <ydb/core/testlib/actors/block_events.h>
 
 #include <library/cpp/testing/unittest/registar.h>
 
@@ -39,7 +40,7 @@ namespace {
         ui32 Step = 1;
     };
 
-    TBundle::TResult WritePart(TWriteOptions options = {}) {
+    TBundle::TResult WritePart(TWriteOptions options = {}, TVector<NPageCollection::TGlob>* blobs = nullptr) {
         NTest::TLayoutCook layout;
         layout.Col(0, 1, NScheme::NTypeIds::Uint64)
             .Col(options.Grouped ? 1 : 0, 2, NScheme::NTypeIds::String)
@@ -85,6 +86,9 @@ namespace {
             writer.EndKey();
         }
         UNIT_ASSERT_VALUES_EQUAL(writer.Finish().Parts, 1);
+        if (blobs) {
+            *blobs = bundle.GetBlobsToSave();
+        }
         auto results = bundle.Results();
         UNIT_ASSERT_VALUES_EQUAL(results.size(), 1);
         return std::move(results.front());
@@ -181,7 +185,7 @@ namespace {
             Runtime.SetEventFilter(std::move(PreviousFilter));
         }
 
-        TIntrusiveConstPtr<TColdPartStore> Cold(const TBundle::TResult& written) {
+        TIntrusiveConstPtr<TColdPartStore> Cold(const TBundle::TResult& written, bool withOverlay = true) {
             TVector<NPageCollection::TLargeGlobId> descriptors;
             for (const auto& collection : written.PageCollections) {
                 const auto* packet =
@@ -190,7 +194,7 @@ namespace {
                 descriptors.push_back(packet->LargeGlobId);
             }
             return MakeIntrusiveConst<TColdPartStore>(
-                std::move(descriptors), TString{}, written.Overlay, TEpoch::Zero());
+                std::move(descriptors), TString{}, withOverlay ? written.Overlay : TString{}, TEpoch::Zero());
         }
 
         void Warm(const TBundle::TResult& written) {
@@ -246,6 +250,96 @@ namespace {
 } // anonymous namespace
 
 Y_UNIT_TEST_SUITE(TColdPartCollectionMetadata) {
+    Y_UNIT_TEST(MissRequestsPreserveMixedStickyHints) {
+        TColdFixture fixture;
+        TVector<NPageCollection::TGlob> blobs;
+        auto written = WritePart({}, &blobs);
+        THashMap<TLogoBlobID, TString> bodies;
+        for (auto& blob : blobs) {
+            UNIT_ASSERT(bodies.emplace(blob.GId.Logo, std::move(blob.Data)).second);
+        }
+        auto& cache = NSharedCache::TSharedCache::Get();
+        TVector<TCacheCollectionRef> metadata;
+        for (const auto& collection : written.PageCollections) {
+            metadata.push_back(cache.AdmitCollection(collection.PageCollection));
+        }
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
+
+        struct TSeen {
+            TLogoBlobID Id;
+            TPageLocation Location;
+            bool Sticky;
+        };
+
+        TVector<TSeen> seen;
+        ui32 reads = 0;
+        NActors::TTestActorRuntimeBase::TEventFilter previous;
+        previous = fixture.Runtime.SetEventFilter(
+            [&](NActors::TTestActorRuntimeBase& runtime, TAutoPtr<NActors::IEventHandle>& event) {
+                if (event->GetTypeRewrite() == NSharedCache::TEvRequest::EventType) {
+                    const auto* request = event->Get<NSharedCache::TEvRequest>();
+                    UNIT_ASSERT_VALUES_EQUAL(request->Sticky.size(), request->Pages.size());
+                    for (ui32 index = 0; index < request->Pages.size(); ++index) {
+                        const auto& location = request->Pages[index];
+                        const bool required = TLoader::NeedIn(location.Type) || location.Type == EPage::FlatIndex;
+                        UNIT_ASSERT_VALUES_EQUAL(request->Sticky[index], required);
+                        seen.push_back({ request->PageCollection->Label(), location, required });
+                    }
+                } else if (event->GetTypeRewrite() == TEvBlobStorage::TEvGet::EventType) {
+                    const auto* request = event->Get<TEvBlobStorage::TEvGet>();
+                    auto response =
+                        MakeHolder<TEvBlobStorage::TEvGetResult>(NKikimrProto::OK, request->QuerySize, ui32{ 0 });
+                    for (ui32 index = 0; index < request->QuerySize; ++index) {
+                        const auto& query = request->Queries[index];
+                        const auto* body = bodies.FindPtr(query.Id);
+                        UNIT_ASSERT(body && query.Shift <= body->size());
+                        const size_t size = query.Size ? query.Size : body->size() - query.Shift;
+                        UNIT_ASSERT(size <= body->size() - query.Shift);
+                        auto& result = response->Responses[index];
+                        result.Id = query.Id;
+                        result.Status = NKikimrProto::OK;
+                        result.Shift = query.Shift;
+                        result.RequestedSize = query.Size;
+                        result.Buffer = TRope(TString(body->data() + query.Shift, size));
+                    }
+                    ++reads;
+                    fixture.Runtime.Send(new NActors::IEventHandle(event->Sender, fixture.Proxy, response.Release(), 0,
+                                             event->Cookie), 0, true);
+                    return true;
+                }
+                return previous(runtime, event);
+            });
+        Y_DEFER {
+            fixture.Runtime.SetEventFilter(std::move(previous));
+        };
+
+        TActorId loader;
+        // R37 separately covers teardown after the transient loader unregisters
+        TBlockEvents<NSharedCache::TEvUnregister> unregister(fixture.Runtime, [&](const auto& event) {
+            return event->Sender == loader;
+        });
+        loader = fixture.Start(fixture.First, fixture.Cold(written, false));
+        auto loaded = fixture.Runtime.GrabEdgeEvent<TColdAccess::TEvLoaded>(fixture.First, TDuration::Seconds(5));
+        const auto* part = loaded->Get()->Part.As<TPartStore>();
+        UNIT_ASSERT(part && part->PageCollections.size() == metadata.size());
+        metadata.clear();
+        UNIT_ASSERT(reads != 0);
+        ui32 required = 0;
+        ui32 optional = 0;
+        for (const auto& entry : seen) {
+            TCacheCollectionRef collection;
+            UNIT_ASSERT(cache.Find(entry.Id, collection) == NSharedCache::ECacheResultStatus::Hit);
+            TCachePageRef page;
+            UNIT_ASSERT(cache.Find(collection.CacheItem(), static_cast<ui64>(entry.Location.Offset), page) ==
+                        NSharedCache::ECacheResultStatus::Hit);
+            UNIT_ASSERT_VALUES_EQUAL(page.IsSticky(), entry.Sticky);
+            required += entry.Sticky;
+            optional += !entry.Sticky;
+        }
+        UNIT_ASSERT(required != 0 && optional != 0);
+        unregister.Stop().Unblock();
+    }
+
     Y_UNIT_TEST(ConcurrentReadersReuseCanonicalMetadataAndOuterCollection) {
         TColdFixture fixture;
         auto written = WritePart({ .Outer = true });
