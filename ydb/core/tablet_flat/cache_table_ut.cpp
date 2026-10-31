@@ -1493,6 +1493,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 check(index + 1, true, 1);
             }
             UNIT_ASSERT(cache.DetachCollection(fixture.Item));
+            UNIT_ASSERT(!cache.SetCollectionPagesCacheMode(fixture.Item, ECacheMode::Sticky));
+            UNIT_ASSERT(!cache.SetCollectionPagesCacheMode(fixture.Item, ECacheMode::TryKeepInMemory));
             if (!keepOwner) {
                 fixture.Owner.Drop();
             }
@@ -3263,9 +3265,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         const TLogoBlobID id(120, 50020, 5);
         auto retired = MakeReviewRetainedCollection(fixture, id);
         UNIT_ASSERT(fixture.Cache->DetachCollection(retired.CacheItem()));
-        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, retired.CacheItem()));
-        UNIT_ASSERT(
-            TCacheTestAccess::EraseCold(*fixture.Cache, MakeColdItem(*fixture.Cache, retired.CacheItem().Index())));
+        UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, retired.CacheItem().Index()).IsSticky());
+        UNIT_ASSERT(fixture.Cache->EraseCollection(retired.CacheItem()));
         UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, retired.CacheItem().Index()).IsTombstone());
         auto current = MakeReviewRetainedCollection(fixture, id);
         UNIT_ASSERT(retired.CacheItem() != current.CacheItem());
