@@ -541,6 +541,10 @@ public:
         });
     }
 
+    static const TCacheMemory::TTierUsage& TierUsage(const TTestSharedCache& cache, ECacheTier tier) noexcept {
+        return cache.Memory_.Tier(tier);
+    }
+
     static ui64 CollectionReferences(TTestSharedCache& cache, TCollectionCacheItem collection) {
         auto operation = cache.BeginOperation();
         const auto& handle = operation.Handles()[collection.Index()];
@@ -12963,40 +12967,77 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsHot());
     }
     Y_UNIT_TEST(StickyPromotionLosesToCollectionDisable) {
-        TFixture fixture;
-        const auto collectionKey = TCacheKey::Collection(TLogoBlobID(19, 20, 21));
-        const TCollectionCacheItem collection = AllocateCollection(*fixture.Cache, collectionKey);
-        UNIT_ASSERT(collection);
-        UNIT_ASSERT(TCacheTestAccess::MakeReady(
-            *fixture.Cache, fixture.Registry, collection, MakeCollection(CollectionId(collectionKey))));
+        constexpr ui32 size = 64;
+        constexpr ui64 bytes = size + TSharedData::OverheadSize;
+        for (auto sourceTier : { ECacheTier::Regular, ECacheTier::Keep }) {
+            for (auto mode : { ECacheMode::Regular, ECacheMode::TryKeepInMemory }) {
+                TFixture fixture;
+                auto& cache = *fixture.Cache;
+                UNIT_ASSERT(ConfigureKeep(cache, 4 * bytes));
+                const auto collection = CreateModeCollection(cache, fixture.Registry, TLogoBlobID(19, 20, 21),
+                    sourceTier == ECacheTier::Keep ? ECacheMode::TryKeepInMemory : ECacheMode::Regular);
+                TTestCachePageRef initialOwner;
+                const auto page = InsertOwnedSizedPage(cache, collection, 1, size, 's', initialOwner);
+                initialOwner.Drop();
+                UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()).IsHotInTier(sourceTier));
+                if (sourceTier == ECacheTier::Keep) {
+                    UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+                }
+                // Leave mode sweeps queued so the promotion starts from the original Hot tier
+                UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collection, ECacheMode::Sticky));
 
-        const auto key = TCacheKey::Page(collection, 1);
-        const TPageCacheItem page = AllocatePage(*fixture.Cache, key, 4096);
-        UNIT_ASSERT(page);
-        UNIT_ASSERT(FindOrInsertPage(*fixture.Cache, key, page).Status == ECacheResultStatus::Inserted);
-        UNIT_ASSERT(fixture.Cache->MakeReady(page, MakePageData(page.Index())));
+                TSharedCacheGate gate;
+                gate.Slots[0].Arm(ECacheHookPoint::AfterStickyPageLinked, page.CacheItem());
+                TSharedCacheHookGuard hookGuard(cache, gate.Hooks);
+                bool promoted = true;
+                TGateThread promoter(gate, [&] {
+                    Y_ABORT_UNLESS(!TlsCacheHazard);
+                    TlsCacheHazard = &TCacheThreadTestAccess::Hazard(cache, 0);
+                    Y_DEFER {
+                        TlsCacheHazard = nullptr;
+                    };
+                    promoted = TCacheTestAccess::MakePageSticky(cache, page);
+                });
+                gate.Slots[0].Wait();
+                UNIT_ASSERT_VALUES_EQUAL(cache.StickyOwnedBytes(), bytes);
+                UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collection, mode));
+                UNIT_ASSERT_VALUES_EQUAL(cache.StickyOwnedBytes(), 0);
+                gate.Slots[0].Release();
+                promoter.Join();
+                UNIT_ASSERT(!promoted);
+                UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::StickyPageListHead(cache, collection), 0);
+                const auto finalTier = mode == ECacheMode::TryKeepInMemory ? ECacheTier::Keep : ECacheTier::Regular;
+                UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()).IsHotInTier(finalTier));
+                for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+                    const auto& usage = TCacheTestAccess::TierUsage(cache, tier);
+                    UNIT_ASSERT_VALUES_EQUAL(usage.Hot.PagesEstimate(), tier == finalTier ? 1 : 0);
+                    UNIT_ASSERT_VALUES_EQUAL(usage.Hot.BytesEstimate(), tier == finalTier ? bytes : 0);
+                }
+                UNIT_ASSERT_VALUES_EQUAL(cache.StickyBytes(), 0);
+                UNIT_ASSERT_VALUES_EQUAL(cache.KeepOwnedPages(), finalTier == ECacheTier::Keep ? 1 : 0);
+                UNIT_ASSERT_VALUES_EQUAL(cache.KeepOwnedBytes(), finalTier == ECacheTier::Keep ? bytes : 0);
 
-        TSharedCacheGate gate;
-        gate.Slots[0].Arm(ECacheHookPoint::AfterStickyPageLinked, page.CacheItem());
-        TSharedCacheHookGuard hookGuard(*fixture.Cache, gate.Hooks);
-        auto cache = fixture.Cache;
-        bool promoted = true;
-        TGateThread promoter(gate, [&] {
-            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
-            NSharedCache::TlsCacheHazard = &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0);
-            Y_DEFER {
-                NSharedCache::TlsCacheHazard = nullptr;
-            };
-            promoted = TCacheTestAccess::MakePageSticky(*cache, page);
-        });
-        gate.Slots[0].Wait();
-        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
-        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyOwnedBytes(), 0);
-        gate.Slots[0].Release();
-        promoter.Join();
-        UNIT_ASSERT(!promoted);
-        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::StickyPageListHead(*fixture.Cache, collection), 0);
-        UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsHot());
+                UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+                ui32 sweeps = 0;
+                while (TCacheTestAccess::SweepModes(cache)) {
+                    UNIT_ASSERT(++sweeps < 1024);
+                }
+                UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()).IsHotInTier(ECacheTier::Regular));
+                UNIT_ASSERT_VALUES_EQUAL(cache.KeepOwnedBytes(), 0);
+                UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, page));
+                UNIT_ASSERT(TCacheTestAccess::EraseCold(cache, MakeColdItem(cache, page.Index())));
+                for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+                    const auto& usage = TCacheTestAccess::TierUsage(cache, tier);
+                    UNIT_ASSERT_VALUES_EQUAL(usage.Hot.PagesEstimate(), 0);
+                    UNIT_ASSERT_VALUES_EQUAL(usage.Hot.BytesEstimate(), 0);
+                    UNIT_ASSERT_VALUES_EQUAL(usage.Cold.PagesEstimate(), 0);
+                    UNIT_ASSERT_VALUES_EQUAL(usage.Cold.BytesEstimate(), 0);
+                }
+                UNIT_ASSERT_VALUES_EQUAL(cache.KeepOwnedPages(), 0);
+                UNIT_ASSERT_VALUES_EQUAL(cache.StickyOwnedBytes(), 0);
+                UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
+            }
+        }
     }
     Y_UNIT_TEST(ConcurrentStickyPageInsertionPreservesBothPages) {
         TFixture fixture;
