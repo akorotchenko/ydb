@@ -194,20 +194,63 @@ void TCacheCollections<TTraits>::ForEach(
 }
 
 template <class TTraits>
-void TCacheCollections<TTraits>::DropOwnerReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept {
-    // Keep the payload alive after dropping the page's collection ownership.
-    TOperationItemRef<TTraits> collectionRef(spaceOp, Items(spaceOp).TryAcquireStructural(owner.CacheItem.CacheItem()));
-    Y_ABORT_UNLESS(collectionRef);
-    const bool lastOwner = DropReference(owner);
+void TCacheCollections<TTraits>::SetPageAttachment(
+    TSpaceOperation& spaceOp, TCollection& owner, bool attached) noexcept {
+    THandle& handle = spaceOp.Handles()[owner.CacheItem.Index()];
+    ui64 raw = handle.State.load(std::memory_order_acquire);
+    for (;;) {
+        const auto state = THandleState::FromRaw(raw);
+        Y_DEBUG_ABORT_UNLESS(owner.CacheItem.Matches(state) && (state.IsSticky() || state.IsTombstone()));
+        Y_DEBUG_ABORT_UNLESS(state.Refs() != 0);
+        if (state.HasPageAttachment() == attached) {
+            return;
+        }
+        const auto desired = state.WithPageAttachment(attached);
+        if (handle.State.compare_exchange_weak(
+                raw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_acquire)) {
+            if (!attached) {
+                Cache_.InvokeHook(ECacheHookPoint::AfterPageAttachmentWithdrawn, owner.CacheItem.CacheItem());
+            }
+            return;
+        }
+    }
+}
+
+template <class TTraits>
+void TCacheCollections<TTraits>::AddPageReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept {
+    if (owner.PageReferences.fetch_add(1, std::memory_order_acq_rel) == 0) {
+        // The insertion's native owner bridges publication of the first page attachment
+        Cache_.InvokeHook(ECacheHookPoint::BeforePageAttachmentPublished, owner.CacheItem.CacheItem());
+        SetPageAttachment(spaceOp, owner, true);
+    }
+}
+
+template <class TTraits>
+void TCacheCollections<TTraits>::DropPageReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept {
+    // A page already owns metadata, including metadata explicitly unlinked while admission was in flight
+    TOperationItemRef<TTraits> collectionRef(
+        spaceOp, Items(spaceOp).AcquireMoreCollectionRef(owner.CacheItem.CacheItem()));
+    ui64 references = owner.PageReferences.load(std::memory_order_acquire);
+    for (;;) {
+        Y_DEBUG_ABORT_UNLESS(references != 0);
+        if (references > 1) {
+            if (owner.PageReferences.compare_exchange_weak(
+                    references, references - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                break;
+            }
+            continue;
+        }
+        // Withdraw before zero becomes visible; the native guard retains metadata through the handoff
+        SetPageAttachment(spaceOp, owner, false);
+        if (owner.PageReferences.compare_exchange_strong(
+                references, 0, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            break;
+        }
+        // A new page joined before the last-page CAS; restore its attachment before releasing the guard
+        SetPageAttachment(spaceOp, owner, true);
+    }
     Cache_.InvokeHook(ECacheHookPoint::AfterCollectionOwnerReferenceDropped, collectionRef.CacheItem());
-    if (lastOwner) {
-        const TLogoBlobID id = owner.Id();
-        const TCollectionCacheItem item = owner.CacheItem;
-        PublishCollectionForReclaim(spaceOp, item.CacheItem());
-        Cache_.NotifyCollectionReleased(id, item);
-    } else if (owner.Registry_.load(std::memory_order_acquire) &&
-               owner.References.load(std::memory_order_acquire) == 1) {
-        // The registry is the only remaining structural owner; actor work may now be cleaned up.
+    if (references == 1) {
         Cache_.NotifyCollectionReleased(owner.Id(), owner.CacheItem);
     }
 }
@@ -219,32 +262,7 @@ void TCacheCollections<TTraits>::DropPageItemRef(TSpaceOperation& spaceOp, THand
         return;
     }
     if (TCollection* owner = PageCollection(spaceOp, page)) {
-        DropOwnerReference(spaceOp, *owner);
-    }
-}
-
-template <class TTraits>
-void TCacheCollections<TTraits>::PublishCollectionForReclaim(
-    TSpaceOperation& spaceOp, TCacheItem collectionItem) noexcept {
-    THandle& handle = spaceOp.Handles()[collectionItem.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        if (!collectionItem.Matches(expected) || !expected.IsCollectionKind() || !expected.IsSticky() ||
-            !expected.IsStickyNoneField() || handle.Body.Collection->Registry_.load(std::memory_order_acquire) ||
-            handle.Body.Collection->References.load(std::memory_order_acquire) != 0)
-        {
-            return;
-        }
-        const THandleState desired = expected.WithState(EHandleState::Hot).WithFrequency(0);
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
-        {
-            Cache_.Memory_.Sticky().TransferBytesTo(Cache_.Memory_.Hot(), handle.Metadata.PayloadBytes);
-            Cache_.InvokeHook(ECacheHookPoint::BeforeCollectionHotPublished, collectionItem);
-            Cache_.Eviction_.BindOperation(spaceOp).RouteHot(EHotLevel::L1, collectionItem);
-            return;
-        }
+        DropPageReference(spaceOp, *owner);
     }
 }
 
@@ -261,7 +279,10 @@ void TCacheCollections<TTraits>::FinishCollectionRetain(TSpaceOperation& spaceOp
         if (expected.IsStickyField()) {
             return;
         }
-        const THandleState desired = expected.WithSticky(EStickyState::Sticky).WithFrequency(0);
+        const THandleState desired = expected.WithSticky(EStickyState::Sticky)
+                                         .WithFrequency(0)
+                                         .WithPageAttachment(expected.HasPageAttachment())
+                                         .WithShrinkWaiter(expected.HasShrinkWaiter());
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
         {
@@ -327,8 +348,11 @@ void TCacheCollections<TTraits>::FinishAttach(
         const THandleState expected = THandleState::FromRaw(expectedRaw);
         Y_ABORT_UNLESS(collectionItem.Matches(expected) && expected.IsCollectionKind() &&
                        expected.State() == detachedState && expected.IsTransitionField());
-        const THandleState desired =
-            expected.WithState(EHandleState::Sticky).WithSticky(EStickyState::Sticky).WithFrequency(0);
+        const THandleState desired = expected.WithState(EHandleState::Sticky)
+                                         .WithSticky(EStickyState::Sticky)
+                                         .WithFrequency(0)
+                                         .WithPageAttachment(expected.HasPageAttachment())
+                                         .WithShrinkWaiter(expected.HasShrinkWaiter());
         Cache_.InvokeHook(ECacheHookPoint::BeforeCollectionAttachPublished, collectionItem);
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
@@ -351,7 +375,6 @@ bool TCacheCollections<TTraits>::Attach(
 
     const EHandleState detachedState = attachState.State();
     Y_ABORT_UNLESS(Link(spaceOp, registry, collectionItem));
-    AddReference(*spaceOp.Handles()[collectionItem.Index()].Body.Collection);
     FinishAttach(spaceOp, collectionItem, detachedState);
     Cache_.NotifyResourcesAvailable();
     return true;
@@ -897,15 +920,15 @@ void TCacheCollections<TTraits>::FinishDetach(
         const THandleState expected = THandleState::FromRaw(expectedRaw);
         Y_ABORT_UNLESS(collectionItem.Matches(expected) && expected.IsCollectionKind() && expected.IsSticky() &&
                        expected.IsTransitionField());
-        const THandleState desired = expected.WithSticky(EStickyState::None).WithFrequency(0);
+        const THandleState desired = expected.WithSticky(EStickyState::None)
+                                         .WithFrequency(0)
+                                         .WithPageAttachment(expected.HasPageAttachment())
+                                         .WithShrinkWaiter(expected.HasShrinkWaiter());
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
         {
             break;
         }
-    }
-    if (DropReference(*handle.Body.Collection)) {
-        PublishCollectionForReclaim(spaceOp, collectionItem);
     }
     Cache_.NotifyResourcesAvailable();
 }
@@ -926,11 +949,8 @@ bool TCacheCollections<TTraits>::TryClaimDeletion(TSpaceOperation& spaceOp, TCol
             return false;
         }
         TCollectionRegistry* registry = handle.Body.Collection->Registry_.load(std::memory_order_acquire);
-        /* the record's own reference is carried by the sticky field: attached means one
-         * reference for the record itself, detached means none, and every other
-         * reference belongs to a live page item */
-        const ui64 ownReference = expected.IsStickyField() ? 1 : 0;
-        if (handle.Body.Collection->References.load(std::memory_order_acquire) != ownReference) {
+        if (expected.HasPageAttachment() ||
+            handle.Body.Collection->PageReferences.load(std::memory_order_acquire) != 0) {
             return false;
         }
         const bool stickySource = expected.IsSticky() && expected.IsStickyField() && registry == expectedRegistry;
@@ -938,6 +958,7 @@ bool TCacheCollections<TTraits>::TryClaimDeletion(TSpaceOperation& spaceOp, TCol
         if (!stickySource && !detachedSource) {
             return false;
         }
+        Cache_.InvokeHook(ECacheHookPoint::BeforeCollectionEraseClaim, collectionItem);
         if (Cache_.Table_.TryBeginErase(spaceOp, collectionItem, expected, owner)) {
             const THandleState desired = expected.IncrementRefs().WithState(EHandleState::Tombstone).WithFrequency(0);
             Cache_.UpdateColdReclaimable(handle.Metadata.PayloadBytes, expected, desired);

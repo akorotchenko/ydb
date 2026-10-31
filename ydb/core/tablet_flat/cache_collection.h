@@ -109,7 +109,7 @@ public:
 
     // Page items retain metadata through pending I/O, residency and retirement.
     bool HasPageItems() const noexcept {
-        return References.load(std::memory_order_acquire) > (Registry_.load(std::memory_order_acquire) ? 1 : 0);
+        return PageReferences.load(std::memory_order_acquire) != 0;
     }
 
     ui64 AccountedBytes() const noexcept {
@@ -151,7 +151,8 @@ public:
 public:
     TCollectionCacheItem CacheItem;
     std::atomic<ui32> StickyPageListHead{ 0 };
-    std::atomic<ui64> References{ 0 };
+    // Page items and in-flight batch admission share one native collection attachment
+    std::atomic<ui64> PageReferences{ 0 };
 
 private:
     template <class>

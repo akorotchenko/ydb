@@ -372,7 +372,6 @@ bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* regi
     Memory_.AddCollection(bytes);
     handle.Body.Collection = value.Get();
     value->CacheItem = TCollectionCacheItem::FromValidated(cacheItem);
-    Collections_.AddReference(*value);
     if (registry) {
         Y_ABORT_UNLESS(cacheOp.Collections().Link(*registry, cacheItem));
     } else {
@@ -960,17 +959,10 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
         return false;
     }
     TCollection& owner = *collectionHandle.Body.Collection;
-    // A handle ref protects the object, but only an owner ref prevents detach from making it reclaimable.
-    // Never revive zero: detach may have already dropped the last owner after the state check above.
-    ui64 owners = owner.References.load(std::memory_order_relaxed);
-    do {
-        if (owners == 0) {
-            return false;
-        }
-    } while (!owner.References.compare_exchange_weak(
-        owners, owners + 1, std::memory_order_acquire, std::memory_order_relaxed));
+    // In-flight admissions share the page set's virtual attachment
+    cacheOp.Collections().AddPageReference(owner);
     Y_DEFER {
-        cacheOp.Collections().DropOwnerReference(owner);
+        cacheOp.Collections().DropPageReference(owner);
     };
     const THandleState admittedState = THandleState::FromRaw(collectionHandle.State.load(std::memory_order_acquire));
     if (!collection.Matches(admittedState) || !admittedState.IsSticky() || !admittedState.IsStickyField()) {
@@ -1277,7 +1269,7 @@ void TSharedCache::ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheIte
             Y_ABORT_UNLESS(handle.NextInOwner.load(std::memory_order_acquire) == 0);
             DeleteReplacedPage(handle);
             if (owner) {
-                cacheOp.Collections().DropOwnerReference(*owner);
+                cacheOp.Collections().DropPageReference(*owner);
             }
             Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(cacheItem.Index(), nextVersion));
             NotifyResourcesAvailable();

@@ -647,7 +647,11 @@ bool TCacheTable::TryBeginErase(
         return false;
     }
     Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
-    const THandleState desired = expected.IncrementRefs().WithState(EHandleState::Tombstone).WithFrequency(0);
+    const THandleState desired = expected.IncrementRefs()
+                                     .WithState(EHandleState::Tombstone)
+                                     .WithFrequency(0)
+                                     .WithPageAttachment(expected.HasPageAttachment())
+                                     .WithShrinkWaiter(expected.HasShrinkWaiter());
     ui64 expectedRaw = expected.Raw();
     if (!spaceOp.Handles()[cacheItem.Index()].State.compare_exchange_strong(
             expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed)) {
@@ -673,7 +677,10 @@ bool TCacheTable::TryBeginErase(TSpaceOperation& spaceOp, TCacheItemRef& owner, 
             std::memory_order_release);
         return true;
     }
-    const THandleState desired = expected.WithState(EHandleState::Tombstone).WithFrequency(0);
+    const THandleState desired = expected.WithState(EHandleState::Tombstone)
+                                     .WithFrequency(0)
+                                     .WithPageAttachment(expected.HasPageAttachment())
+                                     .WithShrinkWaiter(expected.HasShrinkWaiter());
     ui64 expectedRaw = expected.Raw();
     if (!handle.State.compare_exchange_strong(
             expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed)) {
