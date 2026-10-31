@@ -10366,6 +10366,58 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->ReclaimCold());
     }
 
+    Y_UNIT_TEST(ColdEraseRetryRejectsAReusedNativeIdentity) {
+        TFixture fixture(5, 2);
+        auto& cache = *fixture.Cache;
+        const auto collection = MakeCollectionCacheItem(541, 542);
+        const auto oldPage = InsertReadyPage(cache, TCacheKey::Page(collection, 0));
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, oldPage));
+        const auto oldTicket = MakeColdItem(cache, oldPage.Index());
+        TVector<TCollectionCacheItem> candidates;
+        Y_DEFER {
+            for (auto candidate : candidates) {
+                TCacheTestAccess::DiscardCandidate(cache, candidate);
+            }
+        };
+        while (AvailableFreeHandles(cache)) {
+            const auto candidate =
+                AllocateCollection(cache, TCacheKey::Collection(TLogoBlobID(243, 244, candidates.size() + 1)));
+            UNIT_ASSERT(candidate);
+            candidates.push_back(candidate);
+        }
+
+        struct TContext {
+            TTestSharedCache& Cache;
+            TColdCacheItem Ticket;
+            TCacheKey NewKey;
+            TPageCacheItem Replacement{};
+            bool Reused = false;
+        } context{ cache, oldTicket, TCacheKey::Page(collection, 1) };
+
+        TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem item) noexcept {
+                              auto& ctx = *static_cast<TContext*>(ptr);
+                              if (point != ECacheHookPoint::BeforeColdEraseClaim ||
+                                  item.Index() != ctx.Ticket.Index() || ctx.Reused) {
+                                  return;
+                              }
+                              ctx.Reused = true;
+                              Y_ABORT_UNLESS(TCacheTestAccess::EraseCold(ctx.Cache, ctx.Ticket));
+                              ctx.Replacement = InsertReadyPage(ctx.Cache, ctx.NewKey);
+                              Y_ABORT_UNLESS(ctx.Replacement.Index() == ctx.Ticket.Index());
+                              Y_ABORT_UNLESS(TCacheTestAccess::EvictFromHot(ctx.Cache, ctx.Replacement));
+                          } };
+        TSharedCacheHookGuard guard(cache, hooks);
+        UNIT_ASSERT(!TCacheTestAccess::EraseCold(cache, oldTicket));
+        UNIT_ASSERT(context.Reused);
+        UNIT_ASSERT_VALUES_EQUAL(context.Replacement.Index(), oldPage.Index());
+        UNIT_ASSERT(context.Replacement.Version() != oldPage.Version());
+        UNIT_ASSERT(MakeColdItem(cache, context.Replacement.Index()).ColdVersion() != oldTicket.ColdVersion());
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, context.Replacement.Index()).IsCold());
+        auto found = FindPage(cache, context.NewKey);
+        UNIT_ASSERT(found.Status == ECacheResultStatus::Hit);
+        UNIT_ASSERT(found.Ref.CacheItem() == context.Replacement);
+    }
+
     Y_UNIT_TEST(ColdPublicationRejectsAReusedNativeIdentity) {
         TFixture fixture;
         const TLogoBlobID id(95, 96, 126);
