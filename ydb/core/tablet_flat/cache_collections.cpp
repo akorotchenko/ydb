@@ -793,8 +793,8 @@ bool TCacheCollections<TTraits>::SetPagesCacheMode(
         return false;
     }
     const bool attached = state.IsSticky() && state.IsStickyField();
-    const bool detached = (state.IsHot() || state.IsCold()) && state.IsStickyNoneField() &&
-                          !value.Registry_.load(std::memory_order_acquire);
+    const bool detached = (state.IsHot() || state.IsCold() || (state.IsSticky() && mode == ECacheMode::Regular)) &&
+                          state.IsStickyNoneField() && !value.Registry_.load(std::memory_order_acquire);
     if (!attached && !detached) {
         return false;
     }
