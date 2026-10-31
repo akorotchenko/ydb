@@ -739,7 +739,7 @@ private:
         auto cacheOp = BindOperation(spaceOp);
         TCollection* owner = cacheOp.ReleaseItem(cacheItem);
         if (owner) {
-            cacheOp.Collections().DropOwnerReference(*owner);
+            cacheOp.Collections().DropPageReference(*owner);
         }
     }
 

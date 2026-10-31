@@ -543,7 +543,26 @@ public:
 
     static ui64 CollectionReferences(TTestSharedCache& cache, TCollectionCacheItem collection) {
         auto operation = cache.BeginOperation();
-        return operation.Handles()[collection.Index()].Body.Collection->References.load(std::memory_order_relaxed);
+        const auto& handle = operation.Handles()[collection.Index()];
+        const auto state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+        // Count page owners plus the implicit registry/foundation owner
+        return handle.Body.Collection->PageReferences.load(std::memory_order_relaxed) +
+               (state.IsStickyField() || state.IsTransitionField());
+    }
+
+    static ui64 PageReferences(TTestSharedCache& cache, TCollectionCacheItem collection) {
+        auto operation = cache.BeginOperation();
+        return operation.Handles()[collection.Index()].Body.Collection->PageReferences.load(std::memory_order_acquire);
+    }
+
+    static void AddPageReference(TTestSharedCache& cache, TCollection& collection) {
+        auto operation = cache.BeginOperation();
+        operation.Collections().AddPageReference(collection);
+    }
+
+    static void DropPageReference(TTestSharedCache& cache, TCollection& collection) {
+        auto operation = cache.BeginOperation();
+        operation.Collections().DropPageReference(collection);
     }
 
     static bool EraseCold(TTestSharedCache& cache, TColdCacheItem cacheItem) {
@@ -1439,6 +1458,212 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(found.Status == ECacheResultStatus::Hit);
         UNIT_ASSERT_VALUES_EQUAL(found.Ref.data()[0], 'c');
         UNIT_ASSERT_VALUES_EQUAL(newer.Version(), old.Version());
+    }
+
+    struct TPageAttachmentFixture : TFixture {
+        TPageAttachmentFixture()
+            : TFixture(6, 3)
+        {
+            const TLogoBlobID id(111, 112, 153);
+            UNIT_ASSERT(Cache->FindOrInsert({ .Id = id }, Item, Owner) == ECacheResultStatus::Inserted);
+            UNIT_ASSERT(Cache->MakeReady(Item, MakeCollection(id), Owner));
+            UNIT_ASSERT(Cache->SetCollectionPagesCacheMode(Item, ECacheMode::Regular));
+        }
+
+        TCollectionCacheItem Item;
+        TTestCacheCollectionRef Owner;
+    };
+
+    Y_UNIT_TEST(PageSetOwnsOneNativeCollectionAttachment) {
+        for (bool keepOwner : { false, true }) {
+            TPageAttachmentFixture fixture;
+            auto& cache = *fixture.Cache;
+            const auto check = [&](ui64 pages, bool attachment, ui32 refs) {
+                const auto state = TCacheTestAccess::HandleState(cache, fixture.Item.Index());
+                UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::PageReferences(cache, fixture.Item), pages);
+                UNIT_ASSERT_VALUES_EQUAL(state.HasPageAttachment(), attachment);
+                UNIT_ASSERT_VALUES_EQUAL(state.Refs(), refs);
+            };
+            check(0, false, 1);
+            std::array<TPageCacheItem, 2> items;
+            for (ui32 index = 0; index < items.size(); ++index) {
+                TTestCachePageRef page;
+                items[index] = InsertOwnedSizedPage(cache, fixture.Item, index, 64, 'p', page);
+                page.Drop();
+                check(index + 1, true, 1);
+            }
+            UNIT_ASSERT(cache.DetachCollection(fixture.Item));
+            if (!keepOwner) {
+                fixture.Owner.Drop();
+            }
+            for (ui32 index = 0; index < items.size(); ++index) {
+                UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, items[index]));
+                UNIT_ASSERT(TCacheTestAccess::EraseCold(cache, MakeColdItem(cache, items[index].Index())));
+                const ui64 remaining = items.size() - index - 1;
+                check(remaining, remaining != 0, keepOwner);
+            }
+            if (keepOwner) {
+                UNIT_ASSERT(TCacheTestAccess::HandleState(cache, fixture.Item.Index()).IsSticky());
+            }
+            fixture.Owner.Drop();
+            check(0, false, 0);
+            UNIT_ASSERT(TCacheTestAccess::HandleState(cache, fixture.Item.Index()).IsHot());
+        }
+    }
+
+    Y_UNIT_TEST(RetiredPageRetainsItsVirtualCollectionAttachment) {
+        TPageAttachmentFixture fixture;
+        auto& cache = *fixture.Cache;
+        TTestCachePageRef owner;
+        const auto page = InsertOwnedSizedPage(cache, fixture.Item, 0, 64, 'p', owner);
+        UNIT_ASSERT(cache.DetachCollection(fixture.Item));
+        fixture.Owner.Drop();
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, page));
+        UNIT_ASSERT(TCacheTestAccess::EraseCold(cache, MakeColdItem(cache, page.Index())));
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()).IsTombstone());
+        const auto state = TCacheTestAccess::HandleState(cache, fixture.Item.Index());
+        UNIT_ASSERT(state.IsSticky() && state.HasPageAttachment());
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::PageReferences(cache, fixture.Item), 1);
+        UNIT_ASSERT_VALUES_EQUAL(owner.data()[0], 'p');
+        UNIT_ASSERT_VALUES_EQUAL(owner.size(), 64);
+        owner.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::PageReferences(cache, fixture.Item), 0);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, fixture.Item.Index()).IsHot());
+    }
+
+    Y_UNIT_TEST(NewPageRestoresAttachmentDuringLastPageDestruction) {
+        TPageAttachmentFixture fixture;
+        auto& cache = *fixture.Cache;
+        TTestCachePageRef oldOwner;
+        const auto oldPage = InsertOwnedSizedPage(cache, fixture.Item, 0, 64, 'o', oldOwner);
+        oldOwner.Drop();
+
+        struct TContext {
+            TTestSharedCache& Cache;
+            TCollectionCacheItem Item;
+            TTestCachePageRef NewOwner{};
+            bool Inserted = false;
+        } context{ cache, fixture.Item };
+
+        TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem item) noexcept {
+                              auto& ctx = *static_cast<TContext*>(ptr);
+                              if (point == ECacheHookPoint::AfterPageAttachmentWithdrawn &&
+                                  item == ctx.Item.CacheItem() && !ctx.Inserted) {
+                                  ctx.Inserted = true;
+                                  InsertOwnedSizedPage(ctx.Cache, ctx.Item, 1, 64, 'n', ctx.NewOwner);
+                              }
+                          } };
+        TSharedCacheHookGuard guard(cache, hooks);
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, oldPage));
+        UNIT_ASSERT(TCacheTestAccess::EraseCold(cache, MakeColdItem(cache, oldPage.Index())));
+        UNIT_ASSERT(context.Inserted);
+        const auto state = TCacheTestAccess::HandleState(cache, fixture.Item.Index());
+        UNIT_ASSERT(state.HasPageAttachment());
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::PageReferences(cache, fixture.Item), 1);
+        UNIT_ASSERT_VALUES_EQUAL(context.NewOwner.data()[0], 'n');
+    }
+
+    Y_UNIT_TEST(PageOnlyCollectionShrinkWakeIsOneShot) {
+        for (bool releaseBeforeArm : { false, true }) {
+            TPageAttachmentFixture fixture;
+            auto& cache = *fixture.Cache;
+            TTestCachePageRef page;
+            InsertOwnedSizedPage(cache, fixture.Item, 0, 64, 'p', page);
+
+            struct TContext {
+                TTestCacheCollectionRef& Owner;
+                bool ReleaseBeforeArm;
+                ui32 Notifications = 0;
+            } context{ fixture.Owner, releaseBeforeArm };
+
+            TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem) noexcept {
+                                  auto& ctx = *static_cast<TContext*>(ptr);
+                                  if (point == ECacheHookPoint::BeforeCollectionShrinkWait && ctx.ReleaseBeforeArm) {
+                                      ctx.Owner.Drop();
+                                  } else if (point == ECacheHookPoint::ResourcesAvailable) {
+                                      ++ctx.Notifications;
+                                  }
+                              } };
+            TSharedCacheHookGuard guard(cache, hooks);
+            cache.ArmResourceWait(cache.AdmissionGeneration());
+            Y_DEFER {
+                cache.DisarmResourceWait();
+            };
+            {
+                auto op = cache.BeginOperation();
+                UNIT_ASSERT(op.ReclaimShrinkHandle(fixture.Item.Index()) ==
+                            (releaseBeforeArm ? EShrinkCutStatus::Progress : EShrinkCutStatus::Blocked));
+            }
+            if (!releaseBeforeArm) {
+                UNIT_ASSERT(TCacheTestAccess::HandleState(cache, fixture.Item.Index()).HasShrinkWaiter());
+                fixture.Owner.Drop();
+            }
+            UNIT_ASSERT_VALUES_EQUAL(context.Notifications, releaseBeforeArm ? 0 : 1);
+            UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, fixture.Item.Index()).HasShrinkWaiter());
+            const auto generation = cache.AdmissionGeneration();
+            cache.ArmResourceWait(generation);
+            for (ui32 probe = 0; probe < 3; ++probe) {
+                auto op = cache.BeginOperation();
+                TOperationItemRef<TTestTraits> ref(op, op.TryAcquireStructural(fixture.Item.CacheItem()));
+                UNIT_ASSERT(ref);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation);
+            UNIT_ASSERT_VALUES_EQUAL(context.Notifications, releaseBeforeArm ? 0 : 1);
+        }
+    }
+
+    Y_UNIT_TEST(InFlightPagesRetainMetadataAfterCollectionErase) {
+        TPageAttachmentFixture fixture;
+        auto& cache = *fixture.Cache;
+        UNIT_ASSERT(cache.DetachCollection(fixture.Item));
+        auto* collection = fixture.Owner.Get();
+        const auto id = collection->Id();
+        TSharedCacheGate gate;
+        gate.Slots[0].Arm(ECacheHookPoint::BeforeCollectionEraseClaim, fixture.Item.CacheItem());
+        gate.Slots[1].Arm(ECacheHookPoint::BeforePageAttachmentPublished, fixture.Item.CacheItem());
+        TSharedCacheHookGuard guard(cache, gate.Hooks);
+        bool erased = false;
+        TGateThread eraser(gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazard);
+            TlsCacheHazard = &TCacheThreadTestAccess::Hazard(cache, 0);
+            Y_DEFER {
+                TlsCacheHazard = nullptr;
+            };
+            erased = cache.EraseCollection(fixture.Item);
+        });
+        gate.Slots[0].Wait();
+        TGateThread adder(gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazard);
+            TlsCacheHazard = &TCacheThreadTestAccess::Hazard(cache, 1);
+            Y_DEFER {
+                TlsCacheHazard = nullptr;
+            };
+            // The existing owner was acquired before erasure; this is an in-flight admission
+            TCacheTestAccess::AddPageReference(cache, *collection);
+        });
+        gate.Slots[1].Wait();
+        // A nonfirst admission can finish while the first is paused before installing the hold
+        TCacheTestAccess::AddPageReference(cache, *collection);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::PageReferences(cache, fixture.Item), 2);
+        gate.Slots[0].Release();
+        eraser.Join();
+        UNIT_ASSERT(erased);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, fixture.Item.Index()).IsTombstone());
+        TTestCacheCollectionRef fresh;
+        UNIT_ASSERT(cache.Find(id, fresh) == ECacheResultStatus::Miss);
+        gate.Slots[1].Release();
+        adder.Join();
+        fixture.Owner.Drop();
+        const auto state = TCacheTestAccess::HandleState(cache, fixture.Item.Index());
+        UNIT_ASSERT(state.IsTombstone() && state.HasPageAttachment());
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(collection->Id(), id);
+        TCacheTestAccess::DropPageReference(cache, *collection);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::PageReferences(cache, fixture.Item), 1);
+        TCacheTestAccess::DropPageReference(cache, *collection);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, fixture.Item.Index()).IsFree());
     }
 
     Y_UNIT_TEST(CollectionLastReleaseTracksDetachEpoch) {
@@ -7084,19 +7309,23 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
             if (lastOwner) {
                 UNIT_ASSERT(cache->EraseCollection(collection));
+                // Final release already ended ownership; the delayed weak Hot publication must not pin metadata
+                UNIT_ASSERT(TCacheTestAccess::HandleState(*cache, collection.Index()).IsFree());
+                UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionValue(*cache, collection.Index()), nullptr);
+                UNIT_ASSERT_VALUES_EQUAL(cache->Collections(), 0);
             } else {
                 UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionReferences(*cache, collection), 1);
                 UNIT_ASSERT(TCacheTestAccess::EraseCold(*cache, MakeColdItem(*cache, pages[1].Index())));
-                UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*cache, collection));
-                UNIT_ASSERT(TCacheTestAccess::EraseCold(*cache, MakeColdItem(*cache, collection.Index())));
-            }
+                UNIT_ASSERT(TCacheTestAccess::HandleState(*cache, collection.Index()).IsSticky());
+                UNIT_ASSERT(cache->EraseCollection(collection));
 
-            const THandleState retired = TCacheTestAccess::HandleState(*cache, collection.Index());
-            UNIT_ASSERT(retired.IsTombstone());
-            UNIT_ASSERT_VALUES_EQUAL(retired.Refs(), 1);
-            UNIT_ASSERT_VALUES_EQUAL(cache->Collections(), 1);
-            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionValue(*cache, collection.Index()), metadata);
-            UNIT_ASSERT_VALUES_EQUAL(metadata->Id(), id);
+                const THandleState retired = TCacheTestAccess::HandleState(*cache, collection.Index());
+                UNIT_ASSERT(retired.IsTombstone());
+                UNIT_ASSERT_VALUES_EQUAL(retired.Refs(), 1);
+                UNIT_ASSERT_VALUES_EQUAL(cache->Collections(), 1);
+                UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionValue(*cache, collection.Index()), metadata);
+                UNIT_ASSERT_VALUES_EQUAL(metadata->Id(), id);
+            }
             TTestCacheCollectionRef missing;
             UNIT_ASSERT(cache->Find(id, missing) == ECacheResultStatus::Miss);
 
@@ -8622,6 +8851,50 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsFree());
         }
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
+    }
+
+    Y_UNIT_TEST(RegisteredPageOnlyCollectionReclaimsLowDependenciesBeforeShrink) {
+        TShrinkDependencyFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto id = fixture.CollectionOwner->Id();
+        TTestCachePageRef owner;
+        const auto page = fixture.AddPage(0, owner);
+        owner.Drop();
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, page));
+        fixture.CollectionOwner.Drop();
+        const auto state = TCacheTestAccess::HandleState(cache, fixture.Collection.Index());
+        UNIT_ASSERT(state.IsStickyField() && state.HasPageAttachment());
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 0);
+
+        struct TContext {
+            TTestSharedCache& Cache;
+            TCollectionRegistry& Registry;
+            TCollectionCacheItem Item;
+            TLogoBlobID Id;
+            ui32 Detached = 0;
+        } context{ cache, fixture.Registry, fixture.Collection, id };
+
+        TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem item) noexcept {
+                              auto& ctx = *static_cast<TContext*>(ptr);
+                              if (point != ECacheHookPoint::CollectionReleased || item != ctx.Item.CacheItem() ||
+                                  !TCacheTestAccess::HandleState(ctx.Cache, item.Index()).IsStickyField()) {
+                                  return;
+                              }
+                              // Deliver the normal deferred actorless cleanup hint after the page set disappears
+                              TTestCacheCollectionRef ref;
+                              if (TCacheTestAccess::FindCollection(ctx.Cache, ctx.Registry, ctx.Id, ref) ==
+                                  ECacheCollectionLookupStatus::Hit) {
+                                  auto op = ctx.Cache.BeginOperation();
+                                  if (op.Collections().DetachReleased(ctx.Registry, ctx.Item.CacheItem())) {
+                                      ++ctx.Detached;
+                                  }
+                              }
+                          } };
+        TSharedCacheHookGuard guard(cache, hooks);
+        fixture.BeginShrink();
+        fixture.FinishShrink();
+        UNIT_ASSERT_VALUES_EQUAL(context.Detached, 1);
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
     }
 
     Y_UNIT_TEST(DetachedHighCollectionReclaimsSparseLowHotPagesBeforeShrink) {

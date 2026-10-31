@@ -74,8 +74,8 @@ TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMoreCollectionRef(
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
     for (;;) {
         const THandleState expected = THandleState::FromRaw(expectedRaw);
-        Y_DEBUG_ABORT_UNLESS(
-            item.Matches(expected) && expected.IsCollectionKind() && expected.Refs() != 0 && handle.Body.Collection);
+        Y_DEBUG_ABORT_UNLESS(item.Matches(expected) && expected.IsCollectionKind() &&
+                             (expected.Refs() != 0 || expected.HasPageAttachment()) && handle.Body.Collection);
         Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
         if (handle.State.compare_exchange_weak(
                 expectedRaw, expected.IncrementRefs().Raw(), std::memory_order_relaxed, std::memory_order_relaxed)) {
@@ -92,12 +92,16 @@ TCollection* TCacheItems<TTraits>::ReleaseTombstone(TSpaceOperation& spaceOp, TC
     for (;;) {
         const THandleState expected = THandleState::FromRaw(expectedRaw);
         Y_ABORT_UNLESS(cacheItem.Matches(expected) && expected.IsTombstone() && expected.Refs() > 0);
-        if (expected.Refs() > 1) {
-            const THandleState desired = expected.DecrementRefs();
+        if (expected.Refs() > 1 || expected.HasPageAttachment()) {
+            THandleState desired = expected.DecrementRefs();
+            const bool notifyShrink = expected.HasShrinkWaiter() && desired.Refs() == 0;
+            if (notifyShrink) {
+                desired = desired.WithShrinkWaiter(false);
+            }
             if (handle.State.compare_exchange_weak(
                     expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
             {
-                if (cacheItem.IsResizeMarker() && expected.Refs() == 2) {
+                if (notifyShrink || (cacheItem.IsResizeMarker() && expected.Refs() == 2)) {
                     Cache_.NotifyResourcesAvailable();
                 }
                 return nullptr;
@@ -137,6 +141,8 @@ TCollection* TCacheItems<TTraits>::ReleaseTombstone(TSpaceOperation& spaceOp, TC
                 expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed))
         {
             Y_ABORT_UNLESS(handle.NextInOwner.load(std::memory_order_acquire) == 0);
+            Y_DEBUG_ABORT_UNLESS(!expected.IsCollectionKind() || !handle.Body.Collection ||
+                                 handle.Body.Collection->PageReferences.load(std::memory_order_acquire) == 0);
             DeletePayload(handle, expected.Kind(), expected.State(), owner);
             Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(cacheItem.Index(), nextVersion));
             Cache_.NotifyResourcesAvailable();
@@ -268,7 +274,8 @@ void TCacheItems<TTraits>::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem
         collectionsOp.UnlinkPendingStickyPage(cacheItem);
         state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     }
-    Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(state) && !state.IsFree() && !state.IsTombstone() && state.Refs() == 0);
+    Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(state) && !state.IsFree() && !state.IsTombstone() && state.Refs() == 0 &&
+                         !state.HasPageAttachment());
     const bool pending = state.IsPending();
     const bool reserved = pending && !state.IsWaitingForMemory();
     const ui64 reservedBytes = reserved ? PayloadBytes(handle, state.Kind()) : 0;
@@ -326,7 +333,7 @@ void TCacheItems<TTraits>::DiscardCandidate(
         expected = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     }
     Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(expected) && expected.Kind() == kind && !expected.IsFree() &&
-                         !expected.IsTombstone() && expected.Refs() == 0);
+                         !expected.IsTombstone() && expected.Refs() == 0 && !expected.HasPageAttachment());
 
     Y_DEBUG_ABORT_UNLESS(!expected.IsPageKind() || !expected.IsSticky());
     Y_DEBUG_ABORT_UNLESS(!expected.IsCollectionKind() || !expected.IsReady() ||
@@ -350,7 +357,7 @@ void TCacheItems<TTraits>::DiscardCandidate(
         TCacheFetches<TTraits>::DeletePendingFetch(handle);
     }
     if (owner) {
-        collectionsOp.DropOwnerReference(*owner);
+        collectionsOp.DropPageReference(*owner);
     }
     Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(index, desired.Version()));
     if (reservedBytes != 0) {
@@ -365,6 +372,14 @@ void TCacheItems<TTraits>::InitializePage(TSpaceOperation& spaceOp, TCacheItem c
     TCollectionCacheItem collection, ui64 offset, ui64 size, NTable::NPage::EPage type, ui32 crc32, EStickyState sticky,
     bool reserved, bool collectionOwnerHeld) noexcept {
     auto collectionsOp = Cache_.Collections_.BindOperation(spaceOp);
+    TOperationItemRef<TTraits> collectionRef(spaceOp);
+    if (!collectionOwnerHeld && collection.Index() < spaceOp.AccessibleHandleCount()) {
+        const auto state =
+            THandleState::FromRaw(spaceOp.Handles()[collection.Index()].State.load(std::memory_order_acquire));
+        if (collection.Matches(state) && state.IsReady()) {
+            collectionRef.Get() = TryAcquireItemRef(spaceOp, collection.CacheItem());
+        }
+    }
     Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AccessibleHandleCount());
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     const THandleState claimed = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
@@ -380,10 +395,10 @@ void TCacheItems<TTraits>::InitializePage(TSpaceOperation& spaceOp, TCacheItem c
     if (TCollection* owner = collectionsOp.PageCollection(handle)) {
         const THandle& collection = spaceOp.Handles()[owner->CacheItem.CacheItem().Index()];
         const THandleState state = THandleState::FromRaw(collection.State.load(std::memory_order_acquire));
-        Y_ABORT_UNLESS(state.IsSticky() && (state.IsStickyField() || collectionOwnerHeld));
+        Y_ABORT_UNLESS((state.IsSticky() && (state.IsStickyField() || collectionOwnerHeld)) ||
+                       (state.IsTombstone() && (collectionOwnerHeld || collectionRef)));
         Cache_.InvokeHook(ECacheHookPoint::AfterPageCollectionStateChecked, owner->CacheItem.CacheItem());
-        const ui64 previous = owner->References.fetch_add(1, std::memory_order_relaxed);
-        Y_ABORT_UNLESS(previous != 0);
+        collectionsOp.AddPageReference(*owner);
     }
     handle.Body.Fetch = new TPageFetchState(TPageCacheItem::FromValidated(cacheItem));
     handle.Body.Fetch->Ref();

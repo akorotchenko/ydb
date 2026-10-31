@@ -199,12 +199,23 @@ private:
 
 class THandleState {
 public:
+    // Packed layout, bit 0 is the least significant bit
+    //  0..23  Refs
+    // 24..25  Sticky
+    // 26..27  Frequency
+    //     28  Kind
+    // 29..32  State
+    // 33..63  Version
+    // Collection Sticky/Tombstone overlay: bit 26 PageAttachment, bit 27 ShrinkWaiter
     static constexpr ui64 RefsMask = 0x0000000000FFFFFFULL;
     static constexpr ui32 RefsShift = 0;
     static constexpr ui64 StickyMask = 0x0000000003000000ULL;
     static constexpr ui32 StickyShift = 24;
     static constexpr ui64 FrequencyMask = 0x000000000C000000ULL;
     static constexpr ui32 FrequencyShift = 26;
+    // Sticky and retired collections reuse frequency bits for page retention and a one-shot shrink wakeup
+    static constexpr ui64 PageAttachmentMask = ui64{ 1 } << FrequencyShift;
+    static constexpr ui64 ShrinkWaiterMask = PageAttachmentMask << 1;
     static constexpr ui64 KindMask = 0x0000000010000000ULL;
     static constexpr ui32 KindShift = 28;
     static constexpr ui64 StateMask = 0x00000001E0000000ULL;
@@ -303,6 +314,22 @@ public:
 
     constexpr bool IsSticky() const noexcept {
         return State() == EHandleState::Sticky;
+    }
+
+    constexpr bool HasPageAttachment() const noexcept {
+        return IsCollectionKind() && (IsSticky() || IsTombstone()) && (Raw_ & PageAttachmentMask);
+    }
+
+    constexpr THandleState WithPageAttachment(bool value) const noexcept {
+        return FromRaw(value ? Raw_ | PageAttachmentMask : Raw_ & ~PageAttachmentMask);
+    }
+
+    constexpr bool HasShrinkWaiter() const noexcept {
+        return IsCollectionKind() && (IsSticky() || IsTombstone()) && (Raw_ & ShrinkWaiterMask);
+    }
+
+    constexpr THandleState WithShrinkWaiter(bool value) const noexcept {
+        return FromRaw(value ? Raw_ | ShrinkWaiterMask : Raw_ & ~ShrinkWaiterMask);
     }
 
     constexpr bool IsReplacing() const noexcept {

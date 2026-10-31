@@ -374,6 +374,9 @@ Y_FORCE_INLINE bool TCacheItems<TTraits>::TryReleaseItemRef(
     // Capture while the native ref protects the payload; detach/reclaim may follow the final CAS.
     const bool lastCollectionRef =
         expected.IsCollectionKind() && expected.IsSticky() && expected.Refs() == 1 && expected.IsStickyField();
+    const bool releaseCollection = expected.IsCollectionKind() && expected.IsSticky() && expected.IsStickyNoneField() &&
+                                   expected.Refs() == 1 && !expected.HasPageAttachment();
+    const ui64 collectionBytes = releaseCollection ? handle.Metadata.PayloadBytes : 0;
     ui32 collectionEpoch = 0;
     bool notifyCollectionRelease = false;
     if (lastCollectionRef) {
@@ -383,7 +386,15 @@ Y_FORCE_INLINE bool TCacheItems<TTraits>::TryReleaseItemRef(
             !collection.GetActorState() || collection.StickyPageListHead.load(std::memory_order_acquire) != 0;
     }
     const TLogoBlobID collectionId = lastCollectionRef ? handle.Body.Collection->Id() : TLogoBlobID{};
-    const THandleState desired = expected.DecrementRefs();
+    THandleState desired = expected.DecrementRefs();
+    if (releaseCollection) {
+        Y_DEBUG_ABORT_UNLESS(!expected.HasPageAttachment());
+        desired = desired.WithState(EHandleState::Hot).WithFrequency(0);
+    }
+    const bool notifyShrink = expected.HasShrinkWaiter() && desired.Refs() == 0;
+    if (notifyShrink) {
+        desired = desired.WithShrinkWaiter(false);
+    }
     if (publishCold) {
         Cache_.InvokeHook(ECacheHookPoint::BeforeLastColdRefRelease, cacheItem);
     }
@@ -402,6 +413,11 @@ Y_FORCE_INLINE bool TCacheItems<TTraits>::TryReleaseItemRef(
             // No native owner remains to use the metadata or hand writer-held Sticky pages to an executor
             Cache_.NotifyCollectionReleased(collectionId, TCollectionCacheItem::FromValidated(cacheItem));
         }
+        if (releaseCollection) {
+            Cache_.Memory_.Sticky().TransferBytesTo(Cache_.Memory_.Hot(), collectionBytes);
+            Cache_.InvokeHook(ECacheHookPoint::BeforeCollectionHotPublished, cacheItem);
+            cacheOp.Eviction().RouteHot(EHotLevel::L1, cacheItem);
+        }
         Cache_.UpdateColdReclaimable(coldBytes, expected, desired);
         if (publishCold) {
             // Acquire membership updates carried by earlier reference releases after a refcount ABA
@@ -412,7 +428,8 @@ Y_FORCE_INLINE bool TCacheItems<TTraits>::TryReleaseItemRef(
                 cacheOp.Eviction().CheckModeGeneration(modeGeneration);
             }
         }
-        if (expected.IsReady() && desired.Refs() == 0 && expected.IsStickyNoneField()) {
+        if (notifyShrink || (expected.IsReady() && desired.Refs() == 0 && !desired.HasPageAttachment() &&
+                                expected.IsStickyNoneField())) {
             Cache_.NotifyResourcesAvailable();
         }
         return true;

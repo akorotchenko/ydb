@@ -64,6 +64,10 @@ enum class ECacheHookPoint {
     AfterReplacingPublished, // Payload is the old forwarding item before its incoming link is replaced.
     AfterReplacedPublished, // Payload is the completed old replacement before its owner ref is dropped.
     AfterCollectionOwnerReferenceDropped, // Payload is the collection after its owner count is decremented.
+    BeforePageAttachmentPublished, // Payload is the collection after the first page reference is counted.
+    AfterPageAttachmentWithdrawn, // Payload is the collection before the last-page counter CAS.
+    BeforeCollectionEraseClaim, // Payload is the collection after observing no page references.
+    BeforeCollectionShrinkWait, // Payload is the collection before arming its owner-release wakeup.
     BeforeCollectionAttachClaim, // Payload is the collection before its transition claim CAS.
     BeforeCollectionAttachPublished, // Payload is the collection before its attached-state CAS.
     BeforeCollectionRefAcquired, // Collection found in the table, before acquiring its native reference

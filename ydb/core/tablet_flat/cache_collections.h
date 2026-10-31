@@ -39,23 +39,13 @@ public:
         owner.BytesNotificationPending_.store(false, std::memory_order_release);
     }
 
-    static Y_FORCE_INLINE void AddReference(TCollection& owner) noexcept {
-        owner.References.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    static Y_FORCE_INLINE bool DropReference(TCollection& owner) noexcept {
-        const ui64 previous = owner.References.fetch_sub(1, std::memory_order_relaxed);
-        Y_ABORT_UNLESS(previous != 0);
-        return previous == 1;
-    }
-
     static Y_FORCE_INLINE bool WantsStickyPage(const TCollection& collection) noexcept {
         return collection.CacheMode_.load(std::memory_order_acquire) == ECacheMode::Sticky;
     }
 
     static Y_FORCE_INLINE bool IsUnregisteredAndUnreferenced(const TCollection& collection) noexcept {
         return !collection.Registry_.load(std::memory_order_acquire) &&
-               collection.References.load(std::memory_order_acquire) == 0;
+               collection.PageReferences.load(std::memory_order_acquire) == 0;
     }
 
 private:
@@ -92,9 +82,10 @@ private:
         Y_ABORT_UNLESS(previous >= bytes);
     }
 
-    void DropOwnerReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept;
+    void SetPageAttachment(TSpaceOperation& spaceOp, TCollection& owner, bool attached) noexcept;
+    void AddPageReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept;
+    void DropPageReference(TSpaceOperation& spaceOp, TCollection& owner) noexcept;
     void DropPageItemRef(TSpaceOperation& spaceOp, THandle& page) noexcept;
-    void PublishCollectionForReclaim(TSpaceOperation& spaceOp, TCacheItem collection) noexcept;
     void FinishCollectionRetain(TSpaceOperation& spaceOp, TCacheItem collection) noexcept;
 
     TCacheItemRefImpl<TTraits> AcquireSticky(
@@ -160,16 +151,16 @@ public:
         return Cache_.Collections_.PageCollection(SpaceOp_, item);
     }
 
-    Y_FORCE_INLINE void DropOwnerReference(TCollection& owner) noexcept {
-        Cache_.Collections_.DropOwnerReference(SpaceOp_, owner);
+    Y_FORCE_INLINE void AddPageReference(TCollection& owner) noexcept {
+        Cache_.Collections_.AddPageReference(SpaceOp_, owner);
+    }
+
+    Y_FORCE_INLINE void DropPageReference(TCollection& owner) noexcept {
+        Cache_.Collections_.DropPageReference(SpaceOp_, owner);
     }
 
     Y_FORCE_INLINE void DropPageItemRef(THandle& page) noexcept {
         Cache_.Collections_.DropPageItemRef(SpaceOp_, page);
-    }
-
-    Y_FORCE_INLINE void PublishCollectionForReclaim(TCacheItem item) noexcept {
-        Cache_.Collections_.PublishCollectionForReclaim(SpaceOp_, item);
     }
 
     Y_FORCE_INLINE TCacheItemRefImpl<TTraits> AcquireSticky(TCollectionCacheItem item, TCollection*& value) noexcept {

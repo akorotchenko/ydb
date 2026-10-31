@@ -61,6 +61,28 @@ Y_UNIT_TEST_SUITE(TSharedCacheItemTest) {
         UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 42);
     }
 
+    Y_UNIT_TEST(CollectionPageAttachmentUsesOnlyRetainedMetadataBits) {
+        constexpr auto sticky =
+            THandleState::Make(13, EHandleState::Sticky, EItemKind::Collection, 0, EStickyState::None, 2)
+                .WithPageAttachment(true)
+                .WithShrinkWaiter(true);
+        static_assert(
+            sticky.HasPageAttachment() && sticky.HasShrinkWaiter() && sticky.Refs() == 2 && sticky.Version() == 13);
+        constexpr auto retired = sticky.WithState(EHandleState::Tombstone)
+                                     .WithFrequency(0)
+                                     .WithPageAttachment(sticky.HasPageAttachment())
+                                     .WithShrinkWaiter(sticky.HasShrinkWaiter());
+        static_assert(retired.HasPageAttachment() && retired.HasShrinkWaiter() && retired.Refs() == 2);
+        static_assert(!retired.WithPageAttachment(false).HasPageAttachment());
+        constexpr auto hot = THandleState::Make(13, EHandleState::Hot, EItemKind::Collection, 1, EStickyState::None, 1);
+        static_assert(!hot.HasPageAttachment() && !hot.HasShrinkWaiter() && hot.Frequency() == 1);
+        constexpr auto attached =
+            hot.WithState(EHandleState::Sticky).WithFrequency(0).WithPageAttachment(hot.HasPageAttachment());
+        static_assert(!attached.HasPageAttachment());
+        constexpr auto page = THandleState::Make(13, EHandleState::Sticky, EItemKind::Page, 1, EStickyState::Sticky, 2);
+        static_assert(!page.HasPageAttachment());
+    }
+
     Y_UNIT_TEST(TierReadyTagsPreservePackedFields) {
         static_assert(sizeof(THandleState) == sizeof(ui64));
         static_assert(ui8(EHandleState::Hot) == 7);

@@ -277,7 +277,21 @@ EShrinkCutStatus TSharedCache::ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui3
             }
         }
     }
-    if (state.IsCollectionKind() && state.IsSticky() && state.IsStickyNoneField() && state.Refs() == 0) {
+    if (state.IsCollectionKind() && (state.IsSticky() || state.IsTombstone()) && state.Refs() != 0) {
+        // Arm in the same word as ownership so its last release cannot miss the shrink waiter
+        if (state.HasShrinkWaiter()) {
+            return EShrinkCutStatus::Blocked;
+        }
+        ui64 expected = state.Raw();
+        InvokeHook(ECacheHookPoint::BeforeCollectionShrinkWait, TCacheItem::Make(state.Version(), index));
+        return spaceOp.Handles()[index].State.compare_exchange_strong(
+                   expected, state.WithShrinkWaiter(true).Raw(), std::memory_order_acq_rel, std::memory_order_acquire)
+                   ? EShrinkCutStatus::Blocked
+                   : EShrinkCutStatus::Progress;
+    }
+    if (state.IsCollectionKind() &&
+        ((state.IsSticky() && (state.IsStickyNoneField() || state.HasPageAttachment())) || state.IsTombstone()) &&
+        state.Refs() == 0) {
         // Cached low pages can keep detached metadata above the shrink boundary alive
         if (Eviction_.SweepModes() || DrainHotResize() || cacheOp.Eviction().ReclaimCold() ||
             cacheOp.Eviction().ProcessHotAtMinimum()) {
