@@ -1518,8 +1518,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     void TryDropExpiredCollection(TCollection& collection) override {
         auto* state = collection.GetActorState();
         // Keep preload records until their results arrive, even after the request-answered notification.
-        if (state && state->Owners.empty() && state->PendingRequests == 0 && state->KeepPreloadRequests.empty() &&
-            Walks.IsIdle(collection.Id()))
+        if (state && state->Owners.empty() && !collection.HasPageItems() && state->PendingRequests == 0 &&
+            state->KeepPreloadRequests.empty() && Walks.IsIdle(collection.Id()))
         {
             Y_DEBUG_ABORT_UNLESS(state->InMemoryOwners.empty());
             const TLogoBlobID id = collection.Id();
