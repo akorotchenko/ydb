@@ -897,11 +897,19 @@ private:
 
     template <class TTraits>
     friend class TCachePageRefImpl;
+    template <class TTraits>
+    friend class TCacheCollectionRefImpl;
+    template <class TTraits>
+    friend class TCacheItems;
 
     // The caller already owns a native reference to this physical handle
-    Y_FORCE_INLINE const THandle& OwnedHandle(TCacheItem item) const noexcept {
+    Y_FORCE_INLINE THandle& OwnedHandle(TCacheItem item) noexcept {
         Y_DEBUG_ABORT_UNLESS(Handles_ && !item.IsNull() && item.Index() < ReservedCapacity_.HandleCount());
         return Handles_[item.Index()];
+    }
+
+    Y_FORCE_INLINE const THandle& OwnedHandle(TCacheItem item) const noexcept {
+        return const_cast<TCacheSpace*>(this)->OwnedHandle(item);
     }
 
     Y_FORCE_INLINE const TSpaceView& NewestView() const noexcept {

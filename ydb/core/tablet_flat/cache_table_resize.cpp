@@ -385,7 +385,7 @@ typename TCacheTable::EResizeStep TCacheTable::RemoveBucketSplit(TSpaceOperation
         }
     }
     Cache_.InvokeHook(ECacheHookPoint::AfterBucketSplitRemoved, markerIdentity);
-    cacheOp.Release(markerIdentity);
+    cacheOp.ReleaseCleanup(markerIdentity);
     const ui32 pairCount = resize.PairCount();
     if (resize.Cursor() < pairCount) {
         return Cache_.Space_->PrepareNextBucketResizePair() ? EResizeStep::Complete : EResizeStep::Blocked;

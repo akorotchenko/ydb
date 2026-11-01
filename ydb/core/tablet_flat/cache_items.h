@@ -96,6 +96,19 @@ private:
         TSpaceOperation& spaceOp, TCacheItem cacheItem, const TLogoBlobID& id, ui64 bytes) noexcept;
 
 private:
+    friend class TCacheItemRefImpl<TTraits>;
+
+    Y_FORCE_INLINE void Release(TCacheItem cacheItem) noexcept {
+        Release<false>(cacheItem);
+    }
+
+    Y_FORCE_INLINE void Release(TPageCacheItem page) noexcept {
+        Release<true>(page.CacheItem());
+    }
+
+    template <bool KnownPage>
+    Y_FORCE_INLINE void Release(TCacheItem cacheItem) noexcept;
+
     // Dependencies
     TSharedCacheImpl<TTraits>& Cache_;
 };
@@ -298,6 +311,36 @@ Y_FORCE_INLINE typename TCacheItems<TTraits>::EAcquireStatus TCacheItems<TTraits
 }
 
 // Reference release
+template <class TTraits>
+template <bool KnownPage>
+Y_FORCE_INLINE void TCacheItems<TTraits>::Release(TCacheItem cacheItem) noexcept {
+    // The native owner protects the stable handle until the release CAS
+    THandle& handle = Cache_.Space_->OwnedHandle(cacheItem);
+    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        Y_DEBUG_ABORT_UNLESS(!KnownPage || expected.IsPageKind());
+        if (!cacheItem.Matches(expected) || (!KnownPage && !expected.IsPageKind()) || !expected.IsHot() ||
+            !expected.IsStickyNoneField()) {
+            auto cacheOp = Cache_.BeginOperation();
+            cacheOp.ReleaseCleanup(cacheItem);
+            return;
+        }
+        Y_DEBUG_ABORT_UNLESS(expected.Refs() != 0);
+        const THandleState desired = expected.DecrementRefs();
+        Cache_.InvokeHook(ECacheHookPoint::BeforeHotPageRefRelease, cacheItem);
+        if (!handle.State.compare_exchange_strong(
+                expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed)) {
+            continue;
+        }
+        // The last owner may enable immediate unmapping; only use captured state after the CAS
+        if (desired.Refs() == 0) {
+            Cache_.NotifyResourcesAvailable();
+        }
+        return;
+    }
+}
+
 template <class TTraits>
 Y_FORCE_INLINE TCollection* TCacheItems<TTraits>::ReleaseItem(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
     auto cacheOp = Cache_.BindOperation(spaceOp);
