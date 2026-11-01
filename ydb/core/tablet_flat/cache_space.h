@@ -1011,32 +1011,26 @@ Y_FORCE_INLINE TSpaceOperation TSpaceOperation::BeginImpl(std::atomic<ui64>& spa
     const TSpaceViews& views,
     TAfterIncrement&& afterIncrement) noexcept(noexcept(std::forward<TAfterIncrement>(afterIncrement)())) {
     for (;;) {
-        TSpaceState entryState = TSpaceState::FromRaw(spaceState.load(std::memory_order_acquire));
+        // The acquire recheck below makes the selected view visible
+        TSpaceState entryState = TSpaceState::FromRaw(spaceState.load(std::memory_order_relaxed));
         ui64 hazardState = hazard.State.load(std::memory_order_relaxed);
         const ui32 activeCount = SpaceHazardActiveCount(hazardState);
         Y_DEBUG_ABORT_UNLESS(activeCount != MaxSpaceHazardActiveCount);
 
-        if (Y_LIKELY(activeCount != 0)) {
-            if (Y_UNLIKELY(!hazard.State.compare_exchange_weak(
-                    hazardState, hazardState + 1, std::memory_order_acq_rel, std::memory_order_relaxed)))
-            {
-                continue;
-            }
-            return TSpaceOperation(hazard, entryState, views);
-        }
-
-        Y_DEBUG_ABORT_UNLESS(hazardState == 0);
         const ui32 generation = entryState.Generation();
-        if (!hazard.State.compare_exchange_weak(hazardState, PackHazardState(generation, activeCount + 1),
-                std::memory_order_acq_rel, std::memory_order_relaxed))
+        const ui64 registeredState = activeCount != 0 ? hazardState + 1 : PackHazardState(generation, 1);
+        if (Y_UNLIKELY(!hazard.State.compare_exchange_weak(
+                hazardState, registeredState, std::memory_order_acq_rel, std::memory_order_relaxed)))
         {
             continue;
         }
         if constexpr (WithHook) {
-            std::forward<TAfterIncrement>(afterIncrement)();
+            if (activeCount == 0) {
+                std::forward<TAfterIncrement>(afterIncrement)();
+            }
         }
         entryState = TSpaceState::FromRaw(spaceState.load(std::memory_order_acquire));
-        if (entryState.Generation() != generation) {
+        if (Y_UNLIKELY(entryState.Generation() != generation)) {
             LeaveHazard(hazard);
             continue;
         }

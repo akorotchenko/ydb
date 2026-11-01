@@ -55,6 +55,15 @@ ui64 SafeDiff(ui64 a, ui64 b) {
     return a - Min(a, b);
 }
 
+ui64 GetCacheCapacityCeiling(ui64 hardLimitBytes, const TProcessMemoryInfo& memoryInfo) {
+    if (hardLimitBytes) {
+        return hardLimitBytes;
+    }
+    bool hasMemTotalHardLimit = false;
+    const ui64 detectedLimit = GetHardLimitBytes({}, memoryInfo, hasMemTotalHardLimit);
+    return detectedLimit ? detectedLimit : GetHardLimitBytes({}, {}, hasMemTotalHardLimit);
+}
+
 ui64 GetMemoryMapsCountOrZero() {
     try {
         return GetMemoryMapsCount();
@@ -408,6 +417,7 @@ private:
 
         bool hasMemTotalHardLimit = false;
         ui64 hardLimitBytes = GetHardLimitBytes(Config, processMemoryInfo, hasMemTotalHardLimit);
+        const ui64 cacheCapacityCeiling = GetCacheCapacityCeiling(hardLimitBytes, processMemoryInfo);
         ui64 softLimitBytes = GetSoftLimitBytes(Config, hardLimitBytes);
         ui64 targetUtilizationBytes = GetTargetUtilizationBytes(Config, hardLimitBytes);
         ui64 activitiesLimitBytes = ResourceBrokerSelfConfig.LimitBytes
@@ -527,7 +537,7 @@ private:
             counters.LimitMaxBytes->Set(consumer.MaxBytes);
             AddMemoryStats(consumer, memoryStats, limitBytes);
 
-            ApplyLimit(consumer, limitBytes, currentLimitBytes);
+            ApplyLimit(consumer, limitBytes, currentLimitBytes, cacheCapacityCeiling);
         }
 
         Counters->GetCounter("Stats/ConsumersLimit")->Set(consumersLimitBytes);
@@ -550,11 +560,13 @@ private:
         Send(ev->Sender, new TEvConsumerRegistered(std::move(consumer)));
         if (msg->Kind == EMemoryConsumerKind::SharedCache) {
             bool hasMemTotalHardLimit = false;
-            const ui64 hardLimitBytes =
-                GetHardLimitBytes(Config, ProcessMemoryInfoProvider->Get(), hasMemTotalHardLimit);
+            const auto memoryInfo = ProcessMemoryInfoProvider->Get();
+            const ui64 hardLimitBytes = GetHardLimitBytes(Config, memoryInfo, hasMemTotalHardLimit);
             const auto state = BuildConsumerState(msg->Kind, Collections.at(msg->Kind), hardLimitBytes);
+            const ui64 capacityLimit =
+                state.MaxBytes ? state.MaxBytes : GetCacheCapacityCeiling(hardLimitBytes, memoryInfo);
             // Bootstrap admission from the positive ceiling; retention starts at the minimum, which may be zero.
-            SendLimitShares(msg->Kind, state.MinBytes, state.MaxBytes, state.MaxBytes, ev->Sender);
+            SendLimitShares(msg->Kind, state.MinBytes, capacityLimit, capacityLimit, ev->Sender);
         }
     }
 
@@ -676,14 +688,19 @@ private:
             : consumer.Consumption;
     }
 
-    void ApplyLimit(const TConsumerState& consumer, ui64 limitBytes, ui64 currentLimitBytes) const {
+    void ApplyLimit(
+        const TConsumerState& consumer, ui64 limitBytes, ui64 currentLimitBytes, ui64 cacheCapacityCeiling) const {
         switch (GetConsumerTraits(consumer.Kind).LimitDelivery) {
             case ELimitDelivery::MemTableCompaction:
                 ApplyMemTableLimit(limitBytes);
                 break;
-            case ELimitDelivery::LimitShares:
-                SendLimitShares(consumer.Kind, limitBytes, consumer.MaxBytes, currentLimitBytes);
+            case ELimitDelivery::LimitShares: {
+                const ui64 capacityLimit = consumer.Kind == EMemoryConsumerKind::SharedCache && !consumer.MaxBytes
+                                               ? cacheCapacityCeiling
+                                               : consumer.MaxBytes;
+                SendLimitShares(consumer.Kind, limitBytes, capacityLimit, currentLimitBytes);
                 break;
+            }
             case ELimitDelivery::PortionsCacheSetter:
                 NKikimr::NOlap::NStorageOptimizer::IOptimizerPlanner::SetPortionsCacheLimit(limitBytes);
                 break;
@@ -707,7 +724,7 @@ private:
             if (registrant && share.Registrant != registrant) {
                 continue;
             }
-            // The ceiling belongs to the configured kind; demand only redistributes current allocations.
+            // Zero cache budgets use the node ceiling for capacity; demand only redistributes current allocations.
             const ui64 maximum = kind == EMemoryConsumerKind::SharedCache ? maxLimitBytes : 0;
             const ui64 current = kind == EMemoryConsumerKind::SharedCache ? currentShares.at(share.Registrant) : 0;
             Send(share.Registrant, new TEvConsumerLimit(share.Bytes, maximum, current), IEventHandle::FlagTrackDelivery);

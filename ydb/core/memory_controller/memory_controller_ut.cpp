@@ -959,6 +959,105 @@ Y_UNIT_TEST(SharedCacheZeroAllocationKeepsPositiveMaximum) {
     }
 }
 
+Y_UNIT_TEST(SharedCacheZeroMaximumKeepsZeroAllocation) {
+    for (bool usePercent : { false, true }) {
+        NKikimrConfig::TMemoryControllerConfig config;
+        config.SetHardLimitBytes(200_MB);
+        if (usePercent) {
+            config.SetSharedCacheMaxPercent(0);
+        } else {
+            config.SetSharedCacheMaxBytes(0);
+        }
+        TControllerFixture fixture(config);
+        const TActorId sender = fixture.Runtime.AllocateEdgeActor();
+        fixture.Runtime.Send(new IEventHandle(
+            fixture.MemoryController, sender, new TEvConsumerRegister(EMemoryConsumerKind::SharedCache)));
+        const auto consumer = fixture.Runtime.GrabEdgeEvent<TEvConsumerRegistered>(sender)->Get()->Consumer;
+        UNIT_ASSERT(consumer);
+        const auto initial = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+        UNIT_ASSERT_VALUES_EQUAL(initial->Get()->LimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(initial->Get()->CurrentLimitBytes, 200_MB);
+        UNIT_ASSERT_VALUES_EQUAL(initial->Get()->MaxLimitBytes, 200_MB);
+
+        fixture.Tick();
+        const auto periodic = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+        UNIT_ASSERT_VALUES_EQUAL(periodic->Get()->LimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(periodic->Get()->CurrentLimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(periodic->Get()->MaxLimitBytes, 200_MB);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/SharedCache/Limit"), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/SharedCache/LimitMin"), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/SharedCache/LimitMax"), 0);
+    }
+}
+
+Y_UNIT_TEST(SharedCacheZeroMaximumUsesDetectedOrDefaultNodeCeiling) {
+    for (bool detected : { false, true }) {
+        NKikimrConfig::TMemoryControllerConfig config;
+        config.SetHardLimitBytes(0);
+        config.SetSharedCacheMaxBytes(0);
+        TControllerFixture fixture(config);
+        if (detected) {
+            fixture.Provider->ProcessMemoryInfo.CGroupLimit = 120_MB;
+            fixture.Provider->ProcessMemoryInfo.MemTotal = 160_MB;
+        }
+        const TActorId sender = fixture.Runtime.AllocateEdgeActor();
+        fixture.Runtime.Send(new IEventHandle(
+            fixture.MemoryController, sender, new TEvConsumerRegister(EMemoryConsumerKind::SharedCache)));
+        UNIT_ASSERT(fixture.Runtime.GrabEdgeEvent<TEvConsumerRegistered>(sender)->Get()->Consumer);
+        const auto initial = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+        UNIT_ASSERT_VALUES_EQUAL(initial->Get()->LimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(initial->Get()->MaxLimitBytes, detected ? 120_MB : 2_GB);
+        UNIT_ASSERT_VALUES_EQUAL(initial->Get()->CurrentLimitBytes, initial->Get()->MaxLimitBytes);
+        fixture.Tick();
+        const auto periodic = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+        UNIT_ASSERT_VALUES_EQUAL(periodic->Get()->LimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(periodic->Get()->MaxLimitBytes, initial->Get()->MaxLimitBytes);
+    }
+}
+
+Y_UNIT_TEST(SharedCacheMaximumCanBecomeZeroAndRecover) {
+    for (bool usePercent : { false, true }) {
+        NKikimrConfig::TMemoryControllerConfig config;
+        config.SetHardLimitBytes(200_MB);
+        config.SetSharedCacheMaxBytes(60_MB);
+        TControllerFixture fixture(config);
+        const TActorId sender = fixture.Runtime.AllocateEdgeActor();
+        UNIT_ASSERT(fixture.Register(sender, EMemoryConsumerKind::SharedCache));
+
+        const auto update = [&](bool zero) {
+            auto changed = config;
+            if (zero && usePercent) {
+                changed.ClearSharedCacheMaxBytes();
+                changed.SetSharedCacheMaxPercent(0);
+            } else {
+                changed.SetSharedCacheMaxBytes(zero ? 0 : 60_MB);
+            }
+            auto request = MakeHolder<NConsole::TEvConsole::TEvConfigNotificationRequest>();
+            request->Record.MutableConfig()->MutableMemoryControllerConfig()->CopyFrom(changed);
+            fixture.Runtime.Send(new IEventHandle(fixture.MemoryController, sender, request.Release()));
+            fixture.Tick();
+        };
+        update(true);
+        const auto zero = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+        UNIT_ASSERT_VALUES_EQUAL(zero->Get()->LimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(zero->Get()->CurrentLimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(zero->Get()->MaxLimitBytes, 200_MB);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/SharedCache/LimitMax"), 0);
+
+        update(false);
+        bool restored = false;
+        for (ui32 attempt = 0; attempt < 4 && !restored; ++attempt) {
+            const auto limit = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+            restored = limit->Get()->MaxLimitBytes == 60_MB;
+            if (restored) {
+                UNIT_ASSERT_GT(limit->Get()->LimitBytes, 0);
+            }
+        }
+        UNIT_ASSERT(restored);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/SharedCache/LimitMax"), 60_MB);
+    }
+}
+
 Y_UNIT_TEST(ConsumerReportClamp) {
     NKikimrConfig::TMemoryControllerConfig config;
     config.SetHardLimitBytes(200_MB);

@@ -78,7 +78,7 @@ struct TEvConsumerRegistered : public TEventLocal<TEvConsumerRegistered, EvConsu
 
 struct TEvConsumerLimit : public TEventLocal<TEvConsumerLimit, EvConsumerLimit> {
     ui64 LimitBytes;
-    // SharedCache: stable configured/machine byte ceiling used to size capacity.
+    // SharedCache capacity ceiling; a configured zero uses the node memory limit
     ui64 MaxLimitBytes = 0;
     // SharedCache: current admission estimate before the additional soft-pressure reduction.
     // Zero means absent; LimitBytes remains the soft allocation and may be zero.

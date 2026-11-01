@@ -2214,6 +2214,77 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         return held;
     }
 
+    Y_UNIT_TEST(ReviewR40TransactionWorkingSetWithoutRetainedCollectionsIsRejected) {
+        TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
+        auto held = HoldAllReviewPageHandles(sharedCache);
+        auto& core = TSharedCache::Get();
+        auto pad = MakeIntrusive<TPagesWaitPad>();
+        auto& locations = pad->WorkingSetPages[sharedCache.Collection1->Label()];
+        for (const auto& page : held) {
+            locations.push_back(page.GetLocation());
+            pad->WorkingSetBytes += page.size() + TSharedData::OverheadSize;
+        }
+        locations.push_back(_P(9000));
+        pad->WorkingSetBytes += PAGE_TOTAL_SIZE;
+        pad->HasPinnedPages.store(true, std::memory_order_release);
+        UNIT_ASSERT(pad->RetainedCollections.empty());
+        UNIT_ASSERT_LT(pad->WorkingSetBytes, core.CurrentLimit());
+        const TCacheHandleRequirement requirement{ sharedCache.Collection1->Label(), locations };
+        UNIT_ASSERT(core.WorkingSetExceedsCapacity({}, { &requirement, 1 }));
+
+        sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, { _P(9000) }, EPriority::Fast, 0, pad);
+        sharedCache.Runtime.WaitFor("transaction releases its oversized attempt", [&] {
+            return AnyOf(sharedCache.Results, [](const auto& result) {
+                return result->Get()->ResourcePressure;
+            });
+        }, TDuration::Seconds(5));
+        held.clear();
+        sharedCache.Runtime.WaitFor("oversized transaction receives a terminal resource result", [&] {
+            return AnyOf(sharedCache.Results, [](const auto& result) {
+                return result->Get()->WorkingSetTooLarge;
+            });
+        }, TDuration::Seconds(5));
+        ui32 terminalResults = 0;
+        for (const auto& result : sharedCache.Results) {
+            UNIT_ASSERT(result->Get()->WaitPad == pad);
+            UNIT_ASSERT(!result->Get()->ResourcesReady);
+            if (result->Get()->WorkingSetTooLarge) {
+                ++terminalResults;
+                UNIT_ASSERT_VALUES_EQUAL(result->Get()->Status, NKikimrProto::ERROR);
+                UNIT_ASSERT(!result->Get()->ResourcePressure);
+            }
+        }
+        UNIT_ASSERT_VALUES_EQUAL(terminalResults, 1);
+        sharedCache.Results.clear();
+        sharedCache.CheckFetches({});
+    }
+
+    Y_UNIT_TEST(ReviewR40ForeignHandlePressureWithoutRetainedCollectionsCanClear) {
+        TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
+        auto held = HoldAllReviewPageHandles(sharedCache);
+        auto pad = MakeIntrusive<TPagesWaitPad>();
+        pad->WorkingSetPages[sharedCache.Collection1->Label()] = { _P(9000) };
+        pad->WorkingSetBytes = PAGE_TOTAL_SIZE;
+        pad->HasPinnedPages.store(true, std::memory_order_release);
+        sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, { _P(9000) }, EPriority::Fast, 0, pad);
+        sharedCache.Runtime.WaitFor("foreign handles postpone a feasible transaction", [&] {
+            return !sharedCache.Results.empty();
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Results.size(), 1);
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->ResourcePressure);
+        UNIT_ASSERT(!sharedCache.Results.front()->Get()->WorkingSetTooLarge);
+        sharedCache.Results.clear();
+        held.pop_back();
+        sharedCache.Runtime.WaitFor("one foreign handle release wakes the feasible transaction", [&] {
+            return !sharedCache.Results.empty();
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Results.size(), 1);
+        UNIT_ASSERT(sharedCache.Results.front()->Get()->ResourcesReady);
+        UNIT_ASSERT(!sharedCache.Results.front()->Get()->WorkingSetTooLarge);
+        sharedCache.Results.clear();
+        sharedCache.CheckFetches({});
+    }
+
     Y_UNIT_TEST(ReviewR20IndependentStickyPressureCanClearWithSubsetAlive) {
         TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
         auto& core = TSharedCache::Get();
