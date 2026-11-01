@@ -645,6 +645,30 @@ void TExecutor::FinishCancellation(TSeat* seat, bool activateMore) {
     }
 }
 
+void TExecutor::FinishTermination(TSeat* seat) {
+    Y_ENSURE(seat->State == ESeatState::None && seat->IsTerminated());
+    TActiveTransactionZone activeTransaction(this);
+    UnpinTransactionPages(*seat);
+    Memory->ReleaseMemory(*seat);
+    CompleteReadOnlyTransaction(RemoveTransaction(seat->UniqID));
+    activeTransaction.Done();
+    PlanTransactionActivation();
+    MaybeRelaxRejectProbability();
+}
+
+void TExecutor::CompleteReadOnlyTransaction(std::unique_ptr<TSeat> seat) {
+    // Note: per-tx InFly is decremented in txloglogic
+    if (Stats->IsFollower()) {
+        // todo: extract completion counters from txloglogic
+        --Stats->TxInFly;
+        Counters->Simple()[TExecutorCounters::DB_TX_IN_FLY] = Stats->TxInFly;
+        CompleteRoTransaction(std::move(seat), OwnerCtx(), Counters.Get(), AppTxCounters);
+    } else if (LogicRedo->CommitROTransaction(std::move(seat), OwnerCtx())) {
+        --Stats->TxInFly;
+        Counters->Simple()[TExecutorCounters::DB_TX_IN_FLY] = Stats->TxInFly;
+    }
+}
+
 void TExecutor::EnqueueActivation(TSeat* seat, bool activate) {
     LWTRACK(TransactionEnqueued, seat->Self->Orbit, seat->UniqID);
     seat->StartEnqueuedSpan();
@@ -2638,16 +2662,7 @@ void TExecutor::CommitTransactionLog(std::unique_ptr<TSeat> seat, TPageCollectio
     const double currentExecTime = seat->CPUExecTime;
 
     if (isReadOnly) {
-        // Note: per-tx InFly is decremented in txloglogic
-        if (Stats->IsFollower()) {
-            // todo: extract completion counters from txloglogic
-            --Stats->TxInFly;
-            Counters->Simple()[TExecutorCounters::DB_TX_IN_FLY] = Stats->TxInFly;
-            CompleteRoTransaction(std::move(seat), OwnerCtx(), Counters.Get(), AppTxCounters);
-        } else if (LogicRedo->CommitROTransaction(std::move(seat), OwnerCtx())) {
-            --Stats->TxInFly;
-            Counters->Simple()[TExecutorCounters::DB_TX_IN_FLY] = Stats->TxInFly;
-        }
+        CompleteReadOnlyTransaction(std::move(seat));
     } else {
         Y_ENSURE(!Stats->IsFollower());
         Y_ENSURE(!seat->IsTerminated(), "Read-write transactions cannot be terminated");
@@ -3454,6 +3469,30 @@ void TExecutor::Handle(TEvents::TEvFlushLog::TPtr &ev) {
 
 void TExecutor::Handle(NSharedCache::TEvResult::TPtr &ev) {
     NSharedCache::TEvResult *msg = ev->Get();
+    if (msg->WorkingSetTooLarge) {
+        const auto it = TransactionWaitPads.find(msg->WaitPad.Get());
+        if (it == TransactionWaitPads.end()) {
+            return;
+        }
+        auto transaction = it->second;
+        TSeat* seat = transaction->Seat;
+        seat->TerminationReason = ETerminationReason::MemoryLimitExceeded;
+        transaction->WaitingSpan.EndError("Page working set exceeds shared cache capacity");
+        TransactionWaitPads.erase(it);
+        if (seat->State == ESeatState::Postponed) {
+            // The broker's allocation cookie still points to this seat; StartSeat will finish it
+            return;
+        }
+        Y_ENSURE(seat->State == ESeatState::Waiting);
+        seat->State = ESeatState::None;
+        if (seat->Cancelled) {
+            FinishCancellation(seat);
+            MaybeRelaxRejectProbability();
+        } else {
+            FinishTermination(seat);
+        }
+        return;
+    }
     if (msg->ResourcesReady) {
         const auto it = TransactionWaitPads.find(msg->WaitPad.Get());
         if (it != TransactionWaitPads.end()) {
@@ -3836,6 +3875,10 @@ void TExecutor::StartSeat(ui64 task, TResource *cookie_)
     }
     if (seat->Cancelled) {
         FinishCancellation(seat);
+        return;
+    }
+    if (seat->IsTerminated()) {
+        FinishTermination(seat);
         return;
     }
 
