@@ -1016,9 +1016,9 @@ Y_FORCE_INLINE TSpaceOperation TSpaceOperation::BeginImpl(std::atomic<ui64>& spa
         const ui32 activeCount = SpaceHazardActiveCount(hazardState);
         Y_DEBUG_ABORT_UNLESS(activeCount != MaxSpaceHazardActiveCount);
 
-        if (activeCount != 0) {
-            if (!hazard.State.compare_exchange_weak(
-                    hazardState, hazardState + 1, std::memory_order_acq_rel, std::memory_order_relaxed))
+        if (Y_LIKELY(activeCount != 0)) {
+            if (Y_UNLIKELY(!hazard.State.compare_exchange_weak(
+                    hazardState, hazardState + 1, std::memory_order_acq_rel, std::memory_order_relaxed)))
             {
                 continue;
             }

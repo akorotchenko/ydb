@@ -528,6 +528,8 @@ class TExecutor
     void TranscriptFollowerBootOpResult(ui32 res, const TActorContext &ctx);
     std::unique_ptr<TSeat> RemoveTransaction(ui64 id);
     void FinishCancellation(TSeat* seat, bool activateMore = true);
+    void FinishTermination(TSeat* seat);
+    void CompleteReadOnlyTransaction(std::unique_ptr<TSeat> seat);
     void ExecuteTransaction(TSeat* seat);
     void CommitTransactionLog(std::unique_ptr<TSeat>, TPageCollectionTxEnv&, TAutoPtr<NTable::TChange>,
                               THPTimer &bookkeepingTimer);

@@ -1132,7 +1132,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     bool WorkingSetTooLarge(const TQueuedRequest& waiting) {
         const auto& pad = waiting.Completion->WaitPad();
-        if (!pad || pad->RetainedCollections.empty()) {
+        if (!pad) {
             return false;
         }
         TVector<TCacheHandleRequirement> requirements;
