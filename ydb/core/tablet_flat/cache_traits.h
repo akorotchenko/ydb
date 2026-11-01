@@ -40,6 +40,7 @@ enum class ECacheHookPoint {
     BeforeHotExchange, // Payload is the Hot item; the target slot has been reserved but not exchanged.
     AfterHotEvictionPublished, // Payload is the evicted item, before category accounting.
     BeforeLastColdRefRelease, // Native identity, before the final Cold reference CAS
+    BeforeHotPageRefRelease, // Owned Hot page, before the unguarded reference-release CAS
     BeforeLastCollectionRefRelease, // Collection, after sampling final-release notification eligibility
     BeforeColdExchange, // Payload is the Cold membership after occupancy accounting, before ring publication.
     BeforeColdRingPop, // No item payload; an occupied Cold ring is about to be probed.
@@ -58,6 +59,7 @@ enum class ECacheHookPoint {
     AfterStickyPageListHeadPublished, // Payload is the owning collection after its retained list is published.
     AfterFetchWaiterSubscribed, // Payload is the pending page while the subscriber still owns its structural ref.
     AfterFetchCompletingClaim, // Payload is the page after the last pending releaser claims exclusive finalization.
+    BeforePendingFetchRefRelease, // Pending identity, after State observation and before the completion check
     BeforeCollectionHotPublished, // Payload is the collection before insertion into a Hot ring.
     BeforePageReplacementRetry, // Source, while a held-page reader waits for its forwarder.
     BeforePageReplacementLinkCas, // Source, after preparing the successor but before freezing the forwarder.
@@ -79,7 +81,7 @@ struct TProdTraits {
     NActors::TActorSystem* KeepEvictionActorSystem = nullptr;
     TActorId KeepEvictionActor;
 
-    static void* TryGetCache() noexcept;
+    static Y_FORCE_INLINE void* TryGetCache() noexcept;
     static bool InstallCache(void* cache) noexcept;
 
     void NotifyResourcesAvailable() const noexcept;

@@ -10,6 +10,8 @@
 #include "cache_capacity.h"
 #include "cache_table.h"
 
+#include <ydb/core/base/appdata_fwd.h>
+
 #include <util/generic/function_ref.h>
 #include <util/generic/size_literals.h>
 
@@ -200,9 +202,11 @@ public:
         return false;
     }
 
-    ECacheResultStatus Find(TCollectionCacheItem collection, ui64 offset, TCachePageRefImpl<TTraits>& page) noexcept;
+    Y_FORCE_INLINE ECacheResultStatus Find(
+        TCollectionCacheItem collection, ui64 offset, TCachePageRefImpl<TTraits>& page) noexcept;
 
-    ECacheResultStatus Find(const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept;
+    Y_FORCE_INLINE ECacheResultStatus Find(
+        const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept;
 
     // Finds and attaches a Ready collection without inserting on a miss
     Y_FORCE_INLINE ECacheCollectionLookupStatus FindCollection(
@@ -533,6 +537,10 @@ private:
     };
 
     struct TPageInsertCandidate {
+        static constexpr bool IsPageKind() noexcept {
+            return true;
+        }
+
         TKeepReservation KeepReservation;
         TCacheKey Key;
         ui64 Size = 0;
@@ -547,12 +555,21 @@ private:
     };
 
     struct TCollectionInsertCandidate {
+        static constexpr bool IsPageKind() noexcept {
+            return false;
+        }
+
         TCacheKey Key;
         ui64 Bytes = 0;
         TCacheItem CacheItem;
     };
 
+    template <bool IsPage>
     struct TCacheKeyedItem {
+        static constexpr bool IsPageKind() noexcept {
+            return IsPage;
+        }
+
         TCacheKey Key;
         TCacheItem CacheItem;
     };
@@ -579,7 +596,9 @@ private:
     void MakeReadyState(TSpaceOperation& spaceOp, TCacheItem cacheItem, EHandleState readyState = EHandleState::Hot,
         TCollection* pageOwner = nullptr, TKeepReservation* keepReservation = nullptr) noexcept;
 
-    ECacheResultStatus Find(TOperationView& cacheOp, const TCacheKey& key, TCacheItemRefImpl<TTraits>& ref) noexcept;
+    template <class TLookup>
+    Y_FORCE_INLINE ECacheResultStatus Find(
+        TOperationView& cacheOp, TLookup&& lookup, TCacheItemRefImpl<TTraits>& ref) noexcept;
 
     ECacheCollectionLookupStatus FindCollection(
         TCollectionRegistry& registry, const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept;
@@ -587,13 +606,27 @@ private:
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, const TCacheItemRefImpl<TTraits>& ref) noexcept;
 
     Y_FORCE_INLINE ECacheResultStatus FindOrInsert(
-        TSpaceOperation& spaceOp, TCacheItem candidate, TCacheItemRefImpl<TTraits>& ref) noexcept {
+        TSpaceOperation& spaceOp, TPageCacheItem candidate, TCacheItemRefImpl<TTraits>& ref) noexcept {
+        return FindOrInsertItem(spaceOp, candidate, ref);
+    }
+
+    Y_FORCE_INLINE ECacheResultStatus FindOrInsert(
+        TSpaceOperation& spaceOp, TCollectionCacheItem candidate, TCacheItemRefImpl<TTraits>& ref) noexcept {
+        return FindOrInsertItem(spaceOp, candidate, ref);
+    }
+
+    template <class TItem>
+    Y_FORCE_INLINE ECacheResultStatus FindOrInsertItem(
+        TSpaceOperation& spaceOp, TItem candidate, TCacheItemRefImpl<TTraits>& ref) noexcept {
+        constexpr bool isPage = std::is_same_v<TItem, TPageCacheItem>;
+        static_assert(isPage || std::is_same_v<TItem, TCollectionCacheItem>);
         auto cacheOp = BindOperation(spaceOp);
         const THandle& handle = spaceOp.Handles()[candidate.Index()];
-        const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
-        TCacheKeyedItem keyedCandidate{
-            .Key = LoadSharedCacheKey(handle, state.Kind()),
-            .CacheItem = candidate,
+        Y_DEBUG_ABORT_UNLESS(
+            THandleState::FromRaw(handle.State.load(std::memory_order_relaxed)).IsPageKind() == isPage);
+        TCacheKeyedItem<isPage> keyedCandidate{
+            .Key = LoadSharedCacheKey(handle, isPage ? EItemKind::Page : EItemKind::Collection),
+            .CacheItem = candidate.CacheItem(),
         };
         return cacheOp.FindOrInsert(keyedCandidate, ref);
     }
@@ -661,7 +694,8 @@ private:
     bool PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate) noexcept;
     bool PrepareCandidate(TSpaceOperation& spaceOp, TCollectionInsertCandidate& candidate) noexcept;
 
-    bool PrepareCandidate(TSpaceOperation&, TCacheKeyedItem& candidate) noexcept {
+    template <bool IsPage>
+    bool PrepareCandidate(TSpaceOperation&, TCacheKeyedItem<IsPage>& candidate) noexcept {
         return !candidate.CacheItem.IsNull();
     }
 
@@ -734,8 +768,8 @@ private:
 
     bool AcquirePage(TPageCacheItem page, TCachePageRefImpl<TTraits>& result) noexcept;
 
-    // Pending-item cleanup may reenter this coordinator
-    void Release(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
+    // May finalize or reclaim an item while its mappings are protected
+    void ReleaseCleanup(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
         auto cacheOp = BindOperation(spaceOp);
         TCollection* owner = cacheOp.ReleaseItem(cacheItem);
         if (owner) {
@@ -772,8 +806,9 @@ private:
         return handle.Metadata.PayloadBytes == candidate.Bytes;
     }
 
+    template <bool IsPage>
     bool MatchesCandidateMetadata(
-        const TSpaceOperation& spaceOp, const TCacheKeyedItem& candidate, TCacheItem existing) const noexcept {
+        const TSpaceOperation& spaceOp, const TCacheKeyedItem<IsPage>& candidate, TCacheItem existing) const noexcept {
         return MatchesCandidateMetadata(spaceOp, candidate.CacheItem, existing);
     }
 
@@ -824,8 +859,6 @@ class TCacheOperationView {
     using EPageAdmission = typename TSharedCacheImpl<TTraits>::EPageAdmission;
     using TPageInsertCandidate = typename TSharedCacheImpl<TTraits>::TPageInsertCandidate;
     using TCollectionInsertCandidate = typename TSharedCacheImpl<TTraits>::TCollectionInsertCandidate;
-    using TCacheKeyedItem = typename TSharedCacheImpl<TTraits>::TCacheKeyedItem;
-
 public: // Cache table operations
     using TInsertPosition = typename TCacheTableImpl<TTraits>::TInsertPosition;
     using EResizeStep = typename TCacheTableImpl<TTraits>::EResizeStep;
@@ -835,17 +868,51 @@ public: // Cache table operations
         return SpaceOp_;
     }
 
-    Y_FORCE_INLINE ECacheResultStatus Find(const TCacheKey& key, TCacheItem& item) noexcept {
-        return Cache_.Table_.Find(SpaceOp_, key, item);
+    Y_FORCE_INLINE ECacheResultStatus FindPage(
+        TCollectionCacheItem collection, ui64 offset, TCacheItem& item) noexcept {
+        return Cache_.Table_.FindPage(SpaceOp_, collection, offset, item);
     }
 
-    Y_FORCE_INLINE ECacheResultStatus Find(const TCacheKey& key, TCacheItemRefImpl<TTraits>& ref) noexcept {
-        return Cache_.Find(*this, key, ref);
+    Y_FORCE_INLINE ECacheResultStatus FindPage(
+        TCollectionCacheItem collection, ui64 offset, TCacheItemRefImpl<TTraits>& ref) noexcept {
+        struct TLookup {
+            TCacheOperationView& CacheOp;
+            TCollectionCacheItem Collection;
+            ui64 Offset;
+
+            Y_FORCE_INLINE ECacheResultStatus operator()(TCacheItem& item) const noexcept {
+                return CacheOp.FindPage(Collection, Offset, item);
+            }
+        };
+
+        return Cache_.Find(*this, TLookup{ *this, collection, offset }, ref);
     }
 
+    Y_FORCE_INLINE ECacheResultStatus FindCollection(const TLogoBlobID& id, TCacheItem& item) noexcept {
+        return Cache_.Table_.FindCollection(SpaceOp_, id, item);
+    }
+
+    Y_FORCE_INLINE ECacheResultStatus FindCollection(const TLogoBlobID& id, TCacheItemRefImpl<TTraits>& ref) noexcept {
+        struct TLookup {
+            TCacheOperationView& CacheOp;
+            const TLogoBlobID& Id;
+
+            Y_FORCE_INLINE ECacheResultStatus operator()(TCacheItem& item) const noexcept {
+                return CacheOp.FindCollection(Id, item);
+            }
+        };
+
+        return Cache_.Find(*this, TLookup{ *this, id }, ref);
+    }
+
+    template <class TKeyedCandidate>
     Y_FORCE_INLINE ECacheResultStatus FindForInsert(
-        const TCacheKey& key, TCacheItem& item, TInsertPosition& position) noexcept {
-        return Cache_.Table_.FindForInsert(SpaceOp_, key, item, position);
+        const TKeyedCandidate& candidate, TCacheItem& item, TInsertPosition& position) noexcept {
+        if constexpr (TKeyedCandidate::IsPageKind()) {
+            return Cache_.Table_.FindPageForInsert(SpaceOp_, candidate.Key, item, position);
+        } else {
+            return Cache_.Table_.FindCollectionForInsert(SpaceOp_, candidate.Key, item, position);
+        }
     }
 
     Y_FORCE_INLINE bool InsertAt(TInsertPosition& position, TCacheItem candidate) noexcept {
@@ -879,8 +946,8 @@ public: // Cache helpers
         return Items().TryAcquireStructural(item);
     }
 
-    Y_FORCE_INLINE void Release(TCacheItem item) noexcept {
-        Cache_.Release(SpaceOp_, item);
+    Y_FORCE_INLINE void ReleaseCleanup(TCacheItem item) noexcept {
+        Cache_.ReleaseCleanup(SpaceOp_, item);
     }
 
     Y_FORCE_INLINE typename TCacheFetches<TTraits>::TOperation Fetches() noexcept {
@@ -915,10 +982,6 @@ public: // Cache helpers
     Y_FORCE_INLINE void MakeReadyState(
         TCacheItem cacheItem, EHandleState readyState = EHandleState::Hot, TCollection* pageOwner = nullptr) noexcept {
         Cache_.MakeReadyState(SpaceOp_, cacheItem, readyState, pageOwner);
-    }
-
-    Y_FORCE_INLINE ECacheResultStatus FindOrInsert(TCacheItem candidate, TCacheItemRefImpl<TTraits>& ref) noexcept {
-        return Cache_.FindOrInsert(SpaceOp_, candidate, ref);
     }
 
     Y_FORCE_INLINE ECacheResultStatus FindOrInsertPage(TPageInsertCandidate& candidate,
@@ -962,7 +1025,8 @@ public: // Cache helpers
         return Cache_.PrepareCandidate(SpaceOp_, candidate);
     }
 
-    Y_FORCE_INLINE bool PrepareCandidate(TCacheKeyedItem& candidate) noexcept {
+    template <class TKeyedCandidate>
+    Y_FORCE_INLINE bool PrepareCandidate(TKeyedCandidate& candidate) noexcept {
         return Cache_.PrepareCandidate(SpaceOp_, candidate);
     }
 
@@ -1017,7 +1081,8 @@ public: // Cache helpers
         return Cache_.MatchesCandidateMetadata(SpaceOp_, candidate, existing);
     }
 
-    Y_FORCE_INLINE bool MatchesCandidateMetadata(const TCacheKeyedItem& candidate, TCacheItem existing) const noexcept {
+    template <class TKeyedCandidate>
+    Y_FORCE_INLINE bool MatchesCandidateMetadata(const TKeyedCandidate& candidate, TCacheItem existing) const noexcept {
         return Cache_.MatchesCandidateMetadata(SpaceOp_, candidate, existing);
     }
 
@@ -1148,6 +1213,67 @@ using TCachePageRequest = TCachePageRequestImpl<>;
 using TSharedCache = TSharedCacheImpl<>;
 
 // Inline implementations
+
+Y_FORCE_INLINE void* TProdTraits::TryGetCache() noexcept {
+    NActors::TActorSystem* actorSystem =
+        NActors::TlsActivationContext ? NActors::TActivationContext::ActorSystem() : nullptr;
+    if (HasAppData(actorSystem)) {
+        const TIntrusivePtr<TSharedCache>& owner = AppData(actorSystem)->SharedCache;
+        return owner.Get();
+    }
+    return nullptr;
+}
+
+template <class TTraits>
+Y_FORCE_INLINE ECacheResultStatus TSharedCacheImpl<TTraits>::Find(
+    TCollectionCacheItem collection, ui64 offset, TCachePageRefImpl<TTraits>& page) noexcept {
+    page.Drop();
+    auto cacheOp = BeginOperation();
+    TOperationItemRef<TTraits> ref(cacheOp);
+    const ECacheResultStatus status = cacheOp.FindPage(collection, offset, ref.Get());
+    if (status == ECacheResultStatus::Hit) {
+        page = cacheOp.BuildPageRef(ref.Take());
+    }
+    return status;
+}
+
+template <class TTraits>
+Y_FORCE_INLINE ECacheResultStatus TSharedCacheImpl<TTraits>::Find(
+    const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept {
+    collection.Drop();
+    auto cacheOp = BeginOperation();
+    TOperationItemRef<TTraits> ref(cacheOp);
+    const ECacheResultStatus status = cacheOp.FindCollection(id, ref.Get());
+    if (status == ECacheResultStatus::Hit) {
+        collection = cacheOp.BuildCollectionRef(ref.Take());
+    }
+    return status;
+}
+
+template <class TTraits>
+template <class TLookup>
+Y_FORCE_INLINE ECacheResultStatus TSharedCacheImpl<TTraits>::Find(
+    TOperationView& cacheOp, TLookup&& lookup, TCacheItemRefImpl<TTraits>& ref) noexcept {
+    for (;;) {
+        TCacheItem cacheItem;
+        const ECacheResultStatus status = lookup(cacheItem);
+        if (status == ECacheResultStatus::Miss) {
+            return ECacheResultStatus::Miss;
+        }
+        Y_DEBUG_ABORT_UNLESS(status == ECacheResultStatus::Hit);
+        TOperationItemRef<TTraits> acquired(cacheOp.SpaceOperation());
+        switch (cacheOp.TryAcquire(cacheItem, false, acquired.Get())) {
+            case EAcquireStatus::Stale:
+                continue;
+            case EAcquireStatus::Pending:
+                return ECacheResultStatus::Pending;
+            case EAcquireStatus::Ready:
+                ref = acquired.Take();
+                return ECacheResultStatus::Hit;
+        }
+        Y_UNREACHABLE();
+    }
+}
 
 template <class TTraits>
 inline TCachePageRequestImpl<TTraits>& TCachePageRequestImpl<TTraits>::operator=(

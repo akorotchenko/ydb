@@ -70,8 +70,11 @@ void TCacheFetches<TTraits>::Release(TOperationItemRef<TTraits>& owner, TPageFet
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
     for (;;) {
+        // Acquire each State observation before checking the separate completion, including CAS retries
+        std::atomic_thread_fence(std::memory_order_acquire);
         const THandleState expected = THandleState::FromRaw(expectedRaw);
         Y_DEBUG_ABORT_UNLESS(MatchesPendingFetch(handle, expected, cacheItem, fetch) && expected.Refs() > 0);
+        Cache_.InvokeHook(ECacheHookPoint::BeforePendingFetchRefRelease, cacheItem);
         const bool finish = expected.Refs() == 1 && fetch.Completion() != EPageFetchCompletion::Pending;
         if (finish && expected.IsStickyField() && fetch.Completion() == EPageFetchCompletion::Failed) {
             // List owners may need this pending predecessor while withdrawing Sticky siblings

@@ -77,17 +77,17 @@ private:
 
     Y_FORCE_INLINE void Drop(TSpaceOperation& spaceOp) noexcept;
 
-    static Y_FORCE_INLINE void Release(TCacheItem item) noexcept {
+    template <class TItem>
+    static Y_FORCE_INLINE void Release(TItem item) noexcept {
         // A missing resolver is the explicit terminal-shutdown abandonment path
         if (TSharedCacheImpl<TTraits>* cache = TSharedCacheImpl<TTraits>::TryGet()) {
-            auto cacheOp = cache->BeginOperation();
-            cacheOp.Release(item);
+            cache->Items_.Release(item);
         }
     }
 
     static Y_FORCE_INLINE void Release(TSpaceOperation& spaceOp, TCacheItem item) noexcept {
         auto cacheOp = TSharedCacheImpl<TTraits>::Get().BindOperation(spaceOp);
-        cacheOp.Release(item);
+        cacheOp.ReleaseCleanup(item);
     }
 
 private:
@@ -157,6 +157,10 @@ template <class TTraits = TProdTraits>
 class TCachePageRefImpl : private TMoveOnly {
 public:
     TCachePageRefImpl() noexcept = default;
+
+    Y_FORCE_INLINE ~TCachePageRefImpl() noexcept {
+        Drop();
+    }
 
     Y_FORCE_INLINE TCachePageRefImpl(TCachePageRefImpl&& other) noexcept
         : Ref_(std::move(other.Ref_))
@@ -239,7 +243,10 @@ public:
     }
 
     Y_FORCE_INLINE void Drop() noexcept {
-        Ref_.Drop();
+        const TCacheItem item = Ref_.Take();
+        if (!item.IsNull()) {
+            TCacheItemRefImpl<TTraits>::Release(TPageCacheItem::FromValidated(item));
+        }
     }
 
 private:
@@ -383,8 +390,7 @@ template <class TTraits>
 Y_FORCE_INLINE TCollection& TCacheCollectionRefImpl<TTraits>::GetCollection() const noexcept {
     Y_DEBUG_ABORT_UNLESS(Ref_);
     TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
-    auto spaceOp = cache.BeginOperation();
-    const THandle& handle = spaceOp.Handles()[Ref_.Index()];
+    const THandle& handle = cache.Space_->OwnedHandle(Ref_.CacheItem());
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     Y_DEBUG_ABORT_UNLESS(Ref_.CacheItem().Matches(state) && state.IsCollectionKind() && state.Refs() != 0);
     return *handle.Body.Collection;
@@ -394,9 +400,8 @@ template <class TTraits>
 Y_FORCE_INLINE bool TCacheCollectionRefImpl<TTraits>::IsSoleReference() const noexcept {
     Y_DEBUG_ABORT_UNLESS(Ref_);
     auto& cache = TSharedCacheImpl<TTraits>::Get();
-    auto spaceOp = cache.BeginOperation();
     const THandleState state =
-        THandleState::FromRaw(spaceOp.Handles()[Ref_.Index()].State.load(std::memory_order_acquire));
+        THandleState::FromRaw(cache.Space_->OwnedHandle(Ref_.CacheItem()).State.load(std::memory_order_acquire));
     Y_DEBUG_ABORT_UNLESS(Ref_.CacheItem().Matches(state) && state.IsCollectionKind() && state.Refs() != 0);
     return state.Refs() == 1;
 }

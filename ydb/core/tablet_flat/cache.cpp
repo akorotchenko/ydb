@@ -24,14 +24,6 @@ namespace {
 
 } // anonymous namespace
 
-void* TProdTraits::TryGetCache() noexcept {
-    if (HasAppData()) {
-        const TIntrusivePtr<TSharedCache>& owner = AppData()->SharedCache;
-        return owner.Get();
-    }
-    return nullptr;
-}
-
 bool TProdTraits::InstallCache(void* cache) noexcept {
     if (!HasAppData()) {
         return false;
@@ -264,7 +256,7 @@ bool TSharedCache::CanAllocateHandles(TArrayRef<const TCacheHandleRequirement> r
     for (const auto& requirement : requirements) {
         TCacheItem item;
         TCollectionCacheItem collection;
-        if (cacheOp.Find(TCacheKey::Collection(requirement.CollectionId), item) != ECacheResultStatus::Miss) {
+        if (cacheOp.FindCollection(requirement.CollectionId, item) != ECacheResultStatus::Miss) {
             const THandleState state =
                 THandleState::FromRaw(cacheOp.Handles()[item.Index()].State.load(std::memory_order_acquire));
             if (!item.Matches(state) || !state.IsCollectionKind() || !state.IsReady()) {
@@ -280,8 +272,7 @@ bool TSharedCache::CanAllocateHandles(TArrayRef<const TCacheHandleRequirement> r
                 continue;
             }
             TCacheItem present;
-            missing +=
-                !collection || cacheOp.Find(TCacheKey::Page(collection, offset), present) == ECacheResultStatus::Miss;
+            missing += !collection || cacheOp.FindPage(collection, offset, present) == ECacheResultStatus::Miss;
         }
     }
     return missing <= cacheOp.SpaceOperation().AvailableHandleCount();
@@ -312,7 +303,7 @@ bool TSharedCache::WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheIte
         auto [it, first] = pages.try_emplace(requirement.CollectionId);
         if (first) {
             TCacheItem current;
-            if (cacheOp.Find(TCacheKey::Collection(requirement.CollectionId), current) == ECacheResultStatus::Miss ||
+            if (cacheOp.FindCollection(requirement.CollectionId, current) == ECacheResultStatus::Miss ||
                 !collections.contains(current.Raw())) {
                 exceeds |= ++handles > handleLimit;
             }
@@ -579,38 +570,13 @@ TCacheItemRef TSharedCache::AcquirePageItem(TSpaceOperation& spaceOp, TPageCache
 }
 
 SHARED_CACHE_TEMPLATE
-ECacheResultStatus TSharedCache::Find(
-    TCollectionCacheItem collection, ui64 offset, TCachePageRefImpl<TTraits>& page) noexcept {
-    page.Drop();
-    auto cacheOp = BeginOperation();
-    TOperationItemRef ref(cacheOp);
-    const ECacheResultStatus status = cacheOp.Find(TCacheKey::Page(collection, offset), ref.Get());
-    if (status == ECacheResultStatus::Hit) {
-        page = cacheOp.BuildPageRef(ref.Take());
-    }
-    return status;
-}
-
-SHARED_CACHE_TEMPLATE
-ECacheResultStatus TSharedCache::Find(const TLogoBlobID& id, TCacheCollectionRef& collection) noexcept {
-    collection.Drop();
-    auto cacheOp = BeginOperation();
-    TOperationItemRef ref(cacheOp);
-    const ECacheResultStatus status = cacheOp.Find(TCacheKey::Collection(id), ref.Get());
-    if (status == ECacheResultStatus::Hit) {
-        collection = cacheOp.BuildCollectionRef(ref.Take());
-    }
-    return status;
-}
-
-SHARED_CACHE_TEMPLATE
 ECacheCollectionLookupStatus TSharedCache::FindCollection(
     TCollectionRegistry& registry, const TLogoBlobID& id, TCacheCollectionRef& collection) noexcept {
     collection.Drop();
     auto cacheOp = BeginOperation();
     for (;;) {
         TCacheItem item;
-        if (cacheOp.Find(TCacheKey::Collection(id), item) == ECacheResultStatus::Miss) {
+        if (cacheOp.FindCollection(id, item) == ECacheResultStatus::Miss) {
             return ECacheCollectionLookupStatus::Miss;
         }
         InvokeHook(ECacheHookPoint::BeforeCollectionRefAcquired, item);
@@ -648,29 +614,6 @@ bool TSharedCache::AttachCollection(
         return false;
     }
     return cacheOp.Collections().Attach(registry, item);
-}
-
-SHARED_CACHE_TEMPLATE
-ECacheResultStatus TSharedCache::Find(TOperationView& cacheOp, const TCacheKey& key, TCacheItemRef& ref) noexcept {
-    for (;;) {
-        TCacheItem cacheItem;
-        const ECacheResultStatus status = cacheOp.Find(key, cacheItem);
-        if (status == ECacheResultStatus::Miss) {
-            return ECacheResultStatus::Miss;
-        }
-        Y_DEBUG_ABORT_UNLESS(status == ECacheResultStatus::Hit);
-        TOperationItemRef acquired(cacheOp.SpaceOperation());
-        switch (cacheOp.TryAcquire(cacheItem, false, acquired.Get())) {
-            case EAcquireStatus::Stale:
-                continue;
-            case EAcquireStatus::Pending:
-                return ECacheResultStatus::Pending;
-            case EAcquireStatus::Ready:
-                ref = acquired.Take();
-                return ECacheResultStatus::Hit;
-        }
-        Y_UNREACHABLE();
-    }
 }
 
 SHARED_CACHE_TEMPLATE
@@ -853,8 +796,9 @@ bool TSharedCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollection& colle
         // Only pages that are absent from the table need admission budget: a page that is already resident is
         // a hit or a pending subscription and must be admitted even when the cache is at its limit.
         TCacheItem resident;
-        candidate.Prepare = cacheOp.Find(candidate.Key, resident) == ECacheResultStatus::Miss &&
-                            preparedOffsets.insert(static_cast<ui64>(request.Location.Offset)).second;
+        candidate.Prepare =
+            cacheOp.FindPage(collection.CacheItem, candidate.Key.Word(1), resident) == ECacheResultStatus::Miss &&
+            preparedOffsets.insert(static_cast<ui64>(request.Location.Offset)).second;
         if (candidate.Prepare) {
             const ui64 pageBytes = TCacheItems<TTraits>::AccountedPageBytes(candidate.Size);
             if (reservedBytes > Max<ui64>() - pageBytes) {
@@ -1037,7 +981,7 @@ ECacheResultStatus TSharedCache::FindOrInsert(
     for (;;) {
         typename TOperation::TInsertPosition insertPosition;
         TCacheItem cacheItem;
-        const ECacheResultStatus status = cacheOp.FindForInsert(candidate.Key, cacheItem, insertPosition);
+        const ECacheResultStatus status = cacheOp.FindForInsert(candidate, cacheItem, insertPosition);
         bool inserted = false;
         if (status == ECacheResultStatus::Miss) {
             if (candidate.CacheItem.IsNull()) {
@@ -1286,5 +1230,14 @@ void TSharedCache::ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheIte
 
 template class TSharedCacheImpl<TProdTraits>;
 template class TSharedCacheImpl<TTestTraits>;
+
+template ECacheResultStatus TSharedCacheImpl<TProdTraits>::FindOrInsert(
+    TSpaceOperation&, TSharedCacheImpl<TProdTraits>::TCacheKeyedItem<true>&, TCacheItemRefImpl<TProdTraits>&) noexcept;
+template ECacheResultStatus TSharedCacheImpl<TProdTraits>::FindOrInsert(
+    TSpaceOperation&, TSharedCacheImpl<TProdTraits>::TCacheKeyedItem<false>&, TCacheItemRefImpl<TProdTraits>&) noexcept;
+template ECacheResultStatus TSharedCacheImpl<TTestTraits>::FindOrInsert(
+    TSpaceOperation&, TSharedCacheImpl<TTestTraits>::TCacheKeyedItem<true>&, TCacheItemRefImpl<TTestTraits>&) noexcept;
+template ECacheResultStatus TSharedCacheImpl<TTestTraits>::FindOrInsert(
+    TSpaceOperation&, TSharedCacheImpl<TTestTraits>::TCacheKeyedItem<false>&, TCacheItemRefImpl<TTestTraits>&) noexcept;
 
 } // namespace NKikimr::NSharedCache
