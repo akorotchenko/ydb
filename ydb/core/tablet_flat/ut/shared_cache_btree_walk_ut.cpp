@@ -54,6 +54,14 @@ namespace {
             return 0;
         }
 
+        i64 GetMetadataMemoryUsage() const noexcept override {
+            return sizeof(TPageCollectionStub);
+        }
+
+        const TSharedData* GetMetadataBuffer() const noexcept override {
+            return nullptr;
+        }
+
         TPageLocation GetLocation(ui32) const override {
             return {};
         }

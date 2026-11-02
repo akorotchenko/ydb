@@ -84,6 +84,14 @@ namespace {
             return 0;
         }
 
+        i64 GetMetadataMemoryUsage() const noexcept override {
+            return sizeof(TBenchmarkCollection);
+        }
+
+        const TSharedData* GetMetadataBuffer() const noexcept override {
+            return nullptr;
+        }
+
         TPageLocation GetLocation(ui32 page) const override {
             Y_DEBUG_ABORT_UNLESS(page < Pages_);
             return TPageLocation::FromPageIndex(page, PageSize, EPage::DataPage, 0);

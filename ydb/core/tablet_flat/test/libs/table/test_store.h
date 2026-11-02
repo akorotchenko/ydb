@@ -465,6 +465,15 @@ namespace NTest {
             return Store->PageCollectionBytes(Room);
         }
 
+        i64 GetMetadataMemoryUsage() const noexcept override {
+            // The backing fixture store is outside this descriptor's modeled footprint
+            return sizeof(TStorePageCollection);
+        }
+
+        const TSharedData* GetMetadataBuffer() const noexcept override {
+            return nullptr;
+        }
+
         NTable::NPage::TPageLocation GetLocation(ui32 pageId) const override {
             return Store->GetPageLocation(Room, pageId);
         }
