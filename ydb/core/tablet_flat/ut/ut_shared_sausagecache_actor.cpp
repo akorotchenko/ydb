@@ -112,6 +112,14 @@ struct TPageCollectionMock : public IPageCollection {
         return 10 * TotalPages;
     }
 
+    i64 GetMetadataMemoryUsage() const noexcept override {
+        return sizeof(TPageCollectionMock);
+    }
+
+    const TSharedData* GetMetadataBuffer() const noexcept override {
+        return nullptr;
+    }
+
     TPageLocation GetLocation(ui32 pageId) const override {
         return TPageLocation::FromPageIndex(pageId, 10, static_cast<EPage>(Page(pageId).Type), pageId + 1);
     }
@@ -1985,14 +1993,20 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         struct TReleaseProbe final : TSharedData::IOwner {
             using THeader = TSharedData::THeader;
+            using TPrivateHeader = TSharedData::TPrivateHeader;
 
             TRequestCompletion* Completion = nullptr;
             ui32 Releases = 0;
 
             TSharedData Allocate(size_t size) {
-                char* raw = new char[sizeof(THeader) + size];
-                new (raw) THeader(this);
-                return TSharedData::AttachUnsafe(raw + sizeof(THeader), size);
+                char* raw = new char[TSharedData::OverheadSize + size];
+                reinterpret_cast<TPrivateHeader*>(raw)->AllocSize = TSharedData::OverheadSize + size;
+                new (raw + TSharedData::PrivateHeaderSize) THeader(this);
+                return TSharedData::AttachUnsafe(raw + TSharedData::OverheadSize, size);
+            }
+
+            size_t GetAllocationSize(const char* data) const noexcept override {
+                return reinterpret_cast<const TPrivateHeader*>(data - TSharedData::OverheadSize)->AllocSize;
             }
 
             void Deallocate(char* data) noexcept override {
@@ -2011,8 +2025,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
                     other.join();
                 }
                 ++Releases;
-                char* raw = data - sizeof(THeader);
-                reinterpret_cast<THeader*>(raw)->~THeader();
+                reinterpret_cast<THeader*>(data - sizeof(THeader))->~THeader();
+                char* raw = data - TSharedData::OverheadSize;
                 delete[] raw;
             }
         } probe;

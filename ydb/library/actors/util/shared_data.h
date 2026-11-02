@@ -5,12 +5,21 @@
 #include <util/system/types.h>
 #include <util/system/compiler.h>
 #include <util/generic/array_ref.h>
+#include <util/generic/ptr.h>
 
 #include <atomic>
+#include <utility>
+
+class TBackTracingOwner;
 
 namespace NActors {
 
     class TSharedData {
+        friend class ::TBackTracingOwner;
+
+        template <class TTag>
+        class TTaggedOwner;
+
     public:
         class TBuffer {
         public:
@@ -30,6 +39,13 @@ namespace NActors {
             }
 
             TSharedData Share(size_t size) const noexcept;
+            size_t GetAllocationSize() const noexcept;
+
+            template <class TTag>
+            TTag* FindAllocationTag() const noexcept;
+
+            template <class TTag, class... TArgs>
+            TTag& GetOrCreateAllocationTag(TArgs&&... args) const;
 
         private:
             friend class TSharedData;
@@ -47,6 +63,12 @@ namespace NActors {
             virtual ~IOwner() = default;
 
             virtual void Deallocate(char*) noexcept = 0;
+            // Requested allocation size, including the owner's headers
+            virtual size_t GetAllocationSize(const char* data) const noexcept = 0;
+
+            virtual void* FindAllocationTag(const void*) const noexcept {
+                return nullptr;
+            }
         };
 
         struct TPrivateHeader {
@@ -58,7 +80,7 @@ namespace NActors {
 
         struct THeader {
             std::atomic<size_t> RefCount;
-            IOwner* Owner;
+            std::atomic<IOwner*> Owner;
 
             explicit THeader(IOwner* owner)
                 : RefCount{ 1 }
@@ -132,6 +154,27 @@ namespace NActors {
         Y_FORCE_INLINE const char* end() const { return Data_ + Size_; }
 
         Y_FORCE_INLINE size_t size() const { return Size_; }
+
+        size_t GetAllocationSize() const noexcept {
+            return AllocationSize(Data_);
+        }
+
+        template <class TTag>
+        static const void* AllocationTagKey() noexcept {
+            static char key;
+            return &key;
+        }
+
+        template <class TTag>
+        TTag* FindAllocationTag() const noexcept {
+            return FindAllocationTagAt<TTag>(Data_);
+        }
+
+        // The caller owns the allocation; the tag must not retain that same allocation
+        template <class TTag, class... TArgs>
+        TTag& GetOrCreateAllocationTag(TArgs&&... args) const {
+            return GetOrCreateAllocationTagAt<TTag>(Data_, std::forward<TArgs>(args)...);
+        }
 
         /**
          * Trims data to the specified size
@@ -245,7 +288,7 @@ namespace NActors {
             if (data) {
                 auto* header = Header(data);
                 if (1 == header->RefCount.fetch_sub(1, std::memory_order_acq_rel)) {
-                    if (auto* owner = header->Owner) {
+                    if (auto* owner = header->Owner.load(std::memory_order_acquire)) {
                         owner->Deallocate(data);
                     } else {
                         Deallocate(data);
@@ -269,6 +312,13 @@ namespace NActors {
     private:
         static char* Allocate(size_t size);
         static void Deallocate(char* data) noexcept;
+        static size_t AllocationSize(const char* data) noexcept;
+
+        template <class TTag>
+        static TTag* FindAllocationTagAt(char* data) noexcept;
+
+        template <class TTag, class... TArgs>
+        static TTag& GetOrCreateAllocationTagAt(char* data, TArgs&&... args);
 
     private:
         char* Data_;
@@ -301,6 +351,20 @@ namespace NActors {
         return result;
     }
 
+    inline size_t TSharedData::TBuffer::GetAllocationSize() const noexcept {
+        return TSharedData::AllocationSize(Data_);
+    }
+
+    template <class TTag>
+    inline TTag* TSharedData::TBuffer::FindAllocationTag() const noexcept {
+        return TSharedData::FindAllocationTagAt<TTag>(Data_);
+    }
+
+    template <class TTag, class... TArgs>
+    inline TTag& TSharedData::TBuffer::GetOrCreateAllocationTag(TArgs&&... args) const {
+        return TSharedData::GetOrCreateAllocationTagAt<TTag>(Data_, std::forward<TArgs>(args)...);
+    }
+
     inline TSharedData::TBuffer TSharedData::Extract() && noexcept {
         TBuffer result(Data_);
         Data_ = nullptr;
@@ -310,4 +374,78 @@ namespace NActors {
 
     static_assert(sizeof(TSharedData::TBuffer) == sizeof(char*));
 
+    template <class TTag>
+    class TSharedData::TTaggedOwner final : public IOwner {
+    public:
+        template <class... TArgs>
+        explicit TTaggedOwner(IOwner* owner, TArgs&&... args)
+            : RealOwner(owner)
+            , Tag(std::forward<TArgs>(args)...)
+        {}
+
+        size_t GetAllocationSize(const char* data) const noexcept override {
+            return RealOwner ? RealOwner->GetAllocationSize(data)
+                             : reinterpret_cast<const TPrivateHeader*>(data - OverheadSize)->AllocSize;
+        }
+
+        void* FindAllocationTag(const void* key) const noexcept override;
+        void Deallocate(char* data) noexcept override;
+
+        // Assigned before publication and immutable afterwards
+        IOwner* RealOwner;
+        mutable TTag Tag;
+    };
+
+    template <class TTag>
+    void* TSharedData::TTaggedOwner<TTag>::FindAllocationTag(const void* key) const noexcept {
+        if (key == AllocationTagKey<TTag>()) {
+            return &Tag;
+        }
+        return RealOwner ? RealOwner->FindAllocationTag(key) : nullptr;
+    }
+
+    template <class TTag>
+    void TSharedData::TTaggedOwner<TTag>::Deallocate(char* data) noexcept {
+        auto* header = TSharedData::Header(data);
+        header->Owner.store(RealOwner, std::memory_order_relaxed);
+        if (RealOwner) {
+            RealOwner->Deallocate(data);
+        } else {
+            TSharedData::Deallocate(data);
+        }
+        delete this;
+    }
+
+    template <class TTag>
+    TTag* TSharedData::FindAllocationTagAt(char* data) noexcept {
+        if (data) {
+            if (auto* owner = Header(data)->Owner.load(std::memory_order_acquire)) {
+                return static_cast<TTag*>(owner->FindAllocationTag(AllocationTagKey<TTag>()));
+            }
+        }
+        return nullptr;
+    }
+
+    template <class TTag, class... TArgs>
+    TTag& TSharedData::GetOrCreateAllocationTagAt(char* data, TArgs&&... args) {
+        Y_ABORT_UNLESS(data);
+        auto* header = Header(data);
+        auto* owner = header->Owner.load(std::memory_order_acquire);
+        THolder<TTaggedOwner<TTag>> candidate;
+        for (;;) {
+            if (owner) {
+                if (auto* tag = owner->FindAllocationTag(AllocationTagKey<TTag>())) {
+                    return *static_cast<TTag*>(tag);
+                }
+            }
+            if (!candidate) {
+                candidate = MakeHolder<TTaggedOwner<TTag>>(owner, std::forward<TArgs>(args)...);
+            }
+            candidate->RealOwner = owner;
+            if (header->Owner.compare_exchange_weak(
+                    owner, candidate.Get(), std::memory_order_acq_rel, std::memory_order_acquire)) {
+                return candidate.Release()->Tag;
+            }
+        }
+    }
 }

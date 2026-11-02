@@ -78,6 +78,36 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         return meta.Finish();
     }
 
+    Y_UNIT_TEST(DescriptorEmbeddedMetadataIsCountedOnce)
+    {
+        TRecord record(0);
+        auto raw = record.Finish();
+        const TLargeGlobId id(0, TLogoBlobID(10, 20, 30, 1, raw.size(), 0), raw.size());
+        const TPageCollection collection(id, raw);
+        const IPageCollection& descriptor = collection;
+        UNIT_ASSERT_VALUES_EQUAL(
+            descriptor.GetMetadataMemoryUsage(), sizeof(TPageCollection) + raw.GetAllocationSize());
+        UNIT_ASSERT(descriptor.GetMetadataBuffer() == &collection.Meta.Raw);
+    }
+
+    Y_UNIT_TEST(DescriptorMemoryFootprintTracksRetainedAllocation)
+    {
+        auto raw = MakeMeta();
+        const TLargeGlobId id(0, TLogoBlobID(10, 20, 30, 1, raw.size(), 0), raw.size());
+        const TPageCollection first(id, raw);
+        const TOuterPageCollection second(id, raw);
+        UNIT_ASSERT_VALUES_EQUAL(first.GetMetadataMemoryUsage(),
+            sizeof(TPageCollection) + Blobs.size() * sizeof(ui64) + raw.GetAllocationSize());
+        UNIT_ASSERT_VALUES_EQUAL(second.GetMetadataMemoryUsage(), first.GetMetadataMemoryUsage());
+        UNIT_ASSERT(first.Meta.Raw.data() == second.Meta.Raw.data());
+
+        auto oversized = TSharedData::Uninitialized(raw.size() + 4096);
+        ::memcpy(oversized.mutable_data(), raw.data(), raw.size());
+        oversized.TrimBack(raw.size());
+        const TPageCollection retained(id, std::move(oversized));
+        UNIT_ASSERT_VALUES_EQUAL(retained.GetMetadataMemoryUsage(), first.GetMetadataMemoryUsage() + 4096);
+    }
+
     Y_UNIT_TEST(Align)
     {
         const std::array<ui64, 3> steps = {{ 200, 500, 1000 }};
@@ -582,6 +612,9 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
 
         auto blob = writer.Make();
         NTable::NPage::TExtBlobs extBlobs(blob, TLogoBlobID(1, 2, 3, 1, blob.size(), 0));
+        UNIT_ASSERT_VALUES_EQUAL(
+            extBlobs.GetMetadataMemoryUsage(), sizeof(NTable::NPage::TExtBlobs) + blob.GetAllocationSize());
+        UNIT_ASSERT(extBlobs.GetMetadataBuffer() == &extBlobs.Raw);
 
         // For independently addressed blobs, Offset equals pageId (index in Array)
         //   0:   0,  1:   1,  2:   2,  3:   3,  4:   4

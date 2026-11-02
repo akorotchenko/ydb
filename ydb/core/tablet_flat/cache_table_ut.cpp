@@ -882,6 +882,14 @@ namespace {
             return BackingSize_;
         }
 
+        i64 GetMetadataMemoryUsage() const noexcept override {
+            return sizeof(TTestPageCollection);
+        }
+
+        const TSharedData* GetMetadataBuffer() const noexcept override {
+            return nullptr;
+        }
+
         NTable::NPage::TPageLocation GetLocation(ui32) const override {
             return {};
         }
