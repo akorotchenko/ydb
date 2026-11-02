@@ -4,9 +4,12 @@
 #include <shared_cache_counters.h>
 #include <util/system/sanitizers.h>
 #include <ydb/core/base/counters.h>
+#include <ydb/core/tablet/resource_broker.h>
 #include <ydb/core/cms/console/console.h>
 #include <ydb/core/testlib/actors/block_events.h>
 #include <ydb/core/testlib/actors/wait_events.h>
+
+#include <deque>
 
 namespace NKikimr::NSharedCache {
 
@@ -2211,6 +2214,256 @@ Y_UNIT_TEST(ResourcePressurePostponesTransactionAndRetriesReads) {
     }, TDuration::Seconds(10));
     UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 1);
     UNIT_ASSERT(retried.size() > 2);
+}
+
+struct TResourceTerminationState {
+    ui32 Executions = 0;
+    ui32 Terminations = 0;
+    bool Completed = false;
+    bool Destroyed = false;
+};
+
+struct TTxReadRowsWithResourceTermination : TTxReadRows {
+    TTxReadRowsWithResourceTermination(
+        TVector<i64> keys, TRetriedCounters& retried, TResourceTerminationState& state, ui32 prefixRows = 0)
+        : TTxReadRows(std::move(keys), retried, state.Completed)
+        , State(state)
+        , PrefixRows(prefixRows)
+    {}
+
+    ~TTxReadRowsWithResourceTermination() override {
+        State.Destroyed = true;
+    }
+
+    bool Execute(TTransactionContext& txc, const TActorContext& ctx) override {
+        ++State.Executions;
+        if (!PrefixRows) {
+            return TTxReadRows::Execute(txc, ctx);
+        }
+        if (!MemoryRequested) {
+            MemoryRequested = true;
+            txc.RequestMemory(1_MB);
+            return false;
+        }
+        bool ready = true;
+        for (ui32 index = 0; index < Keys.size(); ++index) {
+            const i64 key = Keys[index];
+            const TRawTypeValue rawKey[] = { TRawTypeValue(&key, sizeof(key), NScheme::TInt64::TypeId) };
+            const NTable::TTag tags[] = { KeyColumnId, ValueColumnId };
+            NTable::TRowState row;
+            const auto status = txc.DB.Select(TableId, rawKey, tags, row);
+            if (status == NTable::EReady::Page) {
+                if (index < PrefixRows) {
+                    return false;
+                }
+                ready = false;
+            } else {
+                UNIT_ASSERT(status == NTable::EReady::Data);
+                UNIT_ASSERT_VALUES_EQUAL(row.Get(0).AsValue<i64>(), key);
+                UNIT_ASSERT_VALUES_EQUAL(row.Get(1).AsBuf(), TString(96, 'x'));
+            }
+        }
+        return ready;
+    }
+
+    void Terminate(ETerminationReason reason, const TActorContext& ctx) override {
+        UNIT_ASSERT(reason == ETerminationReason::MemoryLimitExceeded);
+        ++State.Terminations;
+        ctx.Send(ctx.SelfID, new NFake::TEvReturn);
+    }
+
+    TResourceTerminationState& State;
+    const ui32 PrefixRows;
+    bool MemoryRequested = false;
+};
+
+void CheckOversizedTransactionResult(bool pressure, bool grantFirst, bool cancel = false) {
+    TRetriedCounters retried;
+    TResourceTerminationState state;
+    ui64 transactionId = 0;
+    bool cancelled = false;
+    TMyEnvBase env;
+    BasicSetup(env);
+    TBlockEvents<NSharedCache::TEvRequest> requests(env.Env);
+    env.SendAsync(new NFake::TEvCall([&](NFlatExecutorSetup::IExecutor* executor, const TActorContext&) {
+        TAutoPtr<ITransaction> transaction(new TTxReadRowsWithResourceTermination({ 33, 66 }, retried, state));
+        transactionId = executor->Enqueue(std::move(transaction));
+    }));
+    env.Env.WaitFor("first transaction page request", [&] {
+        return requests.size() == 1;
+    }, TDuration::Seconds(10));
+    requests.Unblock();
+    env.Env.WaitFor("transaction page request with retained pins", [&] {
+        return requests.size() == 1;
+    }, TDuration::Seconds(10));
+    auto request = requests.front();
+    requests.pop_front();
+    requests.Stop();
+    const auto pad = request->Get()->WaitPad;
+    UNIT_ASSERT(pad && pad->RetainedCollections.empty());
+    UNIT_ASSERT(pad->HasPinnedPages.load(std::memory_order_acquire));
+    const ui32 executions = state.Executions;
+    const auto reply = [&](bool oversized, bool ready, bool resourcePressure) {
+        auto result = MakeHolder<NSharedCache::TEvResult>(request->Get()->PageCollection,
+            ready       ? NKikimrProto::OK
+            : oversized ? NKikimrProto::ERROR
+                        : NKikimrProto::RACE, request->Get()->Cookie, 0, 0, true);
+        result->WaitPad = pad;
+        result->WorkingSetTooLarge = oversized;
+        result->ResourcesReady = ready;
+        result->ResourcePressure = resourcePressure;
+        env.Env.Send(
+            new IEventHandle(request->Sender, MakeSharedPageCacheId(), result.Release(), 0, request->Cookie), 0, true);
+    };
+    using TAllocation = NResourceBroker::TEvResourceBroker::TEvResourceAllocated;
+    std::deque<TAllocation::TPtr> allocations;
+    bool holdAllocations = true;
+    auto allocationObserver = env.Env.AddObserver<TAllocation>([&](auto& ev) {
+        if (holdAllocations && ev->GetRecipientRewrite() == request->Sender && ev->Get()->Cookie) {
+            allocations.push_back(std::move(ev));
+        }
+    });
+    const auto grant = [&] {
+        TWaitForFirstEvent<TAllocation> delivered(env.Env, [&](const auto& ev) {
+            return ev->GetRecipientRewrite() == request->Sender && bool(ev->Get()->Cookie);
+        });
+        holdAllocations = false;
+        while (!allocations.empty()) {
+            const ui32 nodeIndex = allocations.front()->GetRecipientRewrite().NodeId() - env.Env.GetFirstNodeId();
+            env.Env.Send(allocations.front().Release(), nodeIndex, true);
+            allocations.pop_front();
+        }
+        delivered.Wait(TDuration::Seconds(10));
+    };
+    if (pressure) {
+        reply(false, false, true);
+        env.Env.WaitFor("transaction broker allocation is pending", [&] {
+            return allocations.size() == 1;
+        }, TDuration::Seconds(10));
+        if (grantFirst) {
+            grant();
+        }
+    }
+    if (cancel) {
+        env.SendAsync(new NFake::TEvCall([&](NFlatExecutorSetup::IExecutor* executor, const TActorContext&) {
+            cancelled = executor->CancelTransaction(transactionId);
+        }));
+        env.Env.WaitFor("pending transaction is cancelled", [&] {
+            return cancelled;
+        }, TDuration::Seconds(10));
+    }
+    TWaitForFirstEvent<NSharedCache::TEvResult> refused(env.Env, [&](const auto& ev) {
+        return ev->GetRecipientRewrite() == request->Sender && ev->Get()->WorkingSetTooLarge &&
+               ev->Get()->WaitPad == pad;
+    });
+    reply(true, false, false);
+    refused.Wait(TDuration::Seconds(10));
+    if (pressure && !grantFirst) {
+        UNIT_ASSERT(!state.Destroyed && !state.Completed);
+        UNIT_ASSERT_VALUES_EQUAL(state.Terminations, 0);
+        UNIT_ASSERT_VALUES_EQUAL(state.Executions, executions);
+        grant();
+    }
+    env.Env.WaitFor("transaction lifetime ends after resource refusal", [&] {
+        return state.Destroyed;
+    }, TDuration::Seconds(10));
+    UNIT_ASSERT(!state.Completed);
+    UNIT_ASSERT_VALUES_EQUAL(state.Terminations, cancel ? 0 : 1);
+    UNIT_ASSERT_VALUES_EQUAL(state.Executions, executions);
+    if (!cancel) {
+        env.WaitFor<TEvents::TEvWakeup>();
+    }
+    reply(false, true, false);
+    reply(true, false, false);
+    if (!pressure) {
+        reply(false, false, false);
+    }
+    holdAllocations = false;
+    env.Env.SimulateSleep(TDuration::MilliSeconds(10));
+    bool healthyCompleted = false;
+    TRetriedCounters healthyRetried;
+    env.SendSync(new NFake::TEvExecute{ new TTxReadRows(TVector<i64>{ 33 }, healthyRetried, healthyCompleted) });
+    UNIT_ASSERT(healthyCompleted);
+    UNIT_ASSERT_VALUES_EQUAL(state.Terminations, cancel ? 0 : 1);
+}
+
+Y_UNIT_TEST(ReviewR40OversizedWorkingSetTerminatesWhileWaitingForPages) {
+    CheckOversizedTransactionResult(false, false);
+}
+
+Y_UNIT_TEST(ReviewR40OversizedWorkingSetWaitsForPendingMemoryAllocation) {
+    CheckOversizedTransactionResult(true, false);
+}
+
+Y_UNIT_TEST(ReviewR40OversizedWorkingSetTerminatesAfterMemoryAllocation) {
+    CheckOversizedTransactionResult(true, true);
+}
+
+Y_UNIT_TEST(ReviewR40CancellationWinsWhileOversizedWaitsForMemory) {
+    CheckOversizedTransactionResult(true, false, true);
+}
+
+Y_UNIT_TEST(ReviewR40TransactionHandleWorkingSetIsRejectedEndToEnd) {
+    TRetriedCounters retried;
+    TResourceTerminationState state;
+    TMyEnvBase env;
+    env->GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndex(true);
+    env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
+    auto init = MakeHolder<TTxInitSchema>();
+    init->CompactionPolicy->MinDataPageSize = 128;
+    env.SendSync(new NFake::TEvExecute{ init.Release() });
+    SetupSharedCache(env, 128_KB, true, 0, 0);
+    auto& cache = TSharedCache::Get();
+    const ui64 handleLimit = cache.TargetHandleCount() - 2;
+    const ui32 rows = handleLimit + 32;
+    for (ui32 key = 0; key < rows; ++key) {
+        env.SendSync(new NFake::TEvExecute{ new TTxWriteRow(key, TString(96, 'x')) });
+    }
+    env.SendSync(new NFake::TEvCompact(TableId));
+    env.WaitFor<NFake::TEvCompacted>();
+    env.Env.WaitFor("small cache capacity is stable", [&] {
+        return !cache.NeedsCapacityMaintenance();
+    }, TDuration::Seconds(10));
+    bool oversized = false;
+    ui64 requiredHandles = 0;
+    auto requests = env.Env.AddObserver<NSharedCache::TEvRequest>([&](auto& ev) {
+        if (ev->Get()->WaitPad) {
+            UNIT_ASSERT(ev->Get()->WaitPad->RetainedCollections.empty());
+            UNIT_ASSERT_LE(ev->Get()->Pages.size(), cache.TargetHandleCount() - TSharedCache::RequestHandleOverhead);
+        }
+    });
+    auto results = env.Env.AddObserver<NSharedCache::TEvResult>([&](auto& ev) {
+        if (!ev->Get()->WorkingSetTooLarge) {
+            return;
+        }
+        oversized = true;
+        const auto& pad = ev->Get()->WaitPad;
+        UNIT_ASSERT(pad && pad->RetainedCollections.empty());
+        UNIT_ASSERT_LT(pad->WorkingSetBytes, cache.CurrentLimit());
+        requiredHandles = pad->WorkingSetPages.size();
+        for (const auto& [_, pages] : pad->WorkingSetPages) {
+            THashSet<ui64> offsets;
+            for (const auto& page : pages) {
+                offsets.insert(static_cast<ui64>(page.Offset));
+            }
+            requiredHandles += offsets.size();
+        }
+    });
+    TVector<i64> keys;
+    for (ui32 key = 0; key < rows; ++key) {
+        keys.push_back(key);
+    }
+    // Each batch fits alone; retaining the prefix makes the second batch exceed handle capacity
+    env.SendAsync(new NFake::TEvExecute{
+        new TTxReadRowsWithResourceTermination(std::move(keys), retried, state, handleLimit / 2) });
+    env.Env.WaitFor("oversized transaction receives its real terminal result", [&] {
+        return state.Terminations || state.Completed;
+    }, TDuration::Seconds(20));
+    UNIT_ASSERT(oversized);
+    UNIT_ASSERT_GT(requiredHandles, handleLimit);
+    UNIT_ASSERT_VALUES_EQUAL(state.Terminations, 1);
+    UNIT_ASSERT(state.Destroyed && !state.Completed);
+    env.WaitFor<TEvents::TEvWakeup>();
 }
 
 Y_UNIT_TEST(ReviewR14ExecutorPublishesStickyPinsOnNextAttempt) {
