@@ -8266,10 +8266,12 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                         UNIT_ASSERT(bound <= oldOp.View().Tiers[ECacheTier::Regular].HotStorage.SlotCount);
                     }
                 });
+                UNIT_ASSERT(!TCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
             });
 
             UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(0));
             UNIT_ASSERT(fixture.Cache->UpdateCurrentLimit(target.Limit));
+            UNIT_ASSERT(TCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
             TCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
                 const auto before = TCacheTestAccess::HotPolicy(*fixture.Cache, spaceOp);
                 UNIT_ASSERT(TCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
@@ -8371,6 +8373,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(TCacheTestAccess::BeginBucketResize(*fixture.Cache, target.AddressBits));
             CompleteBucketResize(*fixture.Cache, *fixture.Space);
             UNIT_ASSERT(TCacheTestAccess::PublishFinalView(*fixture.Cache, transition));
+            UNIT_ASSERT(TCacheTestAccess::TryDrainTransition(*fixture.Cache, transition));
+            const ui32 publishedGeneration = TCacheTestAccess::CurrentSpaceState(*fixture.Space).Generation();
 
             auto commitLock = TCacheTestAccess::LockHotResize(*fixture.Cache);
             UNIT_ASSERT(commitLock);
@@ -8384,6 +8388,9 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                     NSharedCache::TlsCacheHazard = nullptr;
                 };
                 TCacheTestAccess::WithSpace(*fixture.Cache, [&](TSpaceOperation& spaceOp) {
+                    if (spaceOp.EntryGeneration() != publishedGeneration) {
+                        policyValid.store(false, std::memory_order_relaxed);
+                    }
                     ready.store(true, std::memory_order_release);
                     do {
                         const auto policy = TCacheTestAccess::HotPolicy(*fixture.Cache, spaceOp);

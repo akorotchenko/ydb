@@ -104,9 +104,8 @@ namespace NDetail {
     }
 
     template <bool IsPage>
-    Y_FORCE_INLINE bool CacheKeysEqual(const TCacheKey& left, const TCacheKey& right) noexcept {
-        constexpr EItemKind rightKind = IsPage ? EItemKind::Page : EItemKind::Collection;
-        return left.Kind() == rightKind && left.Word(0) == right.Word(0) && left.Word(1) == right.Word(1) &&
+    Y_FORCE_INLINE bool CacheKeyWordsEqual(const TCacheKey& left, const TCacheKey& right) noexcept {
+        return left.Word(0) == right.Word(0) && left.Word(1) == right.Word(1) &&
                (IsPage || left.Word(2) == right.Word(2));
     }
 
@@ -372,7 +371,7 @@ restart:
             goto restart;
         }
         const TCacheKey itemKey = TCacheKey::FromWords(state.Kind(), key0, key1, key2);
-        if (Y_LIKELY(NDetail::CacheKeysEqual<IsPage>(itemKey, key))) {
+        if (Y_LIKELY(IsPage == state.IsPageKind() && NDetail::CacheKeyWordsEqual<IsPage>(itemKey, key))) {
             result.Equal = !tombstone;
             return true;
         }
