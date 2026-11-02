@@ -76,6 +76,7 @@ private:
     void WakeParserWaits();
     void Advance(TLoad& load);
     bool CheckWaiters(TLoad& load);
+    bool RejectOversizedWaiters(TLoad& load);
     void Deliver(TLoad& load);
     void Retain(TLoad& load);
     void Forget(const TLoad& load, const TWaiter& waiter);

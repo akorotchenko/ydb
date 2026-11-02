@@ -3,6 +3,8 @@
 #include "flat_sausage_solid.h"
 #include "shared_cache_events.h"
 
+#include <util/generic/hash_set.h>
+
 #include <atomic>
 
 namespace NKikimr::NSharedCache {
@@ -13,14 +15,34 @@ enum class ECollectionLoadKind {
     Outer,
 };
 
+class TCollectionLoadWorkingSet : public TThrRefBase {
+public:
+    // Only the owning mailbox adds identities; the cache actor reads the published count
+    bool AddCollection(const TLogoBlobID& id);
+
+    ui64 CollectionCount() const noexcept {
+        return CollectionCount_.load(std::memory_order_acquire);
+    }
+
+private:
+    THashSet<TLogoBlobID> Collections_;
+    std::atomic<ui64> CollectionCount_ = 0;
+};
+
 // Cancellation and role resolution may precede delivery of the request event
 class TCollectionRequest : public TThrRefBase {
 public:
     explicit TCollectionRequest(const NPageCollection::TLargeGlobId& descriptor,
-        ECollectionLoadKind kind = ECollectionLoadKind::Unknown) noexcept
+        ECollectionLoadKind kind = ECollectionLoadKind::Unknown,
+        TIntrusivePtr<TCollectionLoadWorkingSet> workingSet = {})
         : Descriptor(descriptor)
+        , WorkingSet(std::move(workingSet))
         , Kind_(kind)
-    {}
+    {
+        if (WorkingSet) {
+            WorkingSet->AddCollection(Descriptor.Lead);
+        }
+    }
 
     ECollectionLoadKind Kind() const noexcept {
         return Kind_.load(std::memory_order_acquire);
@@ -38,6 +60,7 @@ public:
     }
 
     const NPageCollection::TLargeGlobId Descriptor;
+    const TIntrusivePtr<TCollectionLoadWorkingSet> WorkingSet;
 
 private:
     friend class TCollectionLoadController;
@@ -61,12 +84,17 @@ struct TEvCollectionRequest : public TEventLocal<TEvCollectionRequest, EvCollect
     {}
 };
 
-// A hint to re-read the request's durable cancellation/role state
+// A hint to re-read durable request or shared working-set state
 struct TEvCollectionRequestUpdate : public TEventLocal<TEvCollectionRequestUpdate, EvCollectionRequestUpdate> {
     TIntrusivePtr<TCollectionRequest> Request;
+    TIntrusivePtr<TCollectionLoadWorkingSet> WorkingSet;
 
     explicit TEvCollectionRequestUpdate(TIntrusivePtr<TCollectionRequest> request) noexcept
         : Request(std::move(request))
+    {}
+
+    explicit TEvCollectionRequestUpdate(TIntrusivePtr<TCollectionLoadWorkingSet> workingSet) noexcept
+        : WorkingSet(std::move(workingSet))
     {}
 };
 

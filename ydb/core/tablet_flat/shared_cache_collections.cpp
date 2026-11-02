@@ -4,6 +4,7 @@
 #include <ydb/library/actors/core/actor.h>
 
 #include <util/generic/algorithm.h>
+#include <util/string/builder.h>
 
 #include <utility>
 
@@ -20,6 +21,14 @@ namespace {
     }
 
 } // anonymous namespace
+
+bool TCollectionLoadWorkingSet::AddCollection(const TLogoBlobID& id) {
+    if (!id || !Collections_.insert(id).second) {
+        return false;
+    }
+    CollectionCount_.store(Collections_.size(), std::memory_order_release);
+    return true;
+}
 
 bool TCollectionRequest::Resolve(ECollectionLoadKind kind) noexcept {
     if (kind != ECollectionLoadKind::Regular && kind != ECollectionLoadKind::Outer) {
@@ -191,6 +200,20 @@ bool TCollectionLoadController::CheckWaiters(TLoad& load) {
     return true;
 }
 
+bool TCollectionLoadController::RejectOversizedWaiters(TLoad& load) {
+    const ui64 capacity = Cache_.TargetHandleCount() - 2;
+    for (auto& waiter : load.Waiters) {
+        const auto& workingSet = waiter.Request->WorkingSet;
+        const ui64 required = workingSet ? workingSet->CollectionCount() : 0;
+        if (required > capacity && capacity == Cache_.TargetHandleCount() - 2) {
+            Reply(waiter, NKikimrProto::ERROR, {},
+                TStringBuilder() << "Collection metadata working set needs " << required
+                                 << " handles, but cache capacity is " << capacity);
+        }
+    }
+    return CheckWaiters(load);
+}
+
 void TCollectionLoadController::Advance(TLoad& load) {
     if (load.Retained) {
         if (CheckWaiters(load)) {
@@ -265,6 +288,9 @@ void TCollectionLoadController::Advance(TLoad& load) {
             Queue(load);
             return;
         case ECacheResultStatus::Miss:
+            if (!RejectOversizedWaiters(load)) {
+                return;
+            }
             ResourceWaits_.insert(load.Descriptor.Lead);
             return;
     }
