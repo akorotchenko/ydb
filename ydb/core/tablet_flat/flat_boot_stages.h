@@ -124,7 +124,29 @@ namespace NBoot {
                 Back->Redo = new NRedo::TQueue(std::move(Back->Edges));
             }
 
-            for (auto &se: std::exchange(Back->Switches, { })) {
+            auto switches = std::exchange(Back->Switches, {});
+            auto workingSet = MakeIntrusive<NSharedCache::TCollectionLoadWorkingSet>();
+            for (const auto& se : switches) {
+                if (!Back->DatabaseImpl->Get(se.Table, false)) {
+                    continue;
+                }
+                const auto& schema = Back->DatabaseImpl->Scheme->Tables.at(se.Table);
+                const auto include = [&](const auto& bundles) {
+                    for (const auto& bundle : bundles) {
+                        if (!bundle.Load || (schema.ColdBorrow && !bundle.Deltas &&
+                                                bundle.LargeGlobIds[0].Lead.TabletID() != Back->Tablet)) {
+                            continue;
+                        }
+                        for (const auto& descriptor : bundle.LargeGlobIds) {
+                            workingSet->AddCollection(descriptor.Lead);
+                        }
+                    }
+                };
+                include(se.Bundles);
+                include(se.MovedBundles);
+            }
+
+            for (auto& se : switches) {
                 auto &wrap = Back->DatabaseImpl->Get(se.Table, false);
 
                 if (!wrap) {
@@ -154,7 +176,7 @@ namespace NBoot {
                                 continue;
                             }
 
-                            Pending += Spawn<TBundleLoadStep>(se.Table, bundle);
+                            Pending += Spawn<TBundleLoadStep>(se.Table, bundle, workingSet);
                         }
                     }
                 };

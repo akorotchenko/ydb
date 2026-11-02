@@ -354,7 +354,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     void Handle(TEvCollectionRequestUpdate::TPtr& ev, const TActorContext&) {
         if (CollectionLoads) {
-            CollectionLoads->Update(*ev->Get()->Request);
+            if (const auto& request = ev->Get()->Request) {
+                CollectionLoads->Update(*request);
+            }
             RetryResourceWaits();
         }
     }

@@ -1418,15 +1418,46 @@ void TExecutor::ApplyFollowerAuxUpdate(const TString &auxBody) {
     }
 }
 
+TPendingPartSwitch& TExecutor::NewPartSwitch(ui32 step) {
+    auto workingSet = !PendingPartSwitches.empty() && PendingPartSwitches.back().Step == step
+                          ? PendingPartSwitches.back().CollectionWorkingSet
+                          : MakeIntrusive<NSharedCache::TCollectionLoadWorkingSet>();
+    auto& partSwitch = PendingPartSwitches.emplace_back();
+    partSwitch.Step = step;
+    partSwitch.CollectionWorkingSet = std::move(workingSet);
+    return partSwitch;
+}
+
+void TExecutor::PreparePartSwitchWorkingSet(TPendingPartSwitch& partSwitch) {
+    if (PartSwitchWorkingSet == partSwitch.CollectionWorkingSet) {
+        return;
+    }
+    PartSwitchWorkingSet = partSwitch.CollectionWorkingSet;
+    // A follower's current parts remain owned until the entire front step applies
+    if (Stats->IsFollower()) {
+        for (const auto& [tableId, _] : Scheme().Tables) {
+            const auto subset = Database->Subset(tableId, NTable::TEpoch::Max(), {}, {});
+            for (const auto& part : subset->Flatten) {
+                const auto* store = part.As<NTable::TPartStore>();
+                for (const auto& collection : store->PageCollections) {
+                    PartSwitchWorkingSet->AddCollection(collection->Id());
+                }
+                if (store->Pseudo) {
+                    PartSwitchWorkingSet->AddCollection(store->Pseudo->Id());
+                }
+            }
+        }
+    }
+}
+
 void TExecutor::AddFollowerPartSwitch(
         const NKikimrExecutorFlat::TTablePartSwitch &switchProto,
         const NKikimrExecutorFlat::TFollowerPartSwitchAux::TBySwitch *aux,
         ui32 updateStep, ui32 step)
 {
-    auto& partSwitch = PendingPartSwitches.emplace_back();
+    auto& partSwitch = NewPartSwitch(step);
     partSwitch.FollowerUpdateStep = updateStep;
     partSwitch.TableId = switchProto.GetTableId();
-    partSwitch.Step = step;
 
     if (switchProto.HasIntroducedParts() && switchProto.GetIntroducedParts().BundlesSize()) {
         Y_ENSURE(aux && aux->HotBundlesSize() == switchProto.GetIntroducedParts().BundlesSize());
@@ -1511,6 +1542,7 @@ void TExecutor::CancelPendingCollectionLoads() {
         }
     }
     PendingCollectionLoads.clear();
+    PartSwitchWorkingSet.Reset();
 }
 
 void TExecutor::Handle(NSharedCache::TEvCollectionResult::TPtr& ev) {
@@ -1527,6 +1559,10 @@ void TExecutor::Handle(NSharedCache::TEvCollectionResult::TPtr& ev) {
     --stage->Pending;
     --load.Switch->PendingCollections;
     if (msg->Status != NKikimrProto::OK) {
+        if (auto logl = Logger->Log(ELnLev::Error)) {
+            logl << NFmt::Do(*this) << " Collection metadata load failed for " << msg->Request->Descriptor.Lead << ": "
+                 << msg->Error;
+        }
         if (msg->Status == NKikimrProto::NODATA) {
             GetServiceCounters(AppData()->Counters, "tablets")->GetCounter("alerts_pending_nodata", true)->Inc();
         }
@@ -1586,6 +1622,13 @@ bool TExecutor::PrepareExternalPart(TPendingPartSwitch &partSwitch, NTable::TPar
     }
 
     auto &bundle = partSwitch.NewBundles.emplace_back(std::move(pc));
+    bool changed = false;
+    for (const auto& descriptor : bundle.GetStage<TPendingPartSwitch::TMetaStage>()->Descriptors) {
+        changed |= partSwitch.CollectionWorkingSet->AddCollection(descriptor.Lead);
+    }
+    if (changed && PartSwitchWorkingSet == partSwitch.CollectionWorkingSet) {
+        Send(MakeSharedPageCacheId(), new NSharedCache::TEvCollectionRequestUpdate(partSwitch.CollectionWorkingSet));
+    }
 
     return PrepareExternalPart(partSwitch, bundle);
 }
@@ -1593,6 +1636,10 @@ bool TExecutor::PrepareExternalPart(TPendingPartSwitch &partSwitch, NTable::TPar
 bool TExecutor::PrepareExternalPart(TPendingPartSwitch &partSwitch, TPendingPartSwitch::TNewBundle &bundle) {
     if (auto* stage = bundle.GetStage<TPendingPartSwitch::TMetaStage>()) {
         if (!stage->Started) {
+            if (partSwitch.Step != PendingPartSwitches.front().Step) {
+                return true;
+            }
+            PreparePartSwitchWorkingSet(partSwitch);
             stage->Started = true;
             if (stage->RawPresent.front()) {
                 PrepareRawCollection(bundle, 0);
@@ -1613,7 +1660,8 @@ bool TExecutor::PrepareExternalPart(TPendingPartSwitch &partSwitch, TPendingPart
                                                                       : NSharedCache::ECollectionLoadKind::Regular)
                                : NSharedCache::ECollectionLoadKind::Unknown;
                 }
-                auto request = MakeIntrusive<NSharedCache::TCollectionRequest>(stage->Descriptors[slot], kind);
+                auto request = MakeIntrusive<NSharedCache::TCollectionRequest>(
+                    stage->Descriptors[slot], kind, partSwitch.CollectionWorkingSet);
                 CollectionActorSystem = TActivationContext::ActorSystem();
                 Y_ENSURE(PendingCollectionLoads
                              .emplace(request.Get(), TPendingCollectionLoad{ request, &partSwitch, &bundle, slot })
@@ -1645,6 +1693,11 @@ bool TExecutor::PrepareExternalPart(TPendingPartSwitch &partSwitch, TPendingPart
         }
 
         auto partView = bundle.Loader->Result();
+        const auto* store = partView.As<NTable::TPartStore>();
+        if (store->Pseudo && partSwitch.CollectionWorkingSet->AddCollection(store->Pseudo->Id())) {
+            Send(
+                MakeSharedPageCacheId(), new NSharedCache::TEvCollectionRequestUpdate(partSwitch.CollectionWorkingSet));
+        }
         bundle.Loader.reset();
         bundle.Stage.emplace<TPendingPartSwitch::TResultStage>(std::move(partView));
         return false;
@@ -1756,8 +1809,18 @@ void TExecutor::AdvancePendingPartSwitches() {
 bool TExecutor::ApplyReadyPartSwitches() {
     while (PendingPartSwitches) {
         auto step = PendingPartSwitches.front().Step;
+        for (auto& partSwitch : PendingPartSwitches) {
+            if (partSwitch.Step != step) {
+                break;
+            }
+            for (auto& bundle : partSwitch.NewBundles) {
+                if (auto* stage = bundle.GetStage<TPendingPartSwitch::TMetaStage>(); stage && !stage->Started) {
+                    PrepareExternalPart(partSwitch, bundle);
+                }
+            }
+        }
         auto last = PendingPartSwitches.begin() + ReadyPartSwitches;
-        while (last != PendingPartSwitches.end() && !last->PendingBlobs && !last->PendingLoads &&
+        while (last != PendingPartSwitches.end() && last->Step == step && !last->PendingBlobs && !last->PendingLoads &&
                !last->PendingCollections) {
             ++ReadyPartSwitches;
             ++last;
@@ -1773,6 +1836,7 @@ bool TExecutor::ApplyReadyPartSwitches() {
             PendingPartSwitches.pop_front();
             --ReadyPartSwitches;
         }
+        PartSwitchWorkingSet.Reset();
     }
 
     return true;
@@ -3005,9 +3069,8 @@ void TExecutor::CommitTransactionLog(std::unique_ptr<TSeat> seat, TPageCollectio
 
         aux.MutableBySwitchAux()->Reserve(aux.BySwitchAuxSize() + env.LoanBundle.size() + env.LoanTxStatus.size());
         for (auto &loaned : env.LoanBundle) {
-            auto& partSwitch = PendingPartSwitches.emplace_back();
+            auto& partSwitch = NewPartSwitch(commit->Step);
             partSwitch.TableId = loaned->LocalTableId;
-            partSwitch.Step = commit->Step;
 
             Y_ENSURE(loaned->PartComponents.PageCollectionComponents, "Loaned PartComponents without any page collections");
 
@@ -3051,9 +3114,8 @@ void TExecutor::CommitTransactionLog(std::unique_ptr<TSeat> seat, TPageCollectio
             PrepareExternalPart(partSwitch, std::move(loaned->PartComponents));
         }
         for (auto &loaned : env.LoanTxStatus) {
-            auto& partSwitch = PendingPartSwitches.emplace_back();
+            auto& partSwitch = NewPartSwitch(commit->Step);
             partSwitch.TableId = loaned->LocalTableId;
-            partSwitch.Step = commit->Step;
 
             BorrowLogic->LoanTxStatus(
                 loaned->DataId.Lead, *loaned, commit);

@@ -116,6 +116,7 @@ private:
     NBoot::TSpawned LoadPages(NBoot::IStep*, NTable::TLoader::TFetch&& fetch);
     NBoot::TSpawned LoadCollection(NBoot::IStep*, ui32 slot, TIntrusivePtr<NSharedCache::TCollectionRequest> request);
     void UpdateCollection(const TIntrusivePtr<NSharedCache::TCollectionRequest>& request);
+    void UpdateCollectionWorkingSet(const TIntrusivePtr<NSharedCache::TCollectionLoadWorkingSet>& workingSet);
     void CancelCollectionLoads();
 
     void OnBlobLoaded(const TLogoBlobID& id, TString body, uintptr_t cookie) override;

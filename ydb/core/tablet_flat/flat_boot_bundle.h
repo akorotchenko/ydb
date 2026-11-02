@@ -20,17 +20,17 @@ namespace NBoot {
 
         TBundleLoadStep() = delete;
 
-        TBundleLoadStep(IStep *owner, ui32 table, TSwitch::TBundle &bundle)
+        TBundleLoadStep(IStep* owner, ui32 table, TSwitch::TBundle& bundle,
+            TIntrusivePtr<NSharedCache::TCollectionLoadWorkingSet> workingSet = {})
             : IStep(owner, NBoot::EStep::Bundle)
             , Table(table)
+            , WorkingSet(workingSet ? std::move(workingSet) : MakeIntrusive<NSharedCache::TCollectionLoadWorkingSet>())
             , LargeGlobIds(std::move(bundle.LargeGlobIds))
             , Legacy(std::move(bundle.Legacy))
             , Opaque(std::move(bundle.Opaque))
             , Deltas(std::move(bundle.Deltas))
             , Epoch(bundle.Epoch)
-        {
-
-        }
+        {}
 
     private: /* IStep, boot logic DSL actor interface   */
         void Start() override
@@ -55,7 +55,7 @@ namespace NBoot {
                 const auto kind = slot == 0 || slot + 1 < LargeGlobIds.size()
                                       ? NSharedCache::ECollectionLoadKind::Regular
                                       : NSharedCache::ECollectionLoadKind::Unknown;
-                Requests[slot] = MakeIntrusive<NSharedCache::TCollectionRequest>(LargeGlobIds[slot], kind);
+                Requests[slot] = MakeIntrusive<NSharedCache::TCollectionRequest>(LargeGlobIds[slot], kind, WorkingSet);
                 LeftMetas += Logic->LoadCollection(this, slot, Requests[slot]);
             }
         }
@@ -119,6 +119,10 @@ namespace NBoot {
 
             if (!LeftReads) {
                 NTable::TPartView partView = Loader->Result();
+                const auto* partStore = partView.As<NTable::TPartStore>();
+                if (partStore->Pseudo && WorkingSet->AddCollection(partStore->Pseudo->Id())) {
+                    Logic->UpdateCollectionWorkingSet(WorkingSet);
+                }
 
                 if (auto logl = Env->Logger()->Log(ELnLev::Debug)) {
                     logl
@@ -139,6 +143,7 @@ namespace NBoot {
 
     private:
         const ui32 Table = Max<ui32>();
+        TIntrusivePtr<NSharedCache::TCollectionLoadWorkingSet> WorkingSet;
 
         TAutoPtr<NTable::TLoader> Loader;
         TVector<NPageCollection::TLargeGlobId> LargeGlobIds;

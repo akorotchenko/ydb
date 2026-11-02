@@ -221,6 +221,7 @@ struct TPendingPartSwitch {
     TPendingBlobs PendingBlobs;
     size_t PendingLoads = 0;
     size_t PendingCollections = 0;
+    TIntrusivePtr<NSharedCache::TCollectionLoadWorkingSet> CollectionWorkingSet;
 
     TVector<TChangedBundle> Changed;
     TVector<TBundleDelta> Deltas;
@@ -466,6 +467,7 @@ class TExecutor
     bool HasYellowCheckInFly = false;
 
     TDeque<TPendingPartSwitch> PendingPartSwitches;
+    TIntrusivePtr<NSharedCache::TCollectionLoadWorkingSet> PartSwitchWorkingSet;
     size_t ReadyPartSwitches = 0;
 
     struct TPendingCollectionLoad {
@@ -512,6 +514,8 @@ class TExecutor
         THashSet<TLogoBlobID> reusedBundles, TLogCommit *commit);
     void UtilizeSubset(const NTable::TSubset&, TLogCommit *commit);
     bool PrepareExternalPart(TPendingPartSwitch &partSwitch, NTable::TPartComponents &&pc);
+    TPendingPartSwitch& NewPartSwitch(ui32 step);
+    void PreparePartSwitchWorkingSet(TPendingPartSwitch& partSwitch);
     bool PrepareExternalPart(TPendingPartSwitch &partSwitch, TPendingPartSwitch::TNewBundle &bundle);
     void PrepareRawCollection(TPendingPartSwitch::TNewBundle& bundle, ui32 slot);
     void CancelPendingCollectionLoads();

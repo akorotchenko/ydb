@@ -222,6 +222,11 @@ void TExecutorBootLogic::UpdateCollection(const TIntrusivePtr<NSharedCache::TCol
         NSharedCache::MakeSharedPageCacheId(), SelfId, new NSharedCache::TEvCollectionRequestUpdate(request)));
 }
 
+void TExecutorBootLogic::UpdateCollectionWorkingSet(
+    const TIntrusivePtr<NSharedCache::TCollectionLoadWorkingSet>& workingSet) {
+    Ops->Send(NSharedCache::MakeSharedPageCacheId(), new NSharedCache::TEvCollectionRequestUpdate(workingSet));
+}
+
 void TExecutorBootLogic::CancelCollectionLoads() {
     Cancelled = true;
     for (const auto& [_, load] : CollectionLoads) {

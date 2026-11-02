@@ -3,7 +3,9 @@
 #include <ydb/core/tablet_flat/cache_thread_test.h>
 #include <ydb/core/tablet_flat/flat_sausage_packet.h>
 #include <ydb/core/tablet_flat/flat_sausage_record.h>
+#include <ydb/core/tablet_flat/flat_part_loader.h>
 #include <ydb/core/base/blobstorage.h>
+#include <ydb/core/cms/console/console.h>
 #include <ydb/core/testlib/actors/block_events.h>
 #include <ydb/core/testlib/basics/appdata.h>
 #include <ydb/core/testlib/basics/runtime.h>
@@ -23,7 +25,7 @@ namespace {
     struct TCollectionFixture {
         static constexpr ui32 Group = 77;
 
-        TCollectionFixture() {
+        explicit TCollectionFixture(ui64 memoryLimit = 8_MB) {
             TCacheThreadTestAccess::Setup(Runtime);
             TAutoPtr<TAppPrepare> app = new TAppPrepare;
             Runtime.Initialize(app->Unwrap());
@@ -31,7 +33,7 @@ namespace {
             Proxy = Runtime.AllocateEdgeActor();
             Runtime.RegisterService(MakeBlobStorageProxyID(Group), Proxy);
             TSharedCacheConfig config;
-            config.SetMemoryLimit(8_MB);
+            config.SetMemoryLimit(memoryLimit);
             CacheActor = Runtime.Register(CreateSharedPageCache(config, Runtime.GetDynamicCounters()));
             Send(new TEvCacheReadyRequest);
             Runtime.GrabEdgeEvent<TEvCacheReady>(Client, TDuration::Seconds(5));
@@ -76,10 +78,10 @@ namespace {
             Runtime.Send(new IEventHandle(CacheActor, sender ? sender : Client, event, 0, cookie), 0, true);
         }
 
-        TIntrusivePtr<TCollectionRequest> Load(
-            const TMetadata& metadata, ECollectionLoadKind kind = ECollectionLoadKind::Regular, ui64 cookie = 1,
-            TActorId sender = {}) {
-            auto request = MakeIntrusive<TCollectionRequest>(metadata.Descriptor, kind);
+        TIntrusivePtr<TCollectionRequest> Load(const TMetadata& metadata,
+            ECollectionLoadKind kind = ECollectionLoadKind::Regular, ui64 cookie = 1, TActorId sender = {},
+            TIntrusivePtr<TCollectionLoadWorkingSet> workingSet = {}) {
+            auto request = MakeIntrusive<TCollectionRequest>(metadata.Descriptor, kind, std::move(workingSet));
             Send(new TEvCollectionRequest(request), cookie, sender);
             return request;
         }
@@ -158,6 +160,165 @@ namespace {
 } // anonymous namespace
 
 Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
+    Y_UNIT_TEST(WorkingSetCountsDistinctCollectionIdentities) {
+        auto workingSet = MakeIntrusive<TCollectionLoadWorkingSet>();
+        const TLogoBlobID first(50, 1, 1, 0, 64, 1);
+        const TLogoBlobID second(50, 1, 1, 0, 64, 2);
+        UNIT_ASSERT(!workingSet->AddCollection({}));
+        UNIT_ASSERT(workingSet->AddCollection(first));
+        UNIT_ASSERT(!workingSet->AddCollection(first));
+        UNIT_ASSERT(workingSet->AddCollection(second));
+        UNIT_ASSERT_VALUES_EQUAL(workingSet->CollectionCount(), 2);
+    }
+
+    Y_UNIT_TEST(CompositeLoadRejectsItsOwnRetainedMetadataPrefix) {
+        TCollectionFixture fixture(128_KB);
+        const ui64 capacity = TSharedCache::Get().TargetHandleCount() - 2;
+        auto workingSet = MakeIntrusive<TCollectionLoadWorkingSet>();
+        TVector<TMetadata> metadata;
+        for (ui32 index = 0; index <= capacity; ++index) {
+            metadata.push_back(fixture.Metadata(index + 1));
+            workingSet->AddCollection(metadata.back().Descriptor.Lead);
+        }
+        TVector<THolder<NTable::TLoader>> loaders;
+        for (ui32 index = 0; index < capacity; ++index) {
+            NTable::TPartComponents components{ .Epoch = NTable::TEpoch::Zero() };
+            components.PageCollectionComponents.resize(1);
+            components.PageCollectionComponents.front().LargeGlobId = metadata[index].Descriptor;
+            auto loader = MakeHolder<NTable::TLoader>(std::move(components));
+            auto request = fixture.Load(metadata[index], ECollectionLoadKind::Regular, index, {}, workingSet);
+            fixture.Reply(fixture.Read(metadata[index]), metadata[index]);
+            auto result = fixture.Result();
+            UNIT_ASSERT(result->Get()->Request == request);
+            loader->SetPageCollection(0, std::move(result->Get()->Collection));
+            loaders.push_back(std::move(loader));
+        }
+        const auto& last = metadata.back();
+        auto request = fixture.Load(last, ECollectionLoadKind::Regular, capacity, {}, workingSet);
+        fixture.Reply(fixture.Read(last), last);
+        auto error = fixture.Result(NKikimrProto::ERROR);
+        UNIT_ASSERT(error->Get()->Request == request);
+        UNIT_ASSERT(error->Get()->Error.Contains("working set needs"));
+        UNIT_ASSERT_VALUES_EQUAL(loaders.size(), capacity);
+        loaders.clear();
+        fixture.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.RegisteredCollections(), 0);
+
+        auto retry = fixture.Load(last);
+        fixture.Reply(fixture.Read(last), last);
+        UNIT_ASSERT(fixture.Result()->Get()->Request == retry);
+    }
+
+    Y_UNIT_TEST(OversizedWaiterDoesNotFailAFeasibleCoalescedPeer) {
+        TCollectionFixture fixture(128_KB);
+        const ui64 capacity = TSharedCache::Get().TargetHandleCount() - 2;
+        auto oversized = MakeIntrusive<TCollectionLoadWorkingSet>();
+        TVector<TCacheCollectionRef> held;
+        for (ui32 index = 0; index < capacity; ++index) {
+            const auto metadata = fixture.Metadata(index + 1);
+            oversized->AddCollection(metadata.Descriptor.Lead);
+            fixture.Load(metadata);
+            fixture.Reply(fixture.Read(metadata), metadata);
+            held.push_back(std::move(fixture.Result()->Get()->Collection));
+        }
+        const auto metadata = fixture.Metadata(capacity + 1);
+        auto bad = fixture.Load(metadata, ECollectionLoadKind::Regular, 100, {}, oversized);
+        auto feasible = MakeIntrusive<TCollectionLoadWorkingSet>();
+        const auto peer = fixture.Runtime.AllocateEdgeActor();
+        auto good = fixture.Load(metadata, ECollectionLoadKind::Regular, 200, peer, feasible);
+        const auto cancelledPeer = fixture.Runtime.AllocateEdgeActor();
+        auto cancelled = fixture.Load(metadata, ECollectionLoadKind::Regular, 300, cancelledPeer, oversized);
+        cancelled->Cancel();
+        fixture.Update(cancelled, cancelledPeer);
+        const ui32 results = fixture.Results;
+        fixture.Reply(fixture.Read(metadata), metadata);
+        const ui32 workers = fixture.ReadWorkers.size();
+        auto error = fixture.Result(NKikimrProto::ERROR);
+        UNIT_ASSERT(error->Get()->Request == bad);
+        UNIT_ASSERT(good->IsActive());
+        held.pop_back();
+        auto result = fixture.Result(NKikimrProto::OK, peer);
+        UNIT_ASSERT(result->Get()->Request == good);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.ReadWorkers.size(), workers);
+        fixture.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Results, results + 2);
+    }
+
+    Y_UNIT_TEST(WorkingSetGrowthWakesAResourceBlockedRequest) {
+        TCollectionFixture fixture(128_KB);
+        const ui64 capacity = TSharedCache::Get().TargetHandleCount() - 2;
+        TVector<TCacheCollectionRef> held;
+        for (ui32 index = 0; index < capacity; ++index) {
+            const auto metadata = fixture.Metadata(index + 1);
+            fixture.Load(metadata);
+            fixture.Reply(fixture.Read(metadata), metadata);
+            held.push_back(std::move(fixture.Result()->Get()->Collection));
+        }
+        auto workingSet = MakeIntrusive<TCollectionLoadWorkingSet>();
+        const auto metadata = fixture.Metadata(capacity + 1);
+        auto request = fixture.Load(metadata, ECollectionLoadKind::Regular, 100, {}, workingSet);
+        fixture.Reply(fixture.Read(metadata), metadata);
+        fixture.Drain();
+        UNIT_ASSERT(request->IsActive());
+        for (ui32 index = 0; index < capacity; ++index) {
+            workingSet->AddCollection(fixture.Metadata(index + 1).Descriptor.Lead);
+        }
+        fixture.Send(new TEvCollectionRequestUpdate(workingSet));
+        auto error = fixture.Result(NKikimrProto::ERROR);
+        UNIT_ASSERT(error->Get()->Request == request);
+    }
+
+    Y_UNIT_TEST(OwnedCanonicalHitSurvivesAnOversizedWorkingSet) {
+        TCollectionFixture fixture(128_KB);
+        const auto metadata = fixture.Metadata();
+        fixture.Load(metadata);
+        fixture.Reply(fixture.Read(metadata), metadata);
+        auto retained = fixture.Result();
+        auto workingSet = MakeIntrusive<TCollectionLoadWorkingSet>();
+        for (ui32 index = 0; index < TSharedCache::Get().TargetHandleCount(); ++index) {
+            workingSet->AddCollection(fixture.Metadata(index + 1).Descriptor.Lead);
+        }
+        const auto workers = fixture.ReadWorkers.size();
+        auto request = fixture.Load(metadata, ECollectionLoadKind::Regular, 100, {}, workingSet);
+        auto result = fixture.Result();
+        UNIT_ASSERT(result->Get()->Request == request);
+        UNIT_ASSERT(result->Get()->Collection.CacheItem() == retained->Get()->Collection.CacheItem());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.ReadWorkers.size(), workers);
+    }
+
+    Y_UNIT_TEST(SmallerCapacityRechecksAResourceBlockedWorkingSet) {
+        TCollectionFixture fixture;
+        auto& cache = TSharedCache::Get();
+        const ui64 capacity = cache.TargetHandleCount() - 2;
+        auto workingSet = MakeIntrusive<TCollectionLoadWorkingSet>();
+        TVector<TCacheCollectionRef> held;
+        for (ui32 index = 0; index < capacity; ++index) {
+            const auto metadata = fixture.Metadata(index + 1);
+            if (index + 1 < capacity) {
+                workingSet->AddCollection(metadata.Descriptor.Lead);
+            }
+            fixture.Load(metadata);
+            fixture.Reply(fixture.Read(metadata), metadata);
+            held.push_back(std::move(fixture.Result()->Get()->Collection));
+        }
+        const auto metadata = fixture.Metadata(capacity + 1);
+        auto request = fixture.Load(metadata, ECollectionLoadKind::Regular, 100, {}, workingSet);
+        fixture.Reply(fixture.Read(metadata), metadata);
+        fixture.Drain();
+        UNIT_ASSERT(request->IsActive());
+        UNIT_ASSERT_LE(workingSet->CollectionCount(), capacity);
+
+        auto config = MakeHolder<NConsole::TEvConsole::TEvConfigNotificationRequest>();
+        config->Record.MutableConfig()->MutableSharedCacheConfig()->SetMemoryLimit(128_KB);
+        fixture.Send(config.Release());
+        fixture.Runtime.WaitFor("smaller metadata handle target", [&] {
+            return cache.TargetHandleCount() - 2 < workingSet->CollectionCount();
+        }, TDuration::Seconds(5));
+        fixture.Send(new TEvCollectionRequestUpdate(workingSet));
+        auto error = fixture.Result(NKikimrProto::ERROR);
+        UNIT_ASSERT(error->Get()->Request == request);
+    }
+
     Y_UNIT_TEST(RejectsInvalidDescriptorBeforeLookupOrRead) {
         TCollectionFixture fixture;
         NPageCollection::TLargeGlobId descriptor;

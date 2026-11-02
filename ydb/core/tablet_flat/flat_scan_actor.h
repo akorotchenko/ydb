@@ -111,11 +111,14 @@ namespace NOps {
     private:
         class TColdPartLoader : public ::NActors::TActorBootstrapped<TColdPartLoader> {
         public:
-            TColdPartLoader(TActorId owner, TIntrusiveConstPtr<TColdPartStore> part, EPriority readPriority)
+            TColdPartLoader(TActorId owner, TIntrusiveConstPtr<TColdPartStore> part, EPriority readPriority,
+                TIntrusivePtr<NSharedCache::TCollectionLoadWorkingSet> workingSet = {})
                 : Owner(owner)
                 , Part(std::move(part))
                 , ReadPriority(readPriority)
-            { }
+                , WorkingSet(
+                      workingSet ? std::move(workingSet) : MakeIntrusive<NSharedCache::TCollectionLoadWorkingSet>())
+            {}
 
             ~TColdPartLoader() override {
                 CancelCollectionRequests();
@@ -141,7 +144,8 @@ namespace NOps {
                     const auto kind = slot == 0 || slot + 1 < Requests.size()
                                           ? NSharedCache::ECollectionLoadKind::Regular
                                           : NSharedCache::ECollectionLoadKind::Unknown;
-                    Requests[slot] = MakeIntrusive<NSharedCache::TCollectionRequest>(Part->LargeGlobIds[slot], kind);
+                    Requests[slot] =
+                        MakeIntrusive<NSharedCache::TCollectionRequest>(Part->LargeGlobIds[slot], kind, WorkingSet);
                     Send(MakeSharedPageCacheId(), new NSharedCache::TEvCollectionRequest(Requests[slot], ReadPriority),
                         0, slot);
                 }
@@ -179,6 +183,8 @@ namespace NOps {
                     return;
                 }
                 if (msg->Status != NKikimrProto::OK) {
+                    LOG_ERROR_S(*TlsActivationContext, NKikimrServices::TABLET_OPS_HOST,
+                        "Collection metadata load failed for " << Part->LargeGlobIds[slot].Lead << ": " << msg->Error);
                     return Fail();
                 }
                 try {
@@ -258,6 +264,7 @@ namespace NOps {
             TActorId Owner;
             TIntrusiveConstPtr<TColdPartStore> Part;
             EPriority ReadPriority;
+            TIntrusivePtr<NSharedCache::TCollectionLoadWorkingSet> WorkingSet;
             TVector<TIntrusivePtr<NSharedCache::TCollectionRequest>> Requests;
             TActorSystem* CacheSystem = nullptr;
             TActorId Requester;
@@ -289,8 +296,15 @@ namespace NOps {
             conf.Tablet = Args.Tablet;
 
             Cache = new TEnv(conf, Subset);
-
-
+            for (const auto& part : Subset.Flatten) {
+                const auto* store = part.As<TPartStore>();
+                for (const auto& collection : store->PageCollections) {
+                    CollectionWorkingSet->AddCollection(collection->Id());
+                }
+                if (store->Pseudo) {
+                    CollectionWorkingSet->AddCollection(store->Pseudo->Id());
+                }
+            }
         }
 
         NTable::IPages* MakeEnv() override
@@ -319,7 +333,11 @@ namespace NOps {
                 // Create a loader for this new part
                 TIntrusiveConstPtr<TColdPartStore> partStore = dynamic_cast<TColdPartStore*>(const_cast<TColdPart*>(part.Get()));
                 Y_ENSURE(partStore, "Cannot load unsupported part " << NFmt::Do(*part));
-                ColdPartLoaders[label] = RegisterWithSameMailbox(new TColdPartLoader(SelfId(), std::move(partStore), Args.ReadPrio));
+                for (const auto& descriptor : partStore->LargeGlobIds) {
+                    CollectionWorkingSet->AddCollection(descriptor.Lead);
+                }
+                ColdPartLoaders[label] = RegisterWithSameMailbox(
+                    new TColdPartLoader(SelfId(), std::move(partStore), Args.ReadPrio, CollectionWorkingSet));
             }
 
             // Return empty TPartView to signal loader is still in progress
@@ -556,6 +574,9 @@ namespace NOps {
 
             auto* partStore = partView.As<TPartStore>();
             Y_ENSURE(partStore);
+            if (partStore->Pseudo && CollectionWorkingSet->AddCollection(partStore->Pseudo->Id())) {
+                Send(MakeSharedPageCacheId(), new NSharedCache::TEvCollectionRequestUpdate(CollectionWorkingSet));
+            }
 
             Cache->AddCold(partView);
 
@@ -707,6 +728,8 @@ namespace NOps {
 
         THashMap<TLogoBlobID, TActorId> ColdPartLoaders;
         THashMap<TLogoBlobID, TPartView> ColdPartLoaded;
+        TIntrusivePtr<NSharedCache::TCollectionLoadWorkingSet> CollectionWorkingSet =
+            MakeIntrusive<NSharedCache::TCollectionLoadWorkingSet>();
 
         bool ContinueInFly = false;
 
