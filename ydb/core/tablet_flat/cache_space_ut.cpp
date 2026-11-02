@@ -2104,7 +2104,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(cursor, 3);
 
         auto current = MakeHolder<TSpaceOperation>(TCacheSpaceTestAccess::BeginOnHazard(*space, 0));
+        cursor = 0;
         UNIT_ASSERT(TCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+        UNIT_ASSERT_VALUES_EQUAL(cursor, 3);
+        UNIT_ASSERT(!(current->Hazard().State.load(std::memory_order_acquire) & SpaceHazardDrainWaiter));
         UNIT_ASSERT(TCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
         cursor = 0;
         UNIT_ASSERT(!TCacheSpaceTestAccess::TryDrainBefore(*space, 2, cursor));
@@ -2492,13 +2495,14 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT(space->PublishMigrationView(shrink));
         UNIT_ASSERT_VALUES_EQUAL(TCacheSpaceTestAccess::CurrentView(*space).AllocationLimit, small.HandleCount());
         UNIT_ASSERT_VALUES_EQUAL(TCacheSpaceTestAccess::CurrentView(*space).HandleCount, large.HandleCount());
+        UNIT_ASSERT(space->TryDrainTransition(shrink));
         {
             auto migrationOperation = space->BeginOperation();
             UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().Generation, 3);
             UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().Handles, largeHandles);
             UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().HandleCount, large.HandleCount());
             UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().AllocationLimit, small.HandleCount());
-            UNIT_ASSERT(space->TryDrainTransition(shrink));
+            UNIT_ASSERT(shrink.Phase() == ETransitionPhase::Migrate);
             CompleteEmptyBucketResize(*space, small.AddressBits);
             UNIT_ASSERT(space->PublishFinalView(shrink));
             UNIT_ASSERT_VALUES_EQUAL(migrationOperation.View().Handles, largeHandles);
