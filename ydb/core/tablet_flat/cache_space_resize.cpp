@@ -142,8 +142,12 @@ bool TCacheSpace::FinishBucketResize() noexcept {
 bool TCacheSpace::AdvanceSpaceGeneration() noexcept {
     const TSpaceState current = CurrentSpaceState();
     Y_ABORT_UNLESS(current.Generation() < MaxSpaceGeneration);
+    ui32 cursor = 0;
+    if (!TryDrainBefore(current.Generation(), cursor)) {
+        return false;
+    }
     const TSpaceState next = current.WithGeneration(current.Generation() + 1);
-    PrepareView(next.Generation(), SpaceView(current));
+    PrepareView(next, SpaceView(current));
     SpaceState_.store(next.Raw(), std::memory_order_release);
     return true;
 }
@@ -502,7 +506,7 @@ bool TCacheSpace::PublishMigrationViewImpl(TTransition& transition, TPublishMigr
     TSpaceView nextView = current;
     nextView.CopyMappings(NewestView());
     nextView.AllocationLimit = growing ? current.AllocationLimit : transition.TargetConfiguration_.HandleCount();
-    PrepareView(nextState.Generation(), nextView);
+    PrepareView(nextState, nextView);
     if constexpr (WithHook) {
         hook.Run();
     }
@@ -536,15 +540,26 @@ bool TCacheSpace::TryDrainTransition(TTransition& transition) noexcept {
 
 bool TCacheSpace::TryDrainBefore(ui32 publishedGeneration, ui32& nextHazardIndex) noexcept {
     while (nextHazardIndex < HazardSlotCount_) {
-        // Pair with registration CAS so late readers observe the published generation.
         auto& state = Hazards_[nextHazardIndex]->State;
-        ui64 hazardState = state.fetch_add(0, std::memory_order_acq_rel);
-        if (!SpaceHazardIsDrained(hazardState, publishedGeneration)) {
-            if (!state.compare_exchange_strong(hazardState, hazardState | SpaceHazardDrainWaiter,
-                    std::memory_order_acq_rel, std::memory_order_relaxed)) {
-                continue;
-            }
+        ui64 hazardState = state.load(std::memory_order_acquire);
+        if (SpaceHazardGeneration(hazardState) >= publishedGeneration) {
+            ++nextHazardIndex;
+            continue;
+        }
+        // Close cached entry in one RMW, including while the owner repeatedly enters and leaves
+        hazardState = state.fetch_or(SpaceHazardDrainWaiter, std::memory_order_acq_rel);
+        if (SpaceHazardGeneration(hazardState) >= publishedGeneration) {
+            ++nextHazardIndex;
+            continue;
+        }
+        if (SpaceHazardIsActive(hazardState)) {
             return false;
+        }
+        // Retag the idle gate before retirement so a delayed entry CAS cannot reopen the old view
+        hazardState |= SpaceHazardDrainWaiter;
+        if (!state.compare_exchange_strong(
+                hazardState, ui64{ publishedGeneration } << 32, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            continue;
         }
         ++nextHazardIndex;
     }
@@ -574,7 +589,7 @@ bool TCacheSpace::PublishFinalView(TTransition& transition) noexcept {
         retiredView.Tiers[tier].HotStorage.SlotCount = NewestView().Tiers[tier].HotStorage.SlotCount;
         retiredView.Tiers[tier].ColdStorage.SlotCount = NewestView().Tiers[tier].ColdStorage.SlotCount;
     }
-    PrepareView(retired.Generation(), retiredView);
+    PrepareView(retired, retiredView);
 
     for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
         const ui64 current = EffectiveHotSlots_[tier].load(std::memory_order_acquire);

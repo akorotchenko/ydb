@@ -40,10 +40,11 @@ bool TCacheSpace::TryMappingSize(ui64 count, ui64 itemSize, size_t& result) noex
     return true;
 }
 
-void TCacheSpace::PrepareView(ui32 generation, TSpaceView view) noexcept {
+void TCacheSpace::PrepareView(TSpaceState state, TSpaceView view) noexcept {
     Y_DEBUG_ABORT_UNLESS(S5FifoRings_ && FreeRingCursor_);
     view.Space = this;
-    view.Generation = generation;
+    view.Generation = state.Generation();
+    view.BucketMask = state.BucketMask();
     const ui64 usableHandles = view.AllocationLimit - 2;
     view.ColdMinHandles = (usableHandles + 4) / 5;
     view.ColdGrowHandles = (usableHandles * 3 + 9) / 10;
@@ -52,7 +53,7 @@ void TCacheSpace::PrepareView(ui32 generation, TSpaceView view) noexcept {
         view.Tiers[tier].EffectiveHotSlots = &EffectiveHotSlots_[tier];
     }
     view.FreeCursor = FreeRingCursor_.Get();
-    SpaceViews_[generation % SpaceViewBankCount] = view;
+    SpaceViews_[state.Generation() % SpaceViewBankCount] = view;
 }
 
 void TCacheSpace::SetTierSlotCounts(TSpaceView& view, const TCacheCapacityConfig& capacity) noexcept {
@@ -293,7 +294,6 @@ bool TCacheSpace::Initialize(
         Hazards_.push_back(hazard.get());
     }
     HazardSlotCount_ = Hazards_.size();
-    SetHazardSpace(Hazards_, this);
     HazardCount_ = threads.ThreadCount();
     Capacity_ = current;
     ReservedCapacity_ = reserved;
@@ -306,8 +306,10 @@ bool TCacheSpace::Initialize(
     initialView.HandleCount = current.HandleCount();
     initialView.AllocationLimit = current.HandleCount();
     SetTierSlotCounts(initialView, current);
-    PrepareView(0, initialView);
-    SpaceState_.store(TSpaceState::Make(0, current.AddressBits).Raw(), std::memory_order_release);
+    const TSpaceState initialState = TSpaceState::Make(0, current.AddressBits);
+    PrepareView(initialState, initialView);
+    SetHazardSpace(Hazards_, this);
+    SpaceState_.store(initialState.Raw(), std::memory_order_release);
     for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
         EffectiveHotSlots_[tier].store(current.Tiers[tier].HotSlots, std::memory_order_release);
     }
@@ -316,6 +318,24 @@ bool TCacheSpace::Initialize(
 
 ui32 TSpaceOperation::TryAllocateHandle() noexcept {
     return View().Space->TryAllocateHandleImpl<false>(*this, {});
+}
+
+TSpaceOperation TSpaceOperation::BeginSlow(
+    std::atomic<ui64>& spaceState, TSpaceHazard& hazard, const TSpaceViews& views) noexcept {
+    // Acquire the gate before reading the current view so a closed idle generation cannot reopen
+    for (;;) {
+        ui64 hazardState = hazard.State.load(std::memory_order_acquire);
+        const ui32 activeCount = SpaceHazardActiveCount(hazardState);
+        Y_DEBUG_ABORT_UNLESS(activeCount != MaxSpaceHazardActiveCount);
+        const TSpaceState entryState = TSpaceState::FromRaw(spaceState.load(std::memory_order_acquire));
+        const ui64 registeredState = activeCount ? hazardState + 1 : PackHazardState(entryState.Generation(), 1);
+        if (!hazard.State.compare_exchange_weak(
+                hazardState, registeredState, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            continue;
+        }
+        const TSpaceView& view = views[entryState.Generation() % SpaceViewBankCount];
+        return TSpaceOperation(hazard, entryState, view);
+    }
 }
 
 void TSpaceOperation::NotifyHazardDrained(TSpaceHazard& hazard) noexcept {

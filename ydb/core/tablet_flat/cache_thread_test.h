@@ -22,7 +22,8 @@ public:
 
     ~TCacheTestThreadContext() {
         Y_DEBUG_ABORT_UNLESS(NActors::TlsActivationContext == &Context_);
-        Y_DEBUG_ABORT_UNLESS(TlsCacheHazard && TlsCacheHazard->State.load(std::memory_order_relaxed) == 0);
+        Y_DEBUG_ABORT_UNLESS(
+            TlsCacheHazard && !SpaceHazardIsActive(TlsCacheHazard->State.load(std::memory_order_relaxed)));
         NActors::TlsActivationContext = nullptr;
         TlsCacheHazard = nullptr;
     }

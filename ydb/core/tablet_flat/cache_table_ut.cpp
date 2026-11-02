@@ -12,6 +12,7 @@
 
 #include <array>
 #include <atomic>
+#include <optional>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -1371,7 +1372,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         }
 
         ~TFixture() {
-            Y_DEBUG_ABORT_UNLESS(!TlsCacheHazard || TlsCacheHazard->State.load(std::memory_order_relaxed) == 0);
+            Y_DEBUG_ABORT_UNLESS(
+                !TlsCacheHazard || !SpaceHazardIsActive(TlsCacheHazard->State.load(std::memory_order_relaxed)));
             TlsCacheHazard = nullptr;
         }
 
@@ -1413,7 +1415,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem item) noexcept {
                                       auto& ctx = *static_cast<TContext*>(ptr);
                                       if (point == ECacheHookPoint::BeforeHotPageRefRelease && item == ctx.Item) {
-                                          Y_ABORT_UNLESS(TlsCacheHazard->State.load(std::memory_order_relaxed) == 0);
+                                          Y_ABORT_UNLESS(!SpaceHazardIsActive(
+                                              TlsCacheHazard->State.load(std::memory_order_relaxed)));
                                           ++ctx.Attempts;
                                       } else if (point == ECacheHookPoint::ResourcesAvailable) {
                                           ++ctx.Notifications;
@@ -1466,7 +1469,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                               if (point != ECacheHookPoint::BeforeHotPageRefRelease || item != ctx.Page.CacheItem()) {
                                   return;
                               }
-                              Y_ABORT_UNLESS(TlsCacheHazard->State.load(std::memory_order_relaxed) == 0);
+                              Y_ABORT_UNLESS(
+                                  !SpaceHazardIsActive(TlsCacheHazard->State.load(std::memory_order_relaxed)));
                               if (++ctx.Attempts == 1) {
                                   Y_ABORT_UNLESS(TCacheTestAccess::AcquirePage(ctx.Cache, ctx.Page, ctx.Other));
                               }
@@ -1511,7 +1515,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                     std::exchange(ctx.Entered, true)) {
                     return;
                 }
-                Y_ABORT_UNLESS(TlsCacheHazard->State.load(std::memory_order_relaxed) == 0);
+                Y_ABORT_UNLESS(!SpaceHazardIsActive(TlsCacheHazard->State.load(std::memory_order_relaxed)));
                 switch (ctx.Race) {
                     case EHotReleaseRace::Demote:
                         Y_ABORT_UNLESS(
@@ -1548,7 +1552,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             }
         }
         UNIT_ASSERT_VALUES_EQUAL(cache.RetiredBytes(), 0);
-        UNIT_ASSERT_VALUES_EQUAL(TlsCacheHazard->State.load(std::memory_order_relaxed), 0);
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load(std::memory_order_relaxed)));
     }
 
     Y_UNIT_TEST(HotPageRefReleaseFallsBackAfterDemotion) {
@@ -1602,7 +1606,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                               if (point != ECacheHookPoint::ResourcesAvailable || std::exchange(ctx.Entered, true)) {
                                   return;
                               }
-                              Y_ABORT_UNLESS(TlsCacheHazard->State.load(std::memory_order_relaxed) == 0);
+                              Y_ABORT_UNLESS(
+                                  !SpaceHazardIsActive(TlsCacheHazard->State.load(std::memory_order_relaxed)));
                               Y_ABORT_UNLESS(ctx.Cache.UpdateCurrentLimit(ctx.Target.Limit));
                               Y_ABORT_UNLESS(ctx.Cache.UpdateHardLimit(ctx.Target.Limit));
                               for (ui32 step = 0; step < 50000 && ctx.Cache.NeedsCapacityMaintenance(); ++step) {
@@ -3122,9 +3127,9 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                 UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
                 UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 1);
             }
-            UNIT_ASSERT_VALUES_EQUAL(hazard->State.load(std::memory_order_acquire), 0);
+            UNIT_ASSERT(!SpaceHazardIsActive(hazard->State.load(std::memory_order_acquire)));
         }
-        UNIT_ASSERT_VALUES_EQUAL(hazard->State.load(std::memory_order_acquire), 0);
+        UNIT_ASSERT(!SpaceHazardIsActive(hazard->State.load(std::memory_order_acquire)));
         UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 0);
     }
 
@@ -3154,7 +3159,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             }
             UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
         }
-        UNIT_ASSERT_VALUES_EQUAL(hazard->State.load(std::memory_order_acquire), 0);
+        UNIT_ASSERT(!SpaceHazardIsActive(hazard->State.load(std::memory_order_acquire)));
         UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 0);
     }
 
@@ -4226,7 +4231,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             TSpaceHazard* Hazard = nullptr;
             ui64 PublishedGeneration = 0;
             ui32 Notifications = 0;
-            bool Cleared = true;
+            bool Inactive = true;
             bool CurrentView = true;
         } observation;
 
@@ -4252,7 +4257,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
                               }
                               auto& observation = *static_cast<TObservation*>(context);
                               ++observation.Notifications;
-                              observation.Cleared &= observation.Hazard->State.load(std::memory_order_acquire) == 0;
+                              observation.Inactive &=
+                                  !SpaceHazardIsActive(observation.Hazard->State.load(std::memory_order_acquire));
                               auto cacheOp = observation.Cache->BeginOperation();
                               observation.CurrentView &=
                                   cacheOp.SpaceOperation().EntryGeneration() == observation.PublishedGeneration;
@@ -4286,14 +4292,14 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 0);
             UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
         }
-        UNIT_ASSERT_VALUES_EQUAL(observation.Hazard->State.load(std::memory_order_acquire), 0);
+        UNIT_ASSERT(!SpaceHazardIsActive(observation.Hazard->State.load(std::memory_order_acquire)));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeDrain ? 1 : 0);
         if (!armBeforeDrain) {
             fixture.Cache->ArmResourceWait(generation);
         }
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
-        UNIT_ASSERT(observation.Cleared && observation.CurrentView);
+        UNIT_ASSERT(observation.Inactive && observation.CurrentView);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
         TCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
         fixture.Cache->DisarmResourceWait();
@@ -8048,7 +8054,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         UNIT_ASSERT(TCacheTestAccess::TryReleaseTransition(*fixture.Cache, shrink));
         UNIT_ASSERT(TCacheTestAccess::CommitTransition(*fixture.Cache, shrink));
     }
-    void CheckTypedLookupAcrossResize(bool growing, bool entryActive) {
+    void CheckTypedLookupAcrossResize(bool growing, bool entryActive, bool assignedEntry = false) {
         TCacheCapacityConfig reserved;
         UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 8, reserved));
         TFixture fixture(6, 8, 7, reserved.Limit);
@@ -8092,8 +8098,13 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             UNIT_ASSERT(TCacheTestAccess::BeginBucketResize(cache, target.AddressBits));
         }
         {
+            std::optional<TTestSharedCache::TOperation> outer;
+            if (entryActive && !assignedEntry) {
+                outer.emplace(cache.BeginOperation());
+            }
             auto operation = cache.BeginOperation();
-            UNIT_ASSERT_VALUES_EQUAL(operation.SpaceOperation().EntrySpaceState().Resizing(), entryActive);
+            UNIT_ASSERT_VALUES_EQUAL(
+                operation.SpaceOperation().EntrySpaceState().Resizing(), entryActive && !assignedEntry);
             const auto check = [&] {
                 TCacheItem found;
                 UNIT_ASSERT(operation.FindPage(parent.CacheItem(), pageKey.Word(1), found) == ECacheResultStatus::Hit);
@@ -8140,6 +8151,14 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
 
     Y_UNIT_TEST(TypedLookupRechecksResizeFinishingShrink) {
         CheckTypedLookupAcrossResize(false, true);
+    }
+
+    Y_UNIT_TEST(TypedLookupUsesAssignedRoutingSeedAcrossGrowth) {
+        CheckTypedLookupAcrossResize(true, true, true);
+    }
+
+    Y_UNIT_TEST(TypedLookupUsesAssignedRoutingSeedAcrossShrink) {
+        CheckTypedLookupAcrossResize(false, true, true);
     }
 
     Y_UNIT_TEST(LiveColdReferenceDoesNotPinRingAlias) {

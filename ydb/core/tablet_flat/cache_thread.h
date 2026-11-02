@@ -23,8 +23,24 @@ class TSharedCacheImpl;
 inline constexpr ui64 SpaceHazardDrainWaiter = ui64{ 1 } << 31;
 inline constexpr ui32 MaxSpaceHazardActiveCount = static_cast<ui32>(SpaceHazardDrainWaiter - 1);
 
+inline constexpr ui64 SpaceHazardGeneration(ui64 state) noexcept {
+    return state >> 32;
+}
+
+inline constexpr ui32 SpaceHazardActiveCount(ui64 state) noexcept {
+    return static_cast<ui32>(state) & MaxSpaceHazardActiveCount;
+}
+
+inline constexpr bool SpaceHazardIsActive(ui64 state) noexcept {
+    return SpaceHazardActiveCount(state) != 0;
+}
+
+inline constexpr bool SpaceHazardIsDrained(ui64 state, ui64 generation) noexcept {
+    return !SpaceHazardIsActive(state) || SpaceHazardGeneration(state) == generation;
+}
+
 struct alignas(64) TSpaceHazard {
-    // Shared word: the thread updates generation/count; drainers set the waiter bit for last-exit notification
+    // Threads update counts; drainers retag idle slots and arm old active slots for last-exit notification
     std::atomic<ui64> State{ 0 }; // {generation:32, drain-waiter:1, active-count:31}
     std::atomic<ui64> SpareItem{ 0 };
     TSharedCacheImpl<TTestTraits>* TestCache = nullptr;
@@ -34,6 +50,7 @@ struct alignas(64) TSpaceHazard {
 
 inline void SetHazardSpace(TConstArrayRef<TSpaceHazard*> hazards, const TCacheSpace* space) noexcept {
     for (TSpaceHazard* hazard : hazards) {
+        Y_DEBUG_ABORT_UNLESS(hazard->State.load(std::memory_order_relaxed) == 0);
         hazard->Space = space;
     }
 }
@@ -60,7 +77,7 @@ public:
 
     Y_FORCE_INLINE void OnExecutorThreadStop(NActors::TThreadContext* context) override {
         Y_DEBUG_ABORT_UNLESS(TlsCacheHazard == Threads_.at(context));
-        Y_DEBUG_ABORT_UNLESS(TlsCacheHazard->State.load(std::memory_order_relaxed) == 0);
+        Y_DEBUG_ABORT_UNLESS(!SpaceHazardIsActive(TlsCacheHazard->State.load(std::memory_order_relaxed)));
         TlsCacheHazard = nullptr;
     }
 

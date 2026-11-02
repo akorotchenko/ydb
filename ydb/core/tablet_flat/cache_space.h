@@ -204,6 +204,7 @@ static_assert(std::is_trivially_copyable_v<TBucketResizeState>);
 struct TSpaceView {
     TCacheSpace* Space = nullptr;
     ui32 Generation = 0;
+    ui32 BucketMask = 0; // Immutable routing seed; misses refresh the current bucket route
     THandle* Handles = nullptr;
     std::atomic<ui64>* Buckets = nullptr;
     std::array<TCacheTierView, CacheTierCount> Tiers{
@@ -352,7 +353,7 @@ private:
 
 class TSpaceState {
 public:
-    static constexpr ui64 StableBucketMask = 0x00000000FFFFFFFFULL;
+    static constexpr ui64 GenerationMask = 0xFFFFFFFF00000000ULL;
     static constexpr ui32 GenerationShift = 32;
 
     constexpr TSpaceState() noexcept = default;
@@ -374,7 +375,7 @@ public:
     }
 
     constexpr ui32 BucketMask() const noexcept {
-        return static_cast<ui32>(Raw_ & StableBucketMask);
+        return static_cast<ui32>(Raw_ & ~GenerationMask);
     }
 
     constexpr ui64 BucketCount() const noexcept {
@@ -390,15 +391,15 @@ public:
     }
 
     constexpr TSpaceState WithGeneration(ui32 generation) const noexcept {
-        return FromRaw((Raw_ & ~0xFFFFFFFF00000000ULL) | (ui64(generation) << GenerationShift));
+        return FromRaw((Raw_ & ~GenerationMask) | (ui64(generation) << GenerationShift));
     }
 
     constexpr TSpaceState WithAddressBits(ui8 addressBits) const noexcept {
-        return FromRaw((Raw_ & ~StableBucketMask) | SharedCacheBucketMask(addressBits));
+        return FromRaw((Raw_ & GenerationMask) | SharedCacheBucketMask(addressBits));
     }
 
     constexpr TSpaceState BeginResize() const noexcept {
-        return FromRaw(Raw_ & ~StableBucketMask);
+        return FromRaw(Raw_ & GenerationMask);
     }
 
     friend constexpr bool operator==(const TSpaceState&, const TSpaceState&) noexcept = default;
@@ -527,9 +528,6 @@ bool TryCalculateSharedCacheFootprint(
 bool TryCalculateSharedCacheCapacity(
     ui64 limit, ui64 expectedPageSize, ui64 fixedBytes, ui32 hazardCount, TCacheCapacityConfig& result) noexcept;
 
-inline constexpr ui64 SpaceHazardGeneration(ui64 state) noexcept;
-inline constexpr ui32 SpaceHazardActiveCount(ui64 state) noexcept;
-
 // Keeps handle, bucket and ring mappings alive; page data needs its own owner.
 class TSpaceOperation {
 public:
@@ -647,6 +645,9 @@ private:
         const TSpaceViews& views,
         TAfterIncrement&& afterIncrement) noexcept(noexcept(std::forward<TAfterIncrement>(afterIncrement)()));
 
+    static TSpaceOperation BeginSlow(
+        std::atomic<ui64>& spaceState, TSpaceHazard& hazard, const TSpaceViews& views) noexcept;
+
     static Y_FORCE_INLINE void LeaveHazard(TSpaceHazard& hazard) noexcept;
 
     static void NotifyHazardDrained(TSpaceHazard& hazard) noexcept;
@@ -655,10 +656,10 @@ private:
         return (generation << 32) | activeCount;
     }
 
-    Y_FORCE_INLINE TSpaceOperation(TSpaceHazard& hazard, TSpaceState entryState, const TSpaceViews& views) noexcept
+    Y_FORCE_INLINE TSpaceOperation(TSpaceHazard& hazard, TSpaceState entryState, const TSpaceView& view) noexcept
         : Hazard_(&hazard)
         , EntryState_(entryState)
-        , View_(&views[entryState.Generation() % SpaceViewBankCount])
+        , View_(&view)
     {
         Y_DEBUG_ABORT_UNLESS(View_->Generation == entryState.Generation());
     }
@@ -668,22 +669,6 @@ private:
     TSpaceState EntryState_;
     const TSpaceView* View_;
 };
-
-inline constexpr ui64 SpaceHazardGeneration(ui64 state) noexcept {
-    return state >> 32;
-}
-
-inline constexpr ui32 SpaceHazardActiveCount(ui64 state) noexcept {
-    return static_cast<ui32>(state) & MaxSpaceHazardActiveCount;
-}
-
-inline constexpr bool SpaceHazardIsActive(ui64 state) noexcept {
-    return SpaceHazardActiveCount(state) != 0;
-}
-
-inline constexpr bool SpaceHazardIsDrained(ui64 state, ui64 generation) noexcept {
-    return !SpaceHazardIsActive(state) || SpaceHazardGeneration(state) == generation;
-}
 
 class TCacheSpaceTestAccess;
 class TCacheTestAccess;
@@ -893,7 +878,7 @@ private:
 
     void PublishPreparedView(THolder<TSpaceView> view, THolder<TSpaceView>& oldView) noexcept;
 
-    void PrepareView(ui32 generation, TSpaceView view) noexcept;
+    void PrepareView(TSpaceState state, TSpaceView view) noexcept;
 
     template <class TTraits>
     friend class TCachePageRefImpl;
@@ -1010,48 +995,34 @@ template <bool WithHook, class TAfterIncrement>
 Y_FORCE_INLINE TSpaceOperation TSpaceOperation::BeginImpl(std::atomic<ui64>& spaceState, TSpaceHazard& hazard,
     const TSpaceViews& views,
     TAfterIncrement&& afterIncrement) noexcept(noexcept(std::forward<TAfterIncrement>(afterIncrement)())) {
-    for (;;) {
-        // The acquire recheck below makes the selected view visible
-        TSpaceState entryState = TSpaceState::FromRaw(spaceState.load(std::memory_order_relaxed));
-        ui64 hazardState = hazard.State.load(std::memory_order_relaxed);
-        const ui32 activeCount = SpaceHazardActiveCount(hazardState);
-        Y_DEBUG_ABORT_UNLESS(activeCount != MaxSpaceHazardActiveCount);
-
-        const ui32 generation = entryState.Generation();
-        const ui64 registeredState = activeCount != 0 ? hazardState + 1 : PackHazardState(generation, 1);
-        if (Y_UNLIKELY(!hazard.State.compare_exchange_weak(
-                hazardState, registeredState, std::memory_order_acq_rel, std::memory_order_relaxed)))
-        {
-            continue;
-        }
+    ui64 hazardState = hazard.State.load(std::memory_order_relaxed);
+    if (Y_LIKELY(static_cast<ui32>(hazardState) == 0) &&
+        Y_LIKELY(hazard.State.compare_exchange_strong(
+            hazardState, hazardState + 1, std::memory_order_acq_rel, std::memory_order_relaxed))) {
+        const TSpaceView& view = views[SpaceHazardGeneration(hazardState) % SpaceViewBankCount];
+        const TSpaceState entryState =
+            TSpaceState::FromRaw((hazardState & TSpaceState::GenerationMask) | view.BucketMask);
+        TSpaceOperation operation(hazard, entryState, view);
         if constexpr (WithHook) {
-            if (activeCount == 0) {
-                std::forward<TAfterIncrement>(afterIncrement)();
-            }
+            std::forward<TAfterIncrement>(afterIncrement)();
         }
-        entryState = TSpaceState::FromRaw(spaceState.load(std::memory_order_acquire));
-        if (Y_UNLIKELY(entryState.Generation() != generation)) {
-            LeaveHazard(hazard);
-            continue;
-        }
-
-        return TSpaceOperation(hazard, entryState, views);
+        return operation;
     }
+    auto operation = BeginSlow(spaceState, hazard, views);
+    if constexpr (WithHook) {
+        if (!SpaceHazardIsActive(hazardState)) {
+            std::forward<TAfterIncrement>(afterIncrement)();
+        }
+    }
+    return operation;
 }
 
 Y_FORCE_INLINE void TSpaceOperation::LeaveHazard(TSpaceHazard& hazard) noexcept {
-    ui64 state = hazard.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const ui32 activeCount = SpaceHazardActiveCount(state);
-        Y_DEBUG_ABORT_UNLESS(activeCount != 0);
-        const ui64 desired = activeCount == 1 ? 0 : state - 1;
-        if (hazard.State.compare_exchange_weak(state, desired, std::memory_order_release, std::memory_order_relaxed))
-        {
-            if (Y_UNLIKELY(activeCount == 1 && (state & SpaceHazardDrainWaiter))) {
-                NotifyHazardDrained(hazard);
-            }
-            return;
-        }
+    const ui64 state = hazard.State.fetch_sub(1, std::memory_order_release);
+    const ui32 activeCount = SpaceHazardActiveCount(state);
+    Y_DEBUG_ABORT_UNLESS(activeCount != 0);
+    if (Y_UNLIKELY(activeCount == 1 && (state & SpaceHazardDrainWaiter))) {
+        NotifyHazardDrained(hazard);
     }
 }
 
