@@ -4353,8 +4353,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         fixture.Cache->ArmResourceWait(generation);
         if (currentGeneration) {
             UNIT_ASSERT(TCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
-            auto guard = fixture.Cache->BeginOperation();
             UNIT_ASSERT(TCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+            auto guard = fixture.Cache->BeginOperation();
+            UNIT_ASSERT_VALUES_EQUAL(guard.SpaceOperation().EntryGeneration(),
+                TCacheTestAccess::CurrentSpaceState(*fixture.Space).Generation());
             UNIT_ASSERT(!(TlsCacheHazard->State.load() & SpaceHazardDrainWaiter));
         } else {
             {
