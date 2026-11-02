@@ -425,7 +425,7 @@ Y_FORCE_INLINE typename TCacheTableImpl<TTraits>::EBucketRouteResult TCacheTable
         Cache_.Space_->RefreshBucketRoute(spaceState, route.Resize);
         return EBucketRouteResult::Retry;
     }
-    if (result.Equal) {
+    if (Y_LIKELY(result.Equal)) {
         return EBucketRouteResult::Done;
     }
     return ResolveBucketMiss<Mode, ResizeActive>(spaceState, route, result);

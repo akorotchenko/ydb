@@ -227,7 +227,8 @@ Y_UNIT_TEST_SUITE(TFlatExecutorLeases) {
         // The queue may recurse within one application, with no cache operation spanning dispatch
         auto cacheThread = runtime.AddObserver<IEventHandle>([&](IEventHandle::TPtr& event) {
             Y_DEBUG_ABORT_UNLESS(!NSharedCache::TlsCacheHazard ||
-                                 NSharedCache::TlsCacheHazard->State.load(std::memory_order_relaxed) == 0);
+                                 !NSharedCache::SpaceHazardIsActive(
+                                     NSharedCache::TlsCacheHazard->State.load(std::memory_order_relaxed)));
             const ui32 node = event->GetRecipientRewrite().NodeId() - runtime.GetNodeId(0);
             Y_ABORT_UNLESS(node < runtime.GetNodeCount());
             auto* system = runtime.GetActorSystem(node);

@@ -166,9 +166,17 @@ public:
     }
 
     static void SetGeneration(TCacheSpace& space, ui32 generation) noexcept {
+        // Tests inject generations only while every hazard owner is quiescent
+        for (const auto* hazard : space.Hazards_) {
+            Y_DEBUG_ABORT_UNLESS(!SpaceHazardIsActive(hazard->State.load(std::memory_order_relaxed)));
+        }
         const auto old = space.CurrentSpaceState();
-        space.PrepareView(generation, space.SpaceView(old));
-        space.SpaceState_.store(old.WithGeneration(generation).Raw(), std::memory_order_release);
+        const auto state = old.WithGeneration(generation);
+        space.PrepareView(state, space.SpaceView(old));
+        space.SpaceState_.store(state.Raw(), std::memory_order_release);
+        for (auto* hazard : space.Hazards_) {
+            hazard->State.store(ui64{ generation } << 32, std::memory_order_release);
+        }
     }
 
     template <class TCallback>
@@ -1829,8 +1837,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(ActivityRegistration) {
         std::atomic<ui64> spaceState = TSpaceState::Make(7, 5).Raw();
         TSpaceHazard slot;
+        slot.State.store(ui64{ 7 } << 32, std::memory_order_relaxed);
         std::array<TSpaceView, 2> views;
         views[7 & 1].Generation = 7;
+        views[7 & 1].BucketMask = SharedCacheBucketMask(5);
 
         {
             auto operation = TSpaceOperation::Begin(spaceState, slot, views);
@@ -1838,12 +1848,14 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
             UNIT_ASSERT(SpaceHazardIsActive(slot.State.load()));
             UNIT_ASSERT_VALUES_EQUAL(SpaceHazardGeneration(slot.State.load()), 7);
         }
-        UNIT_ASSERT_VALUES_EQUAL(slot.State.load(), 0);
+        UNIT_ASSERT(!SpaceHazardIsActive(slot.State.load()));
+        UNIT_ASSERT_VALUES_EQUAL(SpaceHazardGeneration(slot.State.load()), 7);
     }
 
-    Y_UNIT_TEST(ActivityRegistrationRetriesGenerationChange) {
+    Y_UNIT_TEST(ActivityRegistrationKeepsRegisteredViewDuringPublication) {
         std::atomic<ui64> spaceState = TSpaceState::Make(10, 5).Raw();
         TSpaceHazard slot;
+        slot.State.store(ui64{ 10 } << 32, std::memory_order_relaxed);
         std::atomic<bool> incremented = false;
         std::atomic<bool> resume = false;
         std::atomic<ui32> hookCalls = 0;
@@ -1852,6 +1864,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         std::array<TSpaceView, 2> views;
         views[10 & 1].Generation = 10;
         views[11 & 1].Generation = 11;
+        views[10 & 1].BucketMask = SharedCacheBucketMask(5);
+        views[11 & 1].BucketMask = SharedCacheBucketMask(5);
 
         std::thread worker([&] {
             auto operation = TSpaceOperation::BeginWithHook(spaceState, slot, views, [&] {
@@ -1864,7 +1878,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
             });
             registeredGeneration = operation.EntryGeneration();
             const ui64 state = slot.State.load();
-            workerSawActive = SpaceHazardIsActive(state) && SpaceHazardGeneration(state) == 11;
+            workerSawActive = SpaceHazardIsActive(state) && SpaceHazardGeneration(state) == 10;
         });
 
         while (!incremented.load(std::memory_order_acquire)) {
@@ -1878,11 +1892,95 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         resume.store(true, std::memory_order_release);
         worker.join();
 
-        UNIT_ASSERT(hookCalls.load() >= 2);
-        UNIT_ASSERT_VALUES_EQUAL(registeredGeneration, 11);
+        UNIT_ASSERT_VALUES_EQUAL(hookCalls.load(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(registeredGeneration, 10);
         UNIT_ASSERT(workerSawActive);
-        UNIT_ASSERT_VALUES_EQUAL(slot.State.load(), 0);
+        UNIT_ASSERT(!SpaceHazardIsActive(slot.State.load()));
+        UNIT_ASSERT_VALUES_EQUAL(SpaceHazardGeneration(slot.State.load()), 10);
         UNIT_ASSERT(SpaceHazardIsDrained(slot.State.load(), 11));
+        slot.State.store(ui64{ 11 } << 32, std::memory_order_release);
+        auto current = TSpaceOperation::Begin(spaceState, slot, views);
+        UNIT_ASSERT_VALUES_EQUAL(current.EntryGeneration(), 11);
+        UNIT_ASSERT_VALUES_EQUAL(current.View().Generation, 11);
+    }
+
+    Y_UNIT_TEST(EntryKeepsAssignedViewUntilDrain) {
+        TCacheCapacityConfig capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        auto [threads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
+        {
+            auto initial = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+            UNIT_ASSERT_VALUES_EQUAL(initial.EntryGeneration(), 0);
+        }
+        UNIT_ASSERT(TCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+        {
+            auto cached = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+            UNIT_ASSERT_VALUES_EQUAL(space->CurrentSpaceState().Generation(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(cached.EntryGeneration(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(cached.View().Generation, 0);
+        }
+        ui32 cursor = 0;
+        UNIT_ASSERT(TCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+        auto current = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+        UNIT_ASSERT_VALUES_EQUAL(current.EntryGeneration(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(current.View().Generation, 1);
+    }
+
+    Y_UNIT_TEST(IdleHazardRetagRejectsDelayedRegistrationBeforeBankReuse) {
+        TCacheCapacityConfig capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        auto [threads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
+        auto& hazard = TCacheSpaceTestAccess::Hazard(*space, 0);
+        {
+            auto initial = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+            UNIT_ASSERT_VALUES_EQUAL(initial.EntryGeneration(), 0);
+        }
+        const ui64 delayedState = hazard.State.load(std::memory_order_acquire);
+        UNIT_ASSERT(TCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+        ui32 cursor = 0;
+        UNIT_ASSERT(TCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+        UNIT_ASSERT_VALUES_EQUAL(SpaceHazardGeneration(hazard.State.load()), 1);
+        UNIT_ASSERT(TCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+        cursor = 0;
+        UNIT_ASSERT(TCacheSpaceTestAccess::TryDrainBefore(*space, 2, cursor));
+
+        ui64 expected = delayedState;
+        UNIT_ASSERT(!hazard.State.compare_exchange_strong(
+            expected, delayedState + 1, std::memory_order_acq_rel, std::memory_order_relaxed));
+        UNIT_ASSERT_VALUES_EQUAL(SpaceHazardGeneration(expected), 2);
+        auto current = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+        UNIT_ASSERT_VALUES_EQUAL(current.EntryGeneration(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(current.View().Generation, 2);
+    }
+
+    Y_UNIT_TEST(GenerationAdvanceWaitsBeforeReusingViewBank) {
+        TCacheCapacityConfig capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        auto [threads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
+        {
+            auto old = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+            UNIT_ASSERT(TCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+            UNIT_ASSERT(!TCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+            UNIT_ASSERT_VALUES_EQUAL(old.View().Generation, 0);
+            UNIT_ASSERT_VALUES_EQUAL(space->CurrentSpaceState().Generation(), 1);
+        }
+        UNIT_ASSERT(TCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+        ui32 cursor = 0;
+        UNIT_ASSERT(TCacheSpaceTestAccess::TryDrainBefore(*space, 2, cursor));
+        auto current = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+        UNIT_ASSERT_VALUES_EQUAL(current.EntryGeneration(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(current.View().Generation, 2);
+    }
+
+    Y_UNIT_TEST(ViewKeepsItsRoutingSeedDuringBucketResize) {
+        TCacheCapacityConfig capacity;
+        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, capacity));
+        auto [threads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
+        UNIT_ASSERT(space->BeginBucketResize(5));
+        auto operation = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+        UNIT_ASSERT(space->CurrentSpaceState().Resizing());
+        UNIT_ASSERT(!operation.EntrySpaceState().Resizing());
+        UNIT_ASSERT_VALUES_EQUAL(operation.EntrySpaceState().BucketMask(), SharedCacheBucketMask(6));
     }
 
     Y_UNIT_TEST(RegisteredThreadHazard) {
@@ -2045,7 +2143,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT_VALUES_EQUAL(cursor, 1);
     }
 
-    Y_UNIT_TEST(GenerationDrainWakesAfterRejectedOldRegistration) {
+    Y_UNIT_TEST(GenerationDrainWakesAfterRegisteredOldViewExits) {
         TCacheCapacityConfig capacity;
         UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
@@ -2058,20 +2156,27 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         ui32 cursor = 0;
         bool advanced = false;
         bool blocked = false;
-        auto operation = TCacheSpaceTestAccess::BeginOnHazardWithHook(*space, 0, [&]() noexcept {
-            if (++hookCalls == 1) {
+        {
+            auto operation = TCacheSpaceTestAccess::BeginOnHazardWithHook(*space, 0, [&]() noexcept {
+                ++hookCalls;
                 advanced = TCacheSpaceTestAccess::AdvanceSpaceGeneration(*space);
                 blocked = !TCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor);
-            }
-        });
+            });
+            UNIT_ASSERT(advanced && blocked);
+            UNIT_ASSERT_VALUES_EQUAL(hookCalls, 1);
+            UNIT_ASSERT_VALUES_EQUAL(operation.EntryGeneration(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(operation.View().Generation, 0);
+            UNIT_ASSERT(operation.Hazard().State.load() & SpaceHazardDrainWaiter);
+            UNIT_ASSERT_VALUES_EQUAL(notifications, 0);
+        }
         UNIT_ASSERT(advanced && blocked);
-        UNIT_ASSERT_VALUES_EQUAL(hookCalls, 2);
         UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
-        UNIT_ASSERT_VALUES_EQUAL(operation.EntryGeneration(), 1);
         UNIT_ASSERT_VALUES_EQUAL(cursor, 0);
-        UNIT_ASSERT(!(operation.Hazard().State.load() & SpaceHazardDrainWaiter));
         UNIT_ASSERT(TCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
         UNIT_ASSERT_VALUES_EQUAL(cursor, 1);
+        auto current = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
+        UNIT_ASSERT_VALUES_EQUAL(current.EntryGeneration(), 1);
+        UNIT_ASSERT(!(current.Hazard().State.load() & SpaceHazardDrainWaiter));
     }
 
     Y_UNIT_TEST(InitialMappingsAndFreeContents) {
