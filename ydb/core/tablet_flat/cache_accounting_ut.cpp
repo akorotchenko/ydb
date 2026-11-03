@@ -322,8 +322,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheAccounting) {
         TCacheAccounting accounting;
         auto raw = TSharedData::Uninitialized(64);
         const ui64 bytes = raw.GetAllocationSize();
-        auto first = MakeIntrusiveConst<TDescriptor>(raw, 12, 1);
-        auto second = MakeIntrusiveConst<TDescriptor>(raw, 20, 2);
+        auto first = MakeIntrusiveConst<TDescriptor>(raw, ui64{ 12 }, ui32{ 1 });
+        auto second = MakeIntrusiveConst<TDescriptor>(raw, ui64{ 20 }, ui32{ 2 });
         accounting.AccountBuffer(raw);
         accounting.AccountMetadata(*first);
         accounting.AccountMetadata(*first);
@@ -346,7 +346,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheAccounting) {
         std::atomic<ui32> destroyed = 0;
         TIntrusiveConstPtr<TDescriptor> caller;
         {
-            auto descriptor = MakeIntrusiveConst<TDescriptor>(TSharedData{}, 12, 1, &destroyed);
+            auto descriptor = MakeIntrusiveConst<TDescriptor>(TSharedData{}, ui64{ 12 }, ui32{ 1 }, &destroyed);
             accounting.AccountMetadata(*descriptor);
             caller = descriptor;
         }
@@ -410,7 +410,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheAccounting) {
         for (bool descriptorKind : { false, true }) {
             TCacheAccounting accounting;
             auto raw = TSharedData::Uninitialized(64);
-            auto descriptor = MakeIntrusiveConst<TDescriptor>(raw, 12);
+            auto descriptor = MakeIntrusiveConst<TDescriptor>(raw, ui64{ 12 });
 
             struct TPause {
                 bool Descriptor;
@@ -469,7 +469,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheAccounting) {
     Y_UNIT_TEST(ConcurrentRegistrationChargesEachObjectOnce) {
         TCacheAccounting accounting;
         auto raw = TSharedData::Uninitialized(128);
-        auto descriptor = MakeIntrusiveConst<TDescriptor>(raw, 12);
+        auto descriptor = MakeIntrusiveConst<TDescriptor>(raw, ui64{ 12 });
         std::atomic<bool> start = false;
         TVector<std::thread> threads;
         for (ui32 index = 0; index < 6; ++index) {
