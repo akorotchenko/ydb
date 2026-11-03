@@ -9,7 +9,7 @@
 
 namespace NKikimr::NSharedCache {
 class TMetadataRecord;
-class TCacheMetadata;
+class TCacheAccounting;
 } // namespace NKikimr::NSharedCache
 
 namespace NKikimr {
@@ -46,7 +46,7 @@ namespace NPageCollection {
         virtual void SetSkipBTreeIndexV1Shadow(bool) const noexcept { }
 
     private:
-        friend class NSharedCache::TCacheMetadata;
+        friend class NSharedCache::TCacheAccounting;
 
         mutable std::atomic<NSharedCache::TMetadataRecord*> MetadataAccounts_{ nullptr };
     };

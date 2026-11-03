@@ -58,7 +58,7 @@ namespace {
         }
 
         void Start() {
-            Worker = Runtime.Register(CreateCollectionLoadActor(Owner, LoadId, Descriptor));
+            Worker = Runtime.Register(CreateCollectionLoadActor(Owner, LoadId, Descriptor, Accounting.Share()));
         }
 
         TEvBlobStorage::TEvGet::TPtr ReadRequest() {
@@ -119,6 +119,7 @@ namespace {
             UNIT_ASSERT_VALUES_EQUAL(FailedEvents, 0);
         }
 
+        TCacheAccounting Accounting;
         TTestBasicRuntime Runtime;
         TActorId Owner;
         TActorId Proxy;
@@ -135,6 +136,39 @@ namespace {
 } // anonymous namespace
 
 Y_UNIT_TEST_SUITE(TSharedCacheCollectionLoad) {
+    Y_UNIT_TEST(AccountsRawWaitAndQueuedParsedOutcomeUntilRelease) {
+        TCollectionLoadFixture fixture;
+        fixture.Start();
+        fixture.Read();
+        const ui64 rawBytes = fixture.Meta.size() + TSharedData::OverheadSize;
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Accounting.GetMemoryUsage(), rawBytes);
+        fixture.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Accounting.GetMemoryUsage(), rawBytes);
+        fixture.Grant(ECollectionLoadKind::Regular);
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> external;
+        {
+            auto event = fixture.Data();
+            external = event->Get()->PageCollection;
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Accounting.GetMemoryUsage(), external->GetMetadataMemoryUsage());
+        }
+        UNIT_ASSERT(external);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Accounting.GetMemoryUsage(), external->GetMetadataMemoryUsage());
+        external.Reset();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Accounting.GetMemoryUsage(), 0);
+    }
+
+    Y_UNIT_TEST(WorkerDestructionRefundsRawWithoutAStopMessage) {
+        TCacheAccounting observer;
+        {
+            TCollectionLoadFixture fixture;
+            observer = fixture.Accounting.Share();
+            fixture.Start();
+            fixture.Read();
+            UNIT_ASSERT(observer.GetMemoryUsage() > 0);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(observer.GetMemoryUsage(), 0);
+    }
+
     Y_UNIT_TEST(ReadsChunkedMetadataBeforeRegularConstruction) {
         TCollectionLoadFixture fixture(16);
         fixture.Start();
@@ -190,7 +224,9 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollectionLoad) {
         TCollectionLoadFixture fixture;
         fixture.Start();
         fixture.Read();
+        UNIT_ASSERT(fixture.Accounting.GetMemoryUsage() > 0);
         fixture.Stop();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Accounting.GetMemoryUsage(), 0);
     }
 
     Y_UNIT_TEST(PropagatesBlobFailureBeforeRawCompletion) {
@@ -204,6 +240,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollectionLoad) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.RawEvents, 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.DataEvents, 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.FailedEvents, 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Accounting.GetMemoryUsage(), 0);
     }
 
     Y_UNIT_TEST(ReportsCorruptMetadataAfterGrant) {
@@ -217,6 +254,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollectionLoad) {
         UNIT_ASSERT(!event->Get()->PageCollection);
         UNIT_ASSERT_VALUES_EQUAL(fixture.FailedEvents, 1);
         UNIT_ASSERT_VALUES_EQUAL(fixture.DataEvents, 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Accounting.GetMemoryUsage(), 0);
     }
 
     Y_UNIT_TEST(IgnoresParseGrantFromAnotherActor) {

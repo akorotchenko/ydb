@@ -401,7 +401,8 @@ bool TCollectionLoadController::StartJob(TLoad& load) {
     }
     // Unresolved tails cannot consume the known/root slot or its single oversized-job allowance
     const auto worker = NActors::TActivationContext::Register(
-        CreateCollectionLoadActor(Owner_, load.Id, load.Descriptor, load.Priority), Owner_);
+        CreateCollectionLoadActor(Owner_, load.Id, load.Descriptor, Cache_.ShareMemoryAccounting(), load.Priority),
+        Owner_);
     Jobs_.emplace(worker, TJob{ .LoadId = load.Id, .Key = load.Descriptor.Lead, .Bytes = bytes, .Known = known });
     load.Worker = worker;
     ChargedBytes_ += bytes;

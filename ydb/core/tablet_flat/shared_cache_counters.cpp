@@ -28,6 +28,7 @@ TCacheCounters::TCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounte
     , EvictedBytes(counters->GetCounter("EvictedBytes", true))
     // page collection counters:
     , PageCollections(counters->GetCounter("PageCollections"))
+    , BufferBytes(counters->GetCounter("BufferBytes"))
     , MetadataBytes(counters->GetCounter("MetadataBytes"))
     , Owners(counters->GetCounter("Owners"))
     , PageCollectionOwners(counters->GetCounter("PageCollectionOwners"))

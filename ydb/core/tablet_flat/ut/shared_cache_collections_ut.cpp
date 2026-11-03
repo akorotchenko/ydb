@@ -701,6 +701,17 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         UNIT_ASSERT(found.Get() == result->Get()->Collection.Get());
     }
 
+    Y_UNIT_TEST(ParsedOutcomeTransfersItsChargeIntoTheNativeCollection) {
+        TCollectionFixture fixture;
+        const auto metadata = fixture.Metadata();
+        fixture.Load(metadata);
+        fixture.Reply(fixture.Read(metadata), metadata);
+        auto result = fixture.Result();
+        fixture.Drain();
+        const ui64 bytes = result->Get()->Collection->PageCollection()->GetMetadataMemoryUsage();
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCache::Get().StorageBytes(), bytes);
+    }
+
     Y_UNIT_TEST(WriterWinsAndLateParsedCandidateCannotOverwriteIt) {
         TCollectionFixture fixture;
         const auto metadata = fixture.Metadata();
@@ -710,15 +721,20 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         fixture.Runtime.WaitFor("parsed candidate", [&] {
             return loaded.size() == 1;
         }, TDuration::Seconds(5));
+        const ui64 losingBytes = loaded.front()->Get()->PageCollection->GetMetadataMemoryUsage();
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCache::Get().StorageBytes(), losingBytes);
         auto writer =
             MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
         writer->SetSkipBTreeIndexV1Shadow(true);
         auto canonical = TSharedCache::Get().AdmitCollection(writer);
+        const ui64 canonicalBytes = writer->GetMetadataMemoryUsage();
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCache::Get().StorageBytes(), losingBytes + canonicalBytes);
         auto result = fixture.Result();
         UNIT_ASSERT(result->Get()->Request == request);
         UNIT_ASSERT(result->Get()->Collection.Get() == canonical.Get());
         loaded.Unblock();
         fixture.Drain();
+        UNIT_ASSERT_VALUES_EQUAL(TSharedCache::Get().StorageBytes(), canonicalBytes);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Results, 1);
         UNIT_ASSERT(result->Get()->Collection->PageCollection()->SkipBTreeIndexV1Shadow());
         UNIT_ASSERT_VALUES_EQUAL(fixture.ReadWorkers.size(), 1);

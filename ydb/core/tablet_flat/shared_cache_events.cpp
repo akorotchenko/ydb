@@ -82,10 +82,8 @@ TRequestCompletion::TRequestCompletion(TRequestCompletionParams&& params) noexce
     , EventCookie_(params.EventCookie)
     , ExecutorGeneration_(params.ExecutorGeneration)
     , RequestId_(params.RequestId)
-    , PageCollection_(params.Collection ? params.Collection->PageCollection()
-                                        : TIntrusiveConstPtr<NPageCollection::IPageCollection>{})
+    , PageCollection_(params.Collection ? params.Collection->PageCollection() : std::move(params.PageCollection))
     , Collection_(std::move(params.Collection))
-    , PendingMetadata_(std::move(params.PendingMetadata))
     , Locations_(std::move(params.Pages))
     , ReadyPages_(Locations_.size())
     , WaitPad_(std::move(params.WaitPad))
@@ -97,8 +95,7 @@ TRequestCompletion::TRequestCompletion(TRequestCompletionParams&& params) noexce
     , RemainingPages_(static_cast<ui32>(Locations_.size()))
 {
     Y_DEBUG_ABORT_UNLESS(Locations_.size() <= Max<ui32>());
-    Y_DEBUG_ABORT_UNLESS(ActorSystem_ && ReplyTo_ && (Collection_ || PendingMetadata_));
-    Y_DEBUG_ABORT_UNLESS(!Collection_ || !PendingMetadata_);
+    Y_DEBUG_ABORT_UNLESS(ActorSystem_ && ReplyTo_ && PageCollection_);
     if (RemainingPages_.load(std::memory_order_relaxed) == 0 || params.Status != NKikimrProto::OK) {
         SendResult(TakeResult());
     }
@@ -109,12 +106,13 @@ bool TRequestCompletion::BindCollection(TCacheCollectionRef collection) noexcept
     if (Collection_) {
         return Collection_.CacheItem() == collection.CacheItem();
     }
-    if (!collection->PageCollection()->IsCompatible(*PendingMetadata_.PageCollection())) {
+    if (!collection->PageCollection()->IsCompatible(*PageCollection_)) {
         return false;
     }
-    PageCollection_ = collection->PageCollection();
+    auto descriptor = collection->PageCollection();
     Collection_ = std::move(collection);
-    PendingMetadata_.Reset();
+    // The old input is released after both canonical fields have been initialized
+    PageCollection_.Swap(descriptor);
     return true;
 }
 

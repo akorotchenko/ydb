@@ -32,7 +32,7 @@ SRCS(
     shared_cache_collections_ut.cpp
     cache_cyclic_buffer_ut.cpp
     cache_item_ut.cpp
-    cache_metadata_ut.cpp
+    cache_accounting_ut.cpp
     cache_space_ut.cpp
     cache_table_ut.cpp
     cache_thread_ut.cpp

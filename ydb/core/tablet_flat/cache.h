@@ -143,8 +143,20 @@ public:
     THolder<TCollection> PrepareCollection(
         TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, ECacheMode mode = ECacheMode::Sticky);
 
-    TMetadataRetainer RetainMetadata(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection) {
-        return Metadata_.Track(std::move(collection));
+    TCacheAccounting ShareMemoryAccounting() const noexcept {
+        return Accounting_.Share();
+    }
+
+    void AccountMetadata(const NPageCollection::IPageCollection& collection) const {
+        Accounting_.AccountMetadata(collection);
+    }
+
+    void AccountBuffer(const TSharedData& buffer) const {
+        Accounting_.AccountBuffer(buffer);
+    }
+
+    void AccountMetadataBuffer(const TSharedData& buffer) const {
+        Accounting_.AccountMetadataBuffer(buffer);
     }
 
     TCacheCollectionRefImpl<TTraits> AdmitCollection(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection)
@@ -418,18 +430,28 @@ public:
         return Memory_.CollectionBytes();
     }
 
+    ui64 BufferBytes() const noexcept {
+        return Accounting_.BufferBytes();
+    }
+
     ui64 MetadataBytes() const noexcept {
-        return Metadata_.GetMemoryUsage();
+        return Accounting_.MetadataBytes();
+    }
+
+    ui64 StorageBytes() const noexcept {
+        return Accounting_.GetMemoryUsage();
     }
 
     ui64 OverallUsage() const noexcept {
-        return Memory_.OverallUsage() + MetadataBytes();
+        return Memory_.StaticBytes() + Memory_.StaticDeltaBytes() + StorageBytes();
     }
 
-    // Required metadata may exceed the limit; optional page retention uses the remainder
+    // Soft retention uses the net gap between actual storage and the conservative resident page ledger
     ui64 RetentionLimit() const noexcept {
+        const ui64 actual = Accounting_.GetMemoryUsage();
+        const ui64 gap = actual - Min(actual, Memory_.ResidentBytes());
         const ui64 limit = SoftLimit();
-        return limit - Min(limit, MetadataBytes());
+        return limit - Min(limit, gap);
     }
 
     ui64 PayloadUsage() const noexcept {
@@ -883,7 +905,7 @@ private:
     THolder<TCacheSpace> Space_;
     TCacheTableImpl<TTraits> Table_;
     TCacheMemory Memory_;
-    TCacheMetadata Metadata_;
+    TCacheAccounting Accounting_;
     TCacheItems<TTraits> Items_;
     TCacheCollections<TTraits> Collections_;
     TCacheEviction<TTraits> Eviction_;
