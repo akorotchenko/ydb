@@ -1841,6 +1841,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         terminal.clear();
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 13);
         UNIT_ASSERT_VALUES_EQUAL(original->MetadataReads.load(), 0);
+        // The cancellation reply also owns the canonical descriptor
+        sharedCache.CheckResults({ TFetch{ 1, canonical, {} } }, NKikimrProto::RACE);
         canonical.Reset();
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 0);
     }
