@@ -926,7 +926,7 @@ namespace {
     }
 
     THolder<TCollection> MakeCollection(const TLogoBlobID& id, size_t backingSize = 0) {
-        return MakeHolder<TCollection>(
+        return TTestSharedCache::Get().PrepareCollection(
             TIntrusiveConstPtr<NPageCollection::IPageCollection>(new TTestPageCollection(id, backingSize)));
     }
 
@@ -2725,7 +2725,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
             auto metadata = TIntrusiveConstPtr<NPageCollection::IPageCollection>(
                 new TTestPageCollection(id, data, pagesReleasedBeforeCollection));
             UNIT_ASSERT(TCacheTestAccess::MakeReady(
-                *fixture.Cache, fixture.Registry, collection, MakeHolder<TCollection>(std::move(metadata))));
+                *fixture.Cache, fixture.Registry, collection, fixture.Cache->PrepareCollection(std::move(metadata))));
             const auto page = AllocatePage(*fixture.Cache, TCacheKey::Page(collection, 1), data.size());
             UNIT_ASSERT(page);
             // Handle-order teardown would destroy this metadata before releasing its page buffer.
@@ -7531,7 +7531,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         TTestCacheCollectionRef hit;
         UNIT_ASSERT(TCacheTestAccess::FindOrInsert(*fixture.Cache, fixture.Registry, location, collection, hit) ==
                     ECacheResultStatus::Inserted);
-        auto value = MakeHolder<TCollection>(source, collection);
+        auto value = fixture.Cache->PrepareCollection(source);
         auto* owner = value.Get();
         UNIT_ASSERT(TCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, std::move(value)));
         UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));

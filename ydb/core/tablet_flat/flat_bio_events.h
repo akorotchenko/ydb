@@ -3,6 +3,7 @@
 #include "flat_bio_eggs.h"
 #include "flat_sausage_fetch.h"
 #include "flat_sausage_gut.h"
+#include "cache_ref.h"
 #include <ydb/core/protos/base.pb.h>
 #include <ydb/core/base/events.h>
 #include <ydb/library/actors/core/event_local.h>
@@ -31,8 +32,16 @@ namespace NBlockIO {
         {
         }
 
+        TEvFetch(
+            EPriority priority, NSharedCache::TCacheCollectionRef collection, TVector<TPageLocation> pages, ui64 cookie)
+            : TEvFetch(priority, collection->PageCollection(), std::move(pages), cookie)
+        {
+            Collection = std::move(collection);
+        }
+
         const EPriority Priority;
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
+        NSharedCache::TCacheCollectionRef Collection;
         TVector<TPageLocation> Pages;
         NWilson::TTraceId TraceId;
         const ui64 Cookie;
@@ -60,6 +69,7 @@ namespace NBlockIO {
 
         const EStatus Status;
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
+        NSharedCache::TCacheCollectionRef Collection;
         TVector<NPageCollection::TLoadedPageData> Pages;
         const ui64 Cookie;
     };

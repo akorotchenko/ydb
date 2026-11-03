@@ -34,6 +34,7 @@ struct TCacheCounters final : public TAtomicRefCount<TCacheCounters> {
 
     // page collection counters:
     const TCounterPtr PageCollections;
+    const TCounterPtr MetadataBytes;
     const TCounterPtr Owners;
     const TCounterPtr PageCollectionOwners;
 

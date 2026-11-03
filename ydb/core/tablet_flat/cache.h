@@ -140,6 +140,13 @@ public:
         return *cache;
     }
 
+    THolder<TCollection> PrepareCollection(
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, ECacheMode mode = ECacheMode::Sticky);
+
+    TMetadataRetainer RetainMetadata(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection) {
+        return Metadata_.Track(std::move(collection));
+    }
+
     TCacheCollectionRefImpl<TTraits> AdmitCollection(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection)
         requires std::is_same_v<TTraits, TProdTraits>;
 
@@ -245,6 +252,10 @@ public:
         TCollectionCacheItem& inserted, TCacheCollectionRefImpl<TTraits>& hit) noexcept {
         return FindOrInsert(Collections_.Registry(), collection, inserted, hit);
     }
+
+    // Prepares a Regular holder only on a miss, before publishing the pending entry
+    ECacheResultStatus FindOrInsert(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
+        THolder<TCollection>& value, TCollectionCacheItem& inserted, TCacheCollectionRefImpl<TTraits>& hit);
 
     Y_FORCE_INLINE bool ReclaimCold() noexcept {
         auto cacheOp = BeginOperation();
@@ -407,8 +418,18 @@ public:
         return Memory_.CollectionBytes();
     }
 
+    ui64 MetadataBytes() const noexcept {
+        return Metadata_.GetMemoryUsage();
+    }
+
     ui64 OverallUsage() const noexcept {
-        return Memory_.OverallUsage();
+        return Memory_.OverallUsage() + MetadataBytes();
+    }
+
+    // Required metadata may exceed the limit; optional page retention uses the remainder
+    ui64 RetentionLimit() const noexcept {
+        const ui64 limit = SoftLimit();
+        return limit - Min(limit, MetadataBytes());
     }
 
     ui64 PayloadUsage() const noexcept {
@@ -526,7 +547,7 @@ private:
         static_cast<TTraits&>(*this) = std::move(hooks);
     }
 
-    explicit TSharedCacheImpl(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits) noexcept;
+    explicit TSharedCacheImpl(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits);
 
     using EAcquireStatus = typename TCacheItems<TTraits>::EAcquireStatus;
 
@@ -562,6 +583,18 @@ private:
         TCacheKey Key;
         ui64 Bytes = 0;
         TCacheItem CacheItem;
+    };
+
+    struct TCollectionValueCandidate : TCollectionInsertCandidate {
+        TCollectionValueCandidate(
+            const TIntrusiveConstPtr<NPageCollection::IPageCollection>& collection, THolder<TCollection>& value)
+            : TCollectionInsertCandidate{ .Key = TCacheKey::Collection(collection->Label()) }
+            , PageCollection(collection)
+            , Value(value)
+        {}
+
+        const TIntrusiveConstPtr<NPageCollection::IPageCollection>& PageCollection;
+        THolder<TCollection>& Value;
     };
 
     template <bool IsPage>
@@ -687,12 +720,18 @@ private:
         const TCollectionLocation& collection, TCollectionCacheItem& inserted,
         TCacheCollectionRefImpl<TTraits>& hit) noexcept;
 
+    template <class TCandidate>
+    ECacheResultStatus FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
+        TCandidate& candidate, TCollectionCacheItem& inserted,
+        TCacheCollectionRefImpl<TTraits>& hit) noexcept(noexcept(PrepareCandidate(spaceOp, candidate)));
+
     template <class TKeyedCandidate>
-    ECacheResultStatus FindOrInsert(
-        TSpaceOperation& spaceOp, TKeyedCandidate& candidate, TCacheItemRefImpl<TTraits>& ref) noexcept;
+    ECacheResultStatus FindOrInsert(TSpaceOperation& spaceOp, TKeyedCandidate& candidate,
+        TCacheItemRefImpl<TTraits>& ref) noexcept(noexcept(PrepareCandidate(spaceOp, candidate)));
 
     bool PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate) noexcept;
     bool PrepareCandidate(TSpaceOperation& spaceOp, TCollectionInsertCandidate& candidate) noexcept;
+    bool PrepareCandidate(TSpaceOperation& spaceOp, TCollectionValueCandidate& candidate);
 
     template <bool IsPage>
     bool PrepareCandidate(TSpaceOperation&, TCacheKeyedItem<IsPage>& candidate) noexcept {
@@ -844,6 +883,7 @@ private:
     THolder<TCacheSpace> Space_;
     TCacheTableImpl<TTraits> Table_;
     TCacheMemory Memory_;
+    TCacheMetadata Metadata_;
     TCacheItems<TTraits> Items_;
     TCacheCollections<TTraits> Collections_;
     TCacheEviction<TTraits> Eviction_;
@@ -1012,8 +1052,8 @@ public: // Cache helpers
     }
 
     template <class TKeyedCandidate>
-    Y_FORCE_INLINE ECacheResultStatus FindOrInsert(
-        TKeyedCandidate& candidate, TCacheItemRefImpl<TTraits>& ref) noexcept {
+    Y_FORCE_INLINE ECacheResultStatus FindOrInsert(TKeyedCandidate& candidate,
+        TCacheItemRefImpl<TTraits>& ref) noexcept(noexcept(Cache_.FindOrInsert(SpaceOp_, candidate, ref))) {
         return Cache_.FindOrInsert(SpaceOp_, candidate, ref);
     }
 
@@ -1026,7 +1066,8 @@ public: // Cache helpers
     }
 
     template <class TKeyedCandidate>
-    Y_FORCE_INLINE bool PrepareCandidate(TKeyedCandidate& candidate) noexcept {
+    Y_FORCE_INLINE bool PrepareCandidate(TKeyedCandidate& candidate) noexcept(
+        noexcept(Cache_.PrepareCandidate(SpaceOp_, candidate))) {
         return Cache_.PrepareCandidate(SpaceOp_, candidate);
     }
 

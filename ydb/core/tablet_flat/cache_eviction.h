@@ -56,7 +56,7 @@ public:
     }
 
     ui64 EvictableByteBudget() const noexcept {
-        const ui64 softLimit = Cache_.Memory_.SoftLimit();
+        const ui64 softLimit = Cache_.RetentionLimit();
         return softLimit - Min(softLimit, Cache_.Memory_.Sticky().Bytes());
     }
 

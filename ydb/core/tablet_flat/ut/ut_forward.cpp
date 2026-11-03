@@ -45,6 +45,11 @@ namespace {
             return Id;
         }
 
+        bool IsCompatible(const NPageCollection::IPageCollection& other) const noexcept override {
+            const auto* collection = dynamic_cast<const TBlobPageCollection*>(&other);
+            return collection && Frames == collection->Frames;
+        }
+
         ui32 Total() const noexcept override { return 0; }
         NPageCollection::TInfo Page(ui32) const override { return {0, 0}; }
         NPageCollection::TBorder Bounds(ui32) const override { Y_TABLET_ERROR("Not implemented"); }
@@ -195,13 +200,21 @@ namespace {
     struct TTestPageCollection : public NPageCollection::IPageCollection {
         TIntrusiveConstPtr<NTest::TStore> Store;
         ui32 Room;
+        const TLogoBlobID Id;
 
         TTestPageCollection(TIntrusiveConstPtr<NTest::TStore> store, ui32 room)
-            : Store(std::move(store)), Room(room) {}
+            : Store(std::move(store))
+            , Room(room)
+            , Id(reinterpret_cast<ui64>(Store.Get()), 1, 0, 0, 0, room)
+        {}
 
         const TLogoBlobID& Label() const noexcept override {
-            static TLogoBlobID dummy(0, 0, 0, 0, 0, 0);
-            return dummy;
+            return Id;
+        }
+
+        bool IsCompatible(const NPageCollection::IPageCollection& other) const noexcept override {
+            const auto* collection = dynamic_cast<const TTestPageCollection*>(&other);
+            return collection && Store == collection->Store && Room == collection->Room;
         }
 
         ui32 Total() const noexcept override {

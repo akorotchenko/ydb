@@ -464,8 +464,7 @@ void TCollectionLoadController::Data(const TActorId& sender, TEvCollectionData& 
             return;
         }
         // Allocate before any native Begin can become visible
-        job->Candidate =
-            MakeHolder<TCollection>(std::move(result.PageCollection), TCollectionCacheItem{}, ECacheMode::Regular);
+        job->Candidate = Cache_.PrepareCollection(std::move(result.PageCollection), ECacheMode::Regular);
         Queue(*load);
     } else {
         result.PageCollection.Reset();

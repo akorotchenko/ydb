@@ -95,7 +95,11 @@ struct TCollectionOwner {
 struct TQueuedRequest {
     TActorId Sender;
     TIntrusivePtr<TRequestCompletion> Completion;
-    TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
+
+    const TIntrusiveConstPtr<NPageCollection::IPageCollection>& PageCollection() const noexcept {
+        return Completion->PageCollection();
+    }
+
     NBlockIO::EPriority Priority;
     NWilson::TTraceId TraceId;
     TDeque<TPageFetch> Pages;
@@ -380,25 +384,24 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         const TLogoBlobID& pageCollectionId = pageCollection->Label();
         Y_ENSURE(pageCollectionId);
         Y_ENSURE(InitializeCache(), "Cannot initialize shared cache");
-        const TCollectionLocation location{ .Id = pageCollectionId, .BackingSize = pageCollection->BackingSize() };
+        THolder<TCollection> value;
         TCollectionCacheItem inserted;
         TCacheCollectionRef ref;
-        const auto status = Cache->FindOrInsert(location, inserted, ref);
+        const auto status = Cache->FindOrInsert(pageCollection, value, inserted, ref);
         if (status == ECacheResultStatus::Miss || status == ECacheResultStatus::Pending) {
             return nullptr;
         }
         if (status == ECacheResultStatus::Inserted) {
-            auto value = MakeHolder<TCollection>(pageCollection, inserted, ECacheMode::Regular);
-            Y_ENSURE(Cache->MakeReady(inserted, std::move(value)));
-            Y_ENSURE(Cache->Find(pageCollectionId, ref) == ECacheResultStatus::Hit);
+            Y_ENSURE(Cache->MakeReady(inserted, std::move(value), ref));
         } else {
             Y_ENSURE(status == ECacheResultStatus::Hit);
         }
         TCollection& collection = *ref;
-        Y_ENSURE(collection.PageCollection()->Total() == pageCollection->Total(),
-            "Page collection " << pageCollectionId << " changed number of pages from "
-                               << collection.PageCollection()->Total() << " to " << pageCollection->Total()
-                               << " by " << owner);
+        if (!collection.PageCollection()->IsCompatible(*pageCollection)) {
+            LOG_WARN_S(*TlsActivationContext, NKikimrServices::TABLET_SAUSAGECACHE,
+                "Conflicting page collection descriptor " << pageCollectionId << " from " << owner);
+            return nullptr;
+        }
         collection.SetSkipBTreeIndexV1Shadow(pageCollection->SkipBTreeIndexV1Shadow());
         if (!collection.GetActorState()) {
             LOG_DEBUG_S(*TlsActivationContext, NKikimrServices::TABLET_SAUSAGECACHE,
@@ -457,7 +460,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     void DoGC() {
         if (Cache) {
             const ui64 staticBytes = Cache->StaticBytes();
-            const bool pressure = Cache->RetainedBytes() > Cache->SoftLimit();
+            const bool pressure = Cache->RetainedBytes() > Cache->RetentionLimit();
             const ui32 workLimit =
                 pressure || Cache->NeedsCapacityMaintenance() ? SharedCacheTransitionWorkBatch : 1;
             bool moreWork = false;
@@ -467,7 +470,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 if (!reclaimed && !moreWork) {
                     break;
                 }
-                if (!Cache->NeedsCapacityMaintenance() && Cache->RetainedBytes() <= Cache->SoftLimit()) {
+                if (!Cache->NeedsCapacityMaintenance() && Cache->RetainedBytes() <= Cache->RetentionLimit()) {
                     break;
                 }
             }
@@ -484,6 +487,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             Counters.ActiveInMemoryBytes->Set(Cache->KeepReadyPageBytes());
             Counters.PassivePages->Set(Cache->ColdPages());
             Counters.PassiveBytes->Set(Cache->ColdBytes());
+            Counters.MetadataBytes->Set(Cache->MetadataBytes());
         }
         LastKeepResidentBytes = Cache ? Cache->KeepResidentPageBytes() : 0;
         if (MemoryConsumer) {
@@ -729,12 +733,11 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         for (auto it = ResourceWaits.begin(); it != ResourceWaits.end();) {
             const auto& waiting = **it;
             const bool requiredCollection =
-                !collectionId || waiting.PageCollection->Label() == collectionId ||
-                (waiting.WaitingTransaction &&
-                    (waiting.Completion->WaitPad()->WorkingSetPages.contains(collectionId) ||
-                        AnyOf(waiting.HandleRequirements, [&](const auto& completion) {
-                            return completion->PageCollection()->Label() == collectionId;
-                        })));
+                !collectionId || waiting.PageCollection()->Label() == collectionId ||
+                (waiting.WaitingTransaction && (waiting.Completion->WaitPad()->WorkingSetPages.contains(collectionId) ||
+                                                   AnyOf(waiting.HandleRequirements, [&](const auto& completion) {
+                                                       return completion->PageCollection()->Label() == collectionId;
+                                                   })));
             if (waiting.WaitingTransaction && requiredCollection && (!owner || waiting.Sender == owner)) {
                 waiting.Completion->NotifyResourcesReady();
                 it = ResourceWaits.erase(it);
@@ -837,6 +840,13 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             }
         }
         const bool stickyRequest = eventCookie == ui64(ERequestTypeCookie::StickyPages);
+        TCacheCollectionRef collection;
+        const bool found = Cache->Find(id, collection) == ECacheResultStatus::Hit;
+        const bool compatible = !found || collection->PageCollection()->IsCompatible(*msg.PageCollection);
+        TMetadataRetainer pendingMetadata;
+        if (!found) {
+            pendingMetadata = Cache->RetainMetadata(msg.PageCollection);
+        }
         Counters.PendingRequests->Inc();
         const ui64 completionId = NextRequestId++;
         if (owner) {
@@ -846,7 +856,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             .ActorSystem = TActivationContext::ActorSystem(),
             .ReplyTo = sender,
             .EventCookie = eventCookie,
-            .PageCollection = msg.PageCollection,
+            .Collection = std::move(collection),
+            .PendingMetadata = std::move(pendingMetadata),
+            .Status = compatible ? NKikimrProto::OK : NKikimrProto::ERROR,
             .Pages = std::move(msg.Pages),
             .WaitPad = std::move(msg.WaitPad),
             .Cookie = msg.Cookie,
@@ -855,6 +867,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             .CompletionId = completionId,
         });
 
+        msg.PageCollection = completion->PageCollection();
         auto [requestIt, inserted] =
             Requests.emplace(completionId, TRequest{ id, sender, eventCookie, msg.Cookie, completion });
         Y_ENSURE(inserted);
@@ -864,13 +877,12 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             completion->PostponeForResources();
             return true;
         }
-        if (completion->Locations().empty()) {
+        if (!completion->IsActive() || completion->Locations().empty()) {
             return true;
         }
         auto admission = MakeHolder<TQueuedRequest>();
         admission->Sender = sender;
         admission->Completion = completion;
-        admission->PageCollection = msg.PageCollection;
         admission->CollectionItem = owner ? owner->CacheItem : TCollectionCacheItem{};
         admission->Priority = msg.Priority;
         admission->TraceId = std::move(msg.TraceId);
@@ -908,21 +920,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             admission.AdmissionIndices.clear();
             return true;
         }
-        TCollection* owner = FindCollection(admission.PageCollection->Label());
-        if (admission.CollectionItem) {
-            if (!owner || owner->CacheItem != admission.CollectionItem) {
-                admission.Completion->Cancel(true);
-                return true;
-            }
-        } else {
-            owner = TryAttachCollection(admission.PageCollection, admission.Sender);
-            if (!owner) {
-                return false;
-            }
-            admission.CollectionItem = owner->CacheItem;
-            Requests.at(admission.Completion->CompletionId()).CollectionTracked = true;
-            ++owner->GetActorState()->PendingRequests;
-            RecordPendingInMemoryPages(*owner, admission.Completion->Locations());
+        TCollection* owner = TryBindRequestCollection(admission);
+        if (!owner) {
+            return !admission.Completion->IsActive();
         }
         auto& request = Requests.at(admission.Completion->CompletionId());
         const bool preload = request.EventCookie == KeepPreloadResultCookie;
@@ -942,6 +942,54 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             return false;
         }
 
+        return HandlePageAdmission(admission, requests, request, keepPages);
+    }
+
+    // Resolve and bind metadata before publishing any page waiter
+    TCollection* TryBindRequestCollection(TQueuedRequest& admission) {
+        TCollection* owner = FindCollection(admission.PageCollection()->Label());
+        if (admission.CollectionItem) {
+            if (!owner || owner->CacheItem != admission.CollectionItem) {
+                admission.Completion->Cancel(true);
+                return nullptr;
+            }
+        } else {
+            owner = TryAttachCollection(admission.PageCollection(), admission.Sender);
+            if (!owner) {
+                TCacheCollectionRef existing;
+                if (Cache->Find(admission.PageCollection()->Label(), existing) == ECacheResultStatus::Hit &&
+                    !existing->PageCollection()->IsCompatible(*admission.PageCollection())) {
+                    admission.Completion->Fail();
+                }
+                return nullptr;
+            }
+            admission.CollectionItem = owner->CacheItem;
+            Requests.at(admission.Completion->CompletionId()).CollectionTracked = true;
+            ++owner->GetActorState()->PendingRequests;
+            RecordPendingInMemoryPages(*owner, admission.Completion->Locations());
+        }
+        const auto& bound = admission.Completion->Collection();
+        if (bound && bound.CacheItem() != owner->CacheItem) {
+            admission.Completion->Cancel(true);
+            return nullptr;
+        }
+        if (!bound) {
+            TCacheCollectionRef canonical;
+            Y_ENSURE(Cache->Find(owner->Id(), canonical) == ECacheResultStatus::Hit);
+            if (!admission.Completion->BindCollection(std::move(canonical))) {
+                admission.Completion->Fail();
+                return nullptr;
+            }
+        }
+        return owner;
+    }
+
+    bool HandlePageAdmission(
+        TQueuedRequest& admission, TVector<TCachePageRequest>& requests, TRequest& request, bool keepPages) {
+        const bool preload = request.EventCookie == KeepPreloadResultCookie;
+        const bool recordStats =
+            request.EventCookie != KeepPreloadResultCookie && request.EventCookie != WalkResultCookie;
+        const auto& locations = admission.Completion->Locations();
         // Optional work must not hold hits while waiting for missing handles or another request's admission
         const bool retryPreload = preload && AnyOf(requests, [](const auto& page) {
             return page.Status() == ECacheResultStatus::Miss || page.Status() == ECacheResultStatus::Pending;
@@ -980,7 +1028,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 case ECacheResultStatus::Pending:
                     if (!QueueForPriority(admission.Priority) && page.Status() == ECacheResultStatus::Pending) {
                         if (TPageFetch promoted =
-                                TakeQueuedPage(admission.PageCollection->Label(), locations[index].Offset)) {
+                                TakeQueuedPage(admission.PageCollection()->Label(), locations[index].Offset)) {
                             toFetch.push_back(std::move(promoted));
                         }
                     }
@@ -999,8 +1047,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
         admission.AdmissionIndices = std::move(unresolved);
         if (toFetch) {
-            QueueFetch(admission.PageCollection, std::move(toFetch), admission.Priority, admission.Sender,
-                NWilson::TTraceId(admission.TraceId), admission.Completion);
+            QueueFetch(std::move(toFetch), admission.Priority, admission.Sender, NWilson::TTraceId(admission.TraceId),
+                admission.Completion);
         }
         return admission.AdmissionIndices.empty() && !retryPreload;
     }
@@ -1015,13 +1063,12 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
     }
 
-    void QueueFetch(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, TVector<TPageFetch>&& pages,
-        NBlockIO::EPriority priority, const TActorId& sender, NWilson::TTraceId traceId,
-        TIntrusivePtr<TRequestCompletion> completion) {
+    void QueueFetch(TVector<TPageFetch>&& pages, NBlockIO::EPriority priority, const TActorId& sender,
+        NWilson::TTraceId traceId, TIntrusivePtr<TRequestCompletion> completion) {
+        Y_DEBUG_ABORT_UNLESS(completion->Collection());
         auto waiting = MakeHolder<TQueuedRequest>();
         waiting->Sender = sender;
         waiting->Completion = completion;
-        waiting->PageCollection = collection;
         waiting->Priority = priority;
         waiting->TraceId = NWilson::TTraceId(traceId);
         TVector<TPageFetch> ready;
@@ -1055,7 +1102,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             auto queued = MakeHolder<TQueuedRequest>();
             queued->Sender = sender;
             queued->Completion = std::move(completion);
-            queued->PageCollection = collection;
             queued->Priority = priority;
             queued->TraceId = std::move(traceId);
             for (auto& page : ready) {
@@ -1064,7 +1110,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             queue->Requests[sender].push_back(std::move(queued));
             RequestFromQueue(*queue);
         } else {
-            StartFetch(collection, std::move(ready), priority, sender, std::move(traceId));
+            StartFetch(completion->Collection(), std::move(ready), priority, sender, std::move(traceId));
         }
     }
 
@@ -1077,7 +1123,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                     gate = MakeHolder<TQueuedRequest>();
                     gate->Completion = request.Completion;
                     gate->Sender = request.Sender;
-                    gate->PageCollection = request.Completion->PageCollection();
                 }
                 if (createGate) {
                     gate->HandleRequirements.push_back(request.Completion);
@@ -1112,7 +1157,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             for (const ui32 index : waiting.AdmissionIndices) {
                 locations.push_back(waiting.Completion->Locations()[index]);
             }
-            requirements.push_back({ waiting.PageCollection->Label(), locations });
+            requirements.push_back({ waiting.PageCollection()->Label(), locations });
         }
         bool progress = true;
         for (ui32 step = 0;; ++step) {
@@ -1198,8 +1243,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             }
             if (pages) {
                 const size_t before = ResourceWaits.size();
-                QueueFetch(waiting->PageCollection, std::move(pages), waiting->Priority, waiting->Sender,
-                    std::move(waiting->TraceId), waiting->Completion);
+                QueueFetch(std::move(pages), waiting->Priority, waiting->Sender, std::move(waiting->TraceId),
+                    waiting->Completion);
                 if (ResourceWaits.size() > before) {
                     const auto& blocked = *ResourceWaits.back();
                     for (const auto& page : blocked.Pages) {
@@ -1597,7 +1642,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 auto& requests = ownerIt->second;
                 for (auto requestIt = requests.begin(); requestIt != requests.end(); ++requestIt) {
                     auto& request = **requestIt;
-                    if (request.PageCollection->Label() != collectionId) {
+                    if (request.PageCollection()->Label() != collectionId) {
                         continue;
                     }
                     for (auto pageIt = request.Pages.begin(); pageIt != request.Pages.end(); ++pageIt) {
@@ -1619,7 +1664,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
         for (auto requestIt = ResourceWaits.begin(); requestIt != ResourceWaits.end(); ++requestIt) {
             auto& request = **requestIt;
-            if (request.PageCollection->Label() != collectionId) {
+            if (request.PageCollection()->Label() != collectionId) {
                 continue;
             }
             for (auto pageIt = request.Pages.begin(); pageIt != request.Pages.end(); ++pageIt) {
@@ -1670,7 +1715,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             }
             Y_ENSURE(queue.InFly <= Max<ui64>() - bytes);
             queue.InFly += bytes;
-            StartFetch(request.PageCollection, std::move(batch), request.Priority, request.Sender,
+            StartFetch(request.Completion->Collection(), std::move(batch), request.Priority, request.Sender,
                 NWilson::TTraceId(request.TraceId), queue.Cookie);
             if (request.Pages.empty()) {
                 it->second.pop_front();
@@ -1714,10 +1759,11 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
     }
 
-    void StartFetch(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection,
-        TVector<TPageFetch>&& pages, NBlockIO::EPriority priority, const TActorId& statActor,
-        NWilson::TTraceId traceId, EBlockIOFetchTypeCookie queueCookie = EBlockIOFetchTypeCookie::NoQueue) {
+    void StartFetch(const TCacheCollectionRef& collection, TVector<TPageFetch>&& pages, NBlockIO::EPriority priority,
+        const TActorId& statActor, NWilson::TTraceId traceId,
+        EBlockIOFetchTypeCookie queueCookie = EBlockIOFetchTypeCookie::NoQueue) {
         Y_ENSURE(pages);
+        Y_DEBUG_ABORT_UNLESS(collection);
         TVector<TPageLocation> locations;
         locations.reserve(pages.size());
         ui64 bytes = 0;
@@ -1728,9 +1774,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             locations.push_back(location);
             Y_ENSURE(page.Dispatch());
         }
-        auto* request = new NBlockIO::TEvFetch(priority, pageCollection, std::move(locations), bytes);
+        auto* request = new NBlockIO::TEvFetch(priority, collection.Acquire(), std::move(locations), bytes);
         request->TraceId = std::move(traceId);
-        const TLogoBlobID collectionId = pageCollection->Label();
+        const TLogoBlobID collectionId = collection->Id();
         const ui32 pageCount = pages.size();
         Counters.LoadInFlyPages->Add(pageCount);
         Counters.LoadInFlyBytes->Add(bytes);
@@ -1761,7 +1807,9 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             if (valid && data.Pages[index].Offset == page.Location().Offset &&
                 data.Pages[index].Data.size() == page.Size())
             {
-                page.MakeReady(std::move(data.Pages[index].Data));
+                if (!page.MakeReady(std::move(data.Pages[index].Data))) {
+                    failed = true;
+                }
             } else {
                 failed = true;
                 page.FailReady();

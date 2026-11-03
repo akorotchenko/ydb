@@ -3,6 +3,7 @@
 #include "defs.h"
 #include "cache_fwd.h"
 #include "cache_item.h"
+#include "cache_metadata.h"
 
 #include <util/generic/ptr.h>
 
@@ -50,15 +51,6 @@ struct TCollectionActorState;
 
 class TCollection {
 public:
-    Y_FORCE_INLINE explicit TCollection(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection,
-        TCollectionCacheItem cacheItem = {}, ECacheMode initialMode = ECacheMode::Sticky) noexcept
-        : CacheItem(cacheItem)
-        , PageCollection_(std::move(pageCollection))
-        , CacheMode_(initialMode)
-    {
-        Y_DEBUG_ABORT_UNLESS(PageCollection_);
-    }
-
     TCollection(const TCollection&) = delete;
     TCollection& operator=(const TCollection&) = delete;
 
@@ -67,23 +59,23 @@ public:
     }
 
     const TLogoBlobID& Id() const noexcept {
-        return PageCollection_->Label();
+        return PageCollection()->Label();
     }
 
     const TIntrusiveConstPtr<NPageCollection::IPageCollection>& PageCollection() const noexcept {
-        return PageCollection_;
+        return Metadata_.PageCollection();
     }
 
     NTable::NPage::TPageLocation GetLocation(ui32 pageId) const {
-        return PageCollection_->GetLocation(pageId);
+        return PageCollection()->GetLocation(pageId);
     }
 
     NTable::NPage::EPage GetPageType(ui32 pageId) const noexcept {
-        return NTable::NPage::EPage(PageCollection_->Page(pageId).Type);
+        return NTable::NPage::EPage(PageCollection()->Page(pageId).Type);
     }
 
     ui64 GetPageSize(ui32 pageId) const noexcept {
-        return PageCollection_->Page(pageId).Size;
+        return PageCollection()->Page(pageId).Size;
     }
 
     ECacheMode GetCacheMode() const noexcept {
@@ -96,7 +88,7 @@ public:
     TCachePageRef TryGetPage(const NTable::NPage::TPageLocation& location, bool sticky = false) const;
 
     ui64 TotalSize() const noexcept {
-        return NActors::TSharedData::OverheadSize * PageCollection_->Total() + PageCollection_->BackingSize();
+        return NActors::TSharedData::OverheadSize * PageCollection()->Total() + PageCollection()->BackingSize();
     }
 
     // Actor-only bookkeeping; native readers and writers do not access it.
@@ -113,7 +105,7 @@ public:
     }
 
     ui64 AccountedBytes() const noexcept {
-        // Restored when collection metadata joins cache-limit accounting.
+        // Metadata is charged separately from page admission
         return 0;
     }
 
@@ -131,20 +123,20 @@ public:
     }
 
     bool IsKeepAllowedPage(NTable::NPage::EPage type) const noexcept {
-        return !NPageCollection::IsDeadPage(type, PageCollection_->SkipBTreeIndexV1Shadow());
+        return !NPageCollection::IsDeadPage(type, PageCollection()->SkipBTreeIndexV1Shadow());
     }
 
     ui64 KeepResidentPageBytes() const noexcept {
         const ui64 bytes = KeepResidentPageBytes_.load(std::memory_order_relaxed);
         const ui64 shadowBytes =
-            PageCollection_->SkipBTreeIndexV1Shadow() ? BTreeIndexV1ResidentBytes_.load(std::memory_order_relaxed) : 0;
+            PageCollection()->SkipBTreeIndexV1Shadow() ? BTreeIndexV1ResidentBytes_.load(std::memory_order_relaxed) : 0;
         return bytes - Min(bytes, shadowBytes);
     }
 
     ui64 KeepReadyPageBytes() const noexcept {
         const i64 bytes =
             KeepReadyPageBytes_.load(std::memory_order_relaxed) -
-            (PageCollection_->SkipBTreeIndexV1Shadow() ? BTreeIndexV1ReadyBytes_.load(std::memory_order_relaxed) : 0);
+            (PageCollection()->SkipBTreeIndexV1Shadow() ? BTreeIndexV1ReadyBytes_.load(std::memory_order_relaxed) : 0);
         return bytes > 0 ? static_cast<ui64>(bytes) : 0;
     }
 
@@ -155,6 +147,11 @@ public:
     std::atomic<ui64> PageReferences{ 0 };
 
 private:
+    explicit TCollection(TMetadataRetainer metadata, ECacheMode initialMode) noexcept
+        : Metadata_(std::move(metadata))
+        , CacheMode_(initialMode)
+    {}
+
     template <class>
     friend class TCacheCollections;
 
@@ -165,7 +162,7 @@ private:
     friend class TSharedCacheImpl;
 
     std::atomic<TCollectionActorState*> ActorState_{ nullptr };
-    const TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
+    const TMetadataRetainer Metadata_;
     std::atomic<TCollectionRegistry*> Registry_{ nullptr };
     std::atomic<ECacheMode> CacheMode_;
     std::atomic<ui64> KeepGeneration_{ 0 };
@@ -188,7 +185,7 @@ private:
 };
 
 inline ui64 TCollectionLocation::AccountedBytes() const noexcept {
-    // Restored when collection metadata joins cache-limit accounting.
+    // Metadata is charged separately from page admission
     return 0;
 }
 

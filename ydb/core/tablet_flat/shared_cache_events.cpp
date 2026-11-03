@@ -12,20 +12,20 @@ TCacheCollectionRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitCollection(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection)
     requires std::is_same_v<TTraits, TProdTraits>
 {
-    const TCollectionLocation location{ .Id = collection->Label(), .BackingSize = collection->BackingSize() };
+    THolder<TCollection> value;
     TCollectionCacheItem inserted;
     TCacheCollectionRefImpl<TTraits> hit;
-    auto status = FindOrInsert(location, inserted, hit);
+    auto status = FindOrInsert(collection, value, inserted, hit);
     while (status == ECacheResultStatus::Pending) {
         // A concurrent metadata publisher completes synchronously; share its ready collection.
         std::this_thread::yield();
-        status = FindOrInsert(location, inserted, hit);
+        status = FindOrInsert(collection, value, inserted, hit);
     }
     if (status == ECacheResultStatus::Inserted) {
-        Y_ENSURE(
-            MakeReady(inserted, MakeHolder<TCollection>(std::move(collection), inserted, ECacheMode::Regular), hit));
+        Y_ENSURE(MakeReady(inserted, std::move(value), hit));
     } else {
         Y_ENSURE(status == ECacheResultStatus::Hit);
+        Y_ENSURE(hit->PageCollection()->IsCompatible(*collection), "Conflicting collection metadata descriptor");
         hit->SetSkipBTreeIndexV1Shadow(collection->SkipBTreeIndexV1Shadow());
     }
     return hit;
@@ -82,7 +82,10 @@ TRequestCompletion::TRequestCompletion(TRequestCompletionParams&& params) noexce
     , EventCookie_(params.EventCookie)
     , ExecutorGeneration_(params.ExecutorGeneration)
     , RequestId_(params.RequestId)
-    , PageCollection_(std::move(params.PageCollection))
+    , PageCollection_(params.Collection ? params.Collection->PageCollection()
+                                        : TIntrusiveConstPtr<NPageCollection::IPageCollection>{})
+    , Collection_(std::move(params.Collection))
+    , PendingMetadata_(std::move(params.PendingMetadata))
     , Locations_(std::move(params.Pages))
     , ReadyPages_(Locations_.size())
     , WaitPad_(std::move(params.WaitPad))
@@ -90,13 +93,41 @@ TRequestCompletion::TRequestCompletion(TRequestCompletionParams&& params) noexce
     , Notify_(params.Notify)
     , CoreRoute_(params.CoreRoute)
     , CompletionId_(params.CompletionId)
+    , Status_(params.Status)
     , RemainingPages_(static_cast<ui32>(Locations_.size()))
 {
     Y_DEBUG_ABORT_UNLESS(Locations_.size() <= Max<ui32>());
-    Y_DEBUG_ABORT_UNLESS(ActorSystem_ && ReplyTo_ && PageCollection_);
-    if (RemainingPages_.load(std::memory_order_relaxed) == 0) {
+    Y_DEBUG_ABORT_UNLESS(ActorSystem_ && ReplyTo_ && (Collection_ || PendingMetadata_));
+    Y_DEBUG_ABORT_UNLESS(!Collection_ || !PendingMetadata_);
+    if (RemainingPages_.load(std::memory_order_relaxed) == 0 || params.Status != NKikimrProto::OK) {
         SendResult(TakeResult());
     }
+}
+
+bool TRequestCompletion::BindCollection(TCacheCollectionRef collection) noexcept {
+    Y_DEBUG_ABORT_UNLESS(collection);
+    if (Collection_) {
+        return Collection_.CacheItem() == collection.CacheItem();
+    }
+    if (!collection->PageCollection()->IsCompatible(*PendingMetadata_.PageCollection())) {
+        return false;
+    }
+    PageCollection_ = collection->PageCollection();
+    Collection_ = std::move(collection);
+    PendingMetadata_.Reset();
+    return true;
+}
+
+void TRequestCompletion::Fail() noexcept {
+    TVector<TCachePageRef> releasedPages;
+    THolder<TEvResult> result;
+    {
+        TGuard<TMutex> guard(Mutex_);
+        Status_.store(NKikimrProto::ERROR, std::memory_order_relaxed);
+        releasedPages.swap(ReadyPages_);
+        result = TakeResult();
+    }
+    SendResult(std::move(result));
 }
 
 void TRequestCompletion::Complete(ui32 index, TCachePageRef page, EPageFetchCompletion completion) noexcept {
@@ -157,7 +188,7 @@ void TRequestCompletion::PostponeForResources() noexcept {
 
 void TRequestCompletion::NotifyResourcesReady() noexcept {
     auto* result =
-        new TEvResult(PageCollection_, NKikimrProto::OK, Cookie_, ExecutorGeneration_, RequestId_, CoreRoute_);
+        new TEvResult(PageCollection(), NKikimrProto::OK, Cookie_, ExecutorGeneration_, RequestId_, CoreRoute_);
     result->WaitPad = WaitPad_;
     result->ResourcesReady = true;
     ActorSystem_->Send(ReplyTo_, result, 0, EventCookie_);
@@ -165,7 +196,7 @@ void TRequestCompletion::NotifyResourcesReady() noexcept {
 
 void TRequestCompletion::NotifyWorkingSetTooLarge() noexcept {
     auto* result =
-        new TEvResult(PageCollection_, NKikimrProto::ERROR, Cookie_, ExecutorGeneration_, RequestId_, CoreRoute_);
+        new TEvResult(PageCollection(), NKikimrProto::ERROR, Cookie_, ExecutorGeneration_, RequestId_, CoreRoute_);
     result->WaitPad = WaitPad_;
     result->WorkingSetTooLarge = true;
     ActorSystem_->Send(ReplyTo_, result, 0, EventCookie_);
@@ -176,7 +207,7 @@ THolder<TEvResult> TRequestCompletion::TakeResult() noexcept {
         return {};
     }
     const TEvResult::EStatus status = Status_.load(std::memory_order_relaxed);
-    auto result = MakeHolder<TEvResult>(PageCollection_, status, Cookie_, ExecutorGeneration_, RequestId_, CoreRoute_);
+    auto result = MakeHolder<TEvResult>(PageCollection(), status, Cookie_, ExecutorGeneration_, RequestId_, CoreRoute_);
     result->WaitPad = WaitPad_;
     result->ResourcePressure = ResourcePressure_;
     if (status == NKikimrProto::OK) {

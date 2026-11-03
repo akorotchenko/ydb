@@ -79,7 +79,7 @@ void TProdTraits::NotifyResourcesAvailable() const noexcept {
 #define TOperationItemRef TOperationItemRef<TTraits>
 
 SHARED_CACHE_TEMPLATE
-TSharedCache::TSharedCacheImpl(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits) noexcept
+TSharedCache::TSharedCacheImpl(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits)
     : TTraits(std::move(traits))
     , Space_(std::move(space))
     , Table_(*this)
@@ -325,6 +325,12 @@ bool TSharedCache::WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheIte
 }
 
 SHARED_CACHE_TEMPLATE
+THolder<TCollection> TSharedCache::PrepareCollection(
+    TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, ECacheMode mode) {
+    return THolder<TCollection>(new TCollection(Metadata_.Track(std::move(collection)), mode));
+}
+
+SHARED_CACHE_TEMPLATE
 bool TSharedCache::MakeReady(
     TCollectionCacheItem collection, THolder<TCollection>&& value, TCacheCollectionRef& ready) noexcept {
     auto cacheOp = BeginOperation();
@@ -350,7 +356,7 @@ SHARED_CACHE_TEMPLATE
 bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* registry, TCacheItem cacheItem,
     THolder<TCollection>&& value) noexcept {
     auto cacheOp = BindOperation(spaceOp);
-    Y_DEBUG_ABORT_UNLESS(value);
+    Y_DEBUG_ABORT_UNLESS(value && Metadata_.Owns(value->Metadata_));
     Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AccessibleHandleCount());
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
@@ -418,7 +424,7 @@ void TSharedCache::MakeReadyState(TSpaceOperation& spaceOp, TCacheItem item, EHa
                 Memory_.AddRetainedBytes(bytes);
                 retained = true;
             } else {
-                retained = Memory_.TryAddRetainedBytes(bytes);
+                retained = Memory_.TryAddRetainedBytes(bytes, RetentionLimit());
             }
             retentionGuaranteed = guaranteed;
             if (!retained) {
@@ -692,6 +698,14 @@ bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TCollectionInsertC
 }
 
 SHARED_CACHE_TEMPLATE
+bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TCollectionValueCandidate& candidate) {
+    if (!candidate.Value) {
+        candidate.Value = PrepareCollection(candidate.PageCollection, ECacheMode::Regular);
+    }
+    return PrepareCandidate(spaceOp, static_cast<TCollectionInsertCandidate&>(candidate));
+}
+
+SHARED_CACHE_TEMPLATE
 typename TSharedCache::TPageInsertCandidate TSharedCache::BuildPageInsertCandidate(
     TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page, EStickyState sticky) noexcept {
     return {
@@ -953,13 +967,32 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
 }
 
 SHARED_CACHE_TEMPLATE
+ECacheResultStatus TSharedCache::FindOrInsert(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
+    THolder<TCollection>& value, TCollectionCacheItem& inserted, TCacheCollectionRef& hit) {
+    Y_DEBUG_ABORT_UNLESS(!value || (value->PageCollection() == collection && Metadata_.Owns(value->Metadata_)));
+    inserted = {};
+    hit.Drop();
+    TCollectionValueCandidate candidate(collection, value);
+    auto cacheOp = BeginOperation();
+    return FindOrInsertCollection(cacheOp.SpaceOperation(), &Collections_.Registry(), candidate, inserted, hit);
+}
+
+SHARED_CACHE_TEMPLATE
 ECacheResultStatus TSharedCache::FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
     const TCollectionLocation& collection, TCollectionCacheItem& inserted, TCacheCollectionRef& hit) noexcept {
-    auto cacheOp = BindOperation(spaceOp);
     TCollectionInsertCandidate candidate{
         .Key = TCacheKey::Collection(collection.Id),
         .Bytes = collection.AccountedBytes(),
     };
+    return FindOrInsertCollection(spaceOp, registry, candidate, inserted, hit);
+}
+
+SHARED_CACHE_TEMPLATE
+template <class TCandidate>
+ECacheResultStatus TSharedCache::FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
+    TCandidate& candidate, TCollectionCacheItem& inserted,
+    TCacheCollectionRef& hit) noexcept(noexcept(PrepareCandidate(spaceOp, candidate))) {
+    auto cacheOp = BindOperation(spaceOp);
     TOperationItemRef ref(spaceOp);
     const ECacheResultStatus status = cacheOp.FindOrInsert(candidate, ref.Get());
     if (status == ECacheResultStatus::Inserted) {
@@ -975,8 +1008,8 @@ ECacheResultStatus TSharedCache::FindOrInsertCollection(TSpaceOperation& spaceOp
 
 SHARED_CACHE_TEMPLATE
 template <class TKeyedCandidate>
-ECacheResultStatus TSharedCache::FindOrInsert(
-    TSpaceOperation& spaceOp, TKeyedCandidate& candidate, TCacheItemRef& ref) noexcept {
+ECacheResultStatus TSharedCache::FindOrInsert(TSpaceOperation& spaceOp, TKeyedCandidate& candidate,
+    TCacheItemRef& ref) noexcept(noexcept(PrepareCandidate(spaceOp, candidate))) {
     auto cacheOp = BindOperation(spaceOp);
     for (;;) {
         typename TOperation::TInsertPosition insertPosition;
@@ -985,11 +1018,11 @@ ECacheResultStatus TSharedCache::FindOrInsert(
         bool inserted = false;
         if (status == ECacheResultStatus::Miss) {
             if (candidate.CacheItem.IsNull()) {
+                // Preparation may throw; the insertion position is recomputed afterwards
+                cacheOp.DropInsertOwner(insertPosition);
                 if (!cacheOp.PrepareCandidate(candidate)) {
-                    cacheOp.DropInsertOwner(insertPosition);
                     return ECacheResultStatus::Miss;
                 }
-                cacheOp.DropInsertOwner(insertPosition);
                 continue;
             }
             if (!cacheOp.InsertAt(insertPosition, candidate.CacheItem)) {

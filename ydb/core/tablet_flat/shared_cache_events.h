@@ -243,7 +243,9 @@ namespace NKikimr::NSharedCache {
         ui64 EventCookie = 0;
         ui64 ExecutorGeneration = 0;
         ui64 RequestId = 0;
-        TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
+        TCacheCollectionRef Collection;
+        TMetadataRetainer PendingMetadata;
+        NKikimrProto::EReplyStatus Status = NKikimrProto::OK;
         TVector<TPageLocation> Pages;
         TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad;
         ui64 Cookie = 0;
@@ -256,7 +258,10 @@ namespace NKikimr::NSharedCache {
     public:
         explicit TRequestCompletion(TRequestCompletionParams&& params) noexcept;
 
+        // Cache actor only; bind once before publishing any page waiter
+        bool BindCollection(TCacheCollectionRef collection) noexcept;
         void Complete(ui32 index, TCachePageRef page, EPageFetchCompletion completion) noexcept;
+        void Fail() noexcept;
         void Cancel(bool replyImmediately = false) noexcept;
         void PostponeForResources() noexcept;
         void NotifyResourcesReady() noexcept;
@@ -287,7 +292,11 @@ namespace NKikimr::NSharedCache {
         }
 
         const TIntrusiveConstPtr<NPageCollection::IPageCollection>& PageCollection() const noexcept {
-            return PageCollection_;
+            return Collection_ ? PageCollection_ : PendingMetadata_.PageCollection();
+        }
+
+        const TCacheCollectionRef& Collection() const noexcept {
+            return Collection_;
         }
 
     private:
@@ -301,7 +310,10 @@ namespace NKikimr::NSharedCache {
         const ui64 EventCookie_;
         const ui64 ExecutorGeneration_;
         const ui64 RequestId_;
+        // A failure callback can reply without the cache TLS context
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
+        TCacheCollectionRef Collection_;
+        TMetadataRetainer PendingMetadata_;
         TVector<TPageLocation> Locations_;
         TVector<TCachePageRef> ReadyPages_;
         TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad_;
@@ -309,6 +321,7 @@ namespace NKikimr::NSharedCache {
         const NActors::TActorId Notify_;
         const bool CoreRoute_;
         const ui64 CompletionId_;
+        // Protects ReadyPages_ and reply assembly when native callbacks race with actor cancellation
         mutable TMutex Mutex_;
         bool ResourcePressure_ = false;
         std::atomic<TEvResult::EStatus> Status_{ NKikimrProto::OK };

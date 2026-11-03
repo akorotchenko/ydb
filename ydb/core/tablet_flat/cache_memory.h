@@ -239,7 +239,7 @@ public:
     TKeepReservation TryReserveKeep(ui64 bytes, ui64 byteLimit) noexcept;
     void ReleaseKeep(ui64 bytes) noexcept;
 
-    bool TryAddRetainedBytes(ui64 bytes) noexcept;
+    bool TryAddRetainedBytes(ui64 bytes, ui64 limit) noexcept;
 
     void AddRetainedBytes(ui64 bytes) noexcept {
         RetainedBytes_.fetch_add(bytes, std::memory_order_relaxed);
@@ -427,10 +427,10 @@ inline void TCacheMemory::AddStats(const TStats& stats) noexcept {
     MissBytes_.fetch_add(stats.MissBytes, std::memory_order_relaxed);
 }
 
-inline bool TCacheMemory::TryAddRetainedBytes(ui64 bytes) noexcept {
+inline bool TCacheMemory::TryAddRetainedBytes(ui64 bytes, ui64 limit) noexcept {
     ui64 retained = RetainedBytes_.load(std::memory_order_relaxed);
     for (;;) {
-        if (retained + bytes > SoftLimit()) {
+        if (retained > limit || bytes > limit - retained) {
             return false;
         }
         if (RetainedBytes_.compare_exchange_weak(

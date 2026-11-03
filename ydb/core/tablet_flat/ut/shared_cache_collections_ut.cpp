@@ -542,7 +542,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
 
         auto packet =
             MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
-        UNIT_ASSERT(TSharedCache::Get().MakeReady(replacement, MakeHolder<TCollection>(packet)));
+        UNIT_ASSERT(TSharedCache::Get().MakeReady(replacement, TSharedCache::Get().PrepareCollection(packet)));
         auto result = fixture.Result();
         UNIT_ASSERT(result->Get()->Request == fresh);
         UNIT_ASSERT(result->Get()->Collection.CacheItem() == replacement);
@@ -741,7 +741,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Results, 0);
         auto packet =
             MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
-        UNIT_ASSERT(TSharedCache::Get().MakeReady(item, MakeHolder<TCollection>(packet)));
+        UNIT_ASSERT(TSharedCache::Get().MakeReady(item, TSharedCache::Get().PrepareCollection(packet)));
         auto result = fixture.Result();
         UNIT_ASSERT(result->Get()->Request == request);
         UNIT_ASSERT(result->Get()->Collection.CacheItem() == item);
@@ -966,7 +966,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         UNIT_ASSERT(!retained->IsActive() && fresh->IsActive());
         auto packet =
             MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
-        UNIT_ASSERT(TSharedCache::Get().MakeReady(replacement, MakeHolder<TCollection>(packet)));
+        UNIT_ASSERT(TSharedCache::Get().MakeReady(replacement, TSharedCache::Get().PrepareCollection(packet)));
         auto result = fixture.Result(NKikimrProto::OK, other);
         UNIT_ASSERT(result->Get()->Request == fresh);
         UNIT_ASSERT(result->Get()->Collection.CacheItem() == replacement);

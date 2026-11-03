@@ -25,13 +25,12 @@ TCachePageRef TCollection::TryGetPage(const NTable::NPage::TPageLocation& locati
         if (!HasAppData()) {
             return {};
         }
+        THolder<TCollection> value;
         TCollectionCacheItem inserted;
         TCacheCollectionRef attached;
-        const TCollectionLocation collectionLocation{ .Id = Id(), .BackingSize = PageCollection_->BackingSize() };
-        const auto status = cache->FindOrInsert(collectionLocation, inserted, attached);
+        const auto status = cache->FindOrInsert(PageCollection(), value, inserted, attached);
         if (status == ECacheResultStatus::Inserted) {
-            Y_ENSURE(
-                cache->MakeReady(inserted, MakeHolder<TCollection>(PageCollection_, inserted, ECacheMode::Regular)));
+            Y_ENSURE(cache->MakeReady(inserted, std::move(value)));
             return {};
         }
         if (status != ECacheResultStatus::Hit || attached.CacheItem() != item) {

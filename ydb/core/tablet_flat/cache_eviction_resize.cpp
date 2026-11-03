@@ -261,7 +261,7 @@ bool TCacheEviction<TTraits>::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64
     if (ObservedKeepLimit_.exchange(liveKeep, std::memory_order_acq_rel) != liveKeep) {
         Cache_.Capacity_.RequestTierRebalance();
     }
-    const ui64 soft = Cache_.Memory_.SoftLimit();
+    const ui64 soft = Cache_.RetentionLimit();
     const bool currentPressure = ExceedsLimit(Cache_.Memory_.PayloadUsage(), Cache_.Memory_.CurrentLimit(), bytes);
     const bool softPressure =
         SoftLimitPressure_.exchange(false, std::memory_order_relaxed) || Cache_.Memory_.RetainedBytes() > soft;
