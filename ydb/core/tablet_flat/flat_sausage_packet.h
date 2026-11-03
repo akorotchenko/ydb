@@ -6,6 +6,7 @@
 #include "util_fmt_abort.h"
 
 #include <atomic>
+#include <typeinfo>
 
 namespace NKikimr {
 namespace NPageCollection {
@@ -32,6 +33,14 @@ namespace NPageCollection {
         ui32 Total() const noexcept override
         {
             return MetaPages() + SkippedInMeta;
+        }
+
+        bool IsCompatible(const IPageCollection& other) const noexcept override {
+            if (this == &other) {
+                return true;
+            }
+            const auto* packet = dynamic_cast<const TPageCollection*>(&other);
+            return packet && typeid(*this) == typeid(other) && LargeGlobId == packet->LargeGlobId;
         }
 
         /* Structural pages addressable by TPageId (enumerated in TMeta).

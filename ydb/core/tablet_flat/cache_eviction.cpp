@@ -211,7 +211,7 @@ bool TCacheEviction<TTraits>::PromoteCold(TSpaceOperation& spaceOp, TCacheItem i
         const bool guaranteed = force || !owner || owner->GetCacheMode() == ECacheMode::Sticky;
         if (guaranteed) {
             Cache_.Memory_.AddRetainedBytes(bytes);
-        } else if (!Cache_.Memory_.TryAddRetainedBytes(bytes)) {
+        } else if (!Cache_.Memory_.TryAddRetainedBytes(bytes, Cache_.RetentionLimit())) {
             return false;
         }
         const auto after = before.WithState(THandleState::HotState(tier)).WithFrequency(0);

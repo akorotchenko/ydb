@@ -13,14 +13,21 @@ enum class EMetadataReconcile : ui8 {
     Buffer,
 };
 
-// Copies retain one cache ownership group, without acquiring a native cache item
-class TMetadataLease final : public TAtomicRefCount<TMetadataLease> {
+// Descriptor ownership and accounting travel together as a value
+class TMetadataRetainer {
 public:
-    ~TMetadataLease();
-    TMetadataLease(const TMetadataLease&) = delete;
-    TMetadataLease& operator=(const TMetadataLease&) = delete;
-    TMetadataLease(TMetadataLease&&) = delete;
-    TMetadataLease& operator=(TMetadataLease&&) = delete;
+    TMetadataRetainer() noexcept = default;
+    TMetadataRetainer(const TMetadataRetainer& other) noexcept;
+    TMetadataRetainer(TMetadataRetainer&& other) noexcept;
+    TMetadataRetainer& operator=(const TMetadataRetainer& other) noexcept;
+    TMetadataRetainer& operator=(TMetadataRetainer&& other) noexcept;
+    ~TMetadataRetainer();
+
+    explicit operator bool() const noexcept {
+        return Record_ != nullptr;
+    }
+
+    void Reset() noexcept;
 
     const TIntrusiveConstPtr<NPageCollection::IPageCollection>& PageCollection() const noexcept {
         return PageCollection_;
@@ -29,10 +36,13 @@ public:
 private:
     friend class TCacheMetadata;
 
-    TMetadataLease(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, TMetadataRecord& record) noexcept;
+    TMetadataRetainer(
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, TMetadataRecord& record) noexcept;
+
+    void Swap(TMetadataRetainer& other) noexcept;
 
     TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
-    TMetadataRecord& Record_;
+    TMetadataRecord* Record_ = nullptr;
 };
 
 class TCacheMetadata {
@@ -43,7 +53,9 @@ public:
     TCacheMetadata& operator=(const TCacheMetadata&) = delete;
 
     // Footprint and buffer identity must stay fixed for the descriptor's entire lifetime
-    TIntrusivePtr<TMetadataLease> Track(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection);
+    TMetadataRetainer Track(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection);
+
+    bool Owns(const TMetadataRetainer& retainer) const noexcept;
 
     // Allocation may occur here, before entering a no-throw native publication path
     void PreparePageCharge(const TSharedData& buffer);

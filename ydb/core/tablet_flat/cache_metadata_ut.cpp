@@ -18,8 +18,11 @@ public:
     }
 };
 
-static_assert(!std::is_copy_constructible_v<TMetadataLease>);
-static_assert(!std::is_move_constructible_v<TMetadataLease>);
+static_assert(std::is_nothrow_copy_constructible_v<TMetadataRetainer>);
+static_assert(std::is_nothrow_copy_assignable_v<TMetadataRetainer>);
+static_assert(std::is_nothrow_move_constructible_v<TMetadataRetainer>);
+static_assert(std::is_nothrow_move_assignable_v<TMetadataRetainer>);
+static_assert(sizeof(TMetadataRetainer) == 2 * sizeof(void*));
 
 namespace {
 
@@ -128,13 +131,13 @@ namespace {
 Y_UNIT_TEST_SUITE(TSharedCacheMetadataAccounting) {
     Y_UNIT_TEST(DescriptorWithoutRawCountsItsFixedFootprint) {
         TCacheMetadata metadata;
-        auto lease = metadata.Track(MakeIntrusiveConst<TDescriptor>(TSharedData{}, 12));
+        auto retainer = metadata.Track(MakeIntrusiveConst<TDescriptor>(TSharedData{}, 12));
         UNIT_ASSERT_VALUES_EQUAL(metadata.GetMemoryUsage(), 12);
-        lease.Reset();
+        retainer.Reset();
         UNIT_ASSERT_VALUES_EQUAL(metadata.GetMemoryUsage(), 0);
     }
 
-    Y_UNIT_TEST(DeduplicatesDescriptorGroupsAndLeaseCopies) {
+    Y_UNIT_TEST(DeduplicatesDescriptorOwnersAndRetainerCopies) {
         TCacheMetadata metadata;
         auto raw = TSharedData::Uninitialized(64);
         auto descriptor = MakeIntrusiveConst<TDescriptor>(raw, 12);
@@ -149,6 +152,73 @@ Y_UNIT_TEST_SUITE(TSharedCacheMetadataAccounting) {
         copy.Reset();
         UNIT_ASSERT_VALUES_EQUAL(metadata.GetMemoryUsage(), 0);
         UNIT_ASSERT(descriptor);
+    }
+
+    Y_UNIT_TEST(MovesTransferOwnershipWithoutReconciliation) {
+        TCacheMetadata metadata;
+        TMetadataRetainer empty;
+        TMetadataRetainer emptyCopy(empty);
+        TMetadataRetainer emptyMoved(std::move(emptyCopy));
+        empty = std::move(emptyMoved);
+        emptyCopy = empty;
+        empty.Reset();
+        UNIT_ASSERT(!empty && !emptyCopy && !emptyMoved);
+        UNIT_ASSERT(!metadata.Owns(empty));
+        UNIT_ASSERT(!empty.PageCollection());
+
+        auto first = metadata.Track(MakeIntrusiveConst<TDescriptor>(TSharedData{}, 12));
+        std::atomic<ui32> reconciliations = 0;
+        TCacheMetadataTestAccess::SetHook(metadata, &reconciliations, [](void* context, EMetadataReconcile) noexcept {
+            static_cast<std::atomic<ui32>*>(context)->fetch_add(1, std::memory_order_relaxed);
+        });
+        Y_DEFER {
+            TCacheMetadataTestAccess::SetHook(metadata, nullptr, nullptr);
+        };
+        TMetadataRetainer second(std::move(first));
+        TMetadataRetainer third;
+        third = std::move(second);
+        TMetadataRetainer* const self = &third;
+        third = *self;
+        third = std::move(*self);
+        UNIT_ASSERT(!first && !second);
+        UNIT_ASSERT(!first.PageCollection() && !second.PageCollection());
+        UNIT_ASSERT(third);
+        UNIT_ASSERT(metadata.Owns(third));
+        UNIT_ASSERT_VALUES_EQUAL(metadata.GetMemoryUsage(), 12);
+        UNIT_ASSERT_VALUES_EQUAL(reconciliations.load(), 0);
+        TCacheMetadataTestAccess::SetHook(metadata, nullptr, nullptr);
+        third.Reset();
+        UNIT_ASSERT_VALUES_EQUAL(metadata.GetMemoryUsage(), 0);
+    }
+
+    Y_UNIT_TEST(AssignmentsReplaceBothDescriptorAndAccount) {
+        TCacheMetadata firstAccount;
+        TCacheMetadata secondAccount;
+        std::atomic<ui32> firstDestroyed = 0;
+        std::atomic<ui32> secondDestroyed = 0;
+        std::atomic<ui32> thirdDestroyed = 0;
+        auto first = firstAccount.Track(MakeIntrusiveConst<TDescriptor>(TSharedData{}, 12, 1, &firstDestroyed));
+        auto second = secondAccount.Track(MakeIntrusiveConst<TDescriptor>(TSharedData{}, 20, 2, &secondDestroyed));
+        first = second;
+        UNIT_ASSERT_VALUES_EQUAL(firstDestroyed.load(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(firstAccount.GetMemoryUsage(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(secondAccount.GetMemoryUsage(), 20);
+        UNIT_ASSERT(!firstAccount.Owns(first));
+        UNIT_ASSERT(secondAccount.Owns(first));
+        second.Reset();
+        UNIT_ASSERT_VALUES_EQUAL(secondDestroyed.load(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(secondAccount.GetMemoryUsage(), 20);
+
+        auto third = firstAccount.Track(MakeIntrusiveConst<TDescriptor>(TSharedData{}, 32, 3, &thirdDestroyed));
+        first = std::move(third);
+        UNIT_ASSERT(!third);
+        UNIT_ASSERT_VALUES_EQUAL(secondDestroyed.load(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(secondAccount.GetMemoryUsage(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(firstAccount.GetMemoryUsage(), 32);
+        UNIT_ASSERT(firstAccount.Owns(first));
+        first.Reset();
+        UNIT_ASSERT_VALUES_EQUAL(thirdDestroyed.load(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(firstAccount.GetMemoryUsage(), 0);
     }
 
     Y_UNIT_TEST(DeduplicatesSharedRawButKeepsBothFixedFootprints) {
@@ -186,13 +256,13 @@ Y_UNIT_TEST_SUITE(TSharedCacheMetadataAccounting) {
         metadata.AddPageCharge(raw, pageCharge);
         UNIT_ASSERT_VALUES_EQUAL(metadata.GetMemoryUsage(), 0);
         auto descriptor = MakeIntrusiveConst<TDescriptor>(raw, 12);
-        auto lease = metadata.Track(descriptor);
+        auto retainer = metadata.Track(descriptor);
         UNIT_ASSERT_VALUES_EQUAL(metadata.GetMemoryUsage(), 12 + allocation - pageCharge);
         auto buffer = std::move(raw).Extract();
         metadata.RemovePageCharge(buffer, pageCharge);
         buffer = {};
         UNIT_ASSERT_VALUES_EQUAL(metadata.GetMemoryUsage(), 12 + allocation);
-        lease.Reset();
+        retainer.Reset();
         UNIT_ASSERT_VALUES_EQUAL(metadata.GetMemoryUsage(), 0);
     }
 
@@ -201,7 +271,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheMetadataAccounting) {
         auto raw = TSharedData::Uninitialized(64);
         const ui64 allocation = raw.GetAllocationSize();
         metadata.PreparePageCharge(raw);
-        auto lease = metadata.Track(MakeIntrusiveConst<TDescriptor>(raw, 12));
+        auto retainer = metadata.Track(MakeIntrusiveConst<TDescriptor>(raw, 12));
         metadata.AddPageCharge(raw, allocation);
         metadata.AddPageCharge(raw, allocation);
         UNIT_ASSERT_VALUES_EQUAL(metadata.GetMemoryUsage(), 12);
@@ -209,7 +279,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheMetadataAccounting) {
         UNIT_ASSERT_VALUES_EQUAL(metadata.GetMemoryUsage(), 12);
         metadata.RemovePageCharge(raw, allocation);
         UNIT_ASSERT_VALUES_EQUAL(metadata.GetMemoryUsage(), 12 + allocation);
-        lease.Reset();
+        retainer.Reset();
         UNIT_ASSERT_VALUES_EQUAL(metadata.GetMemoryUsage(), 0);
     }
 
@@ -218,32 +288,32 @@ Y_UNIT_TEST_SUITE(TSharedCacheMetadataAccounting) {
         TCacheMetadata second;
         auto raw = TSharedData::Uninitialized(64);
         auto descriptor = MakeIntrusiveConst<TDescriptor>(raw, 12);
-        auto firstLease = first.Track(descriptor);
-        auto secondLease = second.Track(descriptor);
+        auto firstRetainer = first.Track(descriptor);
+        auto secondRetainer = second.Track(descriptor);
         const ui64 expected = 12 + raw.GetAllocationSize();
         first.PreparePageCharge(raw);
         first.AddPageCharge(raw, raw.GetAllocationSize());
         UNIT_ASSERT_VALUES_EQUAL(first.GetMemoryUsage(), 12);
         UNIT_ASSERT_VALUES_EQUAL(second.GetMemoryUsage(), expected);
         first.RemovePageCharge(raw, raw.GetAllocationSize());
-        firstLease.Reset();
+        firstRetainer.Reset();
         UNIT_ASSERT_VALUES_EQUAL(first.GetMemoryUsage(), 0);
         UNIT_ASSERT_VALUES_EQUAL(second.GetMemoryUsage(), expected);
-        secondLease.Reset();
+        secondRetainer.Reset();
         UNIT_ASSERT_VALUES_EQUAL(second.GetMemoryUsage(), 0);
     }
 
-    Y_UNIT_TEST(LeaseRetainsDescriptorAfterFacadeDestruction) {
+    Y_UNIT_TEST(RetainerKeepsDescriptorAfterFacadeDestruction) {
         std::atomic<ui32> destroyed = 0;
-        TIntrusivePtr<TMetadataLease> lease;
+        TMetadataRetainer retainer;
         {
             TCacheMetadata metadata;
             auto descriptor = MakeIntrusiveConst<TDescriptor>(TSharedData::Uninitialized(64), 12, 1, &destroyed);
-            lease = metadata.Track(std::move(descriptor));
+            retainer = metadata.Track(std::move(descriptor));
             UNIT_ASSERT_VALUES_EQUAL(destroyed.load(), 0);
         }
         UNIT_ASSERT_VALUES_EQUAL(destroyed.load(), 0);
-        lease.Reset();
+        retainer.Reset();
         UNIT_ASSERT_VALUES_EQUAL(destroyed.load(), 1);
     }
 
@@ -254,10 +324,10 @@ Y_UNIT_TEST_SUITE(TSharedCacheMetadataAccounting) {
         auto first = metadata.Track(descriptor);
         TPause pause(EMetadataReconcile::Descriptor);
         TCacheMetadataTestAccess::SetHook(metadata, &pause, TPause::OnReconcile);
-        TIntrusivePtr<TMetadataLease> final;
+        TMetadataRetainer final;
         std::atomic<bool> updated = false;
-        std::thread dropping([lease = std::move(first)]() mutable {
-            lease.Reset();
+        std::thread dropping([retainer = std::move(first)]() mutable {
+            retainer.Reset();
         });
         std::thread updating;
         Y_DEFER {
@@ -273,8 +343,9 @@ Y_UNIT_TEST_SUITE(TSharedCacheMetadataAccounting) {
         WaitFor(pause.Entered);
         updating = std::thread([&] {
             auto temporary = metadata.Track(descriptor);
+            auto copy = temporary;
             temporary.Reset();
-            final = metadata.Track(descriptor);
+            final = std::move(copy);
             updated.store(true, std::memory_order_release);
         });
         WaitFor(updated);
@@ -292,7 +363,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheMetadataAccounting) {
         const ui64 bytes = raw.GetAllocationSize();
         std::atomic<ui32> destroyed = 0;
         auto descriptor = MakeIntrusiveConst<TDescriptor>(raw, 12, 1, &destroyed);
-        auto lease = metadata.Track(descriptor);
+        auto retainer = metadata.Track(descriptor);
         descriptor.Reset();
         metadata.PreparePageCharge(raw);
         TPause pause(EMetadataReconcile::Buffer);
@@ -314,7 +385,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheMetadataAccounting) {
         };
         WaitFor(pause.Entered);
         releasing = std::thread([&] {
-            lease.Reset();
+            retainer.Reset();
             released.store(true, std::memory_order_release);
         });
         WaitFor(released);
@@ -341,7 +412,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheMetadataAccounting) {
                     std::this_thread::yield();
                 }
                 for (ui32 iteration = 0; iteration < 500; ++iteration) {
-                    auto lease = metadata.Track(index % 2 ? first : second);
+                    auto retainer = metadata.Track(index % 2 ? first : second);
                     metadata.AddPageCharge(raw, 32);
                     metadata.RemovePageCharge(raw, 32);
                 }

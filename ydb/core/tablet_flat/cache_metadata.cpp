@@ -2,6 +2,8 @@
 
 #include <util/generic/algorithm.h>
 
+#include <utility>
+
 namespace NKikimr::NSharedCache {
 
 class TMetadataAccount final : public TAtomicRefCount<TMetadataAccount> {
@@ -163,6 +165,7 @@ namespace {
 
 } // namespace
 
+// Shared accounting entry for one descriptor and cache account
 class TMetadataRecord {
 public:
     TMetadataRecord(TIntrusivePtr<TMetadataAccount> account, const NPageCollection::IPageCollection& collection)
@@ -231,16 +234,60 @@ private:
     bool ReportedActive_ = false;
 };
 
-TMetadataLease::TMetadataLease(
-    TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, TMetadataRecord& record) noexcept
-    : PageCollection_(std::move(collection))
-    , Record_(record)
-{
-    Record_.AddReference();
+bool TCacheMetadata::Owns(const TMetadataRetainer& retainer) const noexcept {
+    return retainer.Record_ && retainer.Record_->Account == Account_;
 }
 
-TMetadataLease::~TMetadataLease() {
-    Record_.RemoveReference();
+TMetadataRetainer::TMetadataRetainer(
+    TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, TMetadataRecord& record) noexcept
+    : PageCollection_(std::move(collection))
+    , Record_(&record)
+{
+    Record_->AddReference();
+}
+
+TMetadataRetainer::TMetadataRetainer(const TMetadataRetainer& other) noexcept
+    : PageCollection_(other.PageCollection_)
+    , Record_(other.Record_)
+{
+    if (Record_) {
+        Record_->AddReference();
+    }
+}
+
+TMetadataRetainer::TMetadataRetainer(TMetadataRetainer&& other) noexcept
+    : PageCollection_(std::move(other.PageCollection_))
+    , Record_(std::exchange(other.Record_, nullptr))
+{}
+
+TMetadataRetainer& TMetadataRetainer::operator=(const TMetadataRetainer& other) noexcept {
+    if (this != &other) {
+        TMetadataRetainer copy(other);
+        Swap(copy);
+    }
+    return *this;
+}
+
+TMetadataRetainer& TMetadataRetainer::operator=(TMetadataRetainer&& other) noexcept {
+    TMetadataRetainer moved(std::move(other));
+    Swap(moved);
+    return *this;
+}
+
+TMetadataRetainer::~TMetadataRetainer() {
+    if (Record_) {
+        // Keep the descriptor and its Raw allocation alive throughout the accounting update
+        Record_->RemoveReference();
+    }
+}
+
+void TMetadataRetainer::Reset() noexcept {
+    TMetadataRetainer{}.Swap(*this);
+}
+
+void TMetadataRetainer::Swap(TMetadataRetainer& other) noexcept {
+    PageCollection_.Swap(other.PageCollection_);
+    std::swap(Record_, other.Record_);
 }
 
 TCacheMetadata::TCacheMetadata()
@@ -249,14 +296,14 @@ TCacheMetadata::TCacheMetadata()
 
 TCacheMetadata::~TCacheMetadata() = default;
 
-TIntrusivePtr<TMetadataLease> TCacheMetadata::Track(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection) {
+TMetadataRetainer TCacheMetadata::Track(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection) {
     Y_ENSURE(collection);
     auto* head = collection->MetadataAccounts_.load(std::memory_order_acquire);
     THolder<TMetadataRecord> candidate;
     for (;;) {
         for (auto* record = head; record; record = record->Next) {
             if (record->Account == Account_) {
-                return TIntrusivePtr<TMetadataLease>(new TMetadataLease(std::move(collection), *record));
+                return TMetadataRetainer(std::move(collection), *record);
             }
         }
         if (!candidate) {
@@ -266,7 +313,7 @@ TIntrusivePtr<TMetadataLease> TCacheMetadata::Track(TIntrusiveConstPtr<NPageColl
         if (collection->MetadataAccounts_.compare_exchange_weak(
                 head, candidate.Get(), std::memory_order_acq_rel, std::memory_order_acquire)) {
             auto* record = candidate.Release();
-            return TIntrusivePtr<TMetadataLease>(new TMetadataLease(std::move(collection), *record));
+            return TMetadataRetainer(std::move(collection), *record);
         }
     }
 }

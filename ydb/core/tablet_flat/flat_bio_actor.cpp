@@ -50,6 +50,7 @@ void TBlockIO::Inbox(TEventHandlePtr &eh)
         RequestCookie = ev->Cookie;
 
         PageCollection = std::move(ev->PageCollection);
+        Collection = std::move(ev->Collection);
         Pages = std::move(ev->Pages);
         Y_ENSURE(Pages, "Got TFetch request without pages list");
         PagesToBlobsConverter = new TPagesToBlobsConverter(*PageCollection, Pages);
@@ -62,7 +63,11 @@ void TBlockIO::Inbox(TEventHandlePtr &eh)
     } else if (eh->CastAsLocal<TEvents::TEvUndelivered>()) {
         Terminate(NKikimrProto::UNKNOWN);
     } else if (eh->CastAsLocal<TEvents::TEvPoison>()) {
-        PassAway();
+        if (Sender) {
+            Terminate(NKikimrProto::ERROR);
+        } else {
+            PassAway();
+        }
     } else {
         Y_TABLET_ERROR("Page collection blocks IO actor got an unexpected event");
     }
@@ -202,6 +207,8 @@ void TBlockIO::Terminate(EStatus code)
     }
 
     auto *ev = new TEvData(code, PageCollection, RequestCookie);
+    // Both the actor and reply retain the canonical collection through their own lifetimes
+    ev->Collection = Collection.Acquire();
 
     ev->Pages.reserve(Pages.size());
     for (auto index : xrange(Pages.size())) {

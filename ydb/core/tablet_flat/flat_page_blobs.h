@@ -6,6 +6,7 @@
 #include "util_deref.h"
 #include "util_fmt_abort.h"
 #include <array>
+#include <cstring>
 
 namespace NKikimr {
 namespace NTable {
@@ -71,6 +72,15 @@ namespace NPage {
         const TLogoBlobID& Label() const noexcept override
         {
             return Label_;
+        }
+
+        bool IsCompatible(const NPageCollection::IPageCollection& other) const noexcept override {
+            if (this == &other) {
+                return true;
+            }
+            const auto* blobs = dynamic_cast<const TExtBlobs*>(&other);
+            return blobs && Label_ == blobs->Label_ && Raw.size() == blobs->Raw.size() &&
+                   (Raw.data() == blobs->Raw.data() || std::memcmp(Raw.data(), blobs->Raw.data(), Raw.size()) == 0);
         }
 
         ui32 Total() const noexcept override

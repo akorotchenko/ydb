@@ -108,6 +108,24 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         UNIT_ASSERT_VALUES_EQUAL(retained.GetMetadataMemoryUsage(), first.GetMetadataMemoryUsage() + 4096);
     }
 
+    Y_UNIT_TEST(CanonicalDescriptorRequiresMatchingGroupAndAddressingRole)
+    {
+        auto raw = MakeMeta();
+        const TLargeGlobId id(0, TLogoBlobID(10, 20, 30, 1, raw.size(), 0), raw.size());
+        const TPageCollection first(id, raw);
+        const TPageCollection same(id, raw);
+        const TOuterPageCollection outer(id, raw);
+        auto moved = id;
+        moved.Group = 1;
+        const TPageCollection otherGroup(moved, raw);
+        UNIT_ASSERT(first.IsCompatible(same));
+        UNIT_ASSERT(same.IsCompatible(first));
+        UNIT_ASSERT(!first.IsCompatible(outer));
+        UNIT_ASSERT(!outer.IsCompatible(first));
+        UNIT_ASSERT(!first.IsCompatible(otherGroup));
+        UNIT_ASSERT(!otherGroup.IsCompatible(first));
+    }
+
     Y_UNIT_TEST(Align)
     {
         const std::array<ui64, 3> steps = {{ 200, 500, 1000 }};

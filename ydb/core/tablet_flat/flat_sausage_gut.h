@@ -21,6 +21,11 @@ namespace NPageCollection {
 
         virtual const TLogoBlobID& Label() const noexcept = 0;
         virtual ui32 Total() const noexcept = 0;
+
+        // Separate instances may be substituted only when their I/O descriptors are interchangeable
+        virtual bool IsCompatible(const IPageCollection& other) const noexcept {
+            return this == &other;
+        }
         /* Number of structural pages addressable by TPageId */
         virtual ui32 MetaPages() const noexcept { return Total(); }
         virtual TInfo Page(ui32 page) const = 0;

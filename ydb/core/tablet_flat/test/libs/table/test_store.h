@@ -425,6 +425,11 @@ namespace NTest {
             return Id;
         }
 
+        bool IsCompatible(const NPageCollection::IPageCollection& other) const noexcept override {
+            const auto* collection = dynamic_cast<const TStorePageCollection*>(&other);
+            return collection && Store == collection->Store && Room == collection->Room;
+        }
+
         ui32 Total() const noexcept override {
             return Store->PageCollectionPagesCount(Room);
         }

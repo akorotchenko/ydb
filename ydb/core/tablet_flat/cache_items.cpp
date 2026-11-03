@@ -483,6 +483,9 @@ void TCacheItems<TTraits>::DeletePayload(
                 Cache_.Collections_.AddReadyPageBytes(*owner, handle.Metadata.Page.Type, -static_cast<i64>(bytes));
             }
         }
+        if (hasPayload && handle.Metadata.Page.Type == NTable::NPage::EPage::Globs) {
+            Cache_.Metadata_.RemovePageCharge(handle.Body.PageBuffer, bytes);
+        }
         handle.Body.PageBuffer.~TBuffer();
     } else {
         Y_DEBUG_ABORT_UNLESS(hasPayload);
