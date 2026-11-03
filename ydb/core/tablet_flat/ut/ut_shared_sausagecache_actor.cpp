@@ -1624,8 +1624,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
     Y_UNIT_TEST(CollectionAdmitHitDoesNotPrepareMetadata) {
         TSharedPageCacheMock sharedCache;
         auto& cache = TSharedCache::Get();
-        auto canonical = MakeIntrusive<TPageCollectionMock>(7, 1, TSharedData{}, 13);
-        auto duplicate = MakeIntrusive<TPageCollectionMock>(7, 1, TSharedData{}, 19);
+        TIntrusiveConstPtr<TPageCollectionMock> canonical =
+            MakeIntrusive<TPageCollectionMock>(ui64{ 7 }, ui32{ 1 }, TSharedData{}, ui64{ 13 });
+        TIntrusiveConstPtr<TPageCollectionMock> duplicate =
+            MakeIntrusive<TPageCollectionMock>(ui64{ 7 }, ui32{ 1 }, TSharedData{}, ui64{ 19 });
         auto owner = cache.AdmitCollection(canonical);
         auto hit = cache.AdmitCollection(duplicate);
         UNIT_ASSERT(owner.CacheItem() == hit.CacheItem());
@@ -1638,8 +1640,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
     Y_UNIT_TEST(CollectionPreparedHolderSurvivesPendingThenHit) {
         TSharedPageCacheMock sharedCache;
         auto& cache = TSharedCache::Get();
-        auto source = MakeIntrusive<TPageCollectionMock>(9, 1, TSharedData{}, 19);
-        auto canonical = MakeIntrusive<TPageCollectionMock>(9, 1, TSharedData{}, 13);
+        TIntrusiveConstPtr<TPageCollectionMock> source =
+            MakeIntrusive<TPageCollectionMock>(ui64{ 9 }, ui32{ 1 }, TSharedData{}, ui64{ 19 });
+        TIntrusiveConstPtr<TPageCollectionMock> canonical =
+            MakeIntrusive<TPageCollectionMock>(ui64{ 9 }, ui32{ 1 }, TSharedData{}, ui64{ 13 });
         auto value = cache.PrepareCollection(source, ECacheMode::Regular);
         TCollectionCacheItem publisher;
         TCacheCollectionRef hit;
@@ -1663,7 +1667,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
     Y_UNIT_TEST(CollectionPreparationFailureLeavesNoPendingEntry) {
         TSharedPageCacheMock sharedCache;
         auto& cache = TSharedCache::Get();
-        auto invalid = MakeIntrusive<TPageCollectionMock>(8, 1, TSharedData{}, Max<ui64>());
+        TIntrusiveConstPtr<TPageCollectionMock> invalid =
+            MakeIntrusive<TPageCollectionMock>(ui64{ 8 }, ui32{ 1 }, TSharedData{}, Max<ui64>());
         const ui64 handles = cache.AvailableHandleCount();
         // Track rejects the negative footprint before allocating or publishing a Begin item
         UNIT_ASSERT_EXCEPTION(cache.AdmitCollection(invalid), yexception);
@@ -1672,7 +1677,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT(cache.Find(invalid->Label(), missing) == ECacheResultStatus::Miss);
         UNIT_ASSERT_VALUES_EQUAL(cache.AvailableHandleCount(), handles);
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 0);
-        auto valid = MakeIntrusive<TPageCollectionMock>(8, 1, TSharedData{}, 13);
+        TIntrusiveConstPtr<TPageCollectionMock> valid =
+            MakeIntrusive<TPageCollectionMock>(ui64{ 8 }, ui32{ 1 }, TSharedData{}, ui64{ 13 });
         auto owner = cache.AdmitCollection(valid);
         UNIT_ASSERT(owner);
         UNIT_ASSERT_VALUES_EQUAL(owner->PageCollection().Get(), valid.Get());
@@ -1686,8 +1692,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto raw = TSharedData::Uninitialized(64);
         raw.TrimBack(10);
         constexpr ui64 fixedBytes = 17;
-        auto descriptor = MakeIntrusive<TPageCollectionMock>(4, 1, raw, fixedBytes);
-        descriptor->PageTypes = { EPage::Globs };
+        auto mutableDescriptor = MakeIntrusive<TPageCollectionMock>(ui64{ 4 }, ui32{ 1 }, raw, fixedBytes);
+        mutableDescriptor->PageTypes = { EPage::Globs };
+        TIntrusiveConstPtr<TPageCollectionMock> descriptor(std::move(mutableDescriptor));
         const auto location = _P(0, EPage::Globs);
         auto& cache = TSharedCache::Get();
         sharedCache.Attach(sharedCache.Sender1, descriptor);
@@ -1742,7 +1749,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         config.SetMemoryLimit(128_KB);
         TSharedPageCacheMock sharedCache(config);
         auto& cache = TSharedCache::Get();
-        auto descriptor = MakeIntrusive<TPageCollectionMock>(14, 2, TSharedData{}, 13);
+        TIntrusiveConstPtr<TPageCollectionMock> descriptor =
+            MakeIntrusive<TPageCollectionMock>(ui64{ 14 }, ui32{ 2 }, TSharedData{}, ui64{ 13 });
         auto raw = TSharedData::Uninitialized(10);
         auto first = cache.AdmitPage(descriptor, _P(0), TSharedData(raw));
         auto second = cache.AdmitPage(descriptor, _P(1), TSharedData(raw));
@@ -1778,11 +1786,14 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto config = TSharedPageCacheMock::DefaultConfig();
         config.SetMemoryLimit(128_KB);
         TSharedPageCacheMock sharedCache(config);
-        auto canonical = MakeIntrusive<TPageCollectionMock>(5, 1, TSharedData{}, 13);
-        auto original = MakeIntrusive<TPageCollectionMock>(5, 1, TSharedData::Uninitialized(64), 19);
+        auto mutableCanonical = MakeIntrusive<TPageCollectionMock>(ui64{ 5 }, ui32{ 1 }, TSharedData{}, ui64{ 13 });
+        auto mutableOriginal =
+            MakeIntrusive<TPageCollectionMock>(ui64{ 5 }, ui32{ 1 }, TSharedData::Uninitialized(64), ui64{ 19 });
         constexpr ui32 group = 77;
-        canonical->BlobGroup = group;
-        original->BlobGroup = group;
+        mutableCanonical->BlobGroup = group;
+        mutableOriginal->BlobGroup = group;
+        TIntrusiveConstPtr<TPageCollectionMock> canonical(std::move(mutableCanonical));
+        TIntrusiveConstPtr<TPageCollectionMock> original(std::move(mutableOriginal));
         auto& cache = TSharedCache::Get();
         auto collection = cache.AdmitCollection(canonical);
         const auto item = collection.CacheItem();
@@ -1837,7 +1848,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
     Y_UNIT_TEST(RequestCompletionBindsTheCanonicalCollectionOnce) {
         TSharedPageCacheMock sharedCache;
         auto& cache = TSharedCache::Get();
-        auto seed = MakeIntrusive<TPageCollectionMock>(12, 1, TSharedData{}, 19);
+        TIntrusiveConstPtr<TPageCollectionMock> seed =
+            MakeIntrusive<TPageCollectionMock>(ui64{ 12 }, ui32{ 1 }, TSharedData{}, ui64{ 19 });
         cache.AccountMetadata(*seed);
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
@@ -1848,7 +1860,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         });
         UNIT_ASSERT(!completion->Collection());
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 19);
-        auto descriptor = MakeIntrusive<TPageCollectionMock>(12, 1, TSharedData{}, 13);
+        TIntrusiveConstPtr<TPageCollectionMock> descriptor =
+            MakeIntrusive<TPageCollectionMock>(ui64{ 12 }, ui32{ 1 }, TSharedData{}, ui64{ 13 });
         auto canonical = cache.AdmitCollection(descriptor);
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 32);
         UNIT_ASSERT(completion->BindCollection(canonical.Acquire()));
@@ -1857,7 +1870,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 32);
         seed.Reset();
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 13);
-        auto other = cache.AdmitCollection(MakeIntrusive<TPageCollectionMock>(13, 1));
+        auto other = cache.AdmitCollection(
+            TIntrusiveConstPtr<TPageCollectionMock>(MakeIntrusive<TPageCollectionMock>(ui64{ 13 }, ui32{ 1 })));
         UNIT_ASSERT(!completion->BindCollection(std::move(other)));
         UNIT_ASSERT(completion->Collection().CacheItem() == canonical.CacheItem());
         completion->Cancel(true);
@@ -1867,7 +1881,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
     Y_UNIT_TEST(CanonicalizationReleasesSoleMessageOwnedDescriptorBeforeIo) {
         std::atomic<ui32> destroyed = 0;
         TSharedPageCacheMock sharedCache;
-        auto canonical = MakeIntrusive<TPageCollectionMock>(11, 1, TSharedData{}, 13);
+        TIntrusiveConstPtr<TPageCollectionMock> canonical =
+            MakeIntrusive<TPageCollectionMock>(ui64{ 11 }, ui32{ 1 }, TSharedData{}, ui64{ 13 });
         auto collection = TSharedCache::Get().AdmitCollection(canonical);
         TIntrusiveConstPtr<TPageCollectionMock> seed = new TPageCollectionMock(11, 1, TSharedData{}, 19, &destroyed);
         auto* request = new TEvRequest(EPriority::Fast, seed, { _P(0) }, ++sharedCache.RequestId);
@@ -1885,10 +1900,12 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
     Y_UNIT_TEST(CanonicalCollectionRejectsConflictingIoDescriptor) {
         TSharedPageCacheMock sharedCache;
         auto& cache = TSharedCache::Get();
-        auto canonical = MakeIntrusive<TPageCollectionMock>(10, 1, TSharedData{}, 13);
-        auto conflicting = MakeIntrusive<TPageCollectionMock>(10, 1, TSharedData{}, 19);
-        canonical->BlobGroup = 77;
-        conflicting->BlobGroup = 78;
+        auto mutableCanonical = MakeIntrusive<TPageCollectionMock>(ui64{ 10 }, ui32{ 1 }, TSharedData{}, ui64{ 13 });
+        auto mutableConflicting = MakeIntrusive<TPageCollectionMock>(ui64{ 10 }, ui32{ 1 }, TSharedData{}, ui64{ 19 });
+        mutableCanonical->BlobGroup = 77;
+        mutableConflicting->BlobGroup = 78;
+        TIntrusiveConstPtr<TPageCollectionMock> canonical(std::move(mutableCanonical));
+        TIntrusiveConstPtr<TPageCollectionMock> conflicting(std::move(mutableConflicting));
         auto collection = cache.AdmitCollection(canonical);
         sharedCache.Request(sharedCache.Sender1, conflicting, { _P(0) });
         sharedCache.Runtime.WaitFor("incompatible collection reply", [&] {
@@ -1908,7 +1925,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         TSharedPageCacheMock sharedCache(config);
         auto& cache = TSharedCache::Get();
         const ui64 fixedBytes = cache.CurrentLimit() + 1;
-        auto descriptor = MakeIntrusive<TPageCollectionMock>(6, 1, TSharedData{}, fixedBytes);
+        TIntrusiveConstPtr<TPageCollectionMock> descriptor =
+            MakeIntrusive<TPageCollectionMock>(ui64{ 6 }, ui32{ 1 }, TSharedData{}, fixedBytes);
         sharedCache.Attach(sharedCache.Sender1, descriptor);
         sharedCache.Request(sharedCache.Sender1, descriptor, { _P(0) });
         sharedCache.CheckFetches({ TFetch{ 10, descriptor, { _P(0) } } });
@@ -2458,7 +2476,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             .Pages = { _P(0) },
             .Cookie = 96,
         });
-        auto waiter = MakeIntrusive<TRequestPageWaiter>(completion, 0);
+        auto waiter = MakeIntrusive<TRequestPageWaiter>(completion, ui32{ 0 });
         bool noCacheContext = false;
         std::thread callback([&] {
             noCacheContext = TSharedCache::TryGet() == nullptr;
