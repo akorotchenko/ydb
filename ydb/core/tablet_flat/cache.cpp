@@ -327,7 +327,9 @@ bool TSharedCache::WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheIte
 SHARED_CACHE_TEMPLATE
 THolder<TCollection> TSharedCache::PrepareCollection(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, ECacheMode mode) {
-    return THolder<TCollection>(new TCollection(Metadata_.Track(std::move(collection)), mode));
+    Y_ENSURE(collection);
+    AccountMetadata(*collection);
+    return THolder<TCollection>(new TCollection(std::move(collection), mode));
 }
 
 SHARED_CACHE_TEMPLATE
@@ -356,7 +358,7 @@ SHARED_CACHE_TEMPLATE
 bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* registry, TCacheItem cacheItem,
     THolder<TCollection>&& value) noexcept {
     auto cacheOp = BindOperation(spaceOp);
-    Y_DEBUG_ABORT_UNLESS(value && Metadata_.Owns(value->Metadata_));
+    Y_DEBUG_ABORT_UNLESS(value);
     Y_DEBUG_ABORT_UNLESS(cacheItem.Index() >= 2 && cacheItem.Index() < spaceOp.AccessibleHandleCount());
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
@@ -969,7 +971,7 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
 SHARED_CACHE_TEMPLATE
 ECacheResultStatus TSharedCache::FindOrInsert(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
     THolder<TCollection>& value, TCollectionCacheItem& inserted, TCacheCollectionRef& hit) {
-    Y_DEBUG_ABORT_UNLESS(!value || (value->PageCollection() == collection && Metadata_.Owns(value->Metadata_)));
+    Y_DEBUG_ABORT_UNLESS(!value || value->PageCollection() == collection);
     inserted = {};
     hit.Drop();
     TCollectionValueCandidate candidate(collection, value);

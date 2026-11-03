@@ -151,6 +151,6 @@ struct TEvCollectionData : public TEventLocal<TEvCollectionData, EvCollectionDat
 
 // Worker identity is the attempt identity; outcomes carry the stable load identity
 NActors::IActor* CreateCollectionLoadActor(const TActorId& owner, ui64 loadId,
-    const NPageCollection::TLargeGlobId& descriptor, EPriority priority = EPriority::Fast);
+    const NPageCollection::TLargeGlobId& descriptor, TCacheAccounting accounting, EPriority priority = EPriority::Fast);
 
 } // namespace NKikimr::NSharedCache

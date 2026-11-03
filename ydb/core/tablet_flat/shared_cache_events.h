@@ -244,7 +244,7 @@ namespace NKikimr::NSharedCache {
         ui64 ExecutorGeneration = 0;
         ui64 RequestId = 0;
         TCacheCollectionRef Collection;
-        TMetadataRetainer PendingMetadata;
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
         NKikimrProto::EReplyStatus Status = NKikimrProto::OK;
         TVector<TPageLocation> Pages;
         TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad;
@@ -292,7 +292,7 @@ namespace NKikimr::NSharedCache {
         }
 
         const TIntrusiveConstPtr<NPageCollection::IPageCollection>& PageCollection() const noexcept {
-            return Collection_ ? PageCollection_ : PendingMetadata_.PageCollection();
+            return PageCollection_;
         }
 
         const TCacheCollectionRef& Collection() const noexcept {
@@ -313,7 +313,6 @@ namespace NKikimr::NSharedCache {
         // A failure callback can reply without the cache TLS context
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
         TCacheCollectionRef Collection_;
-        TMetadataRetainer PendingMetadata_;
         TVector<TPageLocation> Locations_;
         TVector<TCachePageRef> ReadyPages_;
         TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad_;

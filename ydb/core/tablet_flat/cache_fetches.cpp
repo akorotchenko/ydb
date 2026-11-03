@@ -46,14 +46,16 @@ bool TCacheFetches<TTraits>::Complete(
         return false;
     }
     Y_DEBUG_ABORT_UNLESS(handle->Key2OrSize.load(std::memory_order_relaxed) == data.size());
-    if (handle->Metadata.Page.Type == NTable::NPage::EPage::Globs) {
-        try {
-            Cache_.Metadata_.PreparePageCharge(data);
-        } catch (...) {
-            fetch.SetFailed();
-            Release(owner, fetch);
-            return false;
+    try {
+        if (handle->Metadata.Page.Type == NTable::NPage::EPage::Globs) {
+            Cache_.Accounting_.AccountMetadataBuffer(data);
+        } else {
+            Cache_.Accounting_.AccountBuffer(data);
         }
+    } catch (...) {
+        fetch.SetFailed();
+        Release(owner, fetch);
+        return false;
     }
     fetch.SetReady(std::move(data));
     // Drop the I/O-owner ref; the last pending releaser performs MakeReadyState.
@@ -158,10 +160,6 @@ void TCacheFetches<TTraits>::Finish(
         new (&handle.Body.PageBuffer) NActors::TSharedData::TBuffer(std::move(data).Extract());
         TCollection* owner = Cache_.Collections_.BindOperation(spaceOp).PageCollection(handle);
         Cache_.Memory_.CompleteReservedPage();
-        if (handle.Metadata.Page.Type == NTable::NPage::EPage::Globs) {
-            // Credit starts with resident payload ownership; a pending fetch still reports its reservation
-            Cache_.Metadata_.AddPageCharge(handle.Body.PageBuffer, TCacheItems<TTraits>::PageBytes(handle));
-        }
         Cache_.MakeReadyState(spaceOp, page, EHandleState::Hot, owner, &keep);
     }
     Cache_.InvokeHook(ECacheHookPoint::BeforeReadyWaiters, page);

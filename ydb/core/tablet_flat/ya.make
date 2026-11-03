@@ -107,7 +107,7 @@ SRCS(
     cache_cold_policy.cpp
     cache_items.cpp
     cache_memory.cpp
-    cache_metadata.cpp
+    cache_accounting.cpp
     cache_resize.cpp
     cache_space.cpp
     cache_space_resize.cpp

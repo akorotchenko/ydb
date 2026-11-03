@@ -14,8 +14,8 @@ namespace {
         using TThis = TCollectionLoadActor;
 
     public:
-        TCollectionLoadActor(
-            const TActorId& owner, ui64 loadId, const NPageCollection::TLargeGlobId& descriptor, EPriority priority);
+        TCollectionLoadActor(const TActorId& owner, ui64 loadId, const NPageCollection::TLargeGlobId& descriptor,
+            TCacheAccounting accounting, EPriority priority);
 
         void Bootstrap();
 
@@ -33,6 +33,7 @@ namespace {
         const TActorId Owner_;
         const ui64 LoadId_;
         const NPageCollection::TLargeGlobId Descriptor_;
+        TCacheAccounting Accounting_;
         NTabletFlatExecutor::TLoadBlobQueue Queue_;
         THolder<NPageCollection::TLargeGlobIdRestoreState> Restore_;
         NActors::TSharedData Raw_;
@@ -40,11 +41,12 @@ namespace {
         bool ParseRequested_ = false;
     };
 
-    TCollectionLoadActor::TCollectionLoadActor(
-        const TActorId& owner, ui64 loadId, const NPageCollection::TLargeGlobId& descriptor, EPriority priority)
+    TCollectionLoadActor::TCollectionLoadActor(const TActorId& owner, ui64 loadId,
+        const NPageCollection::TLargeGlobId& descriptor, TCacheAccounting accounting, EPriority priority)
         : Owner_(owner)
         , LoadId_(loadId)
         , Descriptor_(descriptor)
+        , Accounting_(std::move(accounting))
     {
         Queue_.Config.TabletID = descriptor.Lead.TabletID();
         Queue_.Config.Generation = descriptor.Lead.Generation();
@@ -118,6 +120,7 @@ namespace {
                 return;
             }
             Raw_ = Restore_->ExtractSharedData();
+            Accounting_.AccountMetadataBuffer(Raw_);
             Restore_.Destroy();
             Queue_.Clear();
         } catch (const yexception&) {
@@ -159,6 +162,7 @@ namespace {
                 case ECollectionLoadKind::Unknown:
                     Y_UNREACHABLE();
             }
+            Accounting_.AccountMetadata(*candidate);
         } catch (const yexception&) {
             Fail(NKikimrProto::CORRUPTED, CurrentExceptionMessage());
             return;
@@ -188,9 +192,9 @@ namespace {
 
 } // anonymous namespace
 
-NActors::IActor* CreateCollectionLoadActor(
-    const TActorId& owner, ui64 loadId, const NPageCollection::TLargeGlobId& descriptor, EPriority priority) {
-    return new TCollectionLoadActor(owner, loadId, descriptor, priority);
+NActors::IActor* CreateCollectionLoadActor(const TActorId& owner, ui64 loadId,
+    const NPageCollection::TLargeGlobId& descriptor, TCacheAccounting accounting, EPriority priority) {
+    return new TCollectionLoadActor(owner, loadId, descriptor, std::move(accounting), priority);
 }
 
 } // namespace NKikimr::NSharedCache

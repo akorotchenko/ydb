@@ -487,6 +487,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             Counters.ActiveInMemoryBytes->Set(Cache->KeepReadyPageBytes());
             Counters.PassivePages->Set(Cache->ColdPages());
             Counters.PassiveBytes->Set(Cache->ColdBytes());
+            Counters.BufferBytes->Set(Cache->BufferBytes());
             Counters.MetadataBytes->Set(Cache->MetadataBytes());
         }
         LastKeepResidentBytes = Cache ? Cache->KeepResidentPageBytes() : 0;
@@ -843,9 +844,10 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         TCacheCollectionRef collection;
         const bool found = Cache->Find(id, collection) == ECacheResultStatus::Hit;
         const bool compatible = !found || collection->PageCollection()->IsCompatible(*msg.PageCollection);
-        TMetadataRetainer pendingMetadata;
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection;
         if (!found) {
-            pendingMetadata = Cache->RetainMetadata(msg.PageCollection);
+            Cache->AccountMetadata(*msg.PageCollection);
+            pageCollection = msg.PageCollection;
         }
         Counters.PendingRequests->Inc();
         const ui64 completionId = NextRequestId++;
@@ -857,7 +859,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             .ReplyTo = sender,
             .EventCookie = eventCookie,
             .Collection = std::move(collection),
-            .PendingMetadata = std::move(pendingMetadata),
+            .PageCollection = std::move(pageCollection),
             .Status = compatible ? NKikimrProto::OK : NKikimrProto::ERROR,
             .Pages = std::move(msg.Pages),
             .WaitPad = std::move(msg.WaitPad),

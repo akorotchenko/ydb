@@ -3,7 +3,7 @@
 #include "defs.h"
 #include "cache_fwd.h"
 #include "cache_item.h"
-#include "cache_metadata.h"
+#include "cache_accounting.h"
 
 #include <util/generic/ptr.h>
 
@@ -63,7 +63,7 @@ public:
     }
 
     const TIntrusiveConstPtr<NPageCollection::IPageCollection>& PageCollection() const noexcept {
-        return Metadata_.PageCollection();
+        return PageCollection_;
     }
 
     NTable::NPage::TPageLocation GetLocation(ui32 pageId) const {
@@ -147,8 +147,9 @@ public:
     std::atomic<ui64> PageReferences{ 0 };
 
 private:
-    explicit TCollection(TMetadataRetainer metadata, ECacheMode initialMode) noexcept
-        : Metadata_(std::move(metadata))
+    explicit TCollection(
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, ECacheMode initialMode) noexcept
+        : PageCollection_(std::move(collection))
         , CacheMode_(initialMode)
     {}
 
@@ -162,7 +163,7 @@ private:
     friend class TSharedCacheImpl;
 
     std::atomic<TCollectionActorState*> ActorState_{ nullptr };
-    const TMetadataRetainer Metadata_;
+    const TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
     std::atomic<TCollectionRegistry*> Registry_{ nullptr };
     std::atomic<ECacheMode> CacheMode_;
     std::atomic<ui64> KeepGeneration_{ 0 };

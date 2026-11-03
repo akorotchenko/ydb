@@ -46,6 +46,24 @@ namespace NActors {
         }
     }
 
+    bool TSharedData::TrySetBuiltinOwner(IOwner& owner) const noexcept {
+        if (!Data_) {
+            return false;
+        }
+        IOwner* expected = nullptr;
+        return Header()->Owner.compare_exchange_strong(
+            expected, &owner, std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+
+    size_t TSharedData::IOwner::BuiltinAllocationSize(const char* data) noexcept {
+        return reinterpret_cast<const TPrivateHeader*>(data - OverheadSize)->AllocSize;
+    }
+
+    void TSharedData::IOwner::DeallocateBuiltin(char* data) noexcept {
+        Header(data)->Owner.store(nullptr, std::memory_order_relaxed);
+        TSharedData::Deallocate(data);
+    }
+
     size_t TSharedData::AllocationSize(const char* data) noexcept {
         if (!data) {
             return 0;
