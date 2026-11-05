@@ -35,8 +35,8 @@ public:
     void SetSkipBTreeIndexV1Shadow(TCollection& owner, bool skip) noexcept;
 
     Y_FORCE_INLINE void AcknowledgeBytes(TCollection& owner) noexcept {
-        // Clear before the actor samples bytes, so a racing update can schedule the next notification.
-        owner.BytesNotificationPending_.store(false, std::memory_order_release);
+        // Acquire coalesced updates before sampling bytes; later updates can schedule another notification
+        owner.BytesNotificationPending_.exchange(false, std::memory_order_acq_rel);
     }
 
     static Y_FORCE_INLINE bool WantsStickyPage(const TCollection& collection) noexcept {

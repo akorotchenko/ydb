@@ -1173,6 +1173,47 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(second->Read().PageCollections, 0);
     }
 
+    Y_UNIT_TEST(OwnerStatsCoalesceByteChangesBeforeAcknowledgement) {
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_KB);
+        TSharedPageCacheMock sharedCache(config);
+        auto stats = MakeIntrusive<TCollectionOwnerStats>();
+        sharedCache.Attach(
+            sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, false, false, false, stats);
+        UNIT_ASSERT_VALUES_EQUAL(stats->Read().PageCollections, 1);
+        UNIT_ASSERT_VALUES_EQUAL(stats->Read().SharedBodyBytes, 0);
+
+        auto& cache = TSharedCache::Get();
+        TCachePageRef second;
+        ui32 notifications = 0;
+        auto observer =
+            sharedCache.Runtime.AddObserver<TEvCollectionBytesChanged>([&](TEvCollectionBytesChanged::TPtr& event) {
+                if (event->Get()->CollectionId != sharedCache.Collection1->Label()) {
+                    return;
+                }
+                if (++notifications == 1) {
+                    // This update coalesces before the actor acknowledges the first notification
+                    second = cache.AdmitPage(sharedCache.Collection1, _P(1), TSharedData::Copy(TString(10, 'b')));
+                    UNIT_ASSERT(second);
+                }
+            });
+        auto first = cache.AdmitPage(sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'a')));
+        UNIT_ASSERT(first);
+        sharedCache.Runtime.WaitFor("coalesced collection byte statistics", [&] {
+            return stats->Read().SharedBodyBytes == 2 * PAGE_TOTAL_SIZE;
+        }, TDuration::Seconds(5));
+        sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+
+        auto third = cache.AdmitPage(sharedCache.Collection1, _P(2), TSharedData::Copy(TString(10, 'c')));
+        UNIT_ASSERT(third);
+        sharedCache.Runtime.WaitFor("collection byte notification after acknowledgement", [&] {
+            return stats->Read().SharedBodyBytes == 3 * PAGE_TOTAL_SIZE;
+        }, TDuration::Seconds(5));
+        sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 2);
+    }
+
     Y_UNIT_TEST(LateStickyRequestDoesNotReattachDetachedOwner) {
         TSharedPageCacheMock sharedCache;
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1);
