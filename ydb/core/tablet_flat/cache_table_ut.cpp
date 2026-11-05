@@ -5804,42 +5804,66 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
     }
 
     Y_UNIT_TEST(PairedClaimedColdPublicationSurvivesStructuralAcquire) {
-        TFixture fixture;
-        constexpr ui32 size = 128;
-        const ui64 bytes = size + NActors::TSharedData::OverheadSize;
-        const auto collection = CreateModeCollection(
-            *fixture.Cache, fixture.Registry, TLogoBlobID(195, 196, 52), ECacheMode::TryKeepInMemory);
-        UNIT_ASSERT(ConfigureKeep(*fixture.Cache, 4 * bytes));
-        TTestCachePageRef held;
-        const auto page = InsertOwnedSizedPage(*fixture.Cache, collection, 0, size, 'a', held);
-        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        for (ECacheTier tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+            TFixture fixture;
+            constexpr ui32 size = 128;
+            const ui64 bytes = size + NActors::TSharedData::OverheadSize;
+            const ECacheMode mode = tier == ECacheTier::Keep ? ECacheMode::TryKeepInMemory : ECacheMode::Regular;
+            const auto collection =
+                CreateModeCollection(*fixture.Cache, fixture.Registry, TLogoBlobID(195, 196, 52), mode);
+            UNIT_ASSERT(ConfigureKeep(*fixture.Cache, 4 * bytes));
+            TTestCachePageRef held;
+            const auto page = InsertOwnedSizedPage(*fixture.Cache, collection, 0, size, 'a', held);
+            UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+            const ui32 coldVersion = TCacheTestAccess::ColdVersion(*fixture.Cache, page.Index());
 
-        struct TContext {
-            TTestSharedCache& Cache;
-            TPageCacheItem Page;
-            TTestCachePageRef Acquired;
-            bool Visited = false;
-        } context{ *fixture.Cache, page, {} };
+            struct TContext {
+                TTestSharedCache& Cache;
+                TPageCacheItem Page;
+                TTestCacheItemRef Structural;
+                ui32 Claims = 0;
+                ui32 Exchanges = 0;
+            } context{ *fixture.Cache, page, {} };
 
-        TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint at, TCacheItem item) noexcept {
-                              auto& ctx = *static_cast<TContext*>(ptr);
-                              if (at == ECacheHookPoint::AfterColdTicketClaim &&
-                                  item.Index() == ctx.Page.Index() && !ctx.Visited) {
-                                  ctx.Visited = true;
-                                  Y_ABORT_UNLESS(
-                                      TCacheTestAccess::AcquirePage(ctx.Cache, ctx.Page, ctx.Acquired));
-                              }
-                          } };
-        TSharedCacheHookGuard guard(*fixture.Cache, hooks);
-        held.Drop();
-        UNIT_ASSERT(context.Visited && context.Acquired);
-        UNIT_ASSERT_VALUES_EQUAL(context.Acquired.data()[0], 'a');
-        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 1);
-        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::ColdEntries(*fixture.Cache, ECacheTier::Keep), 1);
-        context.Acquired.Drop();
-        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::ColdEntries(*fixture.Cache, ECacheTier::Keep), 1);
-        UNIT_ASSERT(fixture.Cache->ReclaimCold());
-        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
+            TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint at, TCacheItem item) noexcept {
+                                  auto& ctx = *static_cast<TContext*>(ptr);
+                                  if (item.Index() != ctx.Page.Index()) {
+                                      return;
+                                  }
+                                  if (at == ECacheHookPoint::AfterColdTicketClaim && ++ctx.Claims == 1) {
+                                      ctx.Structural =
+                                          TCacheTestAccess::AcquireStructural(ctx.Cache, ctx.Page.CacheItem());
+                                      Y_ABORT_UNLESS(ctx.Structural);
+                                  } else if (at == ECacheHookPoint::BeforeColdExchange) {
+                                      ++ctx.Exchanges;
+                                  }
+                              } };
+            TSharedCacheHookGuard guard(*fixture.Cache, hooks);
+            held.Drop();
+            UNIT_ASSERT(context.Structural && context.Structural.CacheItem() == page.CacheItem());
+            const auto heldState = TCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+            UNIT_ASSERT(page.CacheItem().Matches(heldState) && heldState.IsColdInTier(tier));
+            UNIT_ASSERT_VALUES_EQUAL(heldState.Refs(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::ColdVersion(*fixture.Cache, page.Index()), coldVersion);
+            UNIT_ASSERT_VALUES_EQUAL(context.Claims, 1);
+            UNIT_ASSERT_VALUES_EQUAL(context.Exchanges, 1);
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::ColdEntries(*fixture.Cache, tier), 1);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableItems(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), bytes);
+            context.Structural.Drop();
+            const auto releasedState = TCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+            UNIT_ASSERT(page.CacheItem().Matches(releasedState) && releasedState.IsColdInTier(tier));
+            UNIT_ASSERT_VALUES_EQUAL(releasedState.Refs(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::ColdVersion(*fixture.Cache, page.Index()), coldVersion);
+            UNIT_ASSERT_VALUES_EQUAL(context.Claims, 1);
+            UNIT_ASSERT_VALUES_EQUAL(context.Exchanges, 1);
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::ColdEntries(*fixture.Cache, tier), 1);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdReclaimableItems(), 1);
+            UNIT_ASSERT(fixture.Cache->ReclaimCold());
+            UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsFree());
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepOwnedBytes(), 0);
+        }
     }
 
     Y_UNIT_TEST(PairedPreloadColdCarrySurvivesHeldVictimAndOccupiedVacancy) {
