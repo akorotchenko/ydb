@@ -261,6 +261,14 @@ namespace NKikimr::NSharedCache {
             Now,
         };
 
+        // Exposed for generated enum serialization; transitions remain private
+        enum class EAction {
+            Finish,
+            Fail,
+            Cancel,
+            Postpone,
+        };
+
         explicit TRequestCompletion(TRequestCompletionParams&& params) noexcept;
         ~TRequestCompletion() override;
 
@@ -308,13 +316,6 @@ namespace NKikimr::NSharedCache {
 
     private:
         friend struct TRequestCompletionTestAccess;
-
-        enum class EAction {
-            Finish,
-            Fail,
-            Cancel,
-            Postpone,
-        };
 
         struct TAction {
             ui64 Reply = 0;
