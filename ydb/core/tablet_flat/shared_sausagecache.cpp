@@ -728,7 +728,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         for (auto& [_, request] : Requests) {
             if ((!collectionId || request.CollectionId == collectionId) && (!owner || request.Sender == owner)) {
                 request.Cancelled = true;
-                request.Completion->Cancel(request.Sender != SelfId());
+                request.Completion->Cancel(request.Sender != SelfId() ? TRequestCompletion::EReplyMode::Now
+                                                                      : TRequestCompletion::EReplyMode::AfterPages);
                             }
                         }
         for (auto it = ResourceWaits.begin(); it != ResourceWaits.end();) {
@@ -899,7 +900,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (!TryAdmitPages(*admission)) {
             if (eventCookie == KeepPreloadResultCookie) {
                 requestIt->second.Cancelled = true;
-                completion->Cancel(true);
+                completion->Cancel(TRequestCompletion::EReplyMode::Now);
                 ActualizeCacheSizeLimit();
                 return false;
             } else if (RestartBlockedWalk(*admission)) {
@@ -952,7 +953,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         TCollection* owner = FindCollection(admission.PageCollection()->Label());
         if (admission.CollectionItem) {
             if (!owner || owner->CacheItem != admission.CollectionItem) {
-                admission.Completion->Cancel(true);
+                admission.Completion->Cancel(TRequestCompletion::EReplyMode::Now);
                 return nullptr;
             }
         } else {
@@ -972,7 +973,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
         const auto& bound = admission.Completion->Collection();
         if (bound && bound.CacheItem() != owner->CacheItem) {
-            admission.Completion->Cancel(true);
+            admission.Completion->Cancel(TRequestCompletion::EReplyMode::Now);
             return nullptr;
         }
         if (!bound) {
@@ -998,7 +999,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         });
         if (retryPreload) {
             request.Cancelled = true;
-            admission.Completion->Cancel(true);
+            admission.Completion->Cancel(TRequestCompletion::EReplyMode::Now);
         }
 
         TVector<ui32> unresolved;

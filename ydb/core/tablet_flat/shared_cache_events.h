@@ -6,7 +6,7 @@
 #include "cache_item.h"
 #include <ydb/core/protos/shared_cache.pb.h>
 
-#include <util/system/mutex.h>
+#include <util/generic/ptr.h>
 #include <util/generic/map.h>
 #include <util/generic/set.h>
 #include <util/generic/hash.h>
@@ -256,27 +256,34 @@ namespace NKikimr::NSharedCache {
 
     class TRequestCompletion final : public TThrRefBase {
     public:
+        enum class EReplyMode {
+            AfterPages,
+            Now,
+        };
+
         explicit TRequestCompletion(TRequestCompletionParams&& params) noexcept;
+        ~TRequestCompletion() override;
 
         // Cache actor only; bind once before publishing any page waiter
         bool BindCollection(TCacheCollectionRef collection) noexcept;
         void Complete(ui32 index, TCachePageRef page, EPageFetchCompletion completion) noexcept;
         void Fail() noexcept;
-        void Cancel(bool replyImmediately = false) noexcept;
+        void Cancel(EReplyMode replyMode = EReplyMode::AfterPages) noexcept;
         void PostponeForResources() noexcept;
         void NotifyResourcesReady() noexcept;
         void NotifyWorkingSetTooLarge() noexcept;
 
         bool IsActive() const noexcept {
-            return Status_.load(std::memory_order_acquire) == NKikimrProto::OK;
+            const ui64 control = Control_.load(std::memory_order_acquire);
+            return Status(control) == NKikimrProto::OK && !(control & ReplyClaimedMask);
         }
 
         bool IsCancelled() const noexcept {
-            return Status_.load(std::memory_order_acquire) == NKikimrProto::RACE;
+            return Status(Control_.load(std::memory_order_acquire)) == NKikimrProto::RACE;
         }
 
         bool HasFailed() const noexcept {
-            return Status_.load(std::memory_order_acquire) == NKikimrProto::ERROR;
+            return Status(Control_.load(std::memory_order_acquire)) == NKikimrProto::ERROR;
         }
 
         const TIntrusivePtr<NPageCollection::TPagesWaitPad>& WaitPad() const noexcept {
@@ -300,8 +307,38 @@ namespace NKikimr::NSharedCache {
         }
 
     private:
-        // Caller holds Mutex_ once the completion is shared
-        THolder<TEvResult> TakeResult() noexcept;
+        friend struct TRequestCompletionTestAccess;
+
+        enum class EAction {
+            Finish,
+            Fail,
+            Cancel,
+            Postpone,
+        };
+
+        struct TAction {
+            ui64 Reply = 0;
+            bool ReleasePages = false;
+        };
+
+        // Low 32 bits hold status; the first stop or successful reply fixes status and pressure
+        static constexpr ui64 StatusMask = Max<ui32>();
+        static constexpr ui64 ResourcePressureMask = ui64{ 1 } << 32;
+        static constexpr ui64 ReplyClaimedMask = ui64{ 1 } << 33;
+        // Index zero cannot own a page; zero itself remains the unpublished slot value
+        static constexpr ui64 ClosedPageSlot = TCacheItem::Make(1, 0).Raw();
+        static_assert(sizeof(TCachePageRef) == sizeof(std::atomic<ui64>));
+
+        static TEvResult::EStatus Status(ui64 control) noexcept {
+            return static_cast<TEvResult::EStatus>(control & StatusMask);
+        }
+
+        bool PublishPage(ui32 index, TCachePageRef& page) noexcept;
+        TAction Update(EAction action, EReplyMode replyMode) noexcept;
+        TAction FinishPage(TAction action) noexcept;
+        void Apply(TAction action) noexcept;
+        void ReleasePages() noexcept;
+        THolder<TEvResult> TakeResult(ui64 reply) noexcept;
         void SendResult(THolder<TEvResult> result) noexcept;
 
     private:
@@ -314,18 +351,15 @@ namespace NKikimr::NSharedCache {
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
         TCacheCollectionRef Collection_;
         TVector<TPageLocation> Locations_;
-        TVector<TCachePageRef> ReadyPages_;
+        // Slots own native page words until taken or permanently closed; callbacks keep the array alive
+        TArrayHolder<std::atomic<ui64>> ReadyPages_;
         TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad_;
         const ui64 Cookie_;
         const NActors::TActorId Notify_;
         const bool CoreRoute_;
         const ui64 CompletionId_;
-        // Protects ReadyPages_ and reply assembly when native callbacks race with actor cancellation
-        mutable TMutex Mutex_;
-        bool ResourcePressure_ = false;
-        std::atomic<TEvResult::EStatus> Status_{ NKikimrProto::OK };
+        std::atomic<ui64> Control_;
         std::atomic<ui32> RemainingPages_;
-        std::atomic<bool> ResultSent_{ false };
     };
 
     struct TEvResourcesAvailable : public TEventLocal<TEvResourcesAvailable, EvResourcesAvailable> {};
