@@ -33,6 +33,58 @@ using namespace NActors;
 using namespace NTabletFlatExecutor;
 using namespace NPageCollection;
 
+struct TRequestCompletionTestAccess {
+    template <class TCallback>
+    static void AfterPublish(TRequestCompletion& completion, ui32 index, TCachePageRef page, TCallback&& callback) {
+        UNIT_ASSERT(completion.PublishPage(index, page));
+        UNIT_ASSERT(!page);
+        callback();
+        completion.Apply(completion.FinishPage({}));
+    }
+
+    template <class TCallback>
+    static void AfterReplyClaim(TRequestCompletion& completion, ui32 index, TCachePageRef page, TCallback&& callback) {
+        UNIT_ASSERT(completion.PublishPage(index, page));
+        const auto action = completion.FinishPage({});
+        UNIT_ASSERT(action.Reply);
+        UNIT_ASSERT(!completion.IsActive());
+        callback();
+        completion.Apply(action);
+    }
+
+    static void PublishAfterCancel(TRequestCompletion& completion, ui32 index, TCachePageRef page) {
+        const auto item = page.CacheItem();
+        completion.Cancel();
+        UNIT_ASSERT(!completion.PublishPage(index, page));
+        UNIT_ASSERT(page && page.CacheItem() == item);
+        completion.Apply(completion.FinishPage(
+            completion.Update(TRequestCompletion::EAction::Fail, TRequestCompletion::EReplyMode::Now)));
+    }
+
+    static void CancelBeforeLastCallback(TRequestCompletion& completion, ui32 index) {
+        const auto action =
+            completion.Update(TRequestCompletion::EAction::Cancel, TRequestCompletion::EReplyMode::AfterPages);
+        completion.Complete(index, {}, EPageFetchCompletion::Failed);
+        completion.Apply(action);
+    }
+
+    template <class TCallback>
+    static void AfterCancelReplyClaim(TRequestCompletion& completion, TCallback&& callback) {
+        const auto action = completion.Update(TRequestCompletion::EAction::Cancel, TRequestCompletion::EReplyMode::Now);
+        UNIT_ASSERT(action.Reply);
+        callback();
+        completion.Apply(action);
+    }
+
+    template <class TCallback>
+    static void AfterFailureClaim(TRequestCompletion& completion, TCallback&& callback) {
+        const auto action = completion.Update(TRequestCompletion::EAction::Fail, TRequestCompletion::EReplyMode::Now);
+        UNIT_ASSERT(action.Reply);
+        callback();
+        completion.Apply(action);
+    }
+};
+
 static const ui64 NO_QUEUE_COOKIE = 1;
 static const ui64 ASYNC_QUEUE_COOKIE = 2;
 static const ui64 TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE = 4;
@@ -1917,7 +1969,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TIntrusiveConstPtr<TPageCollectionMock>(MakeIntrusive<TPageCollectionMock>(ui64{ 13 }, ui32{ 1 })));
         UNIT_ASSERT(!completion->BindCollection(std::move(other)));
         UNIT_ASSERT(completion->Collection().CacheItem() == canonical.CacheItem());
-        completion->Cancel(true);
+        completion->Cancel(TRequestCompletion::EReplyMode::Now);
         sharedCache.CheckResults({ TFetch{ 97, descriptor, {} } }, NKikimrProto::RACE);
     }
 
@@ -2404,6 +2456,375 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         Postpone,
     };
 
+    void CheckCompletionSuccessClaim(ECompletionAction action) {
+        TSharedPageCacheMock sharedCache;
+        auto& cache = TSharedCache::Get();
+        auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .Collection = cache.AdmitCollection(sharedCache.Collection1),
+            .Pages = { _P(0) },
+            .Cookie = 94,
+        });
+        auto page = cache.AdmitPage(sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'x')));
+        const auto item = page.CacheItem();
+        TRequestCompletionTestAccess::AfterReplyClaim(*completion, 0, std::move(page), [&] {
+            switch (action) {
+                case ECompletionAction::Fail:
+                    completion->Fail();
+                    break;
+                case ECompletionAction::Cancel:
+                case ECompletionAction::CancelImmediately:
+                    completion->Cancel(action == ECompletionAction::CancelImmediately
+                                           ? TRequestCompletion::EReplyMode::Now
+                                           : TRequestCompletion::EReplyMode::AfterPages);
+                    break;
+                case ECompletionAction::Postpone:
+                    completion->PostponeForResources();
+                    break;
+            }
+            UNIT_ASSERT(!completion->IsActive());
+            UNIT_ASSERT(!completion->IsCancelled());
+            UNIT_ASSERT(!completion->HasFailed());
+        });
+        sharedCache.Runtime.WaitFor("selected success reply", [&] {
+            return !sharedCache.Results.empty();
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT(!sharedCache.Results.front()->Get()->ResourcePressure);
+        auto pages = sharedCache.CheckResults({ TFetch{ 94, sharedCache.Collection1, { _P(0) } } });
+        UNIT_ASSERT(pages.at(0).CacheItem() == item);
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(pages.at(0).data(), pages.at(0).size()), TString(10, 'x'));
+        sharedCache.CheckResults({});
+    }
+
+    Y_UNIT_TEST(RequestCompletionSuccessClaimSurvivesCancellation) {
+        CheckCompletionSuccessClaim(ECompletionAction::Cancel);
+    }
+
+    Y_UNIT_TEST(RequestCompletionSuccessClaimSurvivesImmediateCancellation) {
+        CheckCompletionSuccessClaim(ECompletionAction::CancelImmediately);
+    }
+
+    Y_UNIT_TEST(RequestCompletionSuccessClaimSurvivesFailure) {
+        CheckCompletionSuccessClaim(ECompletionAction::Fail);
+    }
+
+    Y_UNIT_TEST(RequestCompletionSuccessClaimSurvivesPostponement) {
+        CheckCompletionSuccessClaim(ECompletionAction::Postpone);
+    }
+
+    void CheckCompletionPublicationCancellation(bool afterPublication) {
+        TSharedPageCacheMock sharedCache;
+        auto& cache = TSharedCache::Get();
+        auto waitPad = MakeIntrusive<TPagesWaitPad>();
+        auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .Collection = cache.AdmitCollection(sharedCache.Collection1),
+            .Pages = { _P(0) },
+            .WaitPad = waitPad,
+            .Cookie = 95,
+        });
+        auto page = cache.AdmitPage(sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'x')));
+        if (afterPublication) {
+            TRequestCompletionTestAccess::AfterPublish(*completion, 0, std::move(page), [&] {
+                completion->Cancel();
+                UNIT_ASSERT(completion->IsCancelled());
+            });
+        } else {
+            TRequestCompletionTestAccess::PublishAfterCancel(*completion, 0, std::move(page));
+        }
+        UNIT_ASSERT_VALUES_EQUAL(waitPad->HasPinnedPages.load(std::memory_order_acquire), afterPublication);
+        sharedCache.CheckResults({ TFetch{ 95, sharedCache.Collection1, {} } }, NKikimrProto::RACE);
+        sharedCache.CheckResults({});
+    }
+
+    Y_UNIT_TEST(RequestCompletionCancellationClosesUnpublishedSlot) {
+        CheckCompletionPublicationCancellation(false);
+    }
+
+    Y_UNIT_TEST(RequestCompletionCancellationDoesNotWaitForPublishedCallback) {
+        CheckCompletionPublicationCancellation(true);
+    }
+
+    Y_UNIT_TEST(RequestCompletionDeferredCancellationWaitsForLastCallback) {
+        TSharedPageCacheMock sharedCache;
+        auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .Collection = TSharedCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Pages = { _P(0), _P(1) },
+            .Cookie = 96,
+        });
+        completion->Cancel();
+        completion->Complete(0, {}, EPageFetchCompletion::Failed);
+        sharedCache.CheckResults({});
+        completion->Complete(1, {}, EPageFetchCompletion::Failed);
+        sharedCache.CheckResults({ TFetch{ 96, sharedCache.Collection1, {} } }, NKikimrProto::RACE);
+        sharedCache.CheckResults({});
+    }
+
+    Y_UNIT_TEST(RequestCompletionExplicitFailurePreservesDeferredCancellation) {
+        TSharedPageCacheMock sharedCache;
+        auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .Collection = TSharedCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Pages = { _P(0) },
+            .Cookie = 97,
+        });
+        completion->Cancel();
+        completion->Fail();
+        UNIT_ASSERT(completion->IsCancelled());
+        UNIT_ASSERT(!completion->HasFailed());
+        sharedCache.CheckResults({});
+        completion->Complete(0, {}, EPageFetchCompletion::Failed);
+        sharedCache.CheckResults({ TFetch{ 97, sharedCache.Collection1, {} } }, NKikimrProto::RACE);
+        sharedCache.CheckResults({});
+    }
+
+    Y_UNIT_TEST(RequestCompletionImmediateCancellationAcceleratesDeferredReply) {
+        TSharedPageCacheMock sharedCache;
+        auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .Collection = TSharedCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Pages = { _P(0), _P(1) },
+            .Cookie = 101,
+        });
+        completion->Cancel();
+        completion->Complete(0, {}, EPageFetchCompletion::Failed);
+        sharedCache.CheckResults({});
+        completion->Cancel(TRequestCompletion::EReplyMode::Now);
+        sharedCache.CheckResults({ TFetch{ 101, sharedCache.Collection1, {} } }, NKikimrProto::RACE);
+        completion->Complete(1, {}, EPageFetchCompletion::Failed);
+        sharedCache.CheckResults({});
+    }
+
+    Y_UNIT_TEST(RequestCompletionPostponementPreservesDeferredCancellationOutcome) {
+        TSharedPageCacheMock sharedCache;
+        auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .Collection = TSharedCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Pages = { _P(0) },
+        });
+        completion->Cancel();
+        completion->PostponeForResources();
+        sharedCache.Runtime.WaitFor("cancelled outcome before postponement", [&] {
+            return !sharedCache.Results.empty();
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT(!sharedCache.Results.front()->Get()->ResourcePressure);
+        UNIT_ASSERT(completion->IsCancelled());
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, {} } }, NKikimrProto::RACE);
+        completion->Complete(0, {}, EPageFetchCompletion::Failed);
+        sharedCache.CheckResults({});
+    }
+
+    Y_UNIT_TEST(RequestCompletionFailureOutcomeSurvivesCancellationAndPostponement) {
+        TSharedPageCacheMock sharedCache;
+        auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .Collection = TSharedCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Pages = { _P(0) },
+        });
+        TRequestCompletionTestAccess::AfterFailureClaim(*completion, [&] {
+            completion->Cancel();
+            completion->Cancel(TRequestCompletion::EReplyMode::Now);
+            completion->PostponeForResources();
+            UNIT_ASSERT(completion->HasFailed());
+            UNIT_ASSERT(!completion->IsCancelled());
+            UNIT_ASSERT(!completion->IsActive());
+        });
+        sharedCache.Runtime.WaitFor("failure outcome before cancellation", [&] {
+            return !sharedCache.Results.empty();
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT(!sharedCache.Results.front()->Get()->ResourcePressure);
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, {} } }, NKikimrProto::ERROR);
+        completion->Complete(0, {}, EPageFetchCompletion::Failed);
+        sharedCache.CheckResults({});
+    }
+
+    Y_UNIT_TEST(RequestCompletionRepeatedOffsetsTransferSeparateOwners) {
+        TSharedPageCacheMock sharedCache;
+        auto& cache = TSharedCache::Get();
+        auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .Collection = cache.AdmitCollection(sharedCache.Collection1),
+            .Pages = { _P(0), _P(0) },
+            .Cookie = 98,
+        });
+        auto first = cache.AdmitPage(sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'x')));
+        auto second = first.Acquire();
+        const auto item = first.CacheItem();
+        completion->Complete(1, std::move(second), EPageFetchCompletion::Ready);
+        completion->Complete(0, std::move(first), EPageFetchCompletion::Ready);
+        sharedCache.Runtime.WaitFor("repeated page offsets", [&] {
+            return sharedCache.Results.size() == 1;
+        }, TDuration::Seconds(5));
+        const auto& result = *sharedCache.Results.front()->Get();
+        UNIT_ASSERT_VALUES_EQUAL(result.Status, NKikimrProto::OK);
+        UNIT_ASSERT_VALUES_EQUAL(result.Pages.size(), 2);
+        for (const auto& loaded : result.Pages) {
+            UNIT_ASSERT(loaded.Offset == _P(0).Offset);
+            UNIT_ASSERT(loaded.Page.CacheItem() == item);
+            UNIT_ASSERT_VALUES_EQUAL(TStringBuf(loaded.Page.data(), loaded.Page.size()), TString(10, 'x'));
+        }
+        sharedCache.Results.clear();
+        sharedCache.CheckResults({});
+    }
+
+    Y_UNIT_TEST(RequestCompletionInitialErrorAndEmptySuccess) {
+        TSharedPageCacheMock sharedCache;
+        auto failed = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .PageCollection = sharedCache.Collection1,
+            .Status = NKikimrProto::NODATA,
+            .Pages = { _P(0) },
+            .Cookie = 99,
+        });
+        sharedCache.CheckResults({ TFetch{ 99, sharedCache.Collection1, {} } }, NKikimrProto::NODATA);
+        std::thread late([&] {
+            failed->Complete(0, {}, EPageFetchCompletion::Failed);
+        });
+        late.join();
+        auto empty = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .PageCollection = sharedCache.Collection1,
+            .Cookie = 100,
+        });
+        sharedCache.CheckResults({ TFetch{ 100, sharedCache.Collection1, {} } });
+        sharedCache.CheckResults({});
+    }
+
+    Y_UNIT_TEST(RequestCompletionDestructionReleasesPagesWithoutReply) {
+        TSharedPageCacheMock sharedCache;
+        auto& cache = TSharedCache::Get();
+        UNIT_ASSERT(cache.UpdateSoftLimitOverride(0));
+        const ui64 before = cache.BufferBytes();
+        auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .Collection = cache.AdmitCollection(sharedCache.Collection1),
+            .Pages = { _P(0), _P(1) },
+        });
+        auto page = cache.AdmitPage(sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'x')));
+        UNIT_ASSERT(page);
+        completion->Complete(0, std::move(page), EPageFetchCompletion::Ready);
+        UNIT_ASSERT(cache.BufferBytes() > before);
+        completion.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(cache.BufferBytes(), before);
+        sharedCache.CheckResults({});
+    }
+
+    Y_UNIT_TEST(RequestCompletionFailureAndPostponementChooseOneCoherentReply) {
+        TSharedPageCacheMock sharedCache;
+        for (ui32 iteration = 0; iteration < 16; ++iteration) {
+            auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+                .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+                .ReplyTo = sharedCache.Sender1,
+                .Collection = TSharedCache::Get().AdmitCollection(sharedCache.Collection1),
+                .Pages = { _P(0), _P(1) },
+                .Cookie = iteration,
+            });
+            std::atomic<bool> start = false;
+            const auto wait = [&] {
+                while (!start.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+            };
+            std::thread first([&] {
+                wait();
+                completion->Complete(0, {}, EPageFetchCompletion::Failed);
+            });
+            std::thread second([&] {
+                wait();
+                completion->Complete(1, {}, EPageFetchCompletion::Failed);
+            });
+            std::thread postpone([&] {
+                wait();
+                completion->PostponeForResources();
+            });
+            std::thread cancel([&] {
+                wait();
+                completion->Cancel(TRequestCompletion::EReplyMode::Now);
+            });
+            start.store(true, std::memory_order_release);
+            first.join();
+            second.join();
+            postpone.join();
+            cancel.join();
+            sharedCache.Runtime.WaitFor("one coherent completion reply", [&] {
+                return !sharedCache.Results.empty();
+            }, TDuration::Seconds(5));
+            sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
+            UNIT_ASSERT_VALUES_EQUAL(sharedCache.Results.size(), 1);
+            const auto& result = *sharedCache.Results.front()->Get();
+            UNIT_ASSERT(result.Status == NKikimrProto::ERROR || result.Status == NKikimrProto::RACE);
+            UNIT_ASSERT(!result.ResourcePressure || result.Status == NKikimrProto::RACE);
+            UNIT_ASSERT(!completion->IsActive());
+            UNIT_ASSERT_VALUES_EQUAL(completion->HasFailed(), result.Status == NKikimrProto::ERROR);
+            UNIT_ASSERT_VALUES_EQUAL(completion->IsCancelled(), result.Status == NKikimrProto::RACE);
+            UNIT_ASSERT_VALUES_EQUAL(result.Cookie, iteration);
+            UNIT_ASSERT(result.Pages.empty());
+            sharedCache.Results.clear();
+        }
+    }
+
+    Y_UNIT_TEST(RequestCompletionCancelReplySnapshotSurvivesPostponement) {
+        TSharedPageCacheMock sharedCache;
+        auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .Collection = TSharedCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Pages = { _P(0) },
+        });
+        TRequestCompletionTestAccess::AfterCancelReplyClaim(*completion, [&] {
+            completion->PostponeForResources();
+            completion->Complete(0, {}, EPageFetchCompletion::Failed);
+        });
+        sharedCache.Runtime.WaitFor("selected cancellation reply", [&] {
+            return !sharedCache.Results.empty();
+        }, TDuration::Seconds(5));
+        UNIT_ASSERT(!sharedCache.Results.front()->Get()->ResourcePressure);
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, {} } }, NKikimrProto::RACE);
+        sharedCache.CheckResults({});
+    }
+
+    Y_UNIT_TEST(RequestCompletionResourceMessagesDoNotClaimOrdinaryReply) {
+        TSharedPageCacheMock sharedCache;
+        auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
+            .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
+            .ReplyTo = sharedCache.Sender1,
+            .Collection = TSharedCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Pages = { _P(0) },
+        });
+        completion->PostponeForResources();
+        completion->NotifyResourcesReady();
+        completion->NotifyWorkingSetTooLarge();
+        completion->Complete(0, {}, EPageFetchCompletion::Failed);
+        sharedCache.Runtime.WaitFor("ordinary and resource replies", [&] {
+            return sharedCache.Results.size() >= 3;
+        }, TDuration::Seconds(5));
+        sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
+        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Results.size(), 3);
+        ui32 pressure = 0, ready = 0, tooLarge = 0;
+        for (const auto& event : sharedCache.Results) {
+            const auto& result = *event->Get();
+            pressure += result.ResourcePressure;
+            ready += result.ResourcesReady;
+            tooLarge += result.WorkingSetTooLarge;
+        }
+        UNIT_ASSERT_VALUES_EQUAL(pressure, 1);
+        UNIT_ASSERT_VALUES_EQUAL(ready, 1);
+        UNIT_ASSERT_VALUES_EQUAL(tooLarge, 1);
+        sharedCache.Results.clear();
+    }
+
     void CheckCompletionPageRelease(ECompletionAction action) {
         TSharedPageCacheMock sharedCache;
         auto& cache = TSharedCache::Get();
@@ -2428,16 +2849,16 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             }
 
             void Deallocate(char* data) noexcept override {
-                if (Completion) {
+                if (auto* completion = std::exchange(Completion, nullptr)) {
                     std::atomic<bool> returned = false;
                     std::thread other([&] {
-                        Completion->Complete(2, {}, EPageFetchCompletion::Failed);
+                        completion->Complete(3, {}, EPageFetchCompletion::Failed);
                         returned.store(true, std::memory_order_release);
                     });
                     const TInstant deadline = TInstant::Now() + TDuration::Seconds(10);
                     while (!returned.load(std::memory_order_acquire)) {
                         Y_ABORT_UNLESS(TInstant::Now() < deadline,
-                            "Native page destruction must not hold the request-completion mutex");
+                            "A reentrant callback must not wait for page cleanup or release another slot");
                         std::this_thread::yield();
                     }
                     other.join();
@@ -2454,7 +2875,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
             .Collection = TSharedCache::Get().AdmitCollection(sharedCache.Collection1),
-            .Pages = { _P(0), _P(1), _P(2) },
+            .Pages = { _P(0), _P(1), _P(2), _P(3) },
             .Cookie = cookie,
         });
         probe.Completion = completion.Get();
@@ -2465,25 +2886,28 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto page = cache.AdmitPage(sharedCache.Collection1, _P(0), probe.Allocate(_P(0).Size));
         UNIT_ASSERT(page);
         completion->Complete(0, std::move(page), EPageFetchCompletion::Ready);
+        auto secondPage = cache.AdmitPage(sharedCache.Collection1, _P(1), probe.Allocate(_P(1).Size));
+        UNIT_ASSERT(secondPage);
+        completion->Complete(1, std::move(secondPage), EPageFetchCompletion::Ready);
         UNIT_ASSERT_VALUES_EQUAL(probe.Releases, 0);
 
         switch (action) {
             case ECompletionAction::Fail:
-                completion->Complete(1, {}, EPageFetchCompletion::Failed);
+                completion->Complete(2, {}, EPageFetchCompletion::Failed);
                 break;
             case ECompletionAction::Cancel:
-                completion->Cancel();
+                TRequestCompletionTestAccess::CancelBeforeLastCallback(*completion, 2);
                 break;
             case ECompletionAction::CancelImmediately:
-                completion->Cancel(true);
+                completion->Cancel(TRequestCompletion::EReplyMode::Now);
                 break;
             case ECompletionAction::Postpone:
                 completion->PostponeForResources();
                 break;
         }
-        UNIT_ASSERT_VALUES_EQUAL(probe.Releases, 1);
-        if (action != ECompletionAction::Fail) {
-            completion->Complete(1, {}, EPageFetchCompletion::Failed);
+        UNIT_ASSERT_VALUES_EQUAL(probe.Releases, 2);
+        if (action == ECompletionAction::CancelImmediately || action == ECompletionAction::Postpone) {
+            completion->Complete(2, {}, EPageFetchCompletion::Failed);
         }
         sharedCache.Runtime.WaitFor("completion after releasing native pages", [&] {
             return sharedCache.Results.size() == 1;

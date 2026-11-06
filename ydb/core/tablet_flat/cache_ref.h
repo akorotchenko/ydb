@@ -251,6 +251,16 @@ public:
 
 private:
     friend class TCacheItems<TTraits>;
+    friend class TRequestCompletion;
+
+    // Transfer an existing native owner without acquiring another reference
+    Y_FORCE_INLINE TCacheItem TakeNativeRef() noexcept {
+        return Ref_.Take();
+    }
+
+    static Y_FORCE_INLINE TCachePageRefImpl AdoptNativeRef(TCacheItem item) noexcept {
+        return TCachePageRefImpl(TCacheItemRefImpl<TTraits>(item));
+    }
 
     Y_FORCE_INLINE explicit TCachePageRefImpl(TCacheItemRefImpl<TTraits>&& ref) noexcept
         : Ref_(std::move(ref))

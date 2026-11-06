@@ -85,20 +85,27 @@ TRequestCompletion::TRequestCompletion(TRequestCompletionParams&& params) noexce
     , PageCollection_(params.Collection ? params.Collection->PageCollection() : std::move(params.PageCollection))
     , Collection_(std::move(params.Collection))
     , Locations_(std::move(params.Pages))
-    , ReadyPages_(Locations_.size())
+    , ReadyPages_(Locations_.empty() ? nullptr : new std::atomic<ui64>[Locations_.size()])
     , WaitPad_(std::move(params.WaitPad))
     , Cookie_(params.Cookie)
     , Notify_(params.Notify)
     , CoreRoute_(params.CoreRoute)
     , CompletionId_(params.CompletionId)
-    , Status_(params.Status)
+    , Control_(params.Status)
     , RemainingPages_(static_cast<ui32>(Locations_.size()))
 {
     Y_DEBUG_ABORT_UNLESS(Locations_.size() <= Max<ui32>());
     Y_DEBUG_ABORT_UNLESS(ActorSystem_ && ReplyTo_ && PageCollection_);
-    if (RemainingPages_.load(std::memory_order_relaxed) == 0 || params.Status != NKikimrProto::OK) {
-        SendResult(TakeResult());
+    for (ui32 index = 0; index < Locations_.size(); ++index) {
+        ReadyPages_[index].store(params.Status == NKikimrProto::OK ? 0 : ClosedPageSlot, std::memory_order_relaxed);
     }
+    if (RemainingPages_.load(std::memory_order_relaxed) == 0 || params.Status != NKikimrProto::OK) {
+        Apply(Update(EAction::Finish, EReplyMode::Now));
+    }
+}
+
+TRequestCompletion::~TRequestCompletion() {
+    ReleasePages();
 }
 
 bool TRequestCompletion::BindCollection(TCacheCollectionRef collection) noexcept {
@@ -117,71 +124,120 @@ bool TRequestCompletion::BindCollection(TCacheCollectionRef collection) noexcept
 }
 
 void TRequestCompletion::Fail() noexcept {
-    TVector<TCachePageRef> releasedPages;
-    THolder<TEvResult> result;
-    {
-        TGuard<TMutex> guard(Mutex_);
-        Status_.store(NKikimrProto::ERROR, std::memory_order_relaxed);
-        releasedPages.swap(ReadyPages_);
-        result = TakeResult();
-    }
-    SendResult(std::move(result));
+    Apply(Update(EAction::Fail, EReplyMode::Now));
 }
 
 void TRequestCompletion::Complete(ui32 index, TCachePageRef page, EPageFetchCompletion completion) noexcept {
     Y_DEBUG_ABORT_UNLESS(index < Locations_.size());
     Y_DEBUG_ABORT_UNLESS(completion != EPageFetchCompletion::Pending);
-    TVector<TCachePageRef> releasedPages;
-    THolder<TEvResult> result;
-    {
-        TGuard<TMutex> guard(Mutex_);
-        if (completion == EPageFetchCompletion::Ready && Status_.load(std::memory_order_relaxed) == NKikimrProto::OK) {
-            Y_DEBUG_ABORT_UNLESS(page);
-            ReadyPages_[index] = std::move(page);
-            if (WaitPad_) {
-                WaitPad_->HasPinnedPages.store(true, std::memory_order_release);
-            }
-        } else {
-            TEvResult::EStatus expected = NKikimrProto::OK;
-            if (Status_.compare_exchange_strong(expected, NKikimrProto::ERROR, std::memory_order_relaxed)) {
-                releasedPages.swap(ReadyPages_);
-            }
-        }
-
-        const ui32 remaining = RemainingPages_.fetch_sub(1, std::memory_order_acq_rel);
-        Y_DEBUG_ABORT_UNLESS(remaining != 0);
-        if (remaining == 1 || HasFailed()) {
-            result = TakeResult();
-        }
+    TAction action;
+    if (completion != EPageFetchCompletion::Ready || !IsActive() || !PublishPage(index, page)) {
+        action = Update(EAction::Fail, EReplyMode::Now);
     }
-    SendResult(std::move(result));
+    // A rejected local owner survives countdown and sending, including destructor reentry
+    Apply(FinishPage(action));
 }
 
-void TRequestCompletion::Cancel(bool replyImmediately) noexcept {
-    TVector<TCachePageRef> releasedPages;
-    THolder<TEvResult> result;
-    {
-        TGuard<TMutex> guard(Mutex_);
-        Status_.store(NKikimrProto::RACE, std::memory_order_relaxed);
-        releasedPages.swap(ReadyPages_);
-        if (replyImmediately) {
-            result = TakeResult();
-        }
-    }
-    SendResult(std::move(result));
+void TRequestCompletion::Cancel(EReplyMode replyMode) noexcept {
+    Apply(Update(EAction::Cancel, replyMode));
 }
 
 void TRequestCompletion::PostponeForResources() noexcept {
-    TVector<TCachePageRef> releasedPages;
-    THolder<TEvResult> result;
+    Apply(Update(EAction::Postpone, EReplyMode::Now));
+}
+
+bool TRequestCompletion::PublishPage(ui32 index, TCachePageRef& page) noexcept {
+    Y_DEBUG_ABORT_UNLESS(page);
+    // Disarm before publication: a closer may take and destroy this owner as soon as CAS succeeds
+    const TCacheItem item = page.TakeNativeRef();
+    ui64 expected = 0;
+    if (!ReadyPages_[index].compare_exchange_strong(
+            expected, item.Raw(), std::memory_order_release, std::memory_order_relaxed))
     {
-        TGuard<TMutex> guard(Mutex_);
-        ResourcePressure_ = true;
-        Status_.store(NKikimrProto::RACE, std::memory_order_relaxed);
-        releasedPages.swap(ReadyPages_);
-        result = TakeResult();
+        page = TCachePageRef::AdoptNativeRef(item);
+        return false;
     }
-    SendResult(std::move(result));
+    if (WaitPad_) {
+        WaitPad_->HasPinnedPages.store(true, std::memory_order_release);
+    }
+    return true;
+}
+
+TRequestCompletion::TAction TRequestCompletion::Update(EAction action, EReplyMode replyMode) noexcept {
+    ui64 expected = Control_.load(std::memory_order_acquire);
+    for (;;) {
+        if (expected & ReplyClaimedMask) {
+            return {};
+        }
+        ui64 desired = expected;
+        const bool active = Status(expected) == NKikimrProto::OK;
+        // A late page failure and an explicit failure both preserve the first stop reason
+        if (action == EAction::Fail && !active) {
+            return {};
+        }
+        if (active) {
+            switch (action) {
+                case EAction::Fail:
+                    desired = (expected & ~StatusMask) | NKikimrProto::ERROR;
+                    break;
+                case EAction::Cancel:
+                    desired = (expected & ~StatusMask) | NKikimrProto::RACE;
+                    break;
+                case EAction::Postpone:
+                    desired = (expected & ~StatusMask) | NKikimrProto::RACE | ResourcePressureMask;
+                    break;
+                case EAction::Finish:
+                    break;
+            }
+        }
+
+        TAction result;
+        // Only the first stop closes slots; a claimed reply cannot change its outcome
+        result.ReleasePages = active && Status(desired) != NKikimrProto::OK;
+        if (replyMode == EReplyMode::Now) {
+            desired |= ReplyClaimedMask;
+            result.Reply = desired;
+        }
+        if (desired == expected ||
+            Control_.compare_exchange_weak(expected, desired, std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            return result;
+        }
+    }
+}
+
+TRequestCompletion::TAction TRequestCompletion::FinishPage(TAction action) noexcept {
+    const ui32 remaining = RemainingPages_.fetch_sub(1, std::memory_order_acq_rel);
+    Y_DEBUG_ABORT_UNLESS(remaining != 0);
+    if (remaining == 1) {
+        const TAction last = Update(EAction::Finish, EReplyMode::Now);
+        if (last.Reply) {
+            Y_DEBUG_ABORT_UNLESS(!action.Reply);
+            action.Reply = last.Reply;
+        }
+        action.ReleasePages |= last.ReleasePages;
+    }
+    return action;
+}
+
+void TRequestCompletion::Apply(TAction action) noexcept {
+    if (action.Reply) {
+        SendResult(TakeResult(action.Reply));
+    }
+    if (action.ReleasePages) {
+        ReleasePages();
+    }
+}
+
+void TRequestCompletion::ReleasePages() noexcept {
+    for (ui32 index = 0; index < Locations_.size(); ++index) {
+        const TCacheItem item =
+            TCacheItem::FromRaw(ReadyPages_[index].exchange(ClosedPageSlot, std::memory_order_acq_rel));
+        if (!item.IsNull()) {
+            // No other callback helps this closer, even if native destruction reenters Complete
+            auto page = TCachePageRef::AdoptNativeRef(item);
+        }
+    }
 }
 
 void TRequestCompletion::NotifyResourcesReady() noexcept {
@@ -200,20 +256,19 @@ void TRequestCompletion::NotifyWorkingSetTooLarge() noexcept {
     ActorSystem_->Send(ReplyTo_, result, 0, EventCookie_);
 }
 
-THolder<TEvResult> TRequestCompletion::TakeResult() noexcept {
-    if (ResultSent_.exchange(true, std::memory_order_acq_rel)) {
-        return {};
-    }
-    const TEvResult::EStatus status = Status_.load(std::memory_order_relaxed);
+THolder<TEvResult> TRequestCompletion::TakeResult(ui64 reply) noexcept {
+    const TEvResult::EStatus status = Status(reply);
     auto result = MakeHolder<TEvResult>(PageCollection(), status, Cookie_, ExecutorGeneration_, RequestId_, CoreRoute_);
     result->WaitPad = WaitPad_;
-    result->ResourcePressure = ResourcePressure_;
+    result->ResourcePressure = reply & ResourcePressureMask;
     if (status == NKikimrProto::OK) {
-        result->Pages.reserve(ReadyPages_.size());
-        for (ui32 index = 0; index < ReadyPages_.size(); ++index) {
+        result->Pages.reserve(Locations_.size());
+        for (ui32 index = 0; index < Locations_.size(); ++index) {
             const NTable::NPage::TPageLocation& location = Locations_[index];
-            Y_DEBUG_ABORT_UNLESS(ReadyPages_[index]);
-            result->Pages.emplace_back(location.Offset, location.Size, std::move(ReadyPages_[index]));
+            const TCacheItem item =
+                TCacheItem::FromRaw(ReadyPages_[index].exchange(ClosedPageSlot, std::memory_order_acq_rel));
+            Y_DEBUG_ABORT_UNLESS(!item.IsNull());
+            result->Pages.emplace_back(location.Offset, location.Size, TCachePageRef::AdoptNativeRef(item));
         }
     }
     return result;
