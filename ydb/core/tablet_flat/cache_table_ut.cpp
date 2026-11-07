@@ -685,6 +685,14 @@ public:
         return cache.Space_->FinishBucketResize();
     }
 
+    static EResizeStep FindSplitBoundary(TTestSharedCache& cache, ui32 bucket, ui32 splitBit, TCacheItem& firstSuffix) {
+        auto operation = cache.BeginOperation();
+        TCacheTableImpl<TTestTraits>::TOrderedLink result;
+        const auto step = cache.Table_.FindSplitBoundary(operation.SpaceOperation(), bucket, splitBit, true, result);
+        firstSuffix = result.Expected;
+        return step;
+    }
+
     static void FinishErase(TTestSharedCache& cache, TCacheItem cacheItem, const TCacheKey& key) {
         auto operation = cache.BeginOperation();
         TOperationItemRef<TTestTraits> ownerRef(operation, cacheItem);
@@ -1994,6 +2002,131 @@ Y_UNIT_TEST_SUITE(TSharedCacheTableTest) {
         }
         UNIT_FAIL("Could not construct the review test's bucket key");
         Y_UNREACHABLE();
+    }
+
+    enum class EReusedPredecessorReader {
+        Lookup,
+        Erase,
+        SplitBoundary,
+    };
+
+    void CheckReusedPredecessorSnapshot(EReusedPredecessorReader reader) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const TLogoBlobID sourceId(142, 1, 1);
+        const TLogoBlobID targetId(142, 2, 1);
+        const auto sourceCollection = CreateModeCollection(cache, fixture.Registry, sourceId, ECacheMode::Regular);
+        const auto targetCollection = CreateModeCollection(cache, fixture.Registry, targetId, ECacheMode::Regular);
+        auto sourceMetadata = FindCollection(cache, TCacheKey::Collection(sourceId));
+        auto targetMetadata = FindCollection(cache, TCacheKey::Collection(targetId));
+        UNIT_ASSERT(sourceMetadata.Ref && targetMetadata.Ref);
+
+        const ui32 bucketCount = static_cast<ui32>(CurrentBucketCount(*fixture.Space));
+        const ui32 mask = bucketCount - 1;
+        ui32 bucket = 0;
+        while (bucket == (HashCollectionKey(sourceId) & mask) || bucket == (HashCollectionKey(targetId) & mask)) {
+            ++bucket;
+        }
+        // A is a prefix and B a suffix, so the same pair exercises ordered lookup and split discovery
+        const auto sourceKey = ReviewKeyForBucket(sourceCollection, (bucketCount << 1) - 1, bucket, 1000);
+        const auto targetKey =
+            ReviewKeyForBucket(targetCollection, (bucketCount << 1) - 1, bucket | bucketCount, 2000, &sourceKey);
+        const auto replacementKey = ReviewKeyForBucket(sourceCollection, mask, bucket ^ 1, 3000, &targetKey);
+        const auto source = InsertReadyPage(cache, sourceKey);
+        const auto target = InsertReadyPage(cache, targetKey);
+        auto sourceOwner = TCacheTestAccess::AcquireStructural(cache, source.CacheItem());
+        auto targetOwner = TCacheTestAccess::AcquireStructural(cache, target.CacheItem());
+        UNIT_ASSERT(sourceOwner && targetOwner);
+        UNIT_ASSERT(TCacheTestAccess::BucketHead(cache, bucket) == source.CacheItem());
+
+        TVector<TPageCacheItem> candidates;
+        TPageCacheItem replacement;
+        Y_DEFER {
+            if (replacement) {
+                TCacheTestAccess::DiscardCandidate(cache, replacement);
+            }
+            for (const auto candidate : candidates) {
+                TCacheTestAccess::DiscardCandidate(cache, candidate);
+            }
+        };
+        for (ui64 offset = 10000; candidates.size() < fixture.Capacity.HandleCount(); ++offset) {
+            const auto candidate = AllocatePage(cache, TCacheKey::Page(sourceCollection, offset), 16);
+            if (!candidate) {
+                break;
+            }
+            candidates.push_back(candidate);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(cache), 0);
+
+        TSharedCacheGate gate;
+        TSharedCacheHookGuard hookGuard(cache, gate.Hooks);
+        gate.Slots[0].Arm(ECacheHookPoint::BeforeTableItemValidation, source.CacheItem());
+        TPageResult lookup;
+        EResizeStep boundary = EResizeStep::Complete;
+        TCacheItem firstSuffix;
+        TGateThread pausedReader(gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazard);
+            TlsCacheHazard = &TCacheThreadTestAccess::Hazard(cache, 0);
+            Y_DEFER {
+                TlsCacheHazard = nullptr;
+            };
+            if (reader == EReusedPredecessorReader::Lookup) {
+                lookup = FindPage(cache, targetKey);
+            } else if (reader == EReusedPredecessorReader::SplitBoundary) {
+                boundary = TCacheTestAccess::FindSplitBoundary(cache, bucket, bucketCount, firstSuffix);
+            } else {
+                auto operation = cache.BeginOperation();
+                TOperationItemRef<TTestTraits> owner(operation.SpaceOperation(), std::move(targetOwner));
+                auto state =
+                    THandleState::FromRaw(operation.Handles()[target.Index()].State.load(std::memory_order_acquire));
+                Y_ABORT_UNLESS(operation.TryBeginErase(owner.Get(), state));
+                operation.FinishErase(owner.CacheItem(), targetKey);
+                owner.Drop();
+            }
+        });
+        gate.Slots[0].Wait();
+
+        UNIT_ASSERT(TCacheTestAccess::RetirePageResult(cache, source));
+        sourceOwner.Drop();
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, source.Index()).IsFree());
+        UNIT_ASSERT(TCacheTestAccess::BucketHead(cache, bucket) == target.CacheItem());
+        UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(cache), 1);
+        replacement = AllocatePage(cache, replacementKey, 16);
+        UNIT_ASSERT(replacement);
+        UNIT_ASSERT_VALUES_EQUAL(replacement.Index(), source.Index());
+        UNIT_ASSERT_VALUES_UNEQUAL(replacement.Version(), source.Version());
+        // The replacement stays unpublished while the reader validates its old predecessor snapshot
+        gate.Slots[0].Release();
+        pausedReader.Join();
+
+        if (reader == EReusedPredecessorReader::Erase) {
+            UNIT_ASSERT(TCacheTestAccess::HandleState(cache, target.Index()).IsFree());
+            UNIT_ASSERT(TCacheTestAccess::BucketHead(cache, bucket).IsNull());
+            UNIT_ASSERT(FindPage(cache, targetKey).Status == ECacheResultStatus::Miss);
+        } else {
+            if (reader == EReusedPredecessorReader::Lookup) {
+                UNIT_ASSERT(lookup.Status == ECacheResultStatus::Hit);
+                UNIT_ASSERT(lookup.Ref.CacheItem() == target);
+            } else {
+                UNIT_ASSERT(boundary == EResizeStep::Retry);
+                UNIT_ASSERT(TCacheTestAccess::FindSplitBoundary(cache, bucket, bucketCount, firstSuffix) ==
+                            EResizeStep::Complete);
+                UNIT_ASSERT(firstSuffix == target.CacheItem());
+            }
+            AssertPageHit(cache, targetKey, target);
+        }
+    }
+
+    Y_UNIT_TEST(ReviewR42LookupRetriesReusedPredecessorSnapshot) {
+        CheckReusedPredecessorSnapshot(EReusedPredecessorReader::Lookup);
+    }
+
+    Y_UNIT_TEST(ReviewR42EraseUnlinksTargetAfterPredecessorReuse) {
+        CheckReusedPredecessorSnapshot(EReusedPredecessorReader::Erase);
+    }
+
+    Y_UNIT_TEST(ReviewR42SplitBoundaryRejectsReusedPredecessorSnapshot) {
+        CheckReusedPredecessorSnapshot(EReusedPredecessorReader::SplitBoundary);
     }
 
     void InsertRetriesCompletingFetch(bool ready) {
