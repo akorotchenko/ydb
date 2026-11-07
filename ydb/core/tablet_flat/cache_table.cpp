@@ -21,9 +21,9 @@ int CompareSharedCacheKeys(const TCacheKey& left, ui32 leftHash, const TCacheKey
 }
 
 void StoreSharedCacheKey(THandle& handle, const TCacheKey& key) noexcept {
-    handle.Key0.store(key.Word(0), std::memory_order_relaxed);
-    handle.Key1.store(key.Word(1), std::memory_order_relaxed);
-    handle.Key2OrSize.store(key.Word(2), std::memory_order_relaxed);
+    handle.Key0.store(key.Word(0), std::memory_order_release);
+    handle.Key1.store(key.Word(1), std::memory_order_release);
+    handle.Key2OrSize.store(key.Word(2), std::memory_order_release);
 }
 
 TCacheKey LoadSharedCacheKey(const THandle& handle, EItemKind kind) noexcept {
@@ -138,7 +138,7 @@ bool TCacheTable::InsertAt(TSpaceOperation& spaceOp, TInsertPosition& insertPosi
 
     const TCacheItem successor =
         insertPosition.Expected.IsNull() ? TCacheItem::Make(state.Version(), 0) : insertPosition.Expected;
-    handle.Next.store(successor.Raw(), std::memory_order_relaxed);
+    handle.Next.store(successor.Raw(), std::memory_order_release);
     ui64 expectedRaw = insertPosition.Expected.Raw();
     Cache_.InvokeHook(ECacheHookPoint::BeforeTableLinkCas, insertPosition.Owner);
     const bool inserted = insertPosition.Link->compare_exchange_strong(
@@ -179,6 +179,7 @@ restart:
 
         THandle& handle = spaceOp.Handles()[current.Index()];
         const TCacheItem next = TCacheItem::FromRaw(handle.Next.load(std::memory_order_acquire));
+        Cache_.InvokeHook(ECacheHookPoint::BeforeTableItemValidation, current);
         const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
         if (!current.Matches(state) || state.IsFree()) {
             goto restart;

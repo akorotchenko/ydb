@@ -117,6 +117,7 @@ inline int CompareSharedCacheKeys(const TCacheKey& left, const TCacheKey& right)
     return CompareSharedCacheKeys(left, left.Hash(), right, right.Hash());
 }
 
+// The caller owns a fresh handle or has observed its current generation before rewriting its key
 void StoreSharedCacheKey(THandle& handle, const TCacheKey& key) noexcept;
 TCacheKey LoadSharedCacheKey(const THandle& handle, EItemKind kind) noexcept;
 
@@ -335,10 +336,11 @@ restart:
 
         THandle& handle = spaceOp.Handles()[result.Expected.Index()];
         const TCacheItem next = TCacheItem::FromRaw(handle.Next.load(std::memory_order_acquire));
-        // Read the key before validating its handle generation
-        const ui64 key0 = handle.Key0.load(std::memory_order_relaxed);
-        const ui64 key1 = handle.Key1.load(std::memory_order_relaxed);
-        const ui64 key2 = handle.Key2OrSize.load(std::memory_order_relaxed);
+        // Acquire rewritten words before validating their handle generation
+        const ui64 key0 = handle.Key0.load(std::memory_order_acquire);
+        const ui64 key1 = handle.Key1.load(std::memory_order_acquire);
+        const ui64 key2 = handle.Key2OrSize.load(std::memory_order_acquire);
+        Cache_.InvokeHook(ECacheHookPoint::BeforeTableItemValidation, result.Expected);
         const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
         if (Y_UNLIKELY(!result.Expected.Matches(state) || state.IsFree())) {
             goto restart;

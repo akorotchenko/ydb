@@ -211,7 +211,7 @@ TCacheItem TCacheItems<TTraits>::Allocate(TSpaceOperation& spaceOp, ui32 index) 
     }
     const THandleState state = THandleState::FromRaw(spaceOp.Handles()[index].State.load(std::memory_order_relaxed));
     Y_DEBUG_ABORT_UNLESS(state.IsBegin() && state.Refs() == 0);
-    spaceOp.Handles()[index].Key0.store(0, std::memory_order_relaxed);
+    spaceOp.Handles()[index].Key0.store(0, std::memory_order_release);
     spaceOp.Handles()[index].Body.Fetch = nullptr;
     return TCacheItem::Make(state.Version(), index);
 }
@@ -255,7 +255,7 @@ void TCacheItems<TTraits>::RefillSpareItem(TSpaceOperation& spaceOp) noexcept {
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
     // A recycled free handle may retain a destroyed buffer's union bits. Begin also represents
     // these uninitialized spares, so pending-page cleanup must see a blank fetch payload.
-    handle.Key0.store(0, std::memory_order_relaxed);
+    handle.Key0.store(0, std::memory_order_release);
     handle.Body.Fetch = nullptr;
     const TCacheItem cacheItem = TCacheItem::Make(state.Version(), index);
     if (spaceOp.TryStoreSpareItem(cacheItem)) {
@@ -290,7 +290,7 @@ void TCacheItems<TTraits>::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem
             handle, state.Kind(), state.State(), state.IsPageKind() ? collectionsOp.PageCollection(handle) : nullptr);
         collectionsOp.DropPageItemRef(handle);
         if (state.IsPageKind()) {
-            handle.Key0.store(0, std::memory_order_relaxed);
+            handle.Key0.store(0, std::memory_order_release);
             handle.Body.Fetch = nullptr;
         }
         state = state.WithState(EHandleState::Begin).WithFrequency(0).WithSticky(EStickyState::None);
@@ -300,7 +300,7 @@ void TCacheItems<TTraits>::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem
         const bool page = state.IsPageKind();
         if (page) {
             collectionsOp.DropPageItemRef(handle);
-            handle.Key0.store(0, std::memory_order_relaxed);
+            handle.Key0.store(0, std::memory_order_release);
             if (state.IsStickyField()) {
                 Cache_.Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, PageBytes(handle));
             }
@@ -385,9 +385,9 @@ void TCacheItems<TTraits>::InitializePage(TSpaceOperation& spaceOp, TCacheItem c
     const THandleState claimed = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(claimed) && claimed.IsBegin() && claimed.Refs() == 0);
     Cache_.AdvanceColdMembership(handle);
-    handle.Key0.store(collection.Raw(), std::memory_order_relaxed);
-    handle.Key1.store(offset, std::memory_order_relaxed);
-    handle.Key2OrSize.store(size, std::memory_order_relaxed);
+    handle.Key0.store(collection.Raw(), std::memory_order_release);
+    handle.Key1.store(offset, std::memory_order_release);
+    handle.Key2OrSize.store(size, std::memory_order_release);
     handle.Metadata.Page.Type = type;
     handle.Metadata.Page.Reserved = 0;
     handle.Metadata.Page.Crc32 = crc32;
@@ -402,7 +402,7 @@ void TCacheItems<TTraits>::InitializePage(TSpaceOperation& spaceOp, TCacheItem c
     }
     handle.Body.Fetch = new TPageFetchState(TPageCacheItem::FromValidated(cacheItem));
     handle.Body.Fetch->Ref();
-    handle.Next.store(TCacheItem::Make(claimed.Version(), 0).Raw(), std::memory_order_relaxed);
+    handle.Next.store(TCacheItem::Make(claimed.Version(), 0).Raw(), std::memory_order_release);
     handle.NextInOwner.store(0, std::memory_order_relaxed);
     if (sticky == EStickyState::Sticky) {
         Cache_.Memory_.AddStickyOwnedBytes(AccountedPageBytes(size));
@@ -427,12 +427,12 @@ void TCacheItems<TTraits>::InitializeCollection(
     Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(claimed) && claimed.IsBegin() && claimed.Refs() == 0);
     Cache_.AdvanceColdMembership(handle);
     const ui64* words = id.GetRaw();
-    handle.Key0.store(words[0], std::memory_order_relaxed);
-    handle.Key1.store(words[1], std::memory_order_relaxed);
-    handle.Key2OrSize.store(words[2], std::memory_order_relaxed);
+    handle.Key0.store(words[0], std::memory_order_release);
+    handle.Key1.store(words[1], std::memory_order_release);
+    handle.Key2OrSize.store(words[2], std::memory_order_release);
     new (&handle.Body.Collection) TCollection*(nullptr);
     handle.Metadata.PayloadBytes = bytes;
-    handle.Next.store(TCacheItem::Make(claimed.Version(), 0).Raw(), std::memory_order_relaxed);
+    handle.Next.store(TCacheItem::Make(claimed.Version(), 0).Raw(), std::memory_order_release);
     handle.NextInOwner.store(0, std::memory_order_relaxed);
     const THandleState initialized =
         claimed.WithKind(EItemKind::Collection).WithFrequency(0).WithSticky(EStickyState::Sticky);

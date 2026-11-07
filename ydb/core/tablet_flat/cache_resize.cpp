@@ -130,7 +130,7 @@ bool TSharedCache::PublishPageReplacement(
         const TCacheItem successor = TCacheItem::FromRaw(successorRaw);
         Y_DEBUG_ABORT_UNLESS(!successor.IsFrozen());
         const TCacheItem next = successor.IsNull() ? TCacheItem::Make(replacementItem.Version(), 0) : successor;
-        replacement.Next.store(next.Raw(), std::memory_order_relaxed);
+        replacement.Next.store(next.Raw(), std::memory_order_release);
         InvokeHook(ECacheHookPoint::BeforePageReplacementLinkCas, sourceItem);
         if (source.Next.compare_exchange_weak(successorRaw, replacementItem.WithFrozen().Raw(),
                 std::memory_order_acq_rel, std::memory_order_acquire)) {

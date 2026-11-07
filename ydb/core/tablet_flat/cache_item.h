@@ -659,6 +659,7 @@ private:
 
 struct alignas(64) THandle {
     std::atomic<ui64> State{ 0 };
+    // Release table-word rewrites after observing State; readers acquire them before validating its generation
     std::atomic<ui64> Next{ 0 };
 
     std::atomic<ui64> Key0{ 0 };
