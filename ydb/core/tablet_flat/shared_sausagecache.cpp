@@ -1194,7 +1194,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (!Cache) {
             return;
         }
-        const ui64 generation = Cache->AdmissionGeneration();
+        // Arm before any probe so a concurrent resource change either becomes visible or sends a wakeup
+        Cache->ArmResourceWait();
         if (CollectionLoads) {
             CollectionLoads->Pump();
         }
@@ -1270,9 +1271,6 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
         if (ResourceWaits.empty() && (!CollectionLoads || !CollectionLoads->HasResourceWaits())) {
             Cache->DisarmResourceWait();
-        } else {
-            // Arm after observing the generation before reservation attempts; a concurrent release wakes us.
-            Cache->ArmResourceWait(generation);
         }
     }
 

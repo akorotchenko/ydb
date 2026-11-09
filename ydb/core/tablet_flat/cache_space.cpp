@@ -364,7 +364,8 @@ bool TCacheSpace::ReclaimSpareHandle(TSpaceOperation& spaceOp) noexcept {
         const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
         Y_DEBUG_ABORT_UNLESS(!cacheItem.IsFrozen() && cacheItem.Index() >= 2 && cacheItem.Matches(state) &&
                              state.IsBegin() && state.Refs() == 0);
-        handle.State.store(state.WithState(EHandleState::Free).Raw(), std::memory_order_release);
+        handle.State.store(
+            state.WithState(EHandleState::Free).WithShrinkWaiter(false).Raw(), std::memory_order_release);
         Y_ABORT_UNLESS(spaceOp.ReturnFreeHandle(cacheItem.Index(), cacheItem.Version()));
         return true;
     }
@@ -410,8 +411,10 @@ Y_FORCE_INLINE ui32 TCacheSpace::TryAllocateHandleImpl(TSpaceOperation& spaceOp,
             continue;
         }
 
-        const THandleState desired =
-            expected.WithState(EHandleState::Begin).WithFrequency(0).WithSticky(EStickyState::None);
+        const THandleState desired = expected.WithState(EHandleState::Begin)
+                                         .WithShrinkWaiter(false)
+                                         .WithFrequency(0)
+                                         .WithSticky(EStickyState::None);
         if (handle.State.compare_exchange_strong(
                 expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed))
         {

@@ -68,10 +68,8 @@ Y_UNIT_TEST_SUITE(TCacheItemTest) {
                 .WithShrinkWaiter(true);
         static_assert(
             sticky.HasPageAttachment() && sticky.HasShrinkWaiter() && sticky.Refs() == 2 && sticky.Version() == 13);
-        constexpr auto retired = sticky.WithState(EHandleState::Tombstone)
-                                     .WithFrequency(0)
-                                     .WithPageAttachment(sticky.HasPageAttachment())
-                                     .WithShrinkWaiter(sticky.HasShrinkWaiter());
+        constexpr auto retired =
+            sticky.WithState(EHandleState::Tombstone).WithFrequency(0).WithPageAttachment(sticky.HasPageAttachment());
         static_assert(retired.HasPageAttachment() && retired.HasShrinkWaiter() && retired.Refs() == 2);
         static_assert(!retired.WithPageAttachment(false).HasPageAttachment());
         constexpr auto hot = THandleState::Make(13, EHandleState::Hot, EItemKind::Collection, 1, EStickyState::None, 1);
@@ -81,6 +79,24 @@ Y_UNIT_TEST_SUITE(TCacheItemTest) {
         static_assert(!attached.HasPageAttachment());
         constexpr auto page = THandleState::Make(13, EHandleState::Sticky, EItemKind::Page, 1, EStickyState::Sticky, 2);
         static_assert(!page.HasPageAttachment());
+    }
+
+    Y_UNIT_TEST(ShrinkWaiterIsIndependentOfOtherHandleFields) {
+        static_assert(THandleState::ShrinkWaiterMask == (ui64{ 1 } << 23));
+        static_assert(MaxHandleRefs == (ui32{ 1 } << 23) - 1);
+        constexpr auto base = THandleState::Make(
+            MaxItemVersion, EHandleState::KeepHot, EItemKind::Page, 3, EStickyState::None, MaxHandleRefs);
+        constexpr auto waiting = base.WithShrinkWaiter(true);
+        static_assert(!base.HasShrinkWaiter() && waiting.HasShrinkWaiter());
+        static_assert(waiting.Refs() == MaxHandleRefs && waiting.Frequency() == 3);
+        static_assert(waiting.Raw() == (base.Raw() | THandleState::ShrinkWaiterMask));
+        static_assert(waiting.DecrementRefs().IncrementRefs() == waiting);
+        static_assert(waiting.WithRefs(0).HasShrinkWaiter());
+        static_assert(waiting.WithCold(ECacheTier::Regular).HasShrinkWaiter());
+        static_assert(waiting.WithState(EHandleState::Tombstone).HasShrinkWaiter());
+        static_assert(waiting.WithShrinkWaiter(false) == base);
+        static_assert(
+            !THandleState::Make(0, EHandleState::Free, EItemKind::Page, 0, EStickyState::None, 0).HasShrinkWaiter());
     }
 
     Y_UNIT_TEST(TierReadyTagsPreservePackedFields) {

@@ -310,20 +310,18 @@ public:
         UpdateAggregate(KeepReadyPageBytes_, previous, current);
     }
 
+    // Counts claimed resource notifications, not every resource change
     ui64 AdmissionGeneration() const noexcept {
-        return AdmissionGeneration_.load(std::memory_order_acquire);
+        return ResourceWaitState_.load(std::memory_order_acquire) >> 1;
     }
 
-    // The caller notifies its resource waiter when either operation returns true
-    bool NotifyResourcesAvailable() noexcept {
-        AdmissionGeneration_.fetch_add(1, std::memory_order_release);
-        return ResourceWaitArmed_.exchange(false, std::memory_order_acq_rel);
-    }
+    // The caller notifies its resource waiter when this returns true
+    bool NotifyResourcesAvailable() noexcept;
 
-    bool ArmResourceWait(ui64 generation) noexcept;
+    void ArmResourceWait() noexcept;
 
     void DisarmResourceWait() noexcept {
-        ResourceWaitArmed_.store(false, std::memory_order_release);
+        ResourceWaitState_.fetch_and(~ResourceWaitArmedMask, std::memory_order_release);
     }
 
     // The caller checks its current limit against usage before each attempt.
@@ -412,8 +410,10 @@ private: // Data members
     std::atomic<ui64> SoftLimit_{ 0 };
     std::atomic<ui64> HardLimit_{ 0 };
     ui64 ReservationLimit_ = 0;
-    std::atomic<ui64> AdmissionGeneration_{ 0 };
-    std::atomic<bool> ResourceWaitArmed_{ false };
+    static constexpr ui64 ResourceWaitArmedMask = 1;
+    static constexpr ui64 ResourceWaitGenerationStep = 2;
+    // Bit 0 arms the shared retry event; bits 1..63 count claimed notifications
+    std::atomic<ui64> ResourceWaitState_{ 0 };
 };
 
 // Inline implementations
@@ -469,11 +469,22 @@ inline bool TCacheMemory::UpdateColdReclaimable(ui64 payloadBytes, THandleState 
     return isReclaimable;
 }
 
-inline bool TCacheMemory::ArmResourceWait(ui64 generation) noexcept {
-    // Acquire the notifier's last exchange even when it has already cleared the flag.
-    // This makes its preceding generation update visible and closes the store/load lost-wake race.
-    ResourceWaitArmed_.exchange(true, std::memory_order_acq_rel);
-    return AdmissionGeneration() != generation && ResourceWaitArmed_.exchange(false, std::memory_order_acq_rel);
+inline bool TCacheMemory::NotifyResourcesAvailable() noexcept {
+    ui64 expected = ResourceWaitState_.load(std::memory_order_relaxed);
+    for (;;) {
+        const bool armed = (expected & ResourceWaitArmedMask) != 0;
+        const ui64 desired = armed ? (expected + ResourceWaitGenerationStep) & ~ResourceWaitArmedMask : expected;
+        // Generic publishers retain the same-value RMW; unmarked Hot ref releases never enter here
+        if (ResourceWaitState_.compare_exchange_weak(
+                expected, desired, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            return armed;
+        }
+    }
+}
+
+inline void TCacheMemory::ArmResourceWait() noexcept {
+    // Arm before probing; acquire resource changes published by earlier notifier RMWs
+    ResourceWaitState_.fetch_or(ResourceWaitArmedMask, std::memory_order_acq_rel);
 }
 
 inline bool TCacheMemory::TryReserve(ui64& usage, ui64 bytes, ui64 pages) noexcept {

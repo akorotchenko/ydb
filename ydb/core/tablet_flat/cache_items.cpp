@@ -27,6 +27,19 @@ TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::TryAcquireRetiredItemRef(
 }
 
 template <class TTraits>
+bool TCacheItems<TTraits>::TryRegisterShrinkWait(
+    TSpaceOperation& spaceOp, TCacheItem item, THandleState expected) noexcept {
+    if (!spaceOp.Contains(item) || !item.Matches(expected) || expected.Refs() == 0) {
+        return false;
+    }
+    Cache_.InvokeHook(ECacheHookPoint::BeforeShrinkWaitRegistration, item);
+    ui64 raw = expected.Raw();
+    // Validate even an existing bit: a successful CAS orders registration against the final release
+    return spaceOp.Handles()[item.Index()].State.compare_exchange_strong(
+        raw, expected.WithShrinkWaiter(true).Raw(), std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+template <class TTraits>
 TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::TryAcquireHotItemRef(
     TSpaceOperation& spaceOp, TCacheItem cacheItem, ECacheTier expectedTier) noexcept {
     if (!spaceOp.Contains(cacheItem) || cacheItem.IsFrozen()) {
@@ -113,6 +126,7 @@ TCollection* TCacheItems<TTraits>::ReleaseTombstone(TSpaceOperation& spaceOp, TC
             const ui32 nextVersion = AdvanceItemVersion(expected.Version());
             const THandleState desired = expected.WithVersion(nextVersion)
                                              .WithState(EHandleState::Free)
+                                             .WithShrinkWaiter(false)
                                              .WithFrequency(0)
                                              .WithSticky(EStickyState::None)
                                              .WithRefs(0);
@@ -133,6 +147,7 @@ TCollection* TCacheItems<TTraits>::ReleaseTombstone(TSpaceOperation& spaceOp, TC
         const ui32 nextVersion = AdvanceItemVersion(expected.Version());
         const THandleState desired = expected.WithVersion(nextVersion)
                                          .WithState(EHandleState::Free)
+                                         .WithShrinkWaiter(false)
                                          .WithFrequency(0)
                                          .WithSticky(EStickyState::None)
                                          .WithRefs(0);
@@ -293,7 +308,10 @@ void TCacheItems<TTraits>::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem
             handle.Key0.store(0, std::memory_order_release);
             handle.Body.Fetch = nullptr;
         }
-        state = state.WithState(EHandleState::Begin).WithFrequency(0).WithSticky(EStickyState::None);
+        state = state.WithState(EHandleState::Begin)
+                    .WithShrinkWaiter(false)
+                    .WithFrequency(0)
+                    .WithSticky(EStickyState::None);
         handle.State.store(state.Raw(), std::memory_order_relaxed);
     }
     if (pending) {
@@ -309,7 +327,10 @@ void TCacheItems<TTraits>::RecycleCandidate(TSpaceOperation& spaceOp, TCacheItem
         if (reserved) {
             Cache_.ReleaseReservation(reservedBytes, page ? 1 : 0);
         }
-        state = state.WithState(EHandleState::Begin).WithFrequency(0).WithSticky(EStickyState::None);
+        state = state.WithState(EHandleState::Begin)
+                    .WithShrinkWaiter(false)
+                    .WithFrequency(0)
+                    .WithSticky(EStickyState::None);
         handle.State.store(state.Raw(), std::memory_order_release);
     }
     if (spaceOp.TryStoreSpareItem(cacheItem)) {
@@ -341,7 +362,8 @@ void TCacheItems<TTraits>::DiscardCandidate(
     Y_DEBUG_ABORT_UNLESS(!expected.IsCollectionKind() || !expected.IsReady() ||
                          handle.Body.Collection->Registry_.load(std::memory_order_acquire) == nullptr);
 
-    const THandleState desired = expected.WithState(EHandleState::Free).WithFrequency(0).WithSticky(EStickyState::None);
+    const THandleState desired =
+        expected.WithState(EHandleState::Free).WithShrinkWaiter(false).WithFrequency(0).WithSticky(EStickyState::None);
     TCollection* owner = nullptr;
     if (expected.IsPageKind() && handle.Body.Collection) {
         owner = collectionsOp.PageCollection(handle);

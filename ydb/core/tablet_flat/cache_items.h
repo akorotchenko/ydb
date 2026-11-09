@@ -59,6 +59,9 @@ private:
     TCacheItemRefImpl<TTraits> AcquireMorePageRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
     TCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
 
+    // Shrink waiting
+    bool TryRegisterShrinkWait(TSpaceOperation& spaceOp, TCacheItem item, THandleState expected) noexcept;
+
     // Reference construction
     TCachePageRefImpl<TTraits> BuildPageRef(
         const TSpaceOperation& spaceOp, TCacheItemRefImpl<TTraits>&& ref) const noexcept;
@@ -144,6 +147,11 @@ public:
 
     Y_FORCE_INLINE TCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TCacheItem item) noexcept {
         return Cache_.Items_.AcquireMoreCollectionRef(SpaceOp_, item);
+    }
+
+    // Shrink waiting
+    Y_FORCE_INLINE bool TryRegisterShrinkWait(TCacheItem item, THandleState expected) noexcept {
+        return Cache_.Items_.TryRegisterShrinkWait(SpaceOp_, item, expected);
     }
 
     // Reference construction
@@ -327,14 +335,18 @@ Y_FORCE_INLINE void TCacheItems<TTraits>::Release(TCacheItem cacheItem) noexcept
             return;
         }
         Y_DEBUG_ABORT_UNLESS(expected.Refs() != 0);
-        const THandleState desired = expected.DecrementRefs();
+        THandleState desired = expected.DecrementRefs();
+        const bool notifyShrink = desired.Refs() == 0 && expected.HasShrinkWaiter();
+        if (notifyShrink) {
+            desired = desired.WithShrinkWaiter(false);
+        }
         Cache_.InvokeHook(ECacheHookPoint::BeforeHotPageRefRelease, cacheItem);
         if (!handle.State.compare_exchange_strong(
                 expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed)) {
             continue;
         }
         // The last owner may enable immediate unmapping; only use captured state after the CAS
-        if (desired.Refs() == 0) {
+        if (notifyShrink) {
             Cache_.NotifyResourcesAvailable();
         }
         return;
@@ -471,8 +483,8 @@ Y_FORCE_INLINE bool TCacheItems<TTraits>::TryReleaseItemRef(
                 cacheOp.Eviction().CheckModeGeneration(modeGeneration);
             }
         }
-        if (notifyShrink || (expected.IsReady() && desired.Refs() == 0 && !desired.HasPageAttachment() &&
-                                expected.IsStickyNoneField())) {
+        if (notifyShrink || (!expected.IsHot() && expected.IsReady() && desired.Refs() == 0 &&
+                                !desired.HasPageAttachment() && expected.IsStickyNoneField())) {
             Cache_.NotifyResourcesAvailable();
         }
         return true;

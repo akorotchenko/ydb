@@ -301,10 +301,8 @@ public:
         return Memory_.AdmissionGeneration();
     }
 
-    Y_FORCE_INLINE void ArmResourceWait(ui64 generation) noexcept {
-        if (Memory_.ArmResourceWait(generation)) {
-            TTraits::NotifyResourcesAvailable();
-        }
+    Y_FORCE_INLINE void ArmResourceWait() noexcept {
+        Memory_.ArmResourceWait();
     }
 
     Y_FORCE_INLINE bool TryReserveFetchBatch(TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept {

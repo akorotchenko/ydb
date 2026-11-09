@@ -22,7 +22,7 @@ namespace NKikimr::NSharedCache {
 inline constexpr ui32 MaxItemVersion = (ui32{ 1 } << 31) - 1;
 // The current Cold membership is owned by a publisher, queue slot, or removed-ticket carrier
 inline constexpr ui32 ColdTicketOwnedMask = ui32{ 1 } << 31;
-inline constexpr ui32 MaxHandleRefs = (ui32{ 1 } << 24) - 1;
+inline constexpr ui32 MaxHandleRefs = (ui32{ 1 } << 23) - 1;
 inline constexpr ui32 ResizeMarkerIndex = 1;
 
 enum ECacheTier : ui8 {
@@ -200,22 +200,23 @@ private:
 class THandleState {
 public:
     // Packed layout, bit 0 is the least significant bit
-    //  0..23  Refs
+    //  0..22  Refs
+    //     23  ShrinkWaiter
     // 24..25  Sticky
     // 26..27  Frequency
     //     28  Kind
     // 29..32  State
     // 33..63  Version
-    // Collection Sticky/Tombstone overlay: bit 26 PageAttachment, bit 27 ShrinkWaiter
-    static constexpr ui64 RefsMask = 0x0000000000FFFFFFULL;
+    // Collection Sticky/Tombstone overlay: bit 26 PageAttachment, bit 27 reserved
+    static constexpr ui64 RefsMask = 0x00000000007FFFFFULL;
     static constexpr ui32 RefsShift = 0;
+    static constexpr ui64 ShrinkWaiterMask = ui64{ 1 } << 23;
     static constexpr ui64 StickyMask = 0x0000000003000000ULL;
     static constexpr ui32 StickyShift = 24;
     static constexpr ui64 FrequencyMask = 0x000000000C000000ULL;
     static constexpr ui32 FrequencyShift = 26;
-    // Sticky and retired collections reuse frequency bits for page retention and a one-shot shrink wakeup
+    // Sticky and retired collections reuse a frequency bit for page retention
     static constexpr ui64 PageAttachmentMask = ui64{ 1 } << FrequencyShift;
-    static constexpr ui64 ShrinkWaiterMask = PageAttachmentMask << 1;
     static constexpr ui64 KindMask = 0x0000000010000000ULL;
     static constexpr ui32 KindShift = 28;
     static constexpr ui64 StateMask = 0x00000001E0000000ULL;
@@ -324,8 +325,9 @@ public:
         return FromRaw(value ? Raw_ | PageAttachmentMask : Raw_ & ~PageAttachmentMask);
     }
 
+    // A shrink waiter is notified when the last native reference is released
     constexpr bool HasShrinkWaiter() const noexcept {
-        return IsCollectionKind() && (IsSticky() || IsTombstone()) && (Raw_ & ShrinkWaiterMask);
+        return (Raw_ & ShrinkWaiterMask) != 0;
     }
 
     constexpr THandleState WithShrinkWaiter(bool value) const noexcept {

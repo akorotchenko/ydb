@@ -702,16 +702,16 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             if (event->GetRecipientRewrite() == sharedCache.ActorId &&
                 event->GetTypeRewrite() == TEvResourcesAvailable::EventType) {
                 if (!seenReady) {
+                    cache.ArmResourceWait();
                     TCacheCollectionRef published;
                     if (cache.Find(id, published) == ECacheResultStatus::Hit) {
+                        cache.DisarmResourceWait();
                         seenReady = true;
                         initialMode = published->GetCacheMode();
                         if (!actorCreates) {
                             // Empty metadata lets this native controller update send no nested events
                             ownerModePublished = cache.SetCollectionPagesCacheMode(published.CacheItem(), ownerMode);
                         }
-                    } else {
-                        cache.ArmResourceWait(cache.AdmissionGeneration());
                     }
                 }
                 return true; // Consume the test-owned synchronous publication notification
@@ -721,7 +721,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         Y_DEFER {
             sharedCache.Runtime.SetEventFilter(std::move(previousFilter));
         };
-        cache.ArmResourceWait(cache.AdmissionGeneration());
+        cache.ArmResourceWait();
         TCacheCollectionRef result;
         if (actorCreates) {
             sharedCache.Attach(sharedCache.Sender1, source, ownerMode);

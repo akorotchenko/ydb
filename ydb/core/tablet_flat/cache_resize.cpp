@@ -88,7 +88,8 @@ void TCache::DiscardPageReplacement(TSpaceOperation& spaceOp, TCacheItem replace
     cacheOp.Collections().DropPageItemRef(replacement);
     replacement.Body.PageBuffer.~TBuffer();
     replacement.Body.Fetch = nullptr;
-    replacement.State.store(state.WithState(EHandleState::Begin).WithSticky(EStickyState::None).WithRefs(0).Raw(),
+    replacement.State.store(
+        state.WithState(EHandleState::Begin).WithShrinkWaiter(false).WithSticky(EStickyState::None).WithRefs(0).Raw(),
         std::memory_order_relaxed);
     cacheOp.DiscardCandidate(replacementItem, EItemKind::Page);
 }
@@ -277,17 +278,23 @@ EShrinkCutStatus TCache::ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui32 inde
             }
         }
     }
-    if (state.IsCollectionKind() && (state.IsSticky() || state.IsTombstone()) && state.Refs() != 0) {
-        // Arm in the same word as ownership so its last release cannot miss the shrink waiter
-        if (state.HasShrinkWaiter()) {
-            return EShrinkCutStatus::Blocked;
+    // The probes above may race with retiering or release; register only against the current blocker
+    const auto blocked = THandleState::FromRaw(spaceOp.Handles()[index].State.load(std::memory_order_acquire));
+    if (blocked != state) {
+        return EShrinkCutStatus::Progress;
+    }
+    if (blocked.IsHot() || (blocked.IsCollectionKind() && (blocked.IsSticky() || blocked.IsTombstone()))) {
+        if (blocked.Refs() != 0) {
+            const TCacheItem item = TCacheItem::Make(blocked.Version(), index);
+            if (blocked.IsCollectionKind()) {
+                InvokeHook(ECacheHookPoint::BeforeCollectionShrinkWait, item);
+            }
+            return cacheOp.Items().TryRegisterShrinkWait(item, blocked) ? EShrinkCutStatus::Blocked
+                                                                        : EShrinkCutStatus::Progress;
         }
-        ui64 expected = state.Raw();
-        InvokeHook(ECacheHookPoint::BeforeCollectionShrinkWait, TCacheItem::Make(state.Version(), index));
-        return spaceOp.Handles()[index].State.compare_exchange_strong(
-                   expected, state.WithShrinkWaiter(true).Raw(), std::memory_order_acq_rel, std::memory_order_acquire)
-                   ? EShrinkCutStatus::Blocked
-                   : EShrinkCutStatus::Progress;
+        if (blocked.IsHot() && blocked.IsStickyNoneField()) {
+            return EShrinkCutStatus::Progress;
+        }
     }
     if (state.IsCollectionKind() &&
         ((state.IsSticky() && (state.IsStickyNoneField() || state.HasPageAttachment())) || state.IsTombstone()) &&

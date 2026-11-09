@@ -206,7 +206,8 @@ EShrinkCutStatus TCacheCapacity<TTraits>::ReclaimShrinkCut() noexcept {
         THandle& handle = spaceOp.Handles()[spare.Index()];
         const THandleState expected = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
         Y_DEBUG_ABORT_UNLESS(spare.Matches(expected) && expected.IsBegin() && expected.Refs() == 0);
-        handle.State.store(expected.WithState(EHandleState::Free).Raw(), std::memory_order_release);
+        handle.State.store(
+            expected.WithState(EHandleState::Free).WithShrinkWaiter(false).Raw(), std::memory_order_release);
         return EShrinkCutStatus::Progress;
     }
 

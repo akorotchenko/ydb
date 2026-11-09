@@ -55,6 +55,13 @@ using TItemResult = TTestResult<TTestCacheItemRef>;
 
 class TCacheTestAccess {
 public:
+    static bool RegisterShrinkWait(TTestCache& cache, TCacheItem item) noexcept {
+        auto cacheOp = cache.BeginOperation();
+        const auto expected = THandleState::FromRaw(
+            cacheOp.SpaceOperation().Handles()[item.Index()].State.load(std::memory_order_acquire));
+        return cacheOp.Items().TryRegisterShrinkWait(item, expected);
+    }
+
     static bool FindOrInsertWrittenBatch(
         TTestCache& cache, TCollectionCacheItem collection, TArrayRef<TTestCachePageRequest> requests) noexcept {
         return cache.FindOrInsertWrittenBatch(collection, requests);
@@ -1400,62 +1407,70 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
     Y_UNIT_TEST(HotPageRefReleaseSkipsHazardAndPreservesNotifications) {
         for (bool keep : { false, true }) {
             for (bool armed : { false, true }) {
-                TFixture fixture;
-                auto& cache = *fixture.Cache;
-                UNIT_ASSERT(cache.UpdateKeepLimit(64_KB));
-                const auto collection = CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 160),
-                    keep ? ECacheMode::TryKeepInMemory : ECacheMode::Regular);
-                TTestCachePageRef held;
-                const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
-                auto other = held.Acquire();
-                const auto before = TCacheTestAccess::HandleState(cache, page.Index());
-                UNIT_ASSERT(before.IsHot() && before.IsStickyNoneField());
-                UNIT_ASSERT(before.Tier() == (keep ? ECacheTier::Keep : ECacheTier::Regular));
-                const ui64 payload = cache.PayloadUsage();
-                const ui64 keepBytes = cache.KeepResidentPageBytes();
-                const ui64 keepOwnedBytes = cache.KeepOwnedBytes();
-                const ui64 keepOwnedPages = cache.KeepOwnedPages();
-                UNIT_ASSERT_VALUES_EQUAL(keepOwnedPages, keep ? 1 : 0);
-                const ui64 generation = cache.AdmissionGeneration();
+                for (bool registered : { false, true }) {
+                    TFixture fixture;
+                    auto& cache = *fixture.Cache;
+                    UNIT_ASSERT(cache.UpdateKeepLimit(64_KB));
+                    const auto collection = CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 160),
+                        keep ? ECacheMode::TryKeepInMemory : ECacheMode::Regular);
+                    TTestCachePageRef held;
+                    const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+                    auto other = held.Acquire();
+                    if (registered) {
+                        UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+                    }
+                    const auto before = TCacheTestAccess::HandleState(cache, page.Index());
+                    UNIT_ASSERT(before.IsHot() && before.IsStickyNoneField());
+                    UNIT_ASSERT(before.Tier() == (keep ? ECacheTier::Keep : ECacheTier::Regular));
+                    const ui64 payload = cache.PayloadUsage();
+                    const ui64 keepBytes = cache.KeepResidentPageBytes();
+                    const ui64 keepOwnedBytes = cache.KeepOwnedBytes();
+                    const ui64 keepOwnedPages = cache.KeepOwnedPages();
+                    UNIT_ASSERT_VALUES_EQUAL(keepOwnedPages, keep ? 1 : 0);
+                    const ui64 generation = cache.AdmissionGeneration();
 
-                struct TContext {
-                    TCacheItem Item;
-                    ui32 Attempts = 0;
-                    ui32 Notifications = 0;
-                } context{ page.CacheItem() };
+                    struct TContext {
+                        TCacheItem Item;
+                        ui32 Attempts = 0;
+                        ui32 Notifications = 0;
+                    } context{ page.CacheItem() };
 
-                TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem item) noexcept {
-                                      auto& ctx = *static_cast<TContext*>(ptr);
-                                      if (point == ECacheHookPoint::BeforeHotPageRefRelease && item == ctx.Item) {
-                                          Y_ABORT_UNLESS(!SpaceHazardIsActive(
-                                              TlsCacheHazard->State.load(std::memory_order_relaxed)));
-                                          ++ctx.Attempts;
-                                      } else if (point == ECacheHookPoint::ResourcesAvailable) {
-                                          ++ctx.Notifications;
-                                      }
-                                  } };
-                TCacheHookGuard guard(cache, hooks);
-                if (armed) {
-                    cache.ArmResourceWait(generation);
+                    TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem item) noexcept {
+                                          auto& ctx = *static_cast<TContext*>(ptr);
+                                          if (point == ECacheHookPoint::BeforeHotPageRefRelease && item == ctx.Item) {
+                                              Y_ABORT_UNLESS(!SpaceHazardIsActive(
+                                                  TlsCacheHazard->State.load(std::memory_order_relaxed)));
+                                              ++ctx.Attempts;
+                                          } else if (point == ECacheHookPoint::ResourcesAvailable) {
+                                              ++ctx.Notifications;
+                                          }
+                                      } };
+                    TCacheHookGuard guard(cache, hooks);
+                    if (armed) {
+                        cache.ArmResourceWait();
+                    }
+                    other.Drop();
+                    UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation);
+                    UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 0);
+                    UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()) == before.DecrementRefs());
+                    held.Drop();
+                    UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()) ==
+                                before.WithRefs(0).WithShrinkWaiter(false));
+                    UNIT_ASSERT_VALUES_EQUAL(context.Attempts, 2);
+                    UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation + (armed && registered));
+                    UNIT_ASSERT_VALUES_EQUAL(context.Notifications, armed && registered ? 1 : 0);
+                    if (!armed) {
+                        cache.ArmResourceWait();
+                        // A release before arming is observed by the following probe
+                        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, page.Index()).Refs(), 0);
+                    }
+                    UNIT_ASSERT_VALUES_EQUAL(context.Notifications, armed && registered ? 1 : 0);
+                    cache.DisarmResourceWait();
+                    UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), payload);
+                    UNIT_ASSERT_VALUES_EQUAL(cache.KeepResidentPageBytes(), keepBytes);
+                    UNIT_ASSERT_VALUES_EQUAL(cache.KeepOwnedBytes(), keepOwnedBytes);
+                    UNIT_ASSERT_VALUES_EQUAL(cache.KeepOwnedPages(), keepOwnedPages);
                 }
-                other.Drop();
-                UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation);
-                UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 0);
-                UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()) == before.DecrementRefs());
-                held.Drop();
-                UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()) == before.WithRefs(0));
-                UNIT_ASSERT_VALUES_EQUAL(context.Attempts, 2);
-                UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation + 1);
-                UNIT_ASSERT_VALUES_EQUAL(context.Notifications, armed ? 1 : 0);
-                if (!armed) {
-                    cache.ArmResourceWait(generation);
-                }
-                UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 1);
-                cache.DisarmResourceWait();
-                UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), payload);
-                UNIT_ASSERT_VALUES_EQUAL(cache.KeepResidentPageBytes(), keepBytes);
-                UNIT_ASSERT_VALUES_EQUAL(cache.KeepOwnedBytes(), keepOwnedBytes);
-                UNIT_ASSERT_VALUES_EQUAL(cache.KeepOwnedPages(), keepOwnedPages);
             }
         }
     }
@@ -1467,6 +1482,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 163), ECacheMode::Regular);
         TTestCachePageRef held;
         const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+        UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
         const ui64 generation = cache.AdmissionGeneration();
 
         struct TContext {
@@ -1488,14 +1504,120 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                               }
                           } };
         TCacheHookGuard guard(cache, hooks);
+        cache.ArmResourceWait();
         held.Drop();
         UNIT_ASSERT_VALUES_EQUAL(context.Attempts, 2);
         UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, page.Index()).Refs(), 1);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
         UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation);
         context.Other.Drop();
         UNIT_ASSERT_VALUES_EQUAL(context.Attempts, 3);
         UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, page.Index()).Refs(), 0);
+        UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
         UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation + 1);
+    }
+
+    Y_UNIT_TEST(ShrinkWaitRegistrationDoesNotOwnAReferenceAndIsOneShot) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 164), ECacheMode::Regular);
+        TTestCachePageRef held;
+        const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+        ui32 notifications = 0;
+        TTestTraits hooks{ &notifications, [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
+                              if (point == ECacheHookPoint::ResourcesAvailable) {
+                                  ++*static_cast<ui32*>(context);
+                              }
+                          } };
+        TCacheHookGuard guard(cache, hooks);
+        cache.ArmResourceWait();
+        const auto before = TCacheTestAccess::HandleState(cache, page.Index());
+        UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+        const auto registered = TCacheTestAccess::HandleState(cache, page.Index());
+        UNIT_ASSERT(registered == before.WithShrinkWaiter(true));
+        UNIT_ASSERT_VALUES_EQUAL(registered.Refs(), 1);
+        held.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
+
+        cache.ArmResourceWait();
+        UNIT_ASSERT(cache.Find(collection, 1, held) == ECacheResultStatus::Hit);
+        held.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        cache.DisarmResourceWait();
+    }
+
+    Y_UNIT_TEST(ShrinkWaitRegistrationRetriesIfTheLastReferenceWasReleased) {
+        for (bool alreadyRegistered : { false, true }) {
+            TFixture fixture;
+            auto& cache = *fixture.Cache;
+            const auto collection =
+                CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 165), ECacheMode::Regular);
+            TTestCachePageRef held;
+            const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+            cache.ArmResourceWait();
+            if (alreadyRegistered) {
+                UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+            }
+
+            struct TContext {
+                TTestCachePageRef& Held;
+                TCacheItem Item;
+                ui32 Notifications = 0;
+            } context{ held, page.CacheItem() };
+
+            TTestTraits hooks{ &context,
+                [](void* ptr, ECacheHookPoint point, TCacheItem item) noexcept {
+                    auto& context = *static_cast<TContext*>(ptr);
+                    if (point == ECacheHookPoint::BeforeShrinkWaitRegistration && item == context.Item) {
+                        context.Held.Drop();
+                    } else if (point == ECacheHookPoint::ResourcesAvailable) {
+                        ++context.Notifications;
+                    }
+                } };
+            TCacheHookGuard guard(cache, hooks);
+            UNIT_ASSERT(!TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+            const auto after = TCacheTestAccess::HandleState(cache, page.Index());
+            UNIT_ASSERT_VALUES_EQUAL(after.Refs(), 0);
+            UNIT_ASSERT(!after.HasShrinkWaiter());
+            UNIT_ASSERT_VALUES_EQUAL(context.Notifications, alreadyRegistered ? 1 : 0);
+            cache.DisarmResourceWait();
+        }
+    }
+
+    Y_UNIT_TEST(ShrinkWaiterSurvivesDemotionAndRelocation) {
+        for (bool relocate : { false, true }) {
+            TFixture fixture;
+            auto& cache = *fixture.Cache;
+            const auto collection =
+                CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 166), ECacheMode::Regular);
+            TTestCachePageRef held;
+            const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+            UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+            if (relocate) {
+                UNIT_ASSERT(TCacheTestAccess::RelocatePage(cache, page));
+                TTestCachePageRef replacement;
+                UNIT_ASSERT(cache.Find(collection, 1, replacement) == ECacheResultStatus::Hit);
+                UNIT_ASSERT(replacement.CacheItem() != page);
+                UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, replacement.CacheItem().Index()).HasShrinkWaiter());
+            } else {
+                UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, page));
+            }
+            UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
+            ui32 notifications = 0;
+            TTestTraits hooks{ &notifications, [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
+                                  if (point == ECacheHookPoint::ResourcesAvailable) {
+                                      ++*static_cast<ui32*>(context);
+                                  }
+                              } };
+            TCacheHookGuard guard(cache, hooks);
+            cache.ArmResourceWait();
+            held.Drop();
+            UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+            UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
+            cache.DisarmResourceWait();
+        }
     }
 
     enum class EHotReleaseRace {
@@ -1630,7 +1752,8 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                               ctx.Shrunk = op.SpaceOperation().View().HandlesBytes == 64_KB;
                           } };
         TCacheHookGuard guard(cache, hooks);
-        cache.ArmResourceWait(cache.AdmissionGeneration());
+        cache.ArmResourceWait();
+        UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
         held.Drop();
         UNIT_ASSERT(context.Entered && context.Shrunk);
         cache.DisarmResourceWait();
@@ -1851,7 +1974,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                                   }
                               } };
             TCacheHookGuard guard(cache, hooks);
-            cache.ArmResourceWait(cache.AdmissionGeneration());
+            cache.ArmResourceWait();
             Y_DEFER {
                 cache.DisarmResourceWait();
             };
@@ -1867,7 +1990,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             UNIT_ASSERT_VALUES_EQUAL(context.Notifications, releaseBeforeArm ? 0 : 1);
             UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, fixture.Item.Index()).HasShrinkWaiter());
             const auto generation = cache.AdmissionGeneration();
-            cache.ArmResourceWait(generation);
+            cache.ArmResourceWait();
             for (ui32 probe = 0; probe < 3; ++probe) {
                 auto op = cache.BeginOperation();
                 TOperationItemRef<TTestTraits> ref(op, op.TryAcquireStructural(fixture.Item.CacheItem()));
@@ -2864,6 +2987,51 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT(pagesReleasedBeforeCollection);
     }
 
+    Y_UNIT_TEST(ResourceWaitArmBeforeProbeObservesEarlierRelease) {
+        TCacheMemory memory(0, 64, 64);
+        ui64 usage = 0;
+        UNIT_ASSERT(memory.TryReserve(usage, 64, 1));
+        memory.ReleaseReservation(64, 1);
+        UNIT_ASSERT(!memory.NotifyResourcesAvailable());
+        UNIT_ASSERT_VALUES_EQUAL(memory.AdmissionGeneration(), 0);
+
+        memory.ArmResourceWait();
+        // Earlier unarmed releases publish to the arm exchange; no event is needed
+        UNIT_ASSERT_VALUES_EQUAL(memory.PayloadUsage(), 0);
+        memory.DisarmResourceWait();
+    }
+
+    Y_UNIT_TEST(ResourceWaitReleaseDuringProbeOwnsOneWakeup) {
+        TCacheMemory memory(0, 64, 64);
+        ui64 usage = 0;
+        UNIT_ASSERT(memory.TryReserve(usage, 64, 1));
+        memory.ArmResourceWait();
+        UNIT_ASSERT_VALUES_EQUAL(memory.PayloadUsage(), 64);
+        memory.ReleaseReservation(64, 1);
+        UNIT_ASSERT(memory.NotifyResourcesAvailable());
+        // A second producer coalesces behind the notification already owned by the first
+        UNIT_ASSERT(!memory.NotifyResourcesAvailable());
+        UNIT_ASSERT_VALUES_EQUAL(memory.AdmissionGeneration(), 1);
+
+        // The notification starts another pass, which arms before its fresh probe
+        memory.ArmResourceWait();
+        UNIT_ASSERT_VALUES_EQUAL(memory.PayloadUsage(), 0);
+        memory.DisarmResourceWait();
+        UNIT_ASSERT(!memory.NotifyResourcesAvailable());
+        UNIT_ASSERT_VALUES_EQUAL(memory.AdmissionGeneration(), 1);
+    }
+
+    Y_UNIT_TEST(ResourceWaitNewWaiterAfterEmptyPassArmsAgain) {
+        TCacheMemory memory(0, 64, 64);
+        memory.ArmResourceWait();
+        memory.DisarmResourceWait();
+        UNIT_ASSERT(!memory.NotifyResourcesAvailable());
+        memory.ArmResourceWait();
+        UNIT_ASSERT(memory.NotifyResourcesAvailable());
+        UNIT_ASSERT(!memory.NotifyResourcesAvailable());
+        UNIT_ASSERT_VALUES_EQUAL(memory.AdmissionGeneration(), 1);
+    }
+
     void CheckHotResizeAdmissionNotification(bool armBeforeUnlock) {
         ui32 notifications = 0;
         TFixture fixture;
@@ -2879,24 +3047,26 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT(!TCacheTestAccess::LockHotResize(*fixture.Cache));
         UNIT_ASSERT(!TCacheTestAccess::LockHotResize(*fixture.Cache));
         if (armBeforeUnlock) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
         }
         UNIT_ASSERT_VALUES_EQUAL(notifications, 0);
         owner = {};
-        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + armBeforeUnlock);
         UNIT_ASSERT_VALUES_EQUAL(notifications, armBeforeUnlock ? 1 : 0);
         if (!armBeforeUnlock) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
+            auto retry = TCacheTestAccess::LockHotResize(*fixture.Cache);
+            UNIT_ASSERT(retry);
         }
-        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(notifications, armBeforeUnlock ? 1 : 0);
 
-        fixture.Cache->ArmResourceWait(fixture.Cache->AdmissionGeneration());
+        fixture.Cache->ArmResourceWait();
         {
             auto uncontended = TCacheTestAccess::LockHotResize(*fixture.Cache);
             UNIT_ASSERT(uncontended);
         }
-        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
-        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + armBeforeUnlock);
+        UNIT_ASSERT_VALUES_EQUAL(notifications, armBeforeUnlock ? 1 : 0);
         fixture.Cache->DisarmResourceWait();
     }
 
@@ -2922,6 +3092,13 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             bool Attached = true;
             ui32 Notifications = 0;
             bool Published = true;
+
+            void Probe() noexcept {
+                const auto state = TCacheTestAccess::HandleState(*Cache, Item.Index());
+                const bool stable = state.IsReady() && (Attached ? state.IsStickyField() : state.IsStickyNoneField());
+                TTestCacheCollectionRef found;
+                Published &= stable && Cache->Find(Id, found) == ECacheResultStatus::Hit && found.CacheItem() == Item;
+            }
         } observation;
 
         TFixture fixture;
@@ -2944,25 +3121,18 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         observation.Item = item;
         observation.Id = id;
         observation.Attached = publication != ECollectionPublication::Detach;
-        TTestTraits hooks{ &observation,
-            [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
-                if (point != ECacheHookPoint::ResourcesAvailable) {
-                    return;
-                }
-                auto& observation = *static_cast<TObservation*>(context);
-                ++observation.Notifications;
-                const auto state = TCacheTestAccess::HandleState(*observation.Cache, observation.Item.Index());
-                const bool stable =
-                    state.IsReady() && (observation.Attached ? state.IsStickyField() : state.IsStickyNoneField());
-                TTestCacheCollectionRef found;
-                observation.Published &= stable &&
-                                         observation.Cache->Find(observation.Id, found) == ECacheResultStatus::Hit &&
-                                         found.CacheItem() == observation.Item;
-            } };
+        TTestTraits hooks{ &observation, [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
+                              if (point != ECacheHookPoint::ResourcesAvailable) {
+                                  return;
+                              }
+                              auto& observation = *static_cast<TObservation*>(context);
+                              ++observation.Notifications;
+                              observation.Probe();
+                          } };
         TCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
         const ui64 generation = fixture.Cache->AdmissionGeneration();
         if (armBeforePublication) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
         }
         switch (publication) {
             case ECollectionPublication::Ready:
@@ -2978,16 +3148,17 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                 UNIT_ASSERT(fixture.Cache->DetachCollection(item));
                 break;
         }
-        UNIT_ASSERT(fixture.Cache->AdmissionGeneration() > generation);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + armBeforePublication);
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? 1 : 0);
         if (!armBeforePublication) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
+            observation.Probe();
         }
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? 1 : 0);
         UNIT_ASSERT(observation.Published);
 
         const ui64 stableGeneration = fixture.Cache->AdmissionGeneration();
-        fixture.Cache->ArmResourceWait(stableGeneration);
+        fixture.Cache->ArmResourceWait();
         if (publication == ECollectionPublication::Detach) {
             UNIT_ASSERT(!fixture.Cache->DetachCollection(item));
         } else {
@@ -2996,7 +3167,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             UNIT_ASSERT(fixture.Cache->FindOrInsert(location, inserted, hit) == ECacheResultStatus::Hit);
         }
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), stableGeneration);
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? 1 : 0);
         fixture.Cache->DisarmResourceWait();
         TCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
     }
@@ -3013,7 +3184,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         ui32 expected = 0;
         for (auto [bytes, pages] : { std::pair<ui64, ui64>{ 0, 0 }, { 1, 0 }, { 0, 1 } }) {
             const ui64 generation = fixture.Cache->AdmissionGeneration();
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
             UNIT_ASSERT(TCacheTestAccess::TryReserve(*fixture.Cache, bytes, pages));
             TCacheTestAccess::ReleaseReservation(*fixture.Cache, bytes, pages);
             expected += bytes != 0 || pages != 0;
@@ -3077,12 +3248,12 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         TCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
         constexpr ui64 reservedBytes = 1;
         UNIT_ASSERT(TCacheTestAccess::TryReserve(*fixture.Cache, reservedBytes));
-        fixture.Cache->ArmResourceWait(fixture.Cache->AdmissionGeneration());
+        fixture.Cache->ArmResourceWait();
         TCacheTestAccess::ReleaseReservation(*fixture.Cache, reservedBytes);
         UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
         UNIT_ASSERT(!payload.IsPrivate());
 
-        fixture.Cache->ArmResourceWait(fixture.Cache->AdmissionGeneration());
+        fixture.Cache->ArmResourceWait();
         TlsCacheHazard = nullptr;
         held.Drop();
         fixture.Cache.Drop();
@@ -3789,7 +3960,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         TCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
         const ui64 generation = fixture.Cache->AdmissionGeneration();
         if (armBeforeReturn) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
         }
         if (reserved) {
             TCacheTestAccess::DiscardCandidate(*fixture.Cache, page);
@@ -3798,12 +3969,18 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             TCacheTestAccess::DiscardCandidate(*fixture.Cache, collection);
             collection = {};
         }
-        UNIT_ASSERT(fixture.Cache->AdmissionGeneration() > generation);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + armBeforeReturn);
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeReturn ? 1 : 0);
         if (!armBeforeReturn) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
+            UNIT_ASSERT(fixture.Cache->CanAllocateHandles({ &observation.Requirement, 1 }));
+            fixture.Cache->DisarmResourceWait();
+            const auto candidate =
+                AllocateCollection(*fixture.Cache, TCacheKey::Collection(observation.Requirement.CollectionId));
+            UNIT_ASSERT(candidate);
+            TCacheTestAccess::DiscardCandidate(*fixture.Cache, candidate);
         }
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeReturn ? 1 : 0);
         UNIT_ASSERT(observation.Published);
         UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), 1);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
@@ -3856,7 +4033,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                           } };
         TCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
         const ui64 generation = fixture.Cache->AdmissionGeneration();
-        fixture.Cache->ArmResourceWait(generation);
+        fixture.Cache->ArmResourceWait();
         const std::array locations{ MakePageLocation(0, 16) };
         const TLogoBlobID id(215, 216, 1);
         const TCacheHandleRequirement one{ id, {} };
@@ -3893,7 +4070,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                               }
                           } };
         TCacheHookGuard guard(*fixture.Cache, hooks);
-        fixture.Cache->ArmResourceWait(generation);
+        fixture.Cache->ArmResourceWait();
         Y_DEFER {
             fixture.Cache->DisarmResourceWait();
         };
@@ -3957,6 +4134,15 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             ui32 Notifications = 0;
             bool Published = false;
             bool Unlocked = false;
+
+            void Probe() noexcept {
+                {
+                    auto lock = TCacheTestAccess::LockHotResize(*Cache);
+                    Unlocked = static_cast<bool>(lock);
+                }
+                Claimed = AllocateCollection(*Cache, TCacheKey::Collection(TLogoBlobID(223, 224, 1)));
+                Published = Claimed && Claimed.Index() >= MinimumIndex;
+            }
         } observation;
 
         const ui8 addressBits = laterBatch ? 9 : 5;
@@ -4006,19 +4192,12 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                               }
                               auto& observation = *static_cast<TObservation*>(context);
                               ++observation.Notifications;
-                              {
-                                  auto lock = TCacheTestAccess::LockHotResize(*observation.Cache);
-                                  observation.Unlocked = static_cast<bool>(lock);
-                              }
-                              observation.Claimed = AllocateCollection(
-                                  *observation.Cache, TCacheKey::Collection(TLogoBlobID(223, 224, 1)));
-                              observation.Published =
-                                  observation.Claimed && observation.Claimed.Index() >= observation.MinimumIndex;
+                              observation.Probe();
                           } };
         TCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
         const ui64 generation = fixture.Cache->AdmissionGeneration();
         if (armBeforePublication) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
         }
         TTransition idle;
         UNIT_ASSERT(!TCacheTestAccess::PublishFinalView(*fixture.Cache, idle));
@@ -4031,21 +4210,25 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             UNIT_ASSERT(!TCacheTestAccess::AppendFreeHandles(*fixture.Cache, growth));
             UNIT_ASSERT(TCacheTestAccess::PublishFinalView(*fixture.Cache, growth));
         }
-        UNIT_ASSERT(fixture.Cache->AdmissionGeneration() > generation);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + armBeforePublication);
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? 1 : 0);
         if (!armBeforePublication) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
+            const TCacheHandleRequirement requirement{ TLogoBlobID(223, 224, 1), {} };
+            UNIT_ASSERT(fixture.Cache->CanAllocateHandles({ &requirement, 1 }));
+            fixture.Cache->DisarmResourceWait();
+            observation.Probe();
         }
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? 1 : 0);
         UNIT_ASSERT(observation.Published);
         UNIT_ASSERT(observation.Unlocked);
         UNIT_ASSERT(growth.Phase() == ETransitionPhase::FinalDrain);
         const ui64 afterPublication = fixture.Cache->AdmissionGeneration();
-        fixture.Cache->ArmResourceWait(afterPublication);
+        fixture.Cache->ArmResourceWait();
         UNIT_ASSERT(!TCacheTestAccess::AppendFreeHandles(*fixture.Cache, growth));
         UNIT_ASSERT(!TCacheTestAccess::PublishFinalView(*fixture.Cache, growth));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), afterPublication);
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? 1 : 0);
         TCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
         fixture.Cache->DisarmResourceWait();
         UNIT_ASSERT(TCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
@@ -4132,7 +4315,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                 }
             } };
         TCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
-        fixture.Cache->ArmResourceWait(fixture.Cache->AdmissionGeneration());
+        fixture.Cache->ArmResourceWait();
         if (controller) {
             UNIT_ASSERT(fixture.Cache->ReclaimSpareHandle());
             UNIT_ASSERT(fixture.Cache->CanAllocateHandles({ &requirement, 1 }));
@@ -4146,7 +4329,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
         UNIT_ASSERT(observation.Published);
         const ui64 generation = fixture.Cache->AdmissionGeneration();
-        fixture.Cache->ArmResourceWait(generation);
+        fixture.Cache->ArmResourceWait();
         UNIT_ASSERT(!fixture.Cache->ReclaimSpareHandle());
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
@@ -4223,6 +4406,15 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             ui32 Notifications = 0;
             bool RearmedBeforeStore = false;
             bool Published = false;
+
+            void Probe() noexcept {
+                if (TCacheTestAccess::SpareItem(*Cache, 0) == 0) {
+                    RearmedBeforeStore = true;
+                    Cache->ArmResourceWait();
+                } else {
+                    Published = true;
+                }
+            }
         } observation;
 
         TFixture fixture(5, 1);
@@ -4259,17 +4451,12 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                               }
                               auto& observation = *static_cast<TObservation*>(context);
                               ++observation.Notifications;
-                              if (TCacheTestAccess::SpareItem(*observation.Cache, 0) == 0) {
-                                  observation.RearmedBeforeStore = true;
-                                  observation.Cache->ArmResourceWait(observation.Cache->AdmissionGeneration());
-                              } else {
-                                  observation.Published = true;
-                              }
+                              observation.Probe();
                           } };
         TCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
         const ui64 generation = fixture.Cache->AdmissionGeneration();
         if (armBeforePublication) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
         }
         {
             auto cacheOp = fixture.Cache->BeginOperation();
@@ -4283,13 +4470,15 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         const bool refundsReservation = recycle && kind == EItemKind::Page;
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? (refundsReservation ? 2 : 1) : 0);
         if (!armBeforePublication) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
+            observation.Probe();
         }
         UNIT_ASSERT(observation.Published);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + observation.Notifications);
         UNIT_ASSERT_VALUES_EQUAL(observation.RearmedBeforeStore, refundsReservation && armBeforePublication);
         const ui32 notifications = observation.Notifications;
         const ui64 afterPublication = fixture.Cache->AdmissionGeneration();
-        fixture.Cache->ArmResourceWait(afterPublication);
+        fixture.Cache->ArmResourceWait();
         {
             auto cacheOp = fixture.Cache->BeginOperation();
             cacheOp.RefillSpareItem();
@@ -4376,6 +4565,12 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             ui32 Notifications = 0;
             bool Inactive = true;
             bool CurrentView = true;
+
+            void Probe() noexcept {
+                Inactive &= !SpaceHazardIsActive(Hazard->State.load(std::memory_order_acquire));
+                auto cacheOp = Cache->BeginOperation();
+                CurrentView &= cacheOp.SpaceOperation().EntryGeneration() == PublishedGeneration;
+            }
         } observation;
 
         TFixture fixture(5, 1, 6);
@@ -4400,11 +4595,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                               }
                               auto& observation = *static_cast<TObservation*>(context);
                               ++observation.Notifications;
-                              observation.Inactive &=
-                                  !SpaceHazardIsActive(observation.Hazard->State.load(std::memory_order_acquire));
-                              auto cacheOp = observation.Cache->BeginOperation();
-                              observation.CurrentView &=
-                                  cacheOp.SpaceOperation().EntryGeneration() == observation.PublishedGeneration;
+                              observation.Probe();
                           } };
         TCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
         ui64 generation = 0;
@@ -4420,7 +4611,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             UNIT_ASSERT(moved.SpaceOperation().EntryGeneration() != observation.PublishedGeneration);
             generation = fixture.Cache->AdmissionGeneration();
             if (armBeforeDrain) {
-                fixture.Cache->ArmResourceWait(generation);
+                fixture.Cache->ArmResourceWait();
             }
             if (nested) {
                 auto inner = fixture.Cache->BeginOperation();
@@ -4436,14 +4627,15 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
         }
         UNIT_ASSERT(!SpaceHazardIsActive(observation.Hazard->State.load(std::memory_order_acquire)));
-        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + armBeforeDrain);
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeDrain ? 1 : 0);
         if (!armBeforeDrain) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
+            observation.Probe();
         }
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeDrain ? 1 : 0);
         UNIT_ASSERT(observation.Inactive && observation.CurrentView);
-        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + armBeforeDrain);
         TCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
         fixture.Cache->DisarmResourceWait();
         UNIT_ASSERT(TCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
@@ -4493,7 +4685,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                           } };
         TCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
         const ui64 generation = fixture.Cache->AdmissionGeneration();
-        fixture.Cache->ArmResourceWait(generation);
+        fixture.Cache->ArmResourceWait();
         if (currentGeneration) {
             UNIT_ASSERT(TCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
             UNIT_ASSERT(TCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
@@ -5064,8 +5256,9 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, fetch.CacheItem().Index()).IsStickyField());
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->StickyOwnedBytes(), bytes);
         UNIT_ASSERT(!fetch.Dispatch());
-        UNIT_ASSERT(!fetch.TryReserveMemory());
         const ui64 generation = fixture.Cache->AdmissionGeneration();
+        fixture.Cache->ArmResourceWait();
+        UNIT_ASSERT(!fetch.TryReserveMemory());
         TCacheTestAccess::ReleaseReservation(*fixture.Cache, bytes);
         UNIT_ASSERT(fixture.Cache->AdmissionGeneration() > generation);
         UNIT_ASSERT(fetch.TryReserveMemory());
@@ -7360,26 +7553,26 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         });
         gate.Slots[0].Wait();
         const ui64 generation = fixture.Cache->AdmissionGeneration();
+        if (armBeforeCompletion) {
+            fixture.Cache->ArmResourceWait();
+        }
         TTestCacheCollectionRef found;
         UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Pending);
         UNIT_ASSERT(!found);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
-        if (armBeforeCompletion) {
-            fixture.Cache->ArmResourceWait(generation);
-        }
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), 0);
         gate.Slots[0].Release();
         worker.Join();
         UNIT_ASSERT(completed);
-        UNIT_ASSERT(fixture.Cache->AdmissionGeneration() > generation);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + armBeforeCompletion);
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), armBeforeCompletion ? 1 : 0);
         if (!armBeforeCompletion) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
         }
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), 1);
-        fixture.Cache->DisarmResourceWait();
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), armBeforeCompletion ? 1 : 0);
         UNIT_ASSERT(fixture.Cache->FindCollection(id, found) == ECacheCollectionLookupStatus::Hit);
         UNIT_ASSERT(found.Get() == held.Get());
+        fixture.Cache->DisarmResourceWait();
     }
 
     Y_UNIT_TEST(FindCollectionWaitsDuringAttachment) {
@@ -8970,6 +9163,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             }
         };
         const ui64 generation = fixture.Cache->AdmissionGeneration();
+        fixture.Cache->ArmResourceWait();
         const auto result = TCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, transition);
         if (maps == 0) {
             return;
@@ -9022,6 +9216,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             };
             TCacheTestAccess::SetCapacityTarget(*fixture.Cache, fixture.ReservedCapacity);
             const ui64 generation = fixture.Cache->AdmissionGeneration();
+            fixture.Cache->ArmResourceWait();
             const bool moreWork = fixture.Cache->RunMaintenance();
             if (prepares == 0) {
                 return;
@@ -9066,6 +9261,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             UNIT_ASSERT(TCacheTestAccess::TryReleaseTransition(*fixture.Cache, transition));
             UNIT_ASSERT(transition.Phase() == ETransitionPhase::PrepareReceiver);
             const ui64 generation = fixture.Cache->AdmissionGeneration();
+            fixture.Cache->ArmResourceWait();
             UNIT_ASSERT(TCacheTestAccess::OwnsCapacityTransition(*fixture.Cache, transition));
             UNIT_ASSERT(!TCacheTestAccess::CanChangeTiers(*fixture.Cache));
             auto& mapping = TCacheTestAccess::RingMapping(*fixture.Cache, ESpaceMap::KeepCold);
@@ -9718,7 +9914,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                 UNIT_ASSERT_VALUES_EQUAL(pageOwner.data()[0], 'x');
                 UNIT_ASSERT_VALUES_EQUAL(pageOwner.size(), 64);
             }
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
             Y_DEFER {
                 fixture.Cache->DisarmResourceWait();
             };
@@ -10168,7 +10364,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                               auto& progress = *static_cast<TProgress*>(context);
                               if (point == ECacheHookPoint::AfterAdmissionReclaimStep) {
                                   if (++progress.Steps == CacheTransitionWorkBatch) {
-                                      progress.Cache->ArmResourceWait(progress.Cache->AdmissionGeneration());
+                                      progress.Cache->ArmResourceWait();
                                   }
                               } else if (point == ECacheHookPoint::ResourcesAvailable) {
                                   ++progress.Notifications;
@@ -10199,7 +10395,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                           } };
         TCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
         const ui64 generation = fixture.Cache->AdmissionGeneration();
-        fixture.Cache->ArmResourceWait(generation);
+        fixture.Cache->ArmResourceWait();
         UNIT_ASSERT(!TCacheTestAccess::TryReserve(*fixture.Cache, 1));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
         UNIT_ASSERT_VALUES_EQUAL(notifications, 0);
@@ -11916,7 +12112,10 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         Y_DEFER {
             fixture.Cache->DisarmResourceWait();
         };
-        fixture.Cache->ArmResourceWait(fixture.Cache->AdmissionGeneration());
+        fixture.Cache->ArmResourceWait();
+        if (releaseForeignRef) {
+            UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(*fixture.Cache, hot.CacheItem()));
+        }
         TTestCachePageRef found;
         TGateThread lookup(observation.Gate, [&] {
             Y_ABORT_UNLESS(!TlsCacheHazard);
@@ -11927,9 +12126,9 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             Y_ABORT_UNLESS(fixture.Cache->Find(collection, 0, found) == ECacheResultStatus::Hit);
         });
         observation.Gate.Slots[0].Wait();
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), releaseForeignRef ? 0 : 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), 0);
         foreign.Drop();
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), releaseForeignRef ? 1 : 0);
         UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, hot.Index()).Refs(), 0);
         const auto hotIsQueued = [&] {
             return TCacheTestAccess::WithSpace(*fixture.Cache, [&](auto& spaceOp) {
@@ -11954,17 +12153,17 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT(!fixture.Cache->CanReserve(bytes));
         UNIT_ASSERT(!fixture.Cache->EnforceCurrentLimit());
         const ui64 generation = fixture.Cache->AdmissionGeneration();
-        fixture.Cache->ArmResourceWait(generation);
+        fixture.Cache->ArmResourceWait();
         UNIT_ASSERT(!TCacheTestAccess::TryReserve(*fixture.Cache, bytes));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), releaseForeignRef ? 1 : 0);
 
         observation.Gate.Slots[0].Release();
         lookup.Join();
         UNIT_ASSERT(found && found.CacheItem() == cold);
         UNIT_ASSERT(hotIsQueued());
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), releaseForeignRef ? 2 : 1);
         UNIT_ASSERT(!fixture.Cache->CanReserve(bytes));
 
         UNIT_ASSERT(TCacheTestAccess::TryReserve(*fixture.Cache, bytes));
@@ -12004,7 +12203,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             fixture.Cache->DisarmResourceWait();
         };
         const ui64 generation = fixture.Cache->AdmissionGeneration();
-        fixture.Cache->ArmResourceWait(generation);
+        fixture.Cache->ArmResourceWait();
         for (ui32 attempt = 0; attempt < 3; ++attempt) {
             UNIT_ASSERT(!TCacheTestAccess::TryReserve(*fixture.Cache, bytes));
             UNIT_ASSERT(!fixture.Cache->ReclaimForAdmission(bytes));
@@ -12431,6 +12630,15 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             ui32 Notifications = 0;
             bool Published = false;
             bool Activated = false;
+
+            void Probe() noexcept {
+                Published = Cache->PayloadUsage() == Bytes && TCacheTestAccess::FreeCount(*Cache) == FreeCount;
+                for (const auto page : Pages) {
+                    const auto state = TCacheTestAccess::HandleState(*Cache, page.Index());
+                    Published &= state.IsTombstone() && state.Refs() == 2 && page.CacheItem().Matches(state);
+                }
+                Activated = TCacheTestAccess::ActivateBucketSplitOrMerge(*Cache);
+            }
         } observation;
 
         observation.Cache = fixture.Cache.Get();
@@ -12448,44 +12656,37 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                 UNIT_ASSERT(cacheOp.TryBeginErase(pages.back().CacheItem(), expected, secondOwner.Get()));
             }
             UNIT_ASSERT(TCacheTestAccess::ActivateBucketSplitStep(*fixture.Cache) == EResizeStep::Blocked);
-            TTestTraits hooks{ &observation,
-                [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
-                    if (point != ECacheHookPoint::ResourcesAvailable) {
-                        return;
-                    }
-                    auto& observation = *static_cast<TObservation*>(context);
-                    ++observation.Notifications;
-                    observation.Published = observation.Cache->PayloadUsage() == observation.Bytes &&
-                                            TCacheTestAccess::FreeCount(*observation.Cache) == observation.FreeCount;
-                    for (const auto page : observation.Pages) {
-                        const auto state = TCacheTestAccess::HandleState(*observation.Cache, page.Index());
-                        observation.Published &=
-                            state.IsTombstone() && state.Refs() == 2 && page.CacheItem().Matches(state);
-                    }
-                    observation.Activated = TCacheTestAccess::ActivateBucketSplitOrMerge(*observation.Cache);
-                } };
+            TTestTraits hooks{ &observation, [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
+                                  if (point != ECacheHookPoint::ResourcesAvailable) {
+                                      return;
+                                  }
+                                  auto& observation = *static_cast<TObservation*>(context);
+                                  ++observation.Notifications;
+                                  observation.Probe();
+                              } };
             TCacheHookGuard hookGuard(*fixture.Cache, hooks);
             const ui64 generation = fixture.Cache->AdmissionGeneration();
             if (armBeforeUnlink) {
-                fixture.Cache->ArmResourceWait(generation);
+                fixture.Cache->ArmResourceWait();
             }
             cacheOp.FinishErase(pages.back().CacheItem(), keys.back());
-            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + armBeforeUnlink);
             UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeUnlink ? 1 : 0);
             if (!armBeforeUnlink) {
-                fixture.Cache->ArmResourceWait(generation);
+                fixture.Cache->ArmResourceWait();
+                observation.Probe();
             }
-            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeUnlink ? 1 : 0);
             UNIT_ASSERT(observation.Published && observation.Activated);
             const ui64 unlinkedGeneration = fixture.Cache->AdmissionGeneration();
-            fixture.Cache->ArmResourceWait(unlinkedGeneration);
+            fixture.Cache->ArmResourceWait();
             for (ui32 index = 0; index < pages.size(); ++index) {
                 cacheOp.FinishErase(pages[index].CacheItem(), keys[index]);
             }
             firstOwner.Drop();
             secondOwner.Drop();
             UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), unlinkedGeneration);
-            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeUnlink ? 1 : 0);
             for (ui32 index = 0; index < pages.size(); ++index) {
                 UNIT_ASSERT(held[index]);
                 UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, pages[index].Index()).Refs(), 1);
@@ -12539,6 +12740,12 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             ui32 Notifications = 0;
             bool Published = false;
             bool Activated = false;
+
+            void Probe() noexcept {
+                const auto state = TCacheTestAccess::HandleState(*Cache, Page.Index());
+                Published = state.IsReady() && state.Refs() > 0 && *Held && Held->CacheItem() == Page;
+                Activated = TCacheTestAccess::ActivateBucketSplitOrMerge(*Cache);
+            }
         } observation;
 
         observation.Cache = fixture.Cache.Get();
@@ -12550,12 +12757,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                               TCacheGate::Invoke(&observation.Gate, point, item);
                               if (point == ECacheHookPoint::ResourcesAvailable) {
                                   ++observation.Notifications;
-                                  const auto state =
-                                      TCacheTestAccess::HandleState(*observation.Cache, observation.Page.Index());
-                                  observation.Published = state.IsReady() && state.Refs() > 0 && *observation.Held &&
-                                                          observation.Held->CacheItem() == observation.Page;
-                                  observation.Activated =
-                                      TCacheTestAccess::ActivateBucketSplitOrMerge(*observation.Cache);
+                                  observation.Probe();
                               }
                           } };
         TCacheHookGuard hookGuard(*fixture.Cache, hooks);
@@ -12574,18 +12776,19 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT(TCacheTestAccess::ActivateBucketSplitStep(*fixture.Cache) == EResizeStep::Blocked);
         const ui64 generation = fixture.Cache->AdmissionGeneration();
         if (armBeforeReady) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
         }
         observation.Gate.Slots[0].Release();
         completer.Join();
         UNIT_ASSERT(ready && waiter->Ready() && held);
         UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 1);
-        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + armBeforeReady);
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeReady ? 1 : 0);
         if (!armBeforeReady) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
+            observation.Probe();
         }
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeReady ? 1 : 0);
         UNIT_ASSERT(observation.Published && observation.Activated);
         TCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
         fixture.Cache->DisarmResourceWait();
@@ -12626,6 +12829,18 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             bool Restore = false;
             ui32 Notifications = 0;
             bool Published = false;
+
+            void Probe() noexcept {
+                const auto state = TCacheTestAccess::HandleState(*Cache, Page.Index());
+                Published = state.Refs() > 0 && TCacheTestAccess::HandleState(*Cache, Collection.Index()).Refs() > 0;
+                if (Restore) {
+                    Published &= state.IsHot() && state.IsStickyNoneField() && Cache->StickyOwnedBytes() == 0 &&
+                                 TCacheTestAccess::NextInOwner(*Cache, Page.Index()) == 0;
+                } else {
+                    Published &= state.IsSticky() && state.IsStickyField() &&
+                                 TCacheTestAccess::StickyPageListHead(*Cache, Collection) == Page.Index();
+                }
+            }
         } observation;
 
         observation.Cache = fixture.Cache.Get();
@@ -12640,19 +12855,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                 TCacheGate::Invoke(&observation.Gate, point, item);
                 if (point == ECacheHookPoint::ResourcesAvailable) {
                     ++observation.Notifications;
-                    const auto state = TCacheTestAccess::HandleState(*observation.Cache, observation.Page.Index());
-                    observation.Published =
-                        state.Refs() > 0 &&
-                        TCacheTestAccess::HandleState(*observation.Cache, observation.Collection.Index()).Refs() > 0;
-                    if (observation.Restore) {
-                        observation.Published &=
-                            state.IsHot() && state.IsStickyNoneField() && observation.Cache->StickyOwnedBytes() == 0 &&
-                            TCacheTestAccess::NextInOwner(*observation.Cache, observation.Page.Index()) == 0;
-                    } else {
-                        observation.Published &= state.IsSticky() && state.IsStickyField() &&
-                                                 TCacheTestAccess::StickyPageListHead(*observation.Cache,
-                                                     observation.Collection) == observation.Page.Index();
-                    }
+                    observation.Probe();
                 }
             } };
         TCacheHookGuard hookGuard(*fixture.Cache, hooks);
@@ -12676,19 +12879,20 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT(!TCacheTestAccess::EvictFromHot(*fixture.Cache, page));
         const ui64 generation = fixture.Cache->AdmissionGeneration();
         if (armBeforePublication) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
         }
         observation.Gate.Slots[0].Release();
         promoter.Join();
         UNIT_ASSERT_VALUES_EQUAL(promoted, !restore);
         UNIT_ASSERT(held && metadata);
         UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 1);
-        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + armBeforePublication);
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? 1 : 0);
         if (!armBeforePublication) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
+            observation.Probe();
         }
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforePublication ? 1 : 0);
         UNIT_ASSERT(observation.Published);
         TCacheTestAccess::InstallHooks(*fixture.Cache, nullptr);
         fixture.Cache->DisarmResourceWait();
@@ -12731,7 +12935,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             UNIT_ASSERT(TCacheTestAccess::MakePageSticky(*fixture.Cache, page));
         }
         const ui64 generation = fixture.Cache->AdmissionGeneration();
-        fixture.Cache->ArmResourceWait(generation);
+        fixture.Cache->ArmResourceWait();
         for (ui32 attempt = 0; attempt < 3; ++attempt) {
             UNIT_ASSERT(pending ? TCacheTestAccess::MakePendingPageSticky(*fixture.Cache, page)
                                 : TCacheTestAccess::MakePageSticky(*fixture.Cache, page));
@@ -12765,6 +12969,17 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             bool CaptureLateHelper = false;
             bool Published = true;
             bool Reused = false;
+
+            void Probe() noexcept {
+                const auto state = TCacheTestAccess::HandleState(*Cache, ResizeMarkerIndex);
+                if (FinalRelease) {
+                    Published &=
+                        state.IsFree() && state.Refs() == 0 && state.Version() == AdvanceItemVersion(Marker.Version());
+                    Reused = TCacheTestAccess::PrepareBucketSplit(*Cache);
+                } else {
+                    Published &= state.IsTombstone() && state.Refs() == 1 && Marker.Matches(state);
+                }
+            }
         } observation;
 
         Y_DEFER {
@@ -12799,15 +13014,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                     *observation.LateHelper = TCacheTestAccess::AcquireTombstoneHelper(*observation.Cache, item);
                 } else if (point == ECacheHookPoint::ResourcesAvailable) {
                     ++observation.Notifications;
-                    const auto state = TCacheTestAccess::HandleState(*observation.Cache, ResizeMarkerIndex);
-                    if (observation.FinalRelease) {
-                        observation.Published &= state.IsFree() && state.Refs() == 0 &&
-                                                 state.Version() == AdvanceItemVersion(observation.Marker.Version());
-                        observation.Reused = TCacheTestAccess::PrepareBucketSplit(*observation.Cache);
-                    } else {
-                        observation.Published &=
-                            state.IsTombstone() && state.Refs() == 1 && observation.Marker.Matches(state);
-                    }
+                    observation.Probe();
                 }
             } };
         TCacheTestAccess::InstallHooks(*fixture.Cache, &hooks);
@@ -12828,7 +13035,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         }
         const ui64 generation = fixture.Cache->AdmissionGeneration();
         if (armBeforeRelease) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
         }
         firstHelper.Drop();
         if (!finalRelease) {
@@ -12837,12 +13044,13 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex).Refs(), 2);
             secondHelper.Drop();
         }
-        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + armBeforeRelease);
         UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeRelease ? 1 : 0);
         if (!armBeforeRelease) {
-            fixture.Cache->ArmResourceWait(generation);
+            fixture.Cache->ArmResourceWait();
+            observation.Probe();
         }
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, armBeforeRelease ? 1 : 0);
         UNIT_ASSERT(observation.Published);
         if (finalRelease) {
             UNIT_ASSERT(observation.Reused);
@@ -12899,7 +13107,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             TCacheTestAccess::AcquireStructural(*fixture.Cache, TCacheItem::Make(state.Version(), ResizeMarkerIndex));
         UNIT_ASSERT(helper);
         const ui64 generation = fixture.Cache->AdmissionGeneration();
-        fixture.Cache->ArmResourceWait(generation);
+        fixture.Cache->ArmResourceWait();
         helper.Drop();
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
         AssertResizeMarker(*fixture.Cache, EHandleState::BucketSplit);
@@ -12924,7 +13132,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         cacheOp.FinishErase(owner.CacheItem(), key);
         UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 2);
         const ui64 generation = fixture.Cache->AdmissionGeneration();
-        fixture.Cache->ArmResourceWait(generation);
+        fixture.Cache->ArmResourceWait();
         owner.Drop();
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
         UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 1);

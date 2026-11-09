@@ -1234,6 +1234,7 @@ void TCache::ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheItem) noe
         const ui32 nextVersion = AdvanceItemVersion(expected.Version());
         const THandleState desired = expected.WithVersion(nextVersion)
                                          .WithState(EHandleState::Free)
+                                         .WithShrinkWaiter(false)
                                          .WithFrequency(0)
                                          .WithSticky(EStickyState::None)
                                          .WithRefs(0);
