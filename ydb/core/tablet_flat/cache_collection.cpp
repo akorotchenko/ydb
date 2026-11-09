@@ -5,12 +5,12 @@
 namespace NKikimr::NSharedCache {
 
 void TCollection::SetSkipBTreeIndexV1Shadow(bool skip) {
-    auto& cache = TSharedCache::Get();
+    auto& cache = TCache::Get();
     cache.Collections_.SetSkipBTreeIndexV1Shadow(*this, skip);
 }
 
 void TCollection::DrainStickyPages() {
-    auto& cache = TSharedCache::Get();
+    auto& cache = TCache::Get();
     auto cacheOp = cache.BeginOperation();
     cacheOp.Collections().DrainStickyPages(*this);
 }

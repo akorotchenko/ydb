@@ -33,7 +33,7 @@ public:
         return size + NActors::TSharedData::OverheadSize;
     }
 
-    explicit TCacheItems(TSharedCacheImpl<TTraits>& cache) noexcept
+    explicit TCacheItems(TCacheImpl<TTraits>& cache) noexcept
         : Cache_(cache)
     {}
 
@@ -110,7 +110,7 @@ private:
     Y_FORCE_INLINE void Release(TCacheItem cacheItem) noexcept;
 
     // Dependencies
-    TSharedCacheImpl<TTraits>& Cache_;
+    TCacheImpl<TTraits>& Cache_;
 };
 
 // Leave operation constructors implicitly instantiated
@@ -205,16 +205,16 @@ public:
 
 private:
     friend class TCacheItems<TTraits>;
-    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheImpl<TTraits>;
     friend class TCacheOperationView<TTraits>;
 
-    Y_FORCE_INLINE TCacheItemsOperation(TSharedCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
+    Y_FORCE_INLINE TCacheItemsOperation(TCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
         : Cache_(cache)
         , SpaceOp_(spaceOp)
     {}
 
 private:
-    TSharedCacheImpl<TTraits>& Cache_;
+    TCacheImpl<TTraits>& Cache_;
     TSpaceOperation& SpaceOp_;
 };
 

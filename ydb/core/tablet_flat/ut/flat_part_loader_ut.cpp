@@ -5,7 +5,7 @@
 #include <ydb/core/tablet_flat/flat_scan_actor.h>
 #include <ydb/core/tablet_flat/cache_thread_test.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
-#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/blobstorage.h>
 #include <ydb/core/base/memory_controller_iface.h>
@@ -111,7 +111,7 @@ namespace {
     }
 
     TCacheCollectionRef AdmitCollection(const TBundle::TResult& written, ui32 slot) {
-        return NSharedCache::TSharedCache::Get().AdmitCollection(written.PageCollections.at(slot).PageCollection);
+        return NSharedCache::TCache::Get().AdmitCollection(written.PageCollections.at(slot).PageCollection);
     }
 
     TPartView Finish(TLoader& loader, const TBundle::TResult& written) {
@@ -132,7 +132,7 @@ namespace {
                     }
                 }
                 UNIT_ASSERT_C(source, "Requested page was not captured by the real writer");
-                auto page = NSharedCache::TSharedCache::Get().AdmitPage(
+                auto page = NSharedCache::TCache::Get().AdmitPage(
                     fetch.PageCollection, location, TSharedData(source->Data), true);
                 UNIT_ASSERT(page);
                 pages.emplace_back(location.Offset, location.Size, std::move(page));
@@ -199,7 +199,7 @@ namespace {
         }
 
         void Warm(const TBundle::TResult& written) {
-            auto& cache = NSharedCache::TSharedCache::Get();
+            auto& cache = NSharedCache::TCache::Get();
             for (const auto& collection : written.PageCollections) {
                 auto metadata = cache.AdmitCollection(collection.PageCollection);
                 for (const auto* group : { &collection.StickyPages, &collection.RegularPages }) {
@@ -259,7 +259,7 @@ Y_UNIT_TEST_SUITE(TColdPartCollectionMetadata) {
         for (auto& blob : blobs) {
             UNIT_ASSERT(bodies.emplace(blob.GId.Logo, std::move(blob.Data)).second);
         }
-        auto& cache = NSharedCache::TSharedCache::Get();
+        auto& cache = NSharedCache::TCache::Get();
         TVector<TCacheCollectionRef> metadata;
         for (const auto& collection : written.PageCollections) {
             metadata.push_back(cache.AdmitCollection(collection.PageCollection));
@@ -448,8 +448,8 @@ Y_UNIT_TEST_SUITE_F(TPartLoaderRoot, NTest::TTableCacheTest) {
         UNIT_ASSERT(loader.HasOuterCollection());
         UNIT_ASSERT_EXCEPTION(loader.SetPageCollection(0, root.Acquire()), yexception);
         TCacheCollectionRef missing;
-        UNIT_ASSERT(NSharedCache::TSharedCache::Get().Find(written.PageCollections[1].PageCollection->Label(),
-                        missing) == NSharedCache::ECacheResultStatus::Miss);
+        UNIT_ASSERT(NSharedCache::TCache::Get().Find(written.PageCollections[1].PageCollection->Label(), missing) ==
+                    NSharedCache::ECacheResultStatus::Miss);
         UNIT_ASSERT_EXCEPTION(loader.Run({ .PreloadIndex = false, .PreloadData = false }), yexception);
         loader.SetPageCollection(1, AdmitCollection(written, 1));
         auto result = Finish(loader, written);

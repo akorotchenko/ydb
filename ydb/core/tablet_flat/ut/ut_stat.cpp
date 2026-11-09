@@ -1,4 +1,4 @@
-#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include "flat_part_charge_range.h"
 #include "flat_stat_table.h"
 #include "flat_stat_table_mixed_index.h"
@@ -243,7 +243,7 @@ Y_UNIT_TEST_SUITE_F(BuildStatsPageLifetime, ::NKikimr::NTable::NTest::TTableCach
             }
         }
         UNIT_ASSERT_GT(indexBytes, 8 * pageBudget);
-        auto& cache = NSharedCache::TSharedCache::Get();
+        auto& cache = NSharedCache::TCache::Get();
         const ui64 savedLimit = cache.CurrentLimit();
         Y_DEFER {
             cache.UpdateCurrentLimit(savedLimit);

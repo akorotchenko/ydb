@@ -17,7 +17,7 @@ struct TCollectionLoadLimits {
 
 class TCollectionLoadController {
 public:
-    TCollectionLoadController(TSharedCache& cache, const TActorId& owner, TCollectionLoadLimits limits = {});
+    TCollectionLoadController(TCache& cache, const TActorId& owner, TCollectionLoadLimits limits = {});
 
     void Request(const TActorId& sender, ui64 cookie, const TEvCollectionRequest& message);
     void Update(const TCollectionRequest& request);
@@ -92,7 +92,7 @@ private:
     TJob* Job(const TActorId& worker, ui64 loadId);
 
 private:
-    TSharedCache& Cache_;
+    TCache& Cache_;
     const TActorId Owner_;
     const TCollectionLoadLimits Limits_;
     THashMap<TLogoBlobID, TLoad> Loads_;

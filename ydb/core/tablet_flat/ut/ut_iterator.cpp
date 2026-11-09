@@ -1,4 +1,4 @@
-#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include <ydb/core/tablet_flat/flat_mem_warm.h>
 #include <ydb/core/tablet_flat/flat_mem_iter.h>
 #include <ydb/core/tablet_flat/flat_table_subset.h>

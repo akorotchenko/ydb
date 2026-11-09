@@ -143,10 +143,10 @@ struct TCachePolicy {
 };
 
 template <class TTraits>
-inline constexpr TCachePolicy SharedCachePolicyFor{};
+inline constexpr TCachePolicy CachePolicyFor{};
 
 template <>
-inline constexpr TCachePolicy SharedCachePolicyFor<TTestTraits>{
+inline constexpr TCachePolicy CachePolicyFor<TTestTraits>{
     .MinCurrentLimitGap = 0,
     .MinHotSlots = 15, // Scaled geometry for small native fixtures
     .MinResizeStep = 1,

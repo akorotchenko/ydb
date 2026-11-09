@@ -1,4 +1,4 @@
-#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include <flat_part_loader.h>
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
@@ -187,7 +187,7 @@ namespace {
 
         TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection = new TTestPartPageCollection(part, 0);
         TVector<TCacheCollectionRef> collections;
-        collections.push_back(TSharedCache::Get().AdmitCollection(pageCollection));
+        collections.push_back(TCache::Get().AdmitCollection(pageCollection));
         NTable::TLoader::TLoaderEnv env(std::move(collections), part->Slots);
         env.ProvidePart(part.Get());
         TKeysLoader loader(part.Get(), &env);

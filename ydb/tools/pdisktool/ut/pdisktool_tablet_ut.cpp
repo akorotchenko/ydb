@@ -194,17 +194,17 @@ void Restore(const TString& dir, TRestored& out, TMaybe<TErasureType> erasure = 
     }
 
     TTabletBoot boot(store, Tablet, out.Issues, cacheBytes);
-    out.InitialCacheHandles = NSharedCache::TSharedCache::Get().PhysicalHandleCount();
+    out.InitialCacheHandles = NSharedCache::TCache::Get().PhysicalHandleCount();
     if (!boot.Run(out.History)) {
         return;
     }
 
     out.Options.Output = out.Output.Name();
     out.Ok = DumpTablet(boot.Database(), boot.Pages(), out.Options, out.Issues, out.Dump);
-    out.FinalCacheHandles = NSharedCache::TSharedCache::Get().PhysicalHandleCount();
-    out.FinalCacheBytes = NSharedCache::TSharedCache::Get().CurrentLimit();
-    UNIT_ASSERT_VALUES_EQUAL(NSharedCache::TSharedCache::Get().SoftLimit(), 0u);
-    UNIT_ASSERT_VALUES_EQUAL(NSharedCache::TSharedCache::Get().PayloadUsage(), 0u);
+    out.FinalCacheHandles = NSharedCache::TCache::Get().PhysicalHandleCount();
+    out.FinalCacheBytes = NSharedCache::TCache::Get().CurrentLimit();
+    UNIT_ASSERT_VALUES_EQUAL(NSharedCache::TCache::Get().SoftLimit(), 0u);
+    UNIT_ASSERT_VALUES_EQUAL(NSharedCache::TCache::Get().PayloadUsage(), 0u);
 }
 
 // A database to take scheme deltas and redo bodies from, standing in for the tablet that wrote the log.
@@ -822,7 +822,7 @@ Y_UNIT_TEST_SUITE(TPDiskToolRestoreTablet) {
         UNIT_ASSERT(it.SkipToRowVersion(TRowVersion(1, 1), stats, nullptr, nullptr, decided) == NTable::EReady::Data);
         NTable::TRowState older(tags.size());
         it.Apply(older, nullptr, nullptr);
-        auto& cache = NSharedCache::TSharedCache::Get();
+        auto& cache = NSharedCache::TCache::Get();
         cache.RunMaintenance();
         UNIT_ASSERT_VALUES_EQUAL(newer.Get(1).AsBuf(), rows[0].second);
         UNIT_ASSERT_VALUES_EQUAL(older.Get(1).AsBuf(), rows[1].second);
@@ -840,7 +840,7 @@ Y_UNIT_TEST_SUITE(TPDiskToolRestoreTablet) {
         auto& db = reader.Boot->Database();
         db.Begin(NTable::TTxStamp(Max<ui32>(), 0), reader.Boot->Pages());
         const TVector<NTable::TTag> tags{ 1, 2 };
-        auto& cache = NSharedCache::TSharedCache::Get();
+        auto& cache = NSharedCache::TCache::Get();
         for (const auto& [key, value] : rows) {
             const TRawTypeValue keyValue(&key, sizeof(key), NScheme::NTypeIds::Uint64);
             NTable::TRowState row;
@@ -901,7 +901,7 @@ Y_UNIT_TEST_SUITE(TPDiskToolRestoreTablet) {
         UNIT_ASSERT_C(history.Ok, Complaints(issues));
         TTabletBoot boot(store, Tablet, issues, 8_MB);
         UNIT_ASSERT_C(boot.Run(history), Complaints(issues));
-        auto& cache = NSharedCache::TSharedCache::Get();
+        auto& cache = NSharedCache::TCache::Get();
         const ui64 handles = cache.PhysicalHandleCount();
         UNIT_ASSERT(cache.UpdateSoftLimitOverride(1));
         auto& db = boot.Database();
@@ -912,10 +912,10 @@ Y_UNIT_TEST_SUITE(TPDiskToolRestoreTablet) {
             UNIT_ASSERT(it->Next(NTable::ENext::Data) == NTable::EReady::Data);
             UNIT_ASSERT_VALUES_EQUAL(it->Row().Get(1).AsBuf(), rows[index].second);
         }
-        UNIT_ASSERT(cache.ColdReclaimableItems() > NSharedCache::SharedCacheTransitionWorkBatch);
+        UNIT_ASSERT(cache.ColdReclaimableItems() > NSharedCache::CacheTransitionWorkBatch);
         const ui64 smallPageBytes = 4096 + 128 + NActors::TSharedData::OverheadSize;
         UNIT_ASSERT(cache.PayloadUsage() + rows.back().second.size() >
-                    cache.CurrentLimit() + NSharedCache::SharedCacheTransitionWorkBatch * smallPageBytes);
+                    cache.CurrentLimit() + NSharedCache::CacheTransitionWorkBatch * smallPageBytes);
         UNIT_ASSERT(it->Next(NTable::ENext::Data) == NTable::EReady::Data);
         UNIT_ASSERT_VALUES_EQUAL(it->Row().Get(1).AsBuf(), rows.back().second);
         UNIT_ASSERT_VALUES_EQUAL(cache.PhysicalHandleCount(), handles);

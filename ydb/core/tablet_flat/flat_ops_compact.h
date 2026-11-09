@@ -802,7 +802,7 @@ namespace NTabletFlatExecutor {
             for (auto &result : Results) {
                 Y_ENSURE(result.PageCollections, "Compaction produced a part without page collections");
                 TVector<TCacheCollectionRef> resultingPageCollections;
-                auto& sharedCache = NSharedCache::TSharedCache::Get();
+                auto& sharedCache = NSharedCache::TCache::Get();
                 for (auto& pageCollection : result.PageCollections) {
                     auto resultingPageCollection = sharedCache.AdmitCollection(pageCollection.PageCollection);
                     auto saveCompactedPages = MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);

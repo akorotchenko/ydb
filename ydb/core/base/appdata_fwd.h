@@ -30,8 +30,8 @@ namespace NKikimr {
     namespace NSharedCache {
         struct TProdTraits;
         template <class TTraits>
-        class TSharedCacheImpl;
-        using TSharedCache = TSharedCacheImpl<TProdTraits>;
+        class TCacheImpl;
+        using TCache = TCacheImpl<TProdTraits>;
     }
     namespace NJaegerTracing {
         class TSamplingThrottlingConfigurator;
@@ -270,7 +270,7 @@ struct TAppData {
     TIntrusivePtr<NKikimr::TControlBoard> Icb;
     TIntrusivePtr<NKikimr::TDynamicControlBoard> Dcb;
     TIntrusivePtr<NGRpcService::TInFlightLimiterRegistry> InFlightLimiterRegistry;
-    TIntrusivePtr<NSharedCache::TSharedCache> SharedCache;
+    TIntrusivePtr<NSharedCache::TCache> SharedCache;
 
     TIntrusivePtr<NInterconnect::TPollerThreads> PollerThreads;
 

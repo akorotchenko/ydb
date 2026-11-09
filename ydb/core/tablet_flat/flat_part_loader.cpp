@@ -50,7 +50,7 @@ void TLoader::PrepareRoot()
         auto& comp = Components.PageCollectionComponents[0];
         Y_ENSURE(comp.RawMeta, "Slot 0 has no raw meta data");
 
-        auto cache = TSharedCache::Get().AdmitCollection(
+        auto cache = TCache::Get().AdmitCollection(
             MakeIntrusiveConst<NPageCollection::TPageCollection>(comp.LargeGlobId, TSharedData(comp.RawMeta)));
 
         PageCollections[0] = std::move(cache);
@@ -228,7 +228,7 @@ void TLoader::StageParseMeta()
         auto& comp = Components.PageCollectionComponents[i];
         Y_ENSURE(comp.RawMeta, "Slot " << i << " has no raw meta data");
 
-        auto collection = TSharedCache::Get().AdmitCollection(
+        auto collection = TCache::Get().AdmitCollection(
             MakeIntrusiveConst<NPageCollection::TPageCollection>(comp.LargeGlobId, TSharedData(comp.RawMeta)));
         PageCollections[i] = std::move(collection);
     }
@@ -238,7 +238,7 @@ void TLoader::StageParseMeta()
         auto& comp = Components.PageCollectionComponents.back();
         Y_ENSURE(comp.RawMeta, "Outer blob slot has no raw meta data");
 
-        auto cache = TSharedCache::Get().AdmitCollection(
+        auto cache = TCache::Get().AdmitCollection(
             MakeIntrusiveConst<NPageCollection::TOuterPageCollection>(comp.LargeGlobId, TSharedData(comp.RawMeta)));
 
         PageCollections.back() = std::move(cache);
@@ -440,7 +440,7 @@ TLoader::TFetch TLoader::StageCreatePartView(bool preloadIndex)
     if (partStore->Blobs) {
         Y_ENSURE(partStore->Large, "Cannot use blobs without frames");
 
-        partStore->Pseudo = TSharedCache::Get().AdmitCollection(partStore->Blobs);
+        partStore->Pseudo = TCache::Get().AdmitCollection(partStore->Blobs);
     }
 
     auto overlay = TOverlay::Decode(Legacy, Opaque);

@@ -86,7 +86,7 @@ bool TCacheEviction<TTraits>::SweepModes() noexcept {
         if (remaining == 0) {
             return false;
         }
-        work = Min<ui64>(remaining, SharedCacheTransitionWorkBatch);
+        work = Min<ui64>(remaining, CacheTransitionWorkBatch);
     } while (!ModeSweepRemaining_.compare_exchange_weak(
         remaining, remaining - work, std::memory_order_acq_rel, std::memory_order_acquire));
     const ui64 generation = ModeGeneration_.load(std::memory_order_acquire);
@@ -107,7 +107,7 @@ bool TCacheEviction<TTraits>::SweepModes() noexcept {
         for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
             span += hotSlots[tier] + spaceOp.View().Tiers[tier].ColdStorage.SlotCount;
         }
-        work = Min<ui64>(span, SharedCacheTransitionWorkBatch);
+        work = Min<ui64>(span, CacheTransitionWorkBatch);
         const ui64 tail = span - work;
         ui64 pending = ModeSweepRemaining_.load(std::memory_order_acquire);
         while (!ModeSweepRemaining_.compare_exchange_weak(
@@ -315,7 +315,7 @@ bool TCacheEviction<TTraits>::EnforceCurrentLimit(TSpaceOperation& spaceOp, ui64
         }
     }
     if (currentPressure || softPressure || soft == 0) {
-        progress = ReclaimToLimits(spaceOp, soft, SharedCacheTransitionWorkBatch, bytes) || progress;
+        progress = ReclaimToLimits(spaceOp, soft, CacheTransitionWorkBatch, bytes) || progress;
         if (Cache_.Memory_.RetainedBytes() > soft) {
             SoftLimitPressure_.store(true, std::memory_order_relaxed);
         }

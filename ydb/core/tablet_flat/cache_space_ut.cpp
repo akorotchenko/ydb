@@ -73,8 +73,7 @@ public:
 
     static ui64 BucketCount(const TCacheSpace& space) noexcept {
         const TSpaceState state = space.CurrentSpaceState();
-        return state.Resizing() ? SharedCacheBucketCount(space.BucketResizeState().OldAddressBits())
-                                : state.BucketCount();
+        return state.Resizing() ? CacheBucketCount(space.BucketResizeState().OldAddressBits()) : state.BucketCount();
     }
 
     static ui64 FreeCount(const TCacheSpace& space) noexcept {
@@ -238,7 +237,7 @@ void CompleteFinalDrain(TCacheSpace& space, TTransition& transition) {
     UNIT_ASSERT(transition.Phase() == ETransitionPhase::Release);
 }
 
-Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
+Y_UNIT_TEST_SUITE(TCacheHotLayoutTest) {
     Y_UNIT_TEST(StandbyHasOneSlotInEachLevel) {
         constexpr THotRingLayout layout{ HotLevelCount };
         static_assert(layout.IsValid());
@@ -314,7 +313,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
 
     Y_UNIT_TEST(ExistingRegularLayoutIsPreserved) {
         for (ui64 count = 0; count < 15; ++count) {
-            UNIT_ASSERT(!SharedCacheHotLayoutIsValid(count));
+            UNIT_ASSERT(!CacheHotLayoutIsValid(count));
         }
         std::array<std::atomic<ui64>, 512> slots{};
         TS5FifoRings cursors;
@@ -322,7 +321,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
         view.Tiers[ECacheTier::Regular].HotStorage.Slots = slots.data();
         view.Tiers[ECacheTier::Regular].Rings = &cursors.Tier(ECacheTier::Regular);
         for (ui64 count = 15; count <= slots.size(); ++count) {
-            UNIT_ASSERT(SharedCacheHotLayoutIsValid(count));
+            UNIT_ASSERT(CacheHotLayoutIsValid(count));
             view.Tiers[ECacheTier::Regular].HotStorage.SlotCount = count;
             const ui64 l3 = count / 15;
             const ui64 l2 = count * 2 / 15;
@@ -495,7 +494,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheHotLayoutTest) {
     }
 }
 
-Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
+Y_UNIT_TEST_SUITE(TCacheTierStorageTest) {
     void CheckDefaultMappings(
         const TSpaceView& view, const TCacheCapacityConfig& logical, const TCacheCapacityConfig& mapped) {
         for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
@@ -514,7 +513,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
 
     TCacheCapacityConfig PairedCapacity(ui8 bits, bool asymmetric = false) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(bits, 4096, 0, 2, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(bits, 4096, 0, 2, capacity));
         const ui64 keepHot = asymmetric ? capacity.HotSlotCount() / 6 : capacity.HotSlotCount() / 2;
         const ui64 regularCold = asymmetric ? capacity.HandleCount() / 4 : capacity.HandleCount() / 2;
         capacity.Tiers = { TCacheTierCapacity{ capacity.HotSlotCount() - keepHot, regularCold },
@@ -770,14 +769,14 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
         const auto capacity = PairedCapacity(6);
         auto [threads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 2);
         UNIT_ASSERT(space);
-        auto cache = TSharedCacheImpl<TTestTraits>::Create(std::move(space), capacity.Limit);
+        auto cache = TCacheImpl<TTestTraits>::Create(std::move(space), capacity.Limit);
         UNIT_ASSERT(cache);
         auto invalid = capacity;
         invalid.Tiers[ECacheTier::Regular].HotSlots += invalid.Tiers[ECacheTier::Keep].HotSlots;
         invalid.Tiers[ECacheTier::Keep].HotSlots = 0;
         auto [badThreads, badSpace] = TCacheThreadTestAccess::MakeSpace(invalid, invalid, 2);
         UNIT_ASSERT(badSpace);
-        UNIT_ASSERT(!TSharedCacheImpl<TTestTraits>::Create(std::move(badSpace), invalid.Limit));
+        UNIT_ASSERT(!TCacheImpl<TTestTraits>::Create(std::move(badSpace), invalid.Limit));
     }
 
     Y_UNIT_TEST(PairedCapacityRejectsMixedCapacityAndPresenceChanges) {
@@ -1088,8 +1087,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
         const ui64 keepWord = TColdCacheItem::Make(33, 3).Raw();
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, small));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, large));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 1, large));
         for (bool growing : { true, false }) {
             const auto& current = growing ? small : large;
             const auto& target = growing ? large : small;
@@ -1139,8 +1138,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
         const ui64 keepWord = TColdCacheItem::Make(33, 3).Raw();
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, small));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, large));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 1, large));
         const std::array stages{ ESpaceMap::Handles, ESpaceMap::Buckets, ESpaceMap::RegularHot, ESpaceMap::RegularCold,
             ESpaceMap::KeepHot, ESpaceMap::KeepCold, ESpaceMap::Free };
         for (ui32 failure = 0; failure < stages.size(); ++failure) {
@@ -1185,8 +1184,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
     Y_UNIT_TEST(TierReleaseRetriesEachRingStage) {
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(14, 4096, 0, 1, small));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(15, 4096, 0, 1, large));
+        UNIT_ASSERT(TryCalculateCacheFootprint(14, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateCacheFootprint(15, 4096, 0, 1, large));
         for (auto* capacity : { &small, &large }) {
             const ui64 hot = capacity->HotSlotCount();
             const ui64 cold = capacity->HandleCount();
@@ -1230,7 +1229,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheTierStorageTest) {
     }
 }
 
-Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
+Y_UNIT_TEST_SUITE(TCacheSpaceTest) {
     Y_UNIT_TEST(MappingCancellationRetainsPartialAliasAndBackingProgress) {
         using EStep = TCacheMappingTestAccess::EStep;
         const size_t small = NSystemInfo::GetPageSize() * 2;
@@ -1359,8 +1358,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
         // Bucket backing grows from 64 KiB to 128 KiB, crossing even 64 KiB OS pages
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(13, 4096, 0, 1, small));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(14, 4096, 0, 1, large));
+        UNIT_ASSERT(TryCalculateCacheFootprint(13, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateCacheFootprint(14, 4096, 0, 1, large));
         auto [threads, space] = TCacheThreadTestAccess::MakeSpace(small, large, 1);
         UNIT_ASSERT(space);
         auto& mapping = TCacheSpaceTestAccess::BucketsMapping(*space);
@@ -1546,7 +1545,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     }
 
     Y_UNIT_TEST(SpaceStatePacking) {
-        constexpr TSpaceState state = TSpaceState::Make(Max<ui32>(), MaxSharedCacheAddressBits);
+        constexpr TSpaceState state = TSpaceState::Make(Max<ui32>(), MaxCacheAddressBits);
         static_assert(state.Generation() == Max<ui32>());
         static_assert(state.BucketMask() == Max<ui32>());
         static_assert(state.BucketCount() == (ui64{ 1 } << 32));
@@ -1569,27 +1568,27 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         static_assert(inactive.Phase() == EBucketResizePhase::Stable);
 
         constexpr TBucketResizeState growth = TBucketResizeState::Make(
-            EBucketResize::Growing, EBucketResizePhase::CursorPublished, MaxSharedCacheAddressBits - 1, Max<ui32>());
+            EBucketResize::Growing, EBucketResizePhase::CursorPublished, MaxCacheAddressBits - 1, Max<ui32>());
         static_assert(growth);
         static_assert(growth.Direction() == EBucketResize::Growing);
         static_assert(growth.Phase() == EBucketResizePhase::CursorPublished);
-        static_assert(growth.OldAddressBits() == MaxSharedCacheAddressBits - 1);
-        static_assert(growth.NewAddressBits() == MaxSharedCacheAddressBits);
+        static_assert(growth.OldAddressBits() == MaxCacheAddressBits - 1);
+        static_assert(growth.NewAddressBits() == MaxCacheAddressBits);
         static_assert(growth.Cursor() == Max<ui32>());
 
-        constexpr TBucketResizeState shrink = TBucketResizeState::Make(
-            EBucketResize::Shrinking, EBucketResizePhase::Closed, MaxSharedCacheAddressBits, 17);
+        constexpr TBucketResizeState shrink =
+            TBucketResizeState::Make(EBucketResize::Shrinking, EBucketResizePhase::Closed, MaxCacheAddressBits, 17);
         static_assert(shrink);
         static_assert(shrink.Direction() == EBucketResize::Shrinking);
         static_assert(shrink.Phase() == EBucketResizePhase::Closed);
-        static_assert(shrink.OldAddressBits() == MaxSharedCacheAddressBits);
-        static_assert(shrink.NewAddressBits() == MaxSharedCacheAddressBits - 1);
+        static_assert(shrink.OldAddressBits() == MaxCacheAddressBits);
+        static_assert(shrink.NewAddressBits() == MaxCacheAddressBits - 1);
         static_assert(shrink.Cursor() == 17);
     }
 
     Y_UNIT_TEST(Footprint) {
         TCacheCapacityConfig footprint;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 128, 3, footprint));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 128, 3, footprint));
         UNIT_ASSERT_VALUES_EQUAL(footprint.FixedBytes, 128);
         UNIT_ASSERT_VALUES_EQUAL(footprint.AddressBits, 5);
         UNIT_ASSERT_VALUES_EQUAL(footprint.HandleCount(), 32);
@@ -1611,7 +1610,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(KeepColdRingUsesConfiguredSlots) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
         UNIT_ASSERT(space);
         Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
@@ -1633,8 +1632,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(KeepColdTailIsDrainedOnPhysicalShrink) {
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 0, small));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 0, large));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 0, small));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 0, large));
         small.Tiers[ECacheTier::Regular].ColdSlots = small.HandleCount() / 2;
         small.Tiers[ECacheTier::Keep].ColdSlots = small.HandleCount() / 2;
         large.Tiers[ECacheTier::Regular].ColdSlots = large.HandleCount() / 2;
@@ -1669,8 +1668,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         for (bool replaceKeepPrefix : { false, true }) {
             TCacheCapacityConfig small;
             TCacheCapacityConfig large;
-            UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 2, small));
-            UNIT_ASSERT(TryCalculateSharedCacheFootprint(8, 4096, 0, 2, large));
+            UNIT_ASSERT(TryCalculateCacheFootprint(7, 4096, 0, 2, small));
+            UNIT_ASSERT(TryCalculateCacheFootprint(8, 4096, 0, 2, large));
             for (auto* capacity : { &small, &large }) {
                 capacity->Tiers = { TCacheTierCapacity{ capacity->HotSlotCount() / 2, capacity->HandleCount() / 2 },
                     TCacheTierCapacity{ capacity->HotSlotCount() / 2, capacity->HandleCount() / 2 } };
@@ -1789,38 +1788,38 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(FootprintRejectsInvalidInput) {
         TCacheCapacityConfig footprint;
-        UNIT_ASSERT(!TryCalculateSharedCacheFootprint(4, 4096, 0, 0, footprint));
-        UNIT_ASSERT(!TryCalculateSharedCacheFootprint(33, 4096, 0, 0, footprint));
-        UNIT_ASSERT(!TryCalculateSharedCacheFootprint(5, 0, 0, 0, footprint));
-        UNIT_ASSERT(!TryCalculateSharedCacheFootprint(5, Max<ui64>(), 0, 0, footprint));
+        UNIT_ASSERT(!TryCalculateCacheFootprint(4, 4096, 0, 0, footprint));
+        UNIT_ASSERT(!TryCalculateCacheFootprint(33, 4096, 0, 0, footprint));
+        UNIT_ASSERT(!TryCalculateCacheFootprint(5, 0, 0, 0, footprint));
+        UNIT_ASSERT(!TryCalculateCacheFootprint(5, Max<ui64>(), 0, 0, footprint));
     }
 
     Y_UNIT_TEST(CapacitySelectsLargestFit) {
         TCacheCapacityConfig fiveBits;
         TCacheCapacityConfig sixBits;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 2, fiveBits));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 2, sixBits));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 2, fiveBits));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 2, sixBits));
 
         TCacheCapacityConfig exact;
-        UNIT_ASSERT(TryCalculateSharedCacheCapacity(fiveBits.TotalBytes, 4096, 0, 2, exact));
+        UNIT_ASSERT(TryCalculateCacheCapacity(fiveBits.TotalBytes, 4096, 0, 2, exact));
         UNIT_ASSERT_VALUES_EQUAL(exact.AddressBits, 5);
 
         TCacheCapacityConfig next;
-        UNIT_ASSERT(TryCalculateSharedCacheCapacity(sixBits.TotalBytes - 1, 4096, 0, 2, next));
+        UNIT_ASSERT(TryCalculateCacheCapacity(sixBits.TotalBytes - 1, 4096, 0, 2, next));
         UNIT_ASSERT_VALUES_EQUAL(next.AddressBits, 5);
-        UNIT_ASSERT(TryCalculateSharedCacheCapacity(sixBits.TotalBytes, 4096, 0, 2, next));
+        UNIT_ASSERT(TryCalculateCacheCapacity(sixBits.TotalBytes, 4096, 0, 2, next));
         UNIT_ASSERT_VALUES_EQUAL(next.AddressBits, 6);
 
-        UNIT_ASSERT(!TryCalculateSharedCacheCapacity(fiveBits.TotalBytes - 1, 4096, 0, 2, next));
+        UNIT_ASSERT(!TryCalculateCacheCapacity(fiveBits.TotalBytes - 1, 4096, 0, 2, next));
     }
 
     Y_UNIT_TEST(CapacityResizeDeltaBits) {
         TCacheCapacityConfig current;
         TCacheCapacityConfig doubled;
         TCacheCapacityConfig quadrupled;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 0, current));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 0, doubled));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(7, 4096, 0, 0, quadrupled));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 0, current));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 0, doubled));
+        UNIT_ASSERT(TryCalculateCacheFootprint(7, 4096, 0, 0, quadrupled));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(current, quadrupled, 0);
         UNIT_ASSERT(space);
 
@@ -1840,7 +1839,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         slot.State.store(ui64{ 7 } << 32, std::memory_order_relaxed);
         std::array<TSpaceView, 2> views;
         views[7 & 1].Generation = 7;
-        views[7 & 1].BucketMask = SharedCacheBucketMask(5);
+        views[7 & 1].BucketMask = CacheBucketMask(5);
 
         {
             auto operation = TSpaceOperation::Begin(spaceState, slot, views);
@@ -1864,8 +1863,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         std::array<TSpaceView, 2> views;
         views[10 & 1].Generation = 10;
         views[11 & 1].Generation = 11;
-        views[10 & 1].BucketMask = SharedCacheBucketMask(5);
-        views[11 & 1].BucketMask = SharedCacheBucketMask(5);
+        views[10 & 1].BucketMask = CacheBucketMask(5);
+        views[11 & 1].BucketMask = CacheBucketMask(5);
 
         std::thread worker([&] {
             auto operation = TSpaceOperation::BeginWithHook(spaceState, slot, views, [&] {
@@ -1906,7 +1905,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(EntryKeepsAssignedViewUntilDrain) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
         auto [threads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
         {
             auto initial = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
@@ -1928,7 +1927,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(IdleHazardRetagRejectsDelayedRegistrationBeforeBankReuse) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
         auto [threads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
         auto& hazard = TCacheSpaceTestAccess::Hazard(*space, 0);
         {
@@ -1955,7 +1954,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(GenerationAdvanceWaitsBeforeReusingViewBank) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
         auto [threads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
         {
             auto old = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
@@ -1974,18 +1973,18 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(ViewKeepsItsRoutingSeedDuringBucketResize) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 1, capacity));
         auto [threads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
         UNIT_ASSERT(space->BeginBucketResize(5));
         auto operation = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
         UNIT_ASSERT(space->CurrentSpaceState().Resizing());
         UNIT_ASSERT(!operation.EntrySpaceState().Resizing());
-        UNIT_ASSERT_VALUES_EQUAL(operation.EntrySpaceState().BucketMask(), SharedCacheBucketMask(6));
+        UNIT_ASSERT_VALUES_EQUAL(operation.EntrySpaceState().BucketMask(), CacheBucketMask(6));
     }
 
     Y_UNIT_TEST(RegisteredThreadHazard) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 2, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 2, capacity));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 2);
         UNIT_ASSERT(space);
 
@@ -2005,7 +2004,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(HotPolicyResizeDoesNotUseHazards) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
         UNIT_ASSERT(space);
 
@@ -2048,7 +2047,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(NestedOperationsShareHazard) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
         UNIT_ASSERT(space);
         Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
@@ -2076,7 +2075,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(GenerationDrainResumesAtFirstBlockedHazard) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 3, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 3, capacity));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 3);
         UNIT_ASSERT(space);
         ui32 notifications = 0;
@@ -2120,7 +2119,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(GenerationDrainKeepsNestedWaiterUntilLastExit) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
         UNIT_ASSERT(space);
         ui32 notifications = 0;
@@ -2148,7 +2147,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(GenerationDrainWakesAfterRegisteredOldViewExits) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
         UNIT_ASSERT(space);
         ui32 notifications = 0;
@@ -2185,8 +2184,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(InitialMappingsAndFreeContents) {
         TCacheCapacityConfig current;
         TCacheCapacityConfig reserved;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 3, current));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 3, reserved));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 3, current));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 3, reserved));
 
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(current, reserved, 3);
         UNIT_ASSERT(space);
@@ -2235,8 +2234,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(RejectsInvalidMappingConfiguration) {
         TCacheCapacityConfig current;
         TCacheCapacityConfig reserved;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 0, current));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 0, reserved));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 0, current));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 0, reserved));
 
         auto invalid = current;
         invalid.AddressBits = reserved.AddressBits + 1;
@@ -2244,7 +2243,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         UNIT_ASSERT(!TCacheSpace::Create(invalid, reserved, threadHazards));
 
         invalid = current;
-        invalid.AddressBits = MinSharedCacheAddressBits - 1;
+        invalid.AddressBits = MinCacheAddressBits - 1;
         UNIT_ASSERT(!TCacheSpace::Create(invalid, reserved, threadHazards));
     }
 
@@ -2252,9 +2251,9 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         TCacheCapacityConfig current;
         TCacheCapacityConfig reserved;
         TCacheCapacityConfig changedEstimate;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, current));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, reserved));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 2048, 0, 1, changedEstimate));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, current));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 1, reserved));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 2048, 0, 1, changedEstimate));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(current, reserved, 1);
         UNIT_ASSERT(space);
         const auto state = space->CurrentSpaceState();
@@ -2270,7 +2269,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(AllocateAndReturnItem) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
         UNIT_ASSERT(space);
         Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
@@ -2310,7 +2309,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
         constexpr ui32 ThreadCount = 8;
 
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(10, 4096, 0, ThreadCount, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(10, 4096, 0, ThreadCount, capacity));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, ThreadCount);
         UNIT_ASSERT(space);
 
@@ -2353,7 +2352,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(AllocateReroutesAfterGenerationChange) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
         UNIT_ASSERT(space);
         Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
@@ -2389,7 +2388,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
 
     Y_UNIT_TEST(ReturnReroutesAfterGenerationChange) {
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
         UNIT_ASSERT(space);
         Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazard);
@@ -2431,8 +2430,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(CapacityGrowthAndShrinkAliasTheLivePrefix) {
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, small));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, large));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 1, large));
 
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(small, large, 1);
         UNIT_ASSERT(space);
@@ -2524,8 +2523,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(CapacityGrowthAddsEveryNewHandleToFree) {
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, small));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, large));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 1, large));
 
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(small, large, 1);
         UNIT_ASSERT(space);
@@ -2566,8 +2565,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(CapacityGrowthWorkIsBatched) {
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(10, 4096, 0, 1, small));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(11, 4096, 0, 1, large));
+        UNIT_ASSERT(TryCalculateCacheFootprint(10, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateCacheFootprint(11, 4096, 0, 1, large));
 
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(small, large, 1);
         UNIT_ASSERT(space);
@@ -2615,8 +2614,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(CapacityShrinkDrainsWrappedFreeRing) {
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, small));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 1, large));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, small));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 1, large));
 
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(large, large, 1);
         UNIT_ASSERT(space);
@@ -2666,8 +2665,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(MigrationViewPublicationOrdersRestrictionBeforeGeneration) {
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 0, small));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 0, large));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 0, small));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 0, large));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(large, large, 0);
         UNIT_ASSERT(space);
 
@@ -2696,8 +2695,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(CapacityReleaseRetriesFailedStage) {
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(10, 4096, 0, 0, small));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(11, 4096, 0, 0, large));
+        UNIT_ASSERT(TryCalculateCacheFootprint(10, 4096, 0, 0, small));
+        UNIT_ASSERT(TryCalculateCacheFootprint(11, 4096, 0, 0, large));
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(large, large, 0);
         UNIT_ASSERT(space);
 
@@ -2744,8 +2743,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheSpaceTest) {
     Y_UNIT_TEST(CapacityShutdownCancelsPrivateAndAbandonsPublished) {
         TCacheCapacityConfig small;
         TCacheCapacityConfig large;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 0, small));
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(6, 4096, 0, 0, large));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 0, small));
+        UNIT_ASSERT(TryCalculateCacheFootprint(6, 4096, 0, 0, large));
 
         auto [spaceThreads, space] = TCacheThreadTestAccess::MakeSpace(small, large, 0);
         UNIT_ASSERT(space);

@@ -242,7 +242,7 @@ public:
         TWaitForFirstEvent<NMemory::TEvConsumerLimit> allocation(Env);
         Env.Send(NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 8_MB));
         allocation.Wait();
-        auto* core = &NSharedCache::TSharedCache::Get();
+        auto* core = &NSharedCache::TCache::Get();
         for (ui32 step = 0; step < 400 && (core->HotPages() != 0 || core->ColdRingEntries() != 0); ++step) {
             TWaitForFirstEvent<TKikimrEvents::TEvWakeup> maintenance(Env);
             Env.Send(NSharedCache::MakeSharedPageCacheId(), TActorId{},

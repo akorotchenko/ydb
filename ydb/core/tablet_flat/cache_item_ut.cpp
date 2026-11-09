@@ -6,7 +6,7 @@
 
 namespace NKikimr::NSharedCache {
 
-Y_UNIT_TEST_SUITE(TSharedCacheItemTest) {
+Y_UNIT_TEST_SUITE(TCacheItemTest) {
     Y_UNIT_TEST(CacheItemFields) {
         constexpr auto cacheItem = TCacheItem::Make(MaxItemVersion, Max<ui32>(), true);
 

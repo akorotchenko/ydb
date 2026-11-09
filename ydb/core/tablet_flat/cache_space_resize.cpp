@@ -55,7 +55,7 @@ bool TCacheSpace::BeginBucketResize(ui8 newAddressBits) noexcept {
     const ui8 oldAddressBits = spaceState.AddressBits();
     EBucketResize direction;
     if (newAddressBits == oldAddressBits + 1 && newAddressBits <= ReservedCapacity_.AddressBits &&
-        SharedCacheBucketCount(newAddressBits) <= NewestView().BucketsBytes / sizeof(std::atomic<ui64>))
+        CacheBucketCount(newAddressBits) <= NewestView().BucketsBytes / sizeof(std::atomic<ui64>))
     {
         direction = EBucketResize::Growing;
     } else if (newAddressBits + 1 == oldAddressBits) {
@@ -66,8 +66,8 @@ bool TCacheSpace::BeginBucketResize(ui8 newAddressBits) noexcept {
 
     if (direction == EBucketResize::Growing) {
         std::atomic<ui64>* buckets = NewestView().Buckets;
-        const ui64 oldBucketCount = SharedCacheBucketCount(oldAddressBits);
-        const ui64 newBucketCount = SharedCacheBucketCount(newAddressBits);
+        const ui64 oldBucketCount = CacheBucketCount(oldAddressBits);
+        const ui64 newBucketCount = CacheBucketCount(newAddressBits);
         for (ui64 index = oldBucketCount; index < newBucketCount; ++index) {
             new (&buckets[index]) std::atomic<ui64>(0);
         }
@@ -203,7 +203,7 @@ EPrepareResult TCacheSpace::PrepareTransitionImpl(
     Y_ABORT_UNLESS(transition.Phase_ == ETransitionPhase::Idle);
     const TSpaceState spaceState = CurrentSpaceState();
     const TSpaceView& current = SpaceView(spaceState);
-    if (target.AddressBits < MinSharedCacheAddressBits || target.AddressBits > MaxSharedCacheAddressBits ||
+    if (target.AddressBits < MinCacheAddressBits || target.AddressBits > MaxCacheAddressBits ||
         target.AddressBits > ReservedCapacity_.AddressBits ||
         target.ExpectedPageSize != ReservedCapacity_.ExpectedPageSize ||
         target.StaticBytes > ReservedCapacity_.StaticBytes || current.HandleCount != Capacity_.HandleCount() ||
@@ -418,7 +418,7 @@ bool TCacheSpace::InitializeGrowth(TTransition& transition) noexcept {
         work = Max(work, view.Tiers[tier].HotStorage.SlotCount - source.Tiers[tier].HotStorage.SlotCount);
         work = Max(work, view.Tiers[tier].ColdStorage.SlotCount - source.Tiers[tier].ColdStorage.SlotCount);
     }
-    const ui64 end = Min(work, transition.NextWorkIndex_ + SharedCacheTransitionWorkBatch);
+    const ui64 end = Min(work, transition.NextWorkIndex_ + CacheTransitionWorkBatch);
     while (transition.NextWorkIndex_ < end) {
         const ui64 offset = transition.NextWorkIndex_++;
         if (offset < handleDelta) {
@@ -456,7 +456,7 @@ bool TCacheSpace::AppendFreeHandles(TTransition& transition) noexcept {
     const ui64 oldCount = transition.OldConfiguration_.HandleCount();
     const ui64 targetCount = transition.TargetConfiguration_.HandleCount();
     Y_DEBUG_ABORT_UNLESS(oldCount < targetCount && view.HandleCount == targetCount);
-    const ui64 end = Min(targetCount, transition.NextWorkIndex_ + SharedCacheTransitionWorkBatch);
+    const ui64 end = Min(targetCount, transition.NextWorkIndex_ + CacheTransitionWorkBatch);
     while (transition.NextWorkIndex_ < end) {
         const ui64 index = transition.NextWorkIndex_++;
         RouteFreeWord(view, TCacheItem::Make(0, static_cast<ui32>(index)).Raw());

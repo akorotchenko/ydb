@@ -1,6 +1,6 @@
 #pragma once
 
-#include "shared_cache_context.h"
+#include "cache_context.h"
 
 #include <library/cpp/testing/unittest/registar.h>
 

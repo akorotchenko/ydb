@@ -21,7 +21,7 @@ class TCacheEviction {
 public:
     using TOperation = TCacheEvictionOperation<TTraits>;
 
-    explicit TCacheEviction(TSharedCacheImpl<TTraits>& cache) noexcept
+    explicit TCacheEviction(TCacheImpl<TTraits>& cache) noexcept
         : Cache_(cache)
         , HotPolicy_(cache)
         , ColdPolicy_(cache)
@@ -152,7 +152,7 @@ private:
 
 private:
     // Dependencies
-    TSharedCacheImpl<TTraits>& Cache_;
+    TCacheImpl<TTraits>& Cache_;
     TCacheHotPolicy<TTraits> HotPolicy_;
     TCacheColdPolicy<TTraits> ColdPolicy_;
 
@@ -282,16 +282,16 @@ public:
 
 private:
     friend class TCacheEviction<TTraits>;
-    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheImpl<TTraits>;
     friend class TCacheOperationView<TTraits>;
 
-    Y_FORCE_INLINE TCacheEvictionOperation(TSharedCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
+    Y_FORCE_INLINE TCacheEvictionOperation(TCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
         : Cache_(cache)
         , SpaceOp_(spaceOp)
     {}
 
 private:
-    TSharedCacheImpl<TTraits>& Cache_;
+    TCacheImpl<TTraits>& Cache_;
     TSpaceOperation& SpaceOp_;
 };
 

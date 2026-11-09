@@ -7,39 +7,39 @@
 
 namespace NKikimr::NSharedCache {
 
-#define SHARED_CACHE_TEMPLATE template <class TTraits>
-#define TSharedCache TSharedCacheImpl<TTraits>
+#define CACHE_TEMPLATE template <class TTraits>
+#define TCache TCacheImpl<TTraits>
 #define TCacheItemRef TCacheItemRefImpl<TTraits>
 #define TCacheTable TCacheTableImpl<TTraits>
 #define TOperationItemRef TOperationItemRef<TTraits>
 
-int CompareSharedCacheKeys(const TCacheKey& left, ui32 leftHash, const TCacheKey& right, ui32 rightHash) noexcept {
+int CompareCacheKeys(const TCacheKey& left, ui32 leftHash, const TCacheKey& right, ui32 rightHash) noexcept {
     if (right.IsPageKind()) {
         return NDetail::CompareKnownCacheKeys<true>(left, leftHash, right, rightHash);
     }
     return NDetail::CompareKnownCacheKeys<false>(left, leftHash, right, rightHash);
 }
 
-void StoreSharedCacheKey(THandle& handle, const TCacheKey& key) noexcept {
+void StoreCacheKey(THandle& handle, const TCacheKey& key) noexcept {
     handle.Key0.store(key.Word(0), std::memory_order_release);
     handle.Key1.store(key.Word(1), std::memory_order_release);
     handle.Key2OrSize.store(key.Word(2), std::memory_order_release);
 }
 
-TCacheKey LoadSharedCacheKey(const THandle& handle, EItemKind kind) noexcept {
+TCacheKey LoadCacheKey(const THandle& handle, EItemKind kind) noexcept {
     const ui64 word0 = handle.Key0.load(std::memory_order_relaxed);
     const ui64 word1 = handle.Key1.load(std::memory_order_relaxed);
     const ui64 word2 = handle.Key2OrSize.load(std::memory_order_relaxed);
     return TCacheKey::FromWords(kind, word0, word1, word2);
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 TCacheItemRef TCacheTable::TryAcquire(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
     auto cacheOp = Cache_.BindOperation(spaceOp);
     return cacheOp.TryAcquireStructural(cacheItem);
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 ECacheResultStatus TCacheTable::FindPageForInsert(
     TSpaceOperation& spaceOp, const TCacheKey& key, TCacheItem& cacheItem, TInsertPosition& insertPosition) noexcept {
     const auto collection = TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(key.Word(0)));
@@ -47,7 +47,7 @@ ECacheResultStatus TCacheTable::FindPageForInsert(
         spaceOp, key, HashPageKey(collection, key.Word(1)), spaceOp.EntrySpaceState(), cacheItem, &insertPosition);
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 ECacheResultStatus TCacheTable::FindCollectionForInsert(
     TSpaceOperation& spaceOp, const TCacheKey& key, TCacheItem& cacheItem, TInsertPosition& insertPosition) noexcept {
     const TLogoBlobID id(key.Word(0), key.Word(1), key.Word(2));
@@ -55,7 +55,7 @@ ECacheResultStatus TCacheTable::FindCollectionForInsert(
         spaceOp, key, HashCollectionKey(id), spaceOp.EntrySpaceState(), cacheItem, &insertPosition);
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 Y_FORCE_INLINE typename TCacheTable::TBucketRoute TCacheTable::SelectBucket(
     ui32 hash, TSpaceState spaceState) const noexcept {
     if (Y_UNLIKELY(spaceState.Resizing())) {
@@ -65,7 +65,7 @@ Y_FORCE_INLINE typename TCacheTable::TBucketRoute TCacheTable::SelectBucket(
     return { .Bucket = bucket, .BaseBucket = bucket };
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 Y_FORCE_INLINE typename TCacheTable::TBucketRoute TCacheTable::SelectResizeBucket(ui32 hash) const noexcept {
     const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
     const ui32 splitBit = resize.SplitBit();
@@ -84,7 +84,7 @@ Y_FORCE_INLINE typename TCacheTable::TBucketRoute TCacheTable::SelectResizeBucke
     return { .Resize = resize, .Bucket = base, .BaseBucket = base, .FollowsSplitSuffix = suffix };
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 template <typename TCacheTable::ETombstoneMode Mode>
 Y_FORCE_INLINE bool TCacheTable::SelectGrowthBucket(TBucketRoute& route, const TOrderedLink& link) noexcept {
     const TBucketResizeState& resize = route.Resize;
@@ -108,7 +108,7 @@ Y_FORCE_INLINE bool TCacheTable::SelectGrowthBucket(TBucketRoute& route, const T
     return false;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 template <typename TCacheTable::ETombstoneMode Mode, bool IsPage>
 typename TCacheTable::EBucketRouteResult TCacheTable::FindWithResize(TSpaceOperation& spaceOp, const TCacheKey& key,
     ui32 hash, TSpaceState& spaceState, TBucketRoute& route, TOrderedLink& result) noexcept {
@@ -121,7 +121,7 @@ typename TCacheTable::EBucketRouteResult TCacheTable::FindWithResize(TSpaceOpera
     }
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 bool TCacheTable::InsertAt(TSpaceOperation& spaceOp, TInsertPosition& insertPosition, TCacheItem candidate) noexcept {
     TSpaceState spaceState = insertPosition.SpaceState;
     TBucketResizeState resizeState = insertPosition.ResizeState;
@@ -150,7 +150,7 @@ bool TCacheTable::InsertAt(TSpaceOperation& spaceOp, TInsertPosition& insertPosi
     return inserted;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 bool TCacheTable::FindLinkOnBucket(
     const TSpaceOperation& spaceOp, TCacheItem target, ui32 bucket, TOrderedLink& result) noexcept {
 restart:
@@ -191,7 +191,7 @@ restart:
     }
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 TCacheItemRef TCacheTable::TryAcquireTombstone(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
     auto ref = Cache_.Items_.BindOperation(spaceOp).TryAcquireRetiredItemRef(cacheItem);
     if (ref) {
@@ -200,7 +200,7 @@ TCacheItemRef TCacheTable::TryAcquireTombstone(TSpaceOperation& spaceOp, TCacheI
     return ref;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 TCacheItem TCacheTable::FreezeNext(const TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     ui64 nextRaw = handle.Next.load(std::memory_order_acquire);
@@ -219,7 +219,7 @@ TCacheItem TCacheTable::FreezeNext(const TSpaceOperation& spaceOp, TCacheItem ca
     }
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 bool TCacheTable::FindLink(
     TSpaceOperation& spaceOp, const TCacheKey& key, TCacheItem target, TOrderedLink& result) noexcept {
     const ui32 hash = key.Hash();
@@ -241,7 +241,7 @@ bool TCacheTable::FindLink(
     }
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 bool TCacheTable::UnlinkTombstone(TCacheItem cacheItem, const TCacheKey& key, TSpaceOperation& spaceOp) noexcept {
     auto cacheOp = Cache_.BindOperation(spaceOp);
     const TCacheItem successor = FreezeNext(spaceOp, cacheItem).WithoutFrozen();
@@ -255,7 +255,7 @@ bool TCacheTable::UnlinkTombstone(TCacheItem cacheItem, const TCacheKey& key, TS
             THandle& tombstone = spaceOp.Handles()[current.Index()];
             const THandleState state = THandleState::FromRaw(tombstone.State.load(std::memory_order_relaxed));
             Y_DEBUG_ABORT_UNLESS(current.Matches(state) && state.IsTombstone() && state.Refs() > 0);
-            currentKey = LoadSharedCacheKey(tombstone, state.Kind());
+            currentKey = LoadCacheKey(tombstone, state.Kind());
         }
         TOrderedLink orderedLink;
         if (!FindLink(spaceOp, currentKey, current, orderedLink)) {
@@ -343,7 +343,7 @@ bool TCacheTable::UnlinkTombstone(TCacheItem cacheItem, const TCacheKey& key, TS
     }
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 void TCacheTable::PublishPageReplacement(
     TCacheItem source, TCacheItem replacement, const TCacheKey& key, TSpaceOperation& spaceOp) noexcept {
     for (;;) {
@@ -390,7 +390,7 @@ void TCacheTable::PublishPageReplacement(
     }
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 void TCacheTable::TryFinishErase(TCacheItem cacheItem, const TCacheKey& routeKey, TSpaceOperation& spaceOp) noexcept {
     TOperationItemRef hold(spaceOp, TryAcquireTombstone(spaceOp, cacheItem));
     if (!hold) {
@@ -400,13 +400,13 @@ void TCacheTable::TryFinishErase(TCacheItem cacheItem, const TCacheKey& routeKey
     THandle& handle = spaceOp.Handles()[tombstone.Index()];
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
     if (tombstone.Matches(state) && state.IsTombstone()) {
-        const TCacheKey key = tombstone.IsResizeMarker() ? routeKey : LoadSharedCacheKey(handle, state.Kind());
+        const TCacheKey key = tombstone.IsResizeMarker() ? routeKey : LoadCacheKey(handle, state.Kind());
         FreezeNext(spaceOp, tombstone);
         UnlinkTombstone(tombstone, key, spaceOp);
     }
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 bool TCacheTable::TryBeginErase(
     TSpaceOperation& spaceOp, TCacheItem cacheItem, THandleState& expected, TCacheItemRef& owner) noexcept {
     Y_DEBUG_ABORT_UNLESS(!owner && !expected.IsCompleting());
@@ -430,7 +430,7 @@ bool TCacheTable::TryBeginErase(
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 bool TCacheTable::TryBeginErase(TSpaceOperation& spaceOp, TCacheItemRef& owner, THandleState& expected) noexcept {
     Y_DEBUG_ABORT_UNLESS(owner && expected.Refs() > 0);
     const TCacheItem cacheItem = owner.CacheItem();
@@ -458,7 +458,7 @@ bool TCacheTable::TryBeginErase(TSpaceOperation& spaceOp, TCacheItemRef& owner, 
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 void TCacheTable::FinishErase(TSpaceOperation& spaceOp, TCacheItem cacheItem, const TCacheKey& key) noexcept {
     const THandleState state =
         THandleState::FromRaw(spaceOp.Handles()[cacheItem.Index()].State.load(std::memory_order_acquire));
@@ -470,8 +470,8 @@ void TCacheTable::FinishErase(TSpaceOperation& spaceOp, TCacheItem cacheItem, co
 #undef TCacheTable
 #undef TCacheItemRef
 #undef TOperationItemRef
-#undef TSharedCache
-#undef SHARED_CACHE_TEMPLATE
+#undef TCache
+#undef CACHE_TEMPLATE
 
 template class TCacheTableImpl<TProdTraits>;
 template class TCacheTableImpl<TTestTraits>;

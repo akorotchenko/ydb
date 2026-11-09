@@ -2,11 +2,11 @@
 
 namespace NKikimr::NSharedCache {
 
-#define SHARED_CACHE_TEMPLATE template <class TTraits>
+#define CACHE_TEMPLATE template <class TTraits>
 #define TCacheTable TCacheTableImpl<TTraits>
 #define TOperationItemRef TOperationItemRef<TTraits>
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 typename TCacheTable::EResizeStep TCacheTable::FindSplitBoundary(
     const TSpaceOperation& spaceOp, ui32 bucket, ui32 splitBit, bool suffix, TOrderedLink& result) noexcept {
     result.Link = &spaceOp.Buckets()[bucket];
@@ -74,7 +74,7 @@ typename TCacheTable::EResizeStep TCacheTable::FindSplitBoundary(
     }
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 typename TCacheTable::EResizeStep TCacheTable::ResizeOwnerResult(
     const TSpaceOperation& spaceOp, TCacheItem owner) const noexcept {
     const THandleState state =
@@ -83,7 +83,7 @@ typename TCacheTable::EResizeStep TCacheTable::ResizeOwnerResult(
                                                                                  : EResizeStep::Retry;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 bool TCacheTable::PrepareSplitMarker(const TSpaceOperation& spaceOp, TCacheItem suffix) noexcept {
     THandle& marker = spaceOp.Handles()[ResizeMarkerIndex];
     ui64 expectedRaw = marker.State.load(std::memory_order_acquire);
@@ -105,7 +105,7 @@ bool TCacheTable::PrepareSplitMarker(const TSpaceOperation& spaceOp, TCacheItem 
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 bool TCacheTable::TransitionSplitMarkerToTombstone(const TSpaceOperation& spaceOp, TCacheItem marker) noexcept {
     THandle& handle = spaceOp.Handles()[ResizeMarkerIndex];
     ui64 expectedRaw = handle.State.load(std::memory_order_acquire);
@@ -129,14 +129,14 @@ bool TCacheTable::TransitionSplitMarkerToTombstone(const TSpaceOperation& spaceO
     }
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 bool TCacheTable::SplitMarkerIsSoleOwner(const TSpaceOperation& spaceOp, TCacheItem marker) const noexcept {
     const THandleState state =
         THandleState::FromRaw(spaceOp.Handles()[ResizeMarkerIndex].State.load(std::memory_order_acquire));
     return marker.Matches(state) && (state.IsBucketSplit() || state.IsTombstone()) && state.Refs() == 1;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 typename TCacheTable::EResizeStep TCacheTable::PrepareBucketSplit(TSpaceOperation& spaceOp) noexcept {
     const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
     const ui32 pairCount = resize.PairCount();
@@ -170,7 +170,7 @@ typename TCacheTable::EResizeStep TCacheTable::PrepareBucketSplit(TSpaceOperatio
     return PrepareSplitMarker(spaceOp, suffix) ? EResizeStep::Complete : EResizeStep::Blocked;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 typename TCacheTable::EResizeStep TCacheTable::ActivateBucketSplitOrMerge(TSpaceOperation& spaceOp) noexcept {
     const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
     const ui32 pairCount = resize.PairCount();
@@ -189,7 +189,7 @@ typename TCacheTable::EResizeStep TCacheTable::ActivateBucketSplitOrMerge(TSpace
                                                         : ActivateBucketMerge(spaceOp, resize, marker);
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 typename TCacheTable::EResizeStep TCacheTable::ActivateBucketSplit(
     TSpaceOperation& spaceOp, const TBucketResizeState& resize, TCacheItem marker) noexcept {
     TOrderedLink boundary;
@@ -240,7 +240,7 @@ typename TCacheTable::EResizeStep TCacheTable::ActivateBucketSplit(
                                                                                   : EResizeStep::Blocked;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 typename TCacheTable::EResizeStep TCacheTable::ActivateBucketMerge(
     TSpaceOperation& spaceOp, const TBucketResizeState& resize, TCacheItem marker) noexcept {
     const ui32 bucket = resize.Cursor();
@@ -273,7 +273,7 @@ typename TCacheTable::EResizeStep TCacheTable::ActivateBucketMerge(
                                                                                   : EResizeStep::Blocked;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 typename TCacheTable::EResizeStep TCacheTable::PublishBucketSplit(TSpaceOperation& spaceOp) noexcept {
     const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
     if (!resize || resize.Phase() != EBucketResizePhase::Activated || resize.Cursor() >= resize.PairCount())
@@ -290,7 +290,7 @@ typename TCacheTable::EResizeStep TCacheTable::PublishBucketSplit(TSpaceOperatio
     return EResizeStep::Complete;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 typename TCacheTable::EResizeStep TCacheTable::CloseBucketSplit(TSpaceOperation& spaceOp) noexcept {
     const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
     if (!resize || resize.Direction() != EBucketResize::Shrinking ||
@@ -316,7 +316,7 @@ typename TCacheTable::EResizeStep TCacheTable::CloseBucketSplit(TSpaceOperation&
                                                                                : EResizeStep::Blocked;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 typename TCacheTable::EResizeStep TCacheTable::RemoveBucketSplit(TSpaceOperation& spaceOp) noexcept {
     auto cacheOp = Cache_.BindOperation(spaceOp);
     const TBucketResizeState resize = Cache_.Space_->BucketResizeState();
@@ -396,7 +396,7 @@ typename TCacheTable::EResizeStep TCacheTable::RemoveBucketSplit(TSpaceOperation
 
 #undef TOperationItemRef
 #undef TCacheTable
-#undef SHARED_CACHE_TEMPLATE
+#undef CACHE_TEMPLATE
 
 // Resize members are instantiated here; other table members are instantiated in cache_table.cpp.
 template TCacheTableImpl<TProdTraits>::EResizeStep TCacheTableImpl<TProdTraits>::FindSplitBoundary(

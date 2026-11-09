@@ -117,25 +117,25 @@ class TRequestPageWaiter;
 class TCompactedPageWaiter;
 
 template <class TTraits = TProdTraits>
-class TSharedCacheImpl : public TThrRefBase, private TTraits {
+class TCacheImpl : public TThrRefBase, private TTraits {
 public:
     static constexpr ui64 ExpectedPageSize = 7_KB;
     // Null handle, resize marker and collection metadata
     static constexpr ui64 RequestHandleOverhead = 3;
 
-    static TIntrusivePtr<TSharedCacheImpl> Create(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits = {});
+    static TIntrusivePtr<TCacheImpl> Create(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits = {});
 
-    ~TSharedCacheImpl() override;
+    ~TCacheImpl() override;
 
-    TSharedCacheImpl(const TSharedCacheImpl&) = delete;
-    TSharedCacheImpl& operator=(const TSharedCacheImpl&) = delete;
+    TCacheImpl(const TCacheImpl&) = delete;
+    TCacheImpl& operator=(const TCacheImpl&) = delete;
 
     using TOperation = TCacheOperation<TTraits>;
 
     Y_FORCE_INLINE TOperation BeginOperation() noexcept;
 
-    static TSharedCacheImpl& Get() noexcept {
-        TSharedCacheImpl* cache = TryGet();
+    static TCacheImpl& Get() noexcept {
+        TCacheImpl* cache = TryGet();
         Y_DEBUG_ABORT_UNLESS(cache);
         return *cache;
     }
@@ -166,8 +166,8 @@ public:
         NTable::NPage::TPageLocation location, NActors::TSharedData&& data, bool sticky = false)
         requires std::is_same_v<TTraits, TProdTraits>;
 
-    static TSharedCacheImpl* TryGet() noexcept {
-        return static_cast<TSharedCacheImpl*>(TTraits::TryGetCache());
+    static TCacheImpl* TryGet() noexcept {
+        return static_cast<TCacheImpl*>(TTraits::TryGetCache());
     }
 
     Y_FORCE_INLINE bool MakeReady(TPageCacheItem page, NActors::TSharedData&& data) noexcept {
@@ -569,7 +569,7 @@ private:
         static_cast<TTraits&>(*this) = std::move(hooks);
     }
 
-    explicit TSharedCacheImpl(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits);
+    explicit TCacheImpl(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits);
 
     using EAcquireStatus = typename TCacheItems<TTraits>::EAcquireStatus;
 
@@ -680,7 +680,7 @@ private:
         Y_DEBUG_ABORT_UNLESS(
             THandleState::FromRaw(handle.State.load(std::memory_order_relaxed)).IsPageKind() == isPage);
         TCacheKeyedItem<isPage> keyedCandidate{
-            .Key = LoadSharedCacheKey(handle, isPage ? EItemKind::Page : EItemKind::Collection),
+            .Key = LoadCacheKey(handle, isPage ? EItemKind::Page : EItemKind::Collection),
             .CacheItem = candidate.CacheItem(),
         };
         return cacheOp.FindOrInsert(keyedCandidate, ref);
@@ -913,18 +913,18 @@ private:
     TCacheFetches<TTraits> Fetches_;
     THotResize HotResize_;
 
-    inline static constexpr TCachePolicy Policy_ = SharedCachePolicyFor<TTraits>;
+    inline static constexpr TCachePolicy Policy_ = CachePolicyFor<TTraits>;
 };
 
 template <class TTraits>
 class TCacheOperationView {
-    using EPageAdmission = typename TSharedCacheImpl<TTraits>::EPageAdmission;
-    using TPageInsertCandidate = typename TSharedCacheImpl<TTraits>::TPageInsertCandidate;
-    using TCollectionInsertCandidate = typename TSharedCacheImpl<TTraits>::TCollectionInsertCandidate;
+    using EPageAdmission = typename TCacheImpl<TTraits>::EPageAdmission;
+    using TPageInsertCandidate = typename TCacheImpl<TTraits>::TPageInsertCandidate;
+    using TCollectionInsertCandidate = typename TCacheImpl<TTraits>::TCollectionInsertCandidate;
 public: // Cache table operations
     using TInsertPosition = typename TCacheTableImpl<TTraits>::TInsertPosition;
     using EResizeStep = typename TCacheTableImpl<TTraits>::EResizeStep;
-    using EAcquireStatus = typename TSharedCacheImpl<TTraits>::EAcquireStatus;
+    using EAcquireStatus = typename TCacheImpl<TTraits>::EAcquireStatus;
 
     Y_FORCE_INLINE TSpaceOperation& SpaceOperation() const noexcept {
         return SpaceOp_;
@@ -1108,13 +1108,13 @@ public: // Cache helpers
     }
 
     Y_FORCE_INLINE TCachePageRefImpl<TTraits> BuildPageRef(TCacheItemRefImpl<TTraits>&& ref) const noexcept {
-        Y_DEBUG_ABORT_UNLESS(&TSharedCacheImpl<TTraits>::Get() == &Cache_);
+        Y_DEBUG_ABORT_UNLESS(&TCacheImpl<TTraits>::Get() == &Cache_);
         return Items().BuildPageRef(std::move(ref));
     }
 
     Y_FORCE_INLINE TCacheCollectionRefImpl<TTraits> BuildCollectionRef(
         TCacheItemRefImpl<TTraits>&& ref) const noexcept {
-        Y_DEBUG_ABORT_UNLESS(&TSharedCacheImpl<TTraits>::Get() == &Cache_);
+        Y_DEBUG_ABORT_UNLESS(&TCacheImpl<TTraits>::Get() == &Cache_);
         return Items().BuildCollectionRef(std::move(ref));
     }
 
@@ -1221,16 +1221,16 @@ public: // Resizing
     }
 
 private:
-    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheImpl<TTraits>;
     friend class TCacheOperation<TTraits>;
 
-    Y_FORCE_INLINE TCacheOperationView(TSharedCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
+    Y_FORCE_INLINE TCacheOperationView(TCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
         : Cache_(cache)
         , SpaceOp_(spaceOp)
     {}
 
 protected: // Data members
-    TSharedCacheImpl<TTraits>& Cache_;
+    TCacheImpl<TTraits>& Cache_;
     TSpaceOperation& SpaceOp_;
 };
 
@@ -1252,28 +1252,28 @@ public:
     {}
 
 private:
-    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheImpl<TTraits>;
 
-    Y_FORCE_INLINE TCacheOperation(TSharedCacheImpl<TTraits>& cache, TSpaceOperation&& spaceOp) noexcept
+    Y_FORCE_INLINE TCacheOperation(TCacheImpl<TTraits>& cache, TSpaceOperation&& spaceOp) noexcept
         : TSpaceOperation(std::move(spaceOp))
         , TOperationView(cache, *this)
     {}
 };
 
 template <class TTraits>
-Y_FORCE_INLINE typename TSharedCacheImpl<TTraits>::TOperationView TSharedCacheImpl<TTraits>::BindOperation(
+Y_FORCE_INLINE typename TCacheImpl<TTraits>::TOperationView TCacheImpl<TTraits>::BindOperation(
     TSpaceOperation& spaceOp) noexcept {
     return TOperationView(*this, spaceOp);
 }
 
 template <class TTraits>
-Y_FORCE_INLINE typename TSharedCacheImpl<TTraits>::TOperation TSharedCacheImpl<TTraits>::BeginOperation() noexcept {
+Y_FORCE_INLINE typename TCacheImpl<TTraits>::TOperation TCacheImpl<TTraits>::BeginOperation() noexcept {
     return TOperation(*this, Space_->BeginOperation());
 }
 
 using TPageFetch = TPageFetchImpl<>;
 using TCachePageRequest = TCachePageRequestImpl<>;
-using TSharedCache = TSharedCacheImpl<>;
+using TCache = TCacheImpl<>;
 
 // Inline implementations
 
@@ -1281,14 +1281,14 @@ Y_FORCE_INLINE void* TProdTraits::TryGetCache() noexcept {
     NActors::TActorSystem* actorSystem =
         NActors::TlsActivationContext ? NActors::TActivationContext::ActorSystem() : nullptr;
     if (HasAppData(actorSystem)) {
-        const TIntrusivePtr<TSharedCache>& owner = AppData(actorSystem)->SharedCache;
+        const TIntrusivePtr<TCache>& owner = AppData(actorSystem)->SharedCache;
         return owner.Get();
     }
     return nullptr;
 }
 
 template <class TTraits>
-Y_FORCE_INLINE ECacheResultStatus TSharedCacheImpl<TTraits>::Find(
+Y_FORCE_INLINE ECacheResultStatus TCacheImpl<TTraits>::Find(
     TCollectionCacheItem collection, ui64 offset, TCachePageRefImpl<TTraits>& page) noexcept {
     page.Drop();
     auto cacheOp = BeginOperation();
@@ -1301,7 +1301,7 @@ Y_FORCE_INLINE ECacheResultStatus TSharedCacheImpl<TTraits>::Find(
 }
 
 template <class TTraits>
-Y_FORCE_INLINE ECacheResultStatus TSharedCacheImpl<TTraits>::Find(
+Y_FORCE_INLINE ECacheResultStatus TCacheImpl<TTraits>::Find(
     const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept {
     collection.Drop();
     auto cacheOp = BeginOperation();
@@ -1315,7 +1315,7 @@ Y_FORCE_INLINE ECacheResultStatus TSharedCacheImpl<TTraits>::Find(
 
 template <class TTraits>
 template <class TLookup>
-Y_FORCE_INLINE ECacheResultStatus TSharedCacheImpl<TTraits>::Find(
+Y_FORCE_INLINE ECacheResultStatus TCacheImpl<TTraits>::Find(
     TOperationView& cacheOp, TLookup&& lookup, TCacheItemRefImpl<TTraits>& ref) noexcept {
     for (;;) {
         TCacheItem cacheItem;

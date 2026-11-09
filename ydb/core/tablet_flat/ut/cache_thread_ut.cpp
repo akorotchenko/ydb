@@ -21,7 +21,7 @@
 
 namespace NKikimr::NSharedCache {
 
-Y_UNIT_TEST_SUITE(TSharedCacheThreadTest) {
+Y_UNIT_TEST_SUITE(TCacheThreadTest) {
     struct TSample {
         TSpaceHazard* Hazard;
         ui32 Worker;
@@ -221,7 +221,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheThreadTest) {
         void OnAfterStart(NActors::TActorSystem&) override {
             State_.CreatedLate = State_.Started.WaitT(TDuration::Seconds(30));
             TCacheCapacityConfig capacity;
-            if (TryCalculateSharedCacheFootprint(5, 4096, 0, Threads_.ThreadCount(), capacity)) {
+            if (TryCalculateCacheFootprint(5, 4096, 0, Threads_.ThreadCount(), capacity)) {
                 State_.Space = TCacheSpace::Create(capacity, capacity, Threads_);
             }
             State_.Ready.Signal();
@@ -258,9 +258,9 @@ Y_UNIT_TEST_SUITE(TSharedCacheThreadTest) {
         UNIT_ASSERT(!TlsCacheHazard);
         TCacheThreadSubSystem threadHazards(1);
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, 1, capacity));
-        auto cache = TSharedCacheImpl<TTestTraits>::Create(
-            TCacheSpace::Create(capacity, capacity, threadHazards), capacity.Limit);
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
+        auto cache =
+            TCacheImpl<TTestTraits>::Create(TCacheSpace::Create(capacity, capacity, threadHazards), capacity.Limit);
         UNIT_ASSERT(cache);
         TlsCacheHazard = &threadHazards.Hazard();
         Y_DEFER {
@@ -268,7 +268,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheThreadTest) {
         };
         auto operation = cache->BeginOperation();
         UNIT_ASSERT_VALUES_EQUAL(&operation.Hazard(), TlsCacheHazard);
-        UNIT_ASSERT_VALUES_EQUAL(&TSharedCacheImpl<TTestTraits>::Get(), cache.Get());
+        UNIT_ASSERT_VALUES_EQUAL(&TCacheImpl<TTestTraits>::Get(), cache.Get());
     }
 
     struct TCoroState {
@@ -370,7 +370,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheThreadTest) {
         };
         actorSystem.Start();
         TCacheCapacityConfig capacity;
-        UNIT_ASSERT(TryCalculateSharedCacheFootprint(5, 4096, 0, domain->ThreadCount(), capacity));
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, domain->ThreadCount(), capacity));
         state.Space = TCacheSpace::Create(capacity, capacity, *domain);
         UNIT_ASSERT(state.Space);
         const auto actor = actorSystem.Register(new NActors::TActorCoro(MakeHolder<TRegisteredCoro>(state)));

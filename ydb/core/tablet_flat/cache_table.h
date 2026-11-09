@@ -111,15 +111,15 @@ namespace NDetail {
 
 } // namespace NDetail
 
-int CompareSharedCacheKeys(const TCacheKey& left, ui32 leftHash, const TCacheKey& right, ui32 rightHash) noexcept;
+int CompareCacheKeys(const TCacheKey& left, ui32 leftHash, const TCacheKey& right, ui32 rightHash) noexcept;
 
-inline int CompareSharedCacheKeys(const TCacheKey& left, const TCacheKey& right) noexcept {
-    return CompareSharedCacheKeys(left, left.Hash(), right, right.Hash());
+inline int CompareCacheKeys(const TCacheKey& left, const TCacheKey& right) noexcept {
+    return CompareCacheKeys(left, left.Hash(), right, right.Hash());
 }
 
 // The caller owns a fresh handle or has observed its current generation before rewriting its key
-void StoreSharedCacheKey(THandle& handle, const TCacheKey& key) noexcept;
-TCacheKey LoadSharedCacheKey(const THandle& handle, EItemKind kind) noexcept;
+void StoreCacheKey(THandle& handle, const TCacheKey& key) noexcept;
+TCacheKey LoadCacheKey(const THandle& handle, EItemKind kind) noexcept;
 
 template <class TTraits = TProdTraits>
 class TCacheTableImpl {
@@ -140,7 +140,7 @@ public: // Cache table operations
         TBucketResizeState ResizeState;
     };
 
-    explicit TCacheTableImpl(TSharedCacheImpl<TTraits>& cache) noexcept
+    explicit TCacheTableImpl(TCacheImpl<TTraits>& cache) noexcept
         : Cache_(cache)
     {}
 
@@ -271,7 +271,7 @@ private: // Resize helpers
     bool SplitMarkerIsSoleOwner(const TSpaceOperation& spaceOp, TCacheItem marker) const noexcept;
 
 private: // Data members
-    TSharedCacheImpl<TTraits>& Cache_;
+    TCacheImpl<TTraits>& Cache_;
 };
 
 using TCacheItemRef = TCacheItemRefImpl<>;

@@ -138,7 +138,7 @@ namespace NTable {
                 Y_ENSURE(it != needPages.end(), "Got unknown decoder page");
                 needPages.erase(it);
                 SavedPages.at(FetchSlot)[page.Location.Offset] =
-                    TSharedCache::Get().AdmitPage(PageCollections.at(FetchSlot)->PageCollection(), page.Location,
+                    TCache::Get().AdmitPage(PageCollections.at(FetchSlot)->PageCollection(), page.Location,
                         std::move(page.Data), NeedIn(page.Location.Type) || page.Location.Type == EPage::FlatIndex);
             }
 

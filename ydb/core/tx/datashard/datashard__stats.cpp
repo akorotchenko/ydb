@@ -189,7 +189,7 @@ private:
     }
 
     void CheckWorkingSet() const {
-        const auto& cache = TSharedCache::Get();
+        const auto& cache = TCache::Get();
         if (RequestWorkingSet.TotalBytes > cache.CurrentLimit() ||
             RequestWorkingSet.Pages + RetainedCollections.size() > cache.TargetHandleCount() - 2) {
             throw TExTableStatsError(
@@ -202,7 +202,7 @@ private:
         for (const auto& [id, pages] : RequestPad->WorkingSetPages) {
             requirements.push_back({ id, pages });
         }
-        auto& cache = TSharedCache::Get();
+        auto& cache = TCache::Get();
         if (cache.WorkingSetExceedsCapacity(RequestPad->RetainedCollections, requirements)) {
             throw TExTableStatsError(
                 ECode::RESOURCE_ALLOCATION_FAILED, "Statistics page working set does not fit the shared cache");

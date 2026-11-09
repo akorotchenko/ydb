@@ -152,7 +152,7 @@ bool TCacheHotPolicy<TTraits>::ProcessBatchImpl(TSpaceOperation& spaceOp, const 
     for (ui32 index = 0; index < HotLevelCount; ++index) {
         const auto level = static_cast<EHotLevel>(index);
         const TRingView hot = tier.Hot(level);
-        const ui64 attempts = Min<ui64>(hot.Capacity, SharedCacheTransitionWorkBatch / HotLevelCount);
+        const ui64 attempts = Min<ui64>(hot.Capacity, CacheTransitionWorkBatch / HotLevelCount);
         for (ui64 attempt = 0; attempt < attempts; ++attempt) {
             const auto popped = Preload ? Cache_.Eviction_.PopForPreload(spaceOp, hot, false)
                                         : TRingExchangeResult{ nullptr, hot.Pop() };

@@ -68,7 +68,7 @@ template <class TTraits>
 template <bool Preload>
 bool TCacheColdPolicy<TTraits>::ReclaimImpl(TSpaceOperation& spaceOp, const TCacheTierView& tier) noexcept {
     const TRingView cold = tier.Cold();
-    const ui64 attempts = Preload ? Min<ui64>(cold.Capacity, SharedCacheTransitionWorkBatch / 2) : cold.Capacity;
+    const ui64 attempts = Preload ? Min<ui64>(cold.Capacity, CacheTransitionWorkBatch / 2) : cold.Capacity;
     for (ui64 attempt = 0; attempt < attempts; ++attempt) {
         if (tier.Rings->ColdEntries() == 0) {
             return false;

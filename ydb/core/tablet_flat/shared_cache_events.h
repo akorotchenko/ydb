@@ -152,13 +152,13 @@ namespace NKikimr::NSharedCache {
         TVector<TPageLocation> Pages;
         TCollectionCacheItem CacheItem;
 
-        Y_FORCE_INLINE TCachePageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
-            return AddPage(cachePages, std::move(page), sticky, TSharedCache::EPageAdmission::Bounded);
+        Y_FORCE_INLINE TCachePageRef AddPage(TCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
+            return AddPage(cachePages, std::move(page), sticky, TCache::EPageAdmission::Bounded);
         }
 
         Y_FORCE_INLINE TCachePageRef AddWrittenPage(
-            TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
-            return AddPage(cachePages, std::move(page), sticky, TSharedCache::EPageAdmission::Written);
+            TCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
+            return AddPage(cachePages, std::move(page), sticky, TCache::EPageAdmission::Written);
         }
 
         TEvSaveCompactedPages(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection)
@@ -168,8 +168,8 @@ namespace NKikimr::NSharedCache {
     private:
         TCacheCollectionRef Collection_;
 
-        TCachePageRef AddPage(TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky,
-            TSharedCache::EPageAdmission admission);
+        TCachePageRef AddPage(
+            TCache& cachePages, NPageCollection::TPageData&& page, bool sticky, TCache::EPageAdmission admission);
     };
 
     struct TEvRequest : public TEventLocal<TEvRequest, EvRequest> {

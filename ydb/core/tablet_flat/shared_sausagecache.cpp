@@ -134,7 +134,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     TIntrusivePtr<NMemory::IMemoryConsumer> MemoryConsumer;
     TSharedCacheConfig Config;
     TCacheCounters Counters;
-    TIntrusivePtr<TSharedCache> Cache;
+    TIntrusivePtr<TCache> Cache;
     THolder<TCollectionLoadController> CollectionLoads;
     TCacheBTreeWalkController Walks{ *this };
     TPendingInMemoryPages PendingInMemoryPages;
@@ -210,7 +210,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
 
     size_t AllowedFetchPageCount(TArrayRef<const TPageLocation> locations, ui64& bytes) const {
         const ui64 byteLimit = Cache->CurrentLimit();
-        const ui64 pageLimit = Cache->TargetHandleCount() - TSharedCache::RequestHandleOverhead;
+        const ui64 pageLimit = Cache->TargetHandleCount() - TCache::RequestHandleOverhead;
         size_t count = 0;
         bytes = 0;
         // Keep the first page so an insufficient limit uses the normal resource-wait path
@@ -307,35 +307,34 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         Y_ENSURE(threads, "Shared-cache thread records must be prepared before cache initialization");
         const ui32 hazardCount = threads->ThreadCount();
         // Small metadata pages can exhaust handles while the byte budget still has room.
-        ui8 minimumAddressBits = Max<ui8>(MinSharedCacheAddressBits, MinimumAddressBits);
+        ui8 minimumAddressBits = Max<ui8>(MinCacheAddressBits, MinimumAddressBits);
         while (TCacheCapacityConfig{ .AddressBits = minimumAddressBits }.HotSlotCount() <
-               SharedCachePolicyFor<TProdTraits>.MinHotSlots)
+               CachePolicyFor<TProdTraits>.MinHotSlots)
         {
             ++minimumAddressBits;
         }
         TCacheCapacityConfig minimum;
-        if (!TryCalculateSharedCacheFootprint(
-                minimumAddressBits, TSharedCache::ExpectedPageSize, 0, hazardCount, minimum))
+        if (!TryCalculateCacheFootprint(minimumAddressBits, TCache::ExpectedPageSize, 0, hazardCount, minimum))
         {
             return false;
         }
         const ui64 targetLimit = GetTargetCacheHardLimitBytes();
         const ui64 allocationLimit = Max(targetLimit, minimum.TotalBytes);
         TCacheCapacityConfig current;
-        if (!TryCalculateSharedCacheCapacity(allocationLimit, TSharedCache::ExpectedPageSize, 0, hazardCount, current))
+        if (!TryCalculateCacheCapacity(allocationLimit, TCache::ExpectedPageSize, 0, hazardCount, current))
         {
             return false;
         }
         TCacheCapacityConfig reserved;
-        if (!TryCalculateSharedCacheCapacity(GetCacheReservationLimitBytes(allocationLimit),
-                TSharedCache::ExpectedPageSize, 0, hazardCount, reserved)) {
+        if (!TryCalculateCacheCapacity(
+                GetCacheReservationLimitBytes(allocationLimit), TCache::ExpectedPageSize, 0, hazardCount, reserved)) {
             return false;
         }
         auto space = TCacheSpace::Create(current, reserved, *threads);
         TProdTraits traits;
         traits.KeepEvictionActorSystem = TActivationContext::ActorSystem();
         traits.KeepEvictionActor = SelfId();
-        Cache = TSharedCache::Create(std::move(space), targetLimit, std::move(traits));
+        Cache = TCache::Create(std::move(space), targetLimit, std::move(traits));
         if (Cache) {
             Y_ENSURE(Cache->UpdateCurrentLimit(GetTargetCacheCurrentLimitBytes()));
             UpdateSoftLimitOverride();
@@ -461,8 +460,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         if (Cache) {
             const ui64 staticBytes = Cache->StaticBytes();
             const bool pressure = Cache->RetainedBytes() > Cache->RetentionLimit();
-            const ui32 workLimit =
-                pressure || Cache->NeedsCapacityMaintenance() ? SharedCacheTransitionWorkBatch : 1;
+            const ui32 workLimit = pressure || Cache->NeedsCapacityMaintenance() ? CacheTransitionWorkBatch : 1;
             bool moreWork = false;
             for (ui32 work = 0; work < workLimit; ++work) {
                 const bool reclaimed = Cache->EnforceCurrentLimit();
@@ -828,7 +826,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     bool RequestPages(TActorId sender, ui64 eventCookie, NSharedCache::TEvRequest& msg) {
         const TLogoBlobID id = msg.PageCollection->Label();
         TCollection* owner = FindCollection(id);
-        const ui64 maxPageHandles = Cache->TargetHandleCount() - TSharedCache::RequestHandleOverhead;
+        const ui64 maxPageHandles = Cache->TargetHandleCount() - TCache::RequestHandleOverhead;
         if (msg.Pages.size() > maxPageHandles) {
             THashSet<TPageOffset> distinctOffsets;
             distinctOffsets.reserve(msg.Pages.size());
@@ -1172,7 +1170,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             if (!progress) {
                 return false;
             }
-            if (step == SharedCacheTransitionWorkBatch) {
+            if (step == CacheTransitionWorkBatch) {
                 Send(SelfId(), new TEvResourcesAvailable);
                 return false;
             }
@@ -1963,7 +1961,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             }
 
             const ui64 pageLimit =
-                Min<ui64>(MaxPreloadBatchLocations, Cache->TargetHandleCount() - TSharedCache::RequestHandleOverhead);
+                Min<ui64>(MaxPreloadBatchLocations, Cache->TargetHandleCount() - TCache::RequestHandleOverhead);
             TVector<TPageLocation> pagesToRequest;
             ui64 requestBytes = 0;
             bool budgetBlocked = false;

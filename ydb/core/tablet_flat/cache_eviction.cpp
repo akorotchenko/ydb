@@ -20,7 +20,7 @@ TKeepReservation TCacheEviction<TTraits>::ReserveKeepForDemand(TSpaceOperation& 
     if (bytes > KeepLimit() || Cache_.Memory_.KeepLimitPages() == 0) {
         return {};
     }
-    for (ui32 attempt = 0; attempt < SharedCacheTransitionWorkBatch; ++attempt) {
+    for (ui32 attempt = 0; attempt < CacheTransitionWorkBatch; ++attempt) {
         auto reservation = Cache_.Memory_.TryReserveKeep(bytes, KeepLimit());
         if (reservation) {
             return reservation;
@@ -250,7 +250,7 @@ void TCacheEviction<TTraits>::FinishPageErase(TSpaceOperation& spaceOp, TCacheIt
                 handle.Metadata.Page.Crc32));
     }
     Cache_.AdvanceColdMembership(handle);
-    cacheOp.FinishErase(cacheItem, LoadSharedCacheKey(handle, EItemKind::Page));
+    cacheOp.FinishErase(cacheItem, LoadCacheKey(handle, EItemKind::Page));
 }
 
 template <class TTraits>
@@ -299,7 +299,7 @@ bool TCacheEviction<TTraits>::EraseCold(
             !handle.Body.Collection || Cache_.Collections_.IsUnregisteredAndUnreferenced(*handle.Body.Collection));
     }
     const TCacheItem cacheItem = ownerRef.CacheItem();
-    const TCacheKey key = LoadSharedCacheKey(handle, coldState.Kind());
+    const TCacheKey key = LoadCacheKey(handle, coldState.Kind());
     if (coldState.IsPageKind() && pageCollection && pageCollection->GetCacheMode() == ECacheMode::TryKeepInMemory &&
         pageCollection->IsKeepAllowedPage(handle.Metadata.Page.Type))
     {
@@ -486,7 +486,7 @@ bool TCacheEviction<TTraits>::ReclaimRegularPage(TSpaceOperation& spaceOp) noexc
     Y_DEFER {
         preload = false;
     };
-    for (ui32 step = 0; step < SharedCacheTransitionWorkBatch; ++step) {
+    for (ui32 step = 0; step < CacheTransitionWorkBatch; ++step) {
         if (ColdPolicy_.ReclaimForPreload(spaceOp, spaceOp.View().Tiers[ECacheTier::Regular])) {
             return true;
         }

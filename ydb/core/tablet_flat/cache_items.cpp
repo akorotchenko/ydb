@@ -126,7 +126,7 @@ TCollection* TCacheItems<TTraits>::ReleaseTombstone(TSpaceOperation& spaceOp, TC
         }
 
         TCollection* owner = expected.IsPageKind() ? cacheOp.Collections().PageCollection(handle) : nullptr;
-        const TCacheKey key = LoadSharedCacheKey(handle, expected.Kind());
+        const TCacheKey key = LoadCacheKey(handle, expected.Kind());
         cacheOp.FinishErase(cacheItem, key);
         Y_DEBUG_ABORT_UNLESS(!expected.IsCollectionKind() ||
                              handle.Body.Collection->StickyPageListHead.load(std::memory_order_acquire) == 0);
@@ -183,7 +183,7 @@ ui32 TCacheItems<TTraits>::TryAllocateHandle(TSpaceOperation& spaceOp) noexcept 
     auto evictionOp = Cache_.Eviction_.BindOperation(spaceOp);
     // Byte headroom does not guarantee a free handle when pages are much smaller than the expected size.
     // Reclaim Cold, or shrink Hot to feed Cold, before refusing the admission.
-    const ui32 workLimit = static_cast<ui32>(Min<ui64>(spaceOp.HandleCount(), SharedCacheTransitionWorkBatch));
+    const ui32 workLimit = static_cast<ui32>(Min<ui64>(spaceOp.HandleCount(), CacheTransitionWorkBatch));
     for (ui32 attempt = 0; attempt < workLimit; ++attempt) {
         bool progress = evictionOp.ReclaimCold() || evictionOp.ReclaimCold(ECacheTier::Keep);
         if (!progress) {

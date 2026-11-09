@@ -1,4 +1,4 @@
-#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include "flat_page_btree_index.h"
 #include "flat_page_btree_index_writer.h"
 #include "flat_part_walker.h"

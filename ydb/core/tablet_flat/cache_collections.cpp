@@ -991,7 +991,7 @@ bool TCacheCollections<TTraits>::Erase(
         Y_DEBUG_ABORT_UNLESS(handle.NextInOwner.load(std::memory_order_relaxed) == 0);
     }
 
-    const TCacheKey key = LoadSharedCacheKey(handle, EItemKind::Collection);
+    const TCacheKey key = LoadCacheKey(handle, EItemKind::Collection);
     Cache_.Table_.FinishErase(spaceOp, deletionOwner.CacheItem(), key);
     return true;
 }

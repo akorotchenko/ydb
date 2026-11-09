@@ -2,13 +2,13 @@
 
 namespace NKikimr::NSharedCache {
 
-#define SHARED_CACHE_TEMPLATE template <class TTraits>
-#define TSharedCache TSharedCacheImpl<TTraits>
+#define CACHE_TEMPLATE template <class TTraits>
+#define TCache TCacheImpl<TTraits>
 #define TCacheItemRef TCacheItemRefImpl<TTraits>
 #define TOperationItemRef TOperationItemRef<TTraits>
 
-SHARED_CACHE_TEMPLATE
-TCacheItemRef TSharedCache::TryAcquirePageForRelocation(TSpaceOperation& spaceOp, ui32 index) noexcept {
+CACHE_TEMPLATE
+TCacheItemRef TCache::TryAcquirePageForRelocation(TSpaceOperation& spaceOp, ui32 index) noexcept {
     THandle& source = spaceOp.Handles()[index];
     ui64 expectedRaw = source.State.load(std::memory_order_relaxed);
     for (;;) {
@@ -30,8 +30,8 @@ TCacheItemRef TSharedCache::TryAcquirePageForRelocation(TSpaceOperation& spaceOp
     }
 }
 
-SHARED_CACHE_TEMPLATE
-TCacheItem TSharedCache::PreparePageReplacement(TSpaceOperation& spaceOp, TCacheItem sourceItem) noexcept {
+CACHE_TEMPLATE
+TCacheItem TCache::PreparePageReplacement(TSpaceOperation& spaceOp, TCacheItem sourceItem) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     THandle& source = spaceOp.Handles()[sourceItem.Index()];
     const THandleState sourceState = THandleState::FromRaw(source.State.load(std::memory_order_acquire));
@@ -77,8 +77,8 @@ TCacheItem TSharedCache::PreparePageReplacement(TSpaceOperation& spaceOp, TCache
     return replacementItem;
 }
 
-SHARED_CACHE_TEMPLATE
-void TSharedCache::DiscardPageReplacement(TSpaceOperation& spaceOp, TCacheItem replacementItem) noexcept {
+CACHE_TEMPLATE
+void TCache::DiscardPageReplacement(TSpaceOperation& spaceOp, TCacheItem replacementItem) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     THandle& replacement = spaceOp.Handles()[replacementItem.Index()];
     const THandleState state = THandleState::FromRaw(replacement.State.load(std::memory_order_relaxed));
@@ -93,8 +93,8 @@ void TSharedCache::DiscardPageReplacement(TSpaceOperation& spaceOp, TCacheItem r
     cacheOp.DiscardCandidate(replacementItem, EItemKind::Page);
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::PublishPageReplacement(
+CACHE_TEMPLATE
+bool TCache::PublishPageReplacement(
     TSpaceOperation& spaceOp, TCacheItem sourceItem, TCacheItem replacementItem, EHandleState& oldState) noexcept {
     THandle& source = spaceOp.Handles()[sourceItem.Index()];
     THandle& replacement = spaceOp.Handles()[replacementItem.Index()];
@@ -139,14 +139,14 @@ bool TSharedCache::PublishPageReplacement(
         // An insertion that already owned this link may have changed the successor.
     }
     InvokeHook(ECacheHookPoint::AfterReplacingPublished, sourceItem);
-    const TCacheKey key = LoadSharedCacheKey(source, EItemKind::Page);
+    const TCacheKey key = LoadCacheKey(source, EItemKind::Page);
     auto cacheOp = BindOperation(spaceOp);
     cacheOp.PublishPageReplacement(sourceItem, replacementItem, key);
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-void TSharedCache::CompletePageReplacement(TSpaceOperation& spaceOp, TCacheItem sourceItem) noexcept {
+CACHE_TEMPLATE
+void TCache::CompletePageReplacement(TSpaceOperation& spaceOp, TCacheItem sourceItem) noexcept {
     THandle& source = spaceOp.Handles()[sourceItem.Index()];
     ui64 expectedRaw = source.State.load(std::memory_order_relaxed);
     for (;;) {
@@ -163,8 +163,8 @@ void TSharedCache::CompletePageReplacement(TSpaceOperation& spaceOp, TCacheItem 
     }
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::RelocatePage(TSpaceOperation& spaceOp, ui32 index) noexcept {
+CACHE_TEMPLATE
+bool TCache::RelocatePage(TSpaceOperation& spaceOp, ui32 index) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     TOperationItemRef sourceRef(spaceOp, cacheOp.TryAcquirePageForRelocation(index));
     if (!sourceRef) {
@@ -192,8 +192,8 @@ bool TSharedCache::RelocatePage(TSpaceOperation& spaceOp, ui32 index) noexcept {
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::DemoteUnlinkedStickyPage(TSpaceOperation& spaceOp, ui32 index) noexcept {
+CACHE_TEMPLATE
+bool TCache::DemoteUnlinkedStickyPage(TSpaceOperation& spaceOp, ui32 index) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     TOperationItemRef pageRef(spaceOp, cacheOp.TryAcquirePageForRelocation(index));
     if (!pageRef) {
@@ -237,8 +237,8 @@ bool TSharedCache::DemoteUnlinkedStickyPage(TSpaceOperation& spaceOp, ui32 index
     }
 }
 
-SHARED_CACHE_TEMPLATE
-EShrinkCutStatus TSharedCache::ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui32 index) noexcept {
+CACHE_TEMPLATE
+EShrinkCutStatus TCache::ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui32 index) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     const THandleState state = THandleState::FromRaw(spaceOp.Handles()[index].State.load(std::memory_order_acquire));
     if (state.IsFree()) {
@@ -307,31 +307,31 @@ EShrinkCutStatus TSharedCache::ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui3
 
 #undef TOperationItemRef
 #undef TCacheItemRef
-#undef TSharedCache
-#undef SHARED_CACHE_TEMPLATE
+#undef TCache
+#undef CACHE_TEMPLATE
 
 // Native relocation and shrink kernels are instantiated here for both trait variants
 
-template TCacheItemRefImpl<TProdTraits> TSharedCacheImpl<TProdTraits>::TryAcquirePageForRelocation(
+template TCacheItemRefImpl<TProdTraits> TCacheImpl<TProdTraits>::TryAcquirePageForRelocation(
     TSpaceOperation&, ui32) noexcept;
-template TCacheItem TSharedCacheImpl<TProdTraits>::PreparePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
-template void TSharedCacheImpl<TProdTraits>::DiscardPageReplacement(TSpaceOperation&, TCacheItem) noexcept;
-template bool TSharedCacheImpl<TProdTraits>::PublishPageReplacement(
+template TCacheItem TCacheImpl<TProdTraits>::PreparePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
+template void TCacheImpl<TProdTraits>::DiscardPageReplacement(TSpaceOperation&, TCacheItem) noexcept;
+template bool TCacheImpl<TProdTraits>::PublishPageReplacement(
     TSpaceOperation&, TCacheItem, TCacheItem, EHandleState&) noexcept;
-template void TSharedCacheImpl<TProdTraits>::CompletePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
-template bool TSharedCacheImpl<TProdTraits>::RelocatePage(TSpaceOperation&, ui32) noexcept;
-template bool TSharedCacheImpl<TProdTraits>::DemoteUnlinkedStickyPage(TSpaceOperation&, ui32) noexcept;
-template EShrinkCutStatus TSharedCacheImpl<TProdTraits>::ReclaimShrinkHandle(TSpaceOperation&, ui32) noexcept;
+template void TCacheImpl<TProdTraits>::CompletePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
+template bool TCacheImpl<TProdTraits>::RelocatePage(TSpaceOperation&, ui32) noexcept;
+template bool TCacheImpl<TProdTraits>::DemoteUnlinkedStickyPage(TSpaceOperation&, ui32) noexcept;
+template EShrinkCutStatus TCacheImpl<TProdTraits>::ReclaimShrinkHandle(TSpaceOperation&, ui32) noexcept;
 
-template TCacheItemRefImpl<TTestTraits> TSharedCacheImpl<TTestTraits>::TryAcquirePageForRelocation(
+template TCacheItemRefImpl<TTestTraits> TCacheImpl<TTestTraits>::TryAcquirePageForRelocation(
     TSpaceOperation&, ui32) noexcept;
-template TCacheItem TSharedCacheImpl<TTestTraits>::PreparePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
-template void TSharedCacheImpl<TTestTraits>::DiscardPageReplacement(TSpaceOperation&, TCacheItem) noexcept;
-template bool TSharedCacheImpl<TTestTraits>::PublishPageReplacement(
+template TCacheItem TCacheImpl<TTestTraits>::PreparePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
+template void TCacheImpl<TTestTraits>::DiscardPageReplacement(TSpaceOperation&, TCacheItem) noexcept;
+template bool TCacheImpl<TTestTraits>::PublishPageReplacement(
     TSpaceOperation&, TCacheItem, TCacheItem, EHandleState&) noexcept;
-template void TSharedCacheImpl<TTestTraits>::CompletePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
-template bool TSharedCacheImpl<TTestTraits>::RelocatePage(TSpaceOperation&, ui32) noexcept;
-template bool TSharedCacheImpl<TTestTraits>::DemoteUnlinkedStickyPage(TSpaceOperation&, ui32) noexcept;
-template EShrinkCutStatus TSharedCacheImpl<TTestTraits>::ReclaimShrinkHandle(TSpaceOperation&, ui32) noexcept;
+template void TCacheImpl<TTestTraits>::CompletePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
+template bool TCacheImpl<TTestTraits>::RelocatePage(TSpaceOperation&, ui32) noexcept;
+template bool TCacheImpl<TTestTraits>::DemoteUnlinkedStickyPage(TSpaceOperation&, ui32) noexcept;
+template EShrinkCutStatus TCacheImpl<TTestTraits>::ReclaimShrinkHandle(TSpaceOperation&, ui32) noexcept;
 
 } // namespace NKikimr::NSharedCache

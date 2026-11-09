@@ -139,7 +139,7 @@ namespace {
 
         ui64 RegisteredCollections() {
             ui64 count = 0;
-            TSharedCache::Get().ForEachCollection([&](TCollection&) {
+            TCache::Get().ForEachCollection([&](TCollection&) {
                 ++count;
             });
             return count;
@@ -173,7 +173,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
 
     Y_UNIT_TEST(CompositeLoadRejectsItsOwnRetainedMetadataPrefix) {
         TCollectionFixture fixture(128_KB);
-        const ui64 capacity = TSharedCache::Get().TargetHandleCount() - 2;
+        const ui64 capacity = TCache::Get().TargetHandleCount() - 2;
         auto workingSet = MakeIntrusive<TCollectionLoadWorkingSet>();
         TVector<TMetadata> metadata;
         for (ui32 index = 0; index <= capacity; ++index) {
@@ -211,7 +211,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
 
     Y_UNIT_TEST(OversizedWaiterDoesNotFailAFeasibleCoalescedPeer) {
         TCollectionFixture fixture(128_KB);
-        const ui64 capacity = TSharedCache::Get().TargetHandleCount() - 2;
+        const ui64 capacity = TCache::Get().TargetHandleCount() - 2;
         auto oversized = MakeIntrusive<TCollectionLoadWorkingSet>();
         TVector<TCacheCollectionRef> held;
         for (ui32 index = 0; index < capacity; ++index) {
@@ -246,7 +246,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
 
     Y_UNIT_TEST(WorkingSetGrowthWakesAResourceBlockedRequest) {
         TCollectionFixture fixture(128_KB);
-        const ui64 capacity = TSharedCache::Get().TargetHandleCount() - 2;
+        const ui64 capacity = TCache::Get().TargetHandleCount() - 2;
         TVector<TCacheCollectionRef> held;
         for (ui32 index = 0; index < capacity; ++index) {
             const auto metadata = fixture.Metadata(index + 1);
@@ -275,7 +275,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         fixture.Reply(fixture.Read(metadata), metadata);
         auto retained = fixture.Result();
         auto workingSet = MakeIntrusive<TCollectionLoadWorkingSet>();
-        for (ui32 index = 0; index < TSharedCache::Get().TargetHandleCount(); ++index) {
+        for (ui32 index = 0; index < TCache::Get().TargetHandleCount(); ++index) {
             workingSet->AddCollection(fixture.Metadata(index + 1).Descriptor.Lead);
         }
         const auto workers = fixture.ReadWorkers.size();
@@ -288,7 +288,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
 
     Y_UNIT_TEST(SmallerCapacityRechecksAResourceBlockedWorkingSet) {
         TCollectionFixture fixture;
-        auto& cache = TSharedCache::Get();
+        auto& cache = TCache::Get();
         const ui64 capacity = cache.TargetHandleCount() - 2;
         auto workingSet = MakeIntrusive<TCollectionLoadWorkingSet>();
         TVector<TCacheCollectionRef> held;
@@ -383,8 +383,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         }, TDuration::Seconds(5));
 
         TCacheCollectionRef retained;
-        UNIT_ASSERT(TSharedCache::Get().FindCollection(metadata.Descriptor.Lead, retained) ==
-                    ECacheCollectionLookupStatus::Hit);
+        UNIT_ASSERT(
+            TCache::Get().FindCollection(metadata.Descriptor.Lead, retained) == ECacheCollectionLookupStatus::Hit);
         observer.Remove();
         for (auto& release : releases) {
             fixture.Runtime.Send(release.Release(), 0, true);
@@ -405,7 +405,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         auto retained = std::move(result->Get()->Collection);
         result.Reset();
 
-        auto& cache = TSharedCache::Get();
+        auto& cache = TCache::Get();
         TVector<TCacheCollectionRef> held;
         for (ui32 cookie = 100; cache.AvailableHandleCount() != 0; ++cookie) {
             auto item = fixture.Metadata(cookie);
@@ -432,7 +432,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         auto packet =
             MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
         const auto location = packet->GetLocation(0);
-        auto& cache = TSharedCache::Get();
+        auto& cache = TCache::Get();
         TEvSaveCompactedPages writer(packet);
         UNIT_ASSERT(cache.UpdateCurrentLimit(1));
         UNIT_ASSERT(
@@ -456,14 +456,14 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         {
             TEvSaveCompactedPages writer(packet);
             page = writer.AddWrittenPage(
-                TSharedCache::Get(), NPageCollection::TPageData(location, TSharedData::Copy(TString(64, 'x'))), true);
+                TCache::Get(), NPageCollection::TPageData(location, TSharedData::Copy(TString(64, 'x'))), true);
             UNIT_ASSERT(page);
             fixture.Drain();
             UNIT_ASSERT_VALUES_EQUAL(fixture.RegisteredCollections(), 1);
             TCacheCollectionRef retained;
-            UNIT_ASSERT(TSharedCache::Get().FindCollection(metadata.Descriptor.Lead, retained) ==
-                        ECacheCollectionLookupStatus::Hit);
-            UNIT_ASSERT(!TSharedCache::Get().TryDetachReleasedCollection(retained));
+            UNIT_ASSERT(
+                TCache::Get().FindCollection(metadata.Descriptor.Lead, retained) == ECacheCollectionLookupStatus::Hit);
+            UNIT_ASSERT(!TCache::Get().TryDetachReleasedCollection(retained));
             UNIT_ASSERT(page.IsSticky());
         }
         fixture.Drain();
@@ -482,22 +482,22 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         UNIT_ASSERT(first->Get()->Request == known);
         auto* canonical = first->Get()->Collection.Get();
         const auto item = first->Get()->Collection.CacheItem();
-        UNIT_ASSERT(TSharedCache::Get().DetachCollection(item));
-        UNIT_ASSERT(TSharedCache::Get().EraseCollection(item));
+        UNIT_ASSERT(TCache::Get().DetachCollection(item));
+        UNIT_ASSERT(TCache::Get().EraseCollection(item));
         first.Reset();
 
         auto packet =
             MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
-        auto replacement = TSharedCache::Get().AdmitCollection(packet);
+        auto replacement = TCache::Get().AdmitCollection(packet);
         UNIT_ASSERT(replacement.CacheItem() != item);
-        UNIT_ASSERT(TSharedCache::Get().DetachCollection(replacement.CacheItem()));
+        UNIT_ASSERT(TCache::Get().DetachCollection(replacement.CacheItem()));
         auto newUnknown = fixture.Load(metadata, ECollectionLoadKind::Unknown, 3);
         auto newKnown = fixture.Load(metadata, ECollectionLoadKind::Regular, 4);
         auto current = fixture.Result();
         UNIT_ASSERT(current->Get()->Request == newKnown);
         UNIT_ASSERT(current->Get()->Collection.Get() == replacement.Get());
         UNIT_ASSERT(current->Get()->Collection.Get() != canonical);
-        UNIT_ASSERT(TSharedCache::Get().DetachCollection(replacement.CacheItem()));
+        UNIT_ASSERT(TCache::Get().DetachCollection(replacement.CacheItem()));
 
         UNIT_ASSERT(unknown->Resolve(ECollectionLoadKind::Regular));
         fixture.Update(unknown);
@@ -521,13 +521,13 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         fixture.Reply(fixture.Read(metadata), metadata);
         auto old = fixture.Result();
         const auto item = old->Get()->Collection.CacheItem();
-        UNIT_ASSERT(TSharedCache::Get().DetachCollection(item));
-        UNIT_ASSERT(TSharedCache::Get().EraseCollection(item));
+        UNIT_ASSERT(TCache::Get().DetachCollection(item));
+        UNIT_ASSERT(TCache::Get().EraseCollection(item));
         old.Reset();
 
         TCollectionCacheItem replacement;
         TCacheCollectionRef found;
-        UNIT_ASSERT(TSharedCache::Get().FindOrInsert({ .Id = metadata.Descriptor.Lead }, replacement, found) ==
+        UNIT_ASSERT(TCache::Get().FindOrInsert({ .Id = metadata.Descriptor.Lead }, replacement, found) ==
                     ECacheResultStatus::Inserted);
         TVector<TEvCollectionReady::TPtr> hints;
         auto hintObserver = fixture.Runtime.AddObserver<TEvCollectionReady>([&hints](TEvCollectionReady::TPtr& event) {
@@ -542,7 +542,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
 
         auto packet =
             MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
-        UNIT_ASSERT(TSharedCache::Get().MakeReady(replacement, TSharedCache::Get().PrepareCollection(packet)));
+        UNIT_ASSERT(TCache::Get().MakeReady(replacement, TCache::Get().PrepareCollection(packet)));
         auto result = fixture.Result();
         UNIT_ASSERT(result->Get()->Request == fresh);
         UNIT_ASSERT(result->Get()->Collection.CacheItem() == replacement);
@@ -567,8 +567,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         request->Cancel();
         fixture.Update(request);
         fixture.Drain();
-        UNIT_ASSERT(TSharedCache::Get().DetachCollection(item));
-        UNIT_ASSERT(TSharedCache::Get().EraseCollection(item));
+        UNIT_ASSERT(TCache::Get().DetachCollection(item));
+        UNIT_ASSERT(TCache::Get().EraseCollection(item));
         replies.Unblock();
         auto result = fixture.Result();
         UNIT_ASSERT(result->Get()->Request == request);
@@ -696,8 +696,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         fixture.Drain();
         UNIT_ASSERT_VALUES_EQUAL(fixture.Results, 1);
         TCacheCollectionRef found;
-        UNIT_ASSERT(
-            TSharedCache::Get().FindCollection(metadata.Descriptor.Lead, found) == ECacheCollectionLookupStatus::Hit);
+        UNIT_ASSERT(TCache::Get().FindCollection(metadata.Descriptor.Lead, found) == ECacheCollectionLookupStatus::Hit);
         UNIT_ASSERT(found.Get() == result->Get()->Collection.Get());
     }
 
@@ -709,7 +708,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         auto result = fixture.Result();
         fixture.Drain();
         const ui64 bytes = result->Get()->Collection->PageCollection()->GetMetadataMemoryUsage();
-        UNIT_ASSERT_VALUES_EQUAL(TSharedCache::Get().StorageBytes(), bytes);
+        UNIT_ASSERT_VALUES_EQUAL(TCache::Get().StorageBytes(), bytes);
     }
 
     Y_UNIT_TEST(WriterWinsAndLateParsedCandidateCannotOverwriteIt) {
@@ -722,19 +721,19 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
             return loaded.size() == 1;
         }, TDuration::Seconds(5));
         const ui64 losingBytes = loaded.front()->Get()->PageCollection->GetMetadataMemoryUsage();
-        UNIT_ASSERT_VALUES_EQUAL(TSharedCache::Get().StorageBytes(), losingBytes);
+        UNIT_ASSERT_VALUES_EQUAL(TCache::Get().StorageBytes(), losingBytes);
         auto writer =
             MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
         writer->SetSkipBTreeIndexV1Shadow(true);
-        auto canonical = TSharedCache::Get().AdmitCollection(writer);
+        auto canonical = TCache::Get().AdmitCollection(writer);
         const ui64 canonicalBytes = writer->GetMetadataMemoryUsage();
-        UNIT_ASSERT_VALUES_EQUAL(TSharedCache::Get().StorageBytes(), losingBytes + canonicalBytes);
+        UNIT_ASSERT_VALUES_EQUAL(TCache::Get().StorageBytes(), losingBytes + canonicalBytes);
         auto result = fixture.Result();
         UNIT_ASSERT(result->Get()->Request == request);
         UNIT_ASSERT(result->Get()->Collection.Get() == canonical.Get());
         loaded.Unblock();
         fixture.Drain();
-        UNIT_ASSERT_VALUES_EQUAL(TSharedCache::Get().StorageBytes(), canonicalBytes);
+        UNIT_ASSERT_VALUES_EQUAL(TCache::Get().StorageBytes(), canonicalBytes);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Results, 1);
         UNIT_ASSERT(result->Get()->Collection->PageCollection()->SkipBTreeIndexV1Shadow());
         UNIT_ASSERT_VALUES_EQUAL(fixture.ReadWorkers.size(), 1);
@@ -746,7 +745,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         const auto metadata = fixture.Metadata();
         TCollectionCacheItem item;
         TCacheCollectionRef found;
-        UNIT_ASSERT(TSharedCache::Get().FindOrInsert({ .Id = metadata.Descriptor.Lead }, item, found) ==
+        UNIT_ASSERT(TCache::Get().FindOrInsert({ .Id = metadata.Descriptor.Lead }, item, found) ==
                     ECacheResultStatus::Inserted);
         TVector<TEvCollectionReady::TPtr> hints;
         auto hintObserver = fixture.Runtime.AddObserver<TEvCollectionReady>([&hints](TEvCollectionReady::TPtr& event) {
@@ -757,7 +756,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Results, 0);
         auto packet =
             MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
-        UNIT_ASSERT(TSharedCache::Get().MakeReady(item, TSharedCache::Get().PrepareCollection(packet)));
+        UNIT_ASSERT(TCache::Get().MakeReady(item, TCache::Get().PrepareCollection(packet)));
         auto result = fixture.Result();
         UNIT_ASSERT(result->Get()->Request == request);
         UNIT_ASSERT(result->Get()->Collection.CacheItem() == item);
@@ -962,13 +961,13 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         fixture.Reply(fixture.Read(metadata), metadata);
         auto old = fixture.Result(NKikimrProto::OK, other);
         const auto item = old->Get()->Collection.CacheItem();
-        UNIT_ASSERT(TSharedCache::Get().DetachCollection(item));
-        UNIT_ASSERT(TSharedCache::Get().EraseCollection(item));
+        UNIT_ASSERT(TCache::Get().DetachCollection(item));
+        UNIT_ASSERT(TCache::Get().EraseCollection(item));
         old.Reset();
 
         TCollectionCacheItem replacement;
         TCacheCollectionRef found;
-        UNIT_ASSERT(TSharedCache::Get().FindOrInsert({ .Id = metadata.Descriptor.Lead }, replacement, found) ==
+        UNIT_ASSERT(TCache::Get().FindOrInsert({ .Id = metadata.Descriptor.Lead }, replacement, found) ==
                     ECacheResultStatus::Inserted);
         TVector<TEvCollectionReady::TPtr> hints;
         auto hintObserver = fixture.Runtime.AddObserver<TEvCollectionReady>([&hints](TEvCollectionReady::TPtr& event) {
@@ -982,7 +981,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         UNIT_ASSERT(!retained->IsActive() && fresh->IsActive());
         auto packet =
             MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
-        UNIT_ASSERT(TSharedCache::Get().MakeReady(replacement, TSharedCache::Get().PrepareCollection(packet)));
+        UNIT_ASSERT(TCache::Get().MakeReady(replacement, TCache::Get().PrepareCollection(packet)));
         auto result = fixture.Result(NKikimrProto::OK, other);
         UNIT_ASSERT(result->Get()->Request == fresh);
         UNIT_ASSERT(result->Get()->Collection.CacheItem() == replacement);
@@ -1007,8 +1006,8 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         fixture.Send(new TEvUnregister);
         fixture.Drain();
         UNIT_ASSERT_VALUES_EQUAL(replies.size(), 1);
-        UNIT_ASSERT(TSharedCache::Get().DetachCollection(item));
-        UNIT_ASSERT(TSharedCache::Get().EraseCollection(item));
+        UNIT_ASSERT(TCache::Get().DetachCollection(item));
+        UNIT_ASSERT(TCache::Get().EraseCollection(item));
         replies.Unblock();
         auto result = fixture.Result();
         UNIT_ASSERT(result->Get()->Request == request);

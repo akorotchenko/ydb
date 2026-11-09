@@ -17,23 +17,23 @@ namespace NKikimr::NSharedCache {
 
 class TCacheSpace;
 template <class TTraits>
-class TSharedCacheImpl;
+class TCacheImpl;
 
 inline constexpr ui64 MaxSpaceGeneration = Max<ui32>();
-inline constexpr ui32 SharedCacheTransitionWorkBatch = 256;
+inline constexpr ui32 CacheTransitionWorkBatch = 256;
 
-inline constexpr ui8 MinSharedCacheAddressBits = 5;
-inline constexpr ui8 MaxSharedCacheAddressBits = 32;
+inline constexpr ui8 MinCacheAddressBits = 5;
+inline constexpr ui8 MaxCacheAddressBits = 32;
 
-constexpr ui32 SharedCacheBucketMask(ui8 addressBits) noexcept {
+constexpr ui32 CacheBucketMask(ui8 addressBits) noexcept {
     return static_cast<ui32>((ui64{ 1 } << addressBits) - 1);
 }
 
-constexpr ui64 SharedCacheBucketCount(ui8 addressBits) noexcept {
+constexpr ui64 CacheBucketCount(ui8 addressBits) noexcept {
     return ui64{ 1 } << addressBits;
 }
 
-constexpr bool SharedCacheHotLayoutIsValid(ui64 hotSlotCount) noexcept {
+constexpr bool CacheHotLayoutIsValid(ui64 hotSlotCount) noexcept {
     const ui64 l3Size = hotSlotCount / 15;
     const ui64 l2Size = (hotSlotCount * 2) / 15;
     const ui64 l1Size = (hotSlotCount * 5) / 15;
@@ -83,7 +83,7 @@ struct TCacheCapacityConfig {
     bool HasValidTierCapacity() const noexcept;
 
     constexpr ui64 HandleCount() const noexcept {
-        return SharedCacheBucketCount(AddressBits);
+        return CacheBucketCount(AddressBits);
     }
 
     constexpr ui64 BucketCount() const noexcept {
@@ -359,7 +359,7 @@ public:
     constexpr TSpaceState() noexcept = default;
 
     static constexpr TSpaceState Make(ui32 generation, ui8 addressBits) noexcept {
-        return FromRaw((ui64(generation) << GenerationShift) | SharedCacheBucketMask(addressBits));
+        return FromRaw((ui64(generation) << GenerationShift) | CacheBucketMask(addressBits));
     }
 
     static constexpr TSpaceState FromRaw(ui64 raw) noexcept {
@@ -395,7 +395,7 @@ public:
     }
 
     constexpr TSpaceState WithAddressBits(ui8 addressBits) const noexcept {
-        return FromRaw((Raw_ & GenerationMask) | SharedCacheBucketMask(addressBits));
+        return FromRaw((Raw_ & GenerationMask) | CacheBucketMask(addressBits));
     }
 
     constexpr TSpaceState BeginResize() const noexcept {
@@ -522,10 +522,10 @@ private:
     bool CapacityAbandoned_ = false;
 };
 
-bool TryCalculateSharedCacheFootprint(
+bool TryCalculateCacheFootprint(
     ui8 addressBits, ui64 expectedPageSize, ui64 fixedBytes, ui32 hazardCount, TCacheCapacityConfig& result) noexcept;
 
-bool TryCalculateSharedCacheCapacity(
+bool TryCalculateCacheCapacity(
     ui64 limit, ui64 expectedPageSize, ui64 fixedBytes, ui32 hazardCount, TCacheCapacityConfig& result) noexcept;
 
 // Keeps handle, bucket and ring mappings alive; page data needs its own owner.
@@ -760,7 +760,7 @@ public:
 private:
     friend class TCacheThreadTestAccess;
     template <class TTraits>
-    friend class TSharedCacheImpl;
+    friend class TCacheImpl;
     friend class TCacheSpaceTestAccess;
     friend class TCacheTestAccess;
     friend class TSpaceOperation;
@@ -1063,7 +1063,7 @@ inline bool TCacheSpace::FinalDrain(
         return false;
     }
 
-    ui32 remainingSlots = SharedCacheTransitionWorkBatch;
+    ui32 remainingSlots = CacheTransitionWorkBatch;
     const ui64 oldHandleCount = transition.OldConfiguration_.HandleCount();
     const ui64 targetHandleCount = transition.TargetConfiguration_.HandleCount();
     while (remainingSlots != 0 && transition.FinalDrainStage_ != ESpaceMap::Done) {

@@ -43,8 +43,7 @@ bool TCollectionRequest::TryComplete() noexcept {
     return !Cancelled_.load(std::memory_order_acquire) && !Completed_.exchange(true, std::memory_order_acq_rel);
 }
 
-TCollectionLoadController::TCollectionLoadController(
-    TSharedCache& cache, const TActorId& owner, TCollectionLoadLimits limits)
+TCollectionLoadController::TCollectionLoadController(TCache& cache, const TActorId& owner, TCollectionLoadLimits limits)
     : Cache_(cache)
     , Owner_(owner)
     , Limits_(limits)

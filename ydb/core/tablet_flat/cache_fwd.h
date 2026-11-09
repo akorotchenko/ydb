@@ -17,7 +17,7 @@ enum class ECacheCollectionLookupStatus {
 
 struct TProdTraits;
 template <class TTraits>
-class TSharedCacheImpl;
+class TCacheImpl;
 
 template <class TTraits>
 class TCacheOperation;
@@ -31,7 +31,7 @@ template <class TTraits>
 class TCacheEvictionOperation;
 template <class TTraits>
 class TCacheFetchesOperation;
-using TSharedCache = TSharedCacheImpl<TProdTraits>;
+using TCache = TCacheImpl<TProdTraits>;
 
 template <class TTraits>
 class TCachePageRefImpl;
@@ -48,7 +48,7 @@ using TPageFetch = TPageFetchImpl<TProdTraits>;
 
 namespace NKikimr {
 
-using NSharedCache::TSharedCache;
+using NSharedCache::TCache;
 using NSharedCache::TCacheCollectionRef;
 using NSharedCache::TCachePageRef;
 

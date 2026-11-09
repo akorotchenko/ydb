@@ -141,7 +141,7 @@ namespace NTest {
             auto* data = storedPart->Store->GetPage(slot, location.Offset);
             auto* collection = storedPart->GetPageCollection(slot);
             const auto actual = collection->GetLocation(ResolvePageId(part, location, slot));
-            return TSharedCache::Get().AdmitPage(storedPart->PageColls.at(slot), actual, TSharedData(*data));
+            return TCache::Get().AdmitPage(storedPart->PageColls.at(slot), actual, TSharedData(*data));
         }
 
         ui32 ResolvePageId(const TPart *part, const TPageLocation& location, ui32 slot) const {

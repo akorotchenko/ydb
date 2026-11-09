@@ -19,7 +19,7 @@ struct TCollectionLocation {
 };
 
 template <class TTraits>
-class TSharedCacheImpl;
+class TCacheImpl;
 
 using ECacheMode = NTable::NPage::ECacheMode;
 
@@ -160,7 +160,7 @@ private:
     friend class TCacheItems;
 
     template <class>
-    friend class TSharedCacheImpl;
+    friend class TCacheImpl;
 
     std::atomic<TCollectionActorState*> ActorState_{ nullptr };
     const TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;

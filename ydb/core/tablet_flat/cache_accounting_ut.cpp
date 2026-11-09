@@ -95,7 +95,7 @@ namespace {
 
 } // namespace
 
-Y_UNIT_TEST_SUITE(TSharedCacheAccounting) {
+Y_UNIT_TEST_SUITE(TCacheAccountingTest) {
     Y_UNIT_TEST(EmptyBufferHasNoAllocationCharge) {
         TCacheAccounting accounting;
         accounting.AccountBuffer({});

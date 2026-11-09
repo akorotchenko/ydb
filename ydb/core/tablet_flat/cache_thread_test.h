@@ -66,7 +66,7 @@ public:
     }
 
     template <class TTraits>
-    static TSpaceHazard& Hazard(const TSharedCacheImpl<TTraits>& cache, ui32 index = 0) {
+    static TSpaceHazard& Hazard(const TCacheImpl<TTraits>& cache, ui32 index = 0) {
         return Hazard(*cache.Space_, index);
     }
 

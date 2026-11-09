@@ -1,4 +1,4 @@
-#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include <ydb/core/tablet_flat/flat_part_shrink.h>
 #include <ydb/core/tablet_flat/test/libs/rows/tool.h>
 #include <ydb/core/tablet_flat/test/libs/rows/mass.h>

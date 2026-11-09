@@ -1,4 +1,4 @@
-#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
 
 #include <library/cpp/testing/unittest/registar.h>
@@ -84,16 +84,15 @@ namespace {
         bool AllowFetch = false;
 
         TWalkHostMock() {
-            Collection =
-                TSharedCache::Get().AdmitCollection(MakeIntrusiveConst<TPageCollectionStub>(TLogoBlobID(1, 1, 1)));
+            Collection = TCache::Get().AdmitCollection(MakeIntrusiveConst<TPageCollectionStub>(TLogoBlobID(1, 1, 1)));
             Collection->EnsureActorState();
-            auto& cache = TSharedCache::Get();
+            auto& cache = TCache::Get();
             UNIT_ASSERT(cache.SetCollectionPagesCacheMode(Collection.CacheItem(), ECacheMode::Regular));
         }
 
         void KeepCollection(const TActorId& owner) {
             Collection->GetActorState()->InMemoryOwners.insert(owner);
-            auto& cache = TSharedCache::Get();
+            auto& cache = TCache::Get();
             UNIT_ASSERT(cache.SetCollectionPagesCacheMode(Collection.CacheItem(), ECacheMode::TryKeepInMemory));
         }
 

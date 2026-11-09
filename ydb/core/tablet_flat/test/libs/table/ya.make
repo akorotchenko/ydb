@@ -2,7 +2,7 @@ LIBRARY()
 
 SRCS(
     misc.cpp
-    shared_cache_context.cpp
+    cache_context.cpp
 )
 
 PEERDIR(

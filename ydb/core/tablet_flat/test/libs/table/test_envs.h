@@ -204,16 +204,14 @@ namespace NTest {
                 {
                     for (auto &fetchEntry: IndexFetch) {
                         auto* pageData = Store->GetPage(IndexRoom, fetchEntry.Offset);
-                        auto ref =
-                            TSharedCache::Get().AdmitPage(IndexPageCollection, fetchEntry, TSharedData(*pageData));
+                        auto ref = TCache::Get().AdmitPage(IndexPageCollection, fetchEntry, TSharedData(*pageData));
                         PageLoadingLogic->Fill(std::move(ref), fetchEntry.Type);
                     }
                 }
                 {
                     for (auto &fetchEntry: GroupFetch) {
                         auto* pageData = Store->GetPage(GroupRoom, fetchEntry.Offset);
-                        auto ref =
-                            TSharedCache::Get().AdmitPage(GroupPageCollection, fetchEntry, TSharedData(*pageData));
+                        auto ref = TCache::Get().AdmitPage(GroupPageCollection, fetchEntry, TSharedData(*pageData));
                         PageLoadingLogic->Fill(std::move(ref), fetchEntry.Type);
                     }
                 }

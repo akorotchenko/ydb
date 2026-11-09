@@ -69,7 +69,7 @@ TCacheMapping& TCacheSpace::RingMapping(ESpaceMap mapping) noexcept {
 }
 
 bool TCacheCapacityConfig::HasValidTierCapacity() const noexcept {
-    if (AddressBits < MinSharedCacheAddressBits || AddressBits > MaxSharedCacheAddressBits) {
+    if (AddressBits < MinCacheAddressBits || AddressBits > MaxCacheAddressBits) {
         return false;
     }
     ui64 hot = 0;
@@ -140,9 +140,9 @@ TCacheItem TCacheSpace::TakeSpareForShrink(ui64 allocationLimit) noexcept {
     return {};
 }
 
-bool TryCalculateSharedCacheFootprint(
+bool TryCalculateCacheFootprint(
     ui8 addressBits, ui64 expectedPageSize, ui64 fixedBytes, ui32 hazardCount, TCacheCapacityConfig& result) noexcept {
-    if (addressBits < MinSharedCacheAddressBits || addressBits > MaxSharedCacheAddressBits || expectedPageSize == 0) {
+    if (addressBits < MinCacheAddressBits || addressBits > MaxCacheAddressBits || expectedPageSize == 0) {
         return false;
     }
 
@@ -194,13 +194,13 @@ bool TryCalculateSharedCacheFootprint(
     return true;
 }
 
-bool TryCalculateSharedCacheCapacity(
+bool TryCalculateCacheCapacity(
     ui64 limit, ui64 expectedPageSize, ui64 fixedBytes, ui32 hazardCount, TCacheCapacityConfig& result) noexcept {
     bool found = false;
     TCacheCapacityConfig best;
-    for (ui32 addressBits = MinSharedCacheAddressBits; addressBits <= MaxSharedCacheAddressBits; ++addressBits) {
+    for (ui32 addressBits = MinCacheAddressBits; addressBits <= MaxCacheAddressBits; ++addressBits) {
         TCacheCapacityConfig footprint;
-        if (!TryCalculateSharedCacheFootprint(
+        if (!TryCalculateCacheFootprint(
                 static_cast<ui8>(addressBits), expectedPageSize, fixedBytes, hazardCount, footprint) ||
             footprint.TotalBytes > limit)
         {
@@ -230,8 +230,8 @@ THolder<TCacheSpace> TCacheSpace::Create(
 bool TCacheSpace::Initialize(
     const TCacheCapacityConfig& current, const TCacheCapacityConfig& reserved, const TCacheThreadSubSystem& threads)
 {
-    if (current.AddressBits < MinSharedCacheAddressBits || current.AddressBits > MaxSharedCacheAddressBits ||
-        reserved.AddressBits < current.AddressBits || reserved.AddressBits > MaxSharedCacheAddressBits ||
+    if (current.AddressBits < MinCacheAddressBits || current.AddressBits > MaxCacheAddressBits ||
+        reserved.AddressBits < current.AddressBits || reserved.AddressBits > MaxCacheAddressBits ||
         current.ExpectedPageSize == 0 || current.ExpectedPageSize != reserved.ExpectedPageSize ||
         current.FixedBytes != reserved.FixedBytes || current.Limit < current.TotalBytes ||
         reserved.Limit < reserved.TotalBytes || reserved.Limit < current.Limit || !current.HasValidTierCapacity() ||

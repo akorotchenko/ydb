@@ -96,14 +96,14 @@ public:
         try {
             NSharedCache::TCacheCapacityConfig capacity;
             constexpr ui32 hazards = 1;
-            Y_ENSURE(NSharedCache::TryCalculateSharedCacheCapacity(
-                cacheBytes, NSharedCache::TSharedCache::ExpectedPageSize, 0, hazards, capacity));
-            while (capacity.HotSlotCount() < NSharedCache::SharedCachePolicyFor<NSharedCache::TProdTraits>.MinHotSlots)
+            Y_ENSURE(NSharedCache::TryCalculateCacheCapacity(
+                cacheBytes, NSharedCache::TCache::ExpectedPageSize, 0, hazards, capacity));
+            while (capacity.HotSlotCount() < NSharedCache::CachePolicyFor<NSharedCache::TProdTraits>.MinHotSlots)
             {
-                Y_ENSURE(NSharedCache::TryCalculateSharedCacheFootprint(static_cast<ui8>(capacity.AddressBits + 1),
-                    NSharedCache::TSharedCache::ExpectedPageSize, 0, hazards, capacity));
+                Y_ENSURE(NSharedCache::TryCalculateCacheFootprint(static_cast<ui8>(capacity.AddressBits + 1),
+                    NSharedCache::TCache::ExpectedPageSize, 0, hazards, capacity));
             }
-            auto core = NSharedCache::TSharedCache::Create(
+            auto core = NSharedCache::TCache::Create(
                 NSharedCache::TCacheSpace::Create(capacity, capacity, CacheThreads_), cacheBytes);
             Y_ENSURE(core);
             Y_ENSURE(core->UpdateSoftLimitOverride(0));
@@ -138,7 +138,7 @@ public:
     {}
 
     ~TOfflinePages() override {
-        auto& cache = TSharedCache::Get();
+        auto& cache = TCache::Get();
         for (auto& [_, entry] : Cache) {
             if (entry.Collection) {
                 cache.DetachCollection(entry.Collection.CacheItem());
@@ -149,7 +149,7 @@ public:
     TCacheCollectionRef AdmitCollection(NPageCollection::TLargeGlobId id, TSharedData meta) {
         auto& entry = Cache[id.Lead];
         if (!entry.Collection) {
-            entry.Collection = TSharedCache::Get().AdmitCollection(
+            entry.Collection = TCache::Get().AdmitCollection(
                 MakeIntrusiveConst<NPageCollection::TPageCollection>(std::move(id), std::move(meta)));
         }
         return entry.Collection.Acquire();
@@ -227,7 +227,7 @@ public:
             return {};
         }
 
-        auto& cache = TSharedCache::Get();
+        auto& cache = TCache::Get();
         NSharedCache::TCacheCollectionRef collection;
         TCachePageRef page;
         if (cache.Find(label, collection) == NSharedCache::ECacheResultStatus::Hit &&

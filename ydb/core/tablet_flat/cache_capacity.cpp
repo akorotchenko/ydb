@@ -110,7 +110,7 @@ bool TCacheCapacity<TTraits>::StartTransition() noexcept {
     const bool growing = current.AddressBits < Target_.AddressBits;
     const ui8 nextBits = growing ? current.AddressBits + 1 : current.AddressBits - 1;
     TCacheCapacityConfig next;
-    if (!TryCalculateSharedCacheFootprint(
+    if (!TryCalculateCacheFootprint(
             nextBits, current.ExpectedPageSize, current.FixedBytes, Cache_.Space_->HazardCount(), next)) {
         return false;
     }
@@ -217,7 +217,7 @@ EShrinkCutStatus TCacheCapacity<TTraits>::ReclaimShrinkCut() noexcept {
         index = allocationLimit;
         transition.CutBlocked_ = false;
     }
-    const ui64 end = Min(handleCount, index + SharedCacheTransitionWorkBatch);
+    const ui64 end = Min(handleCount, index + CacheTransitionWorkBatch);
     while (index < end) {
         switch (Cache_.ReclaimShrinkHandle(spaceOp, static_cast<ui32>(index))) {
             case EShrinkCutStatus::Progress:

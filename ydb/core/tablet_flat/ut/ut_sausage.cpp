@@ -1,4 +1,4 @@
-#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include "cache.h"
 #include <ydb/core/tablet_flat/flat_sausage_align.h>
 #include <ydb/core/tablet_flat/flat_sausage_meta.h>
@@ -718,7 +718,7 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
                 }
                 auto page = location;
                 page.Type = NTable::NPage::EPage::DataPage;
-                return TSharedCache::Get().AdmitPage(Collection, page, TSharedData(it->second));
+                return TCache::Get().AdmitPage(Collection, page, TSharedData(it->second));
             }
 
             TCachePageRef TryGetIndexPage(

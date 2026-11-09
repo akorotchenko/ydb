@@ -271,7 +271,7 @@ void WaitEvent(TMyEnvBase& env, ui32 eventType, ui32 requiredCount = 1) {
 void WakeupSharedCache(TMyEnvBase& env);
 
 void RestartAndClearCache(TMyEnvBase& env, ui64 memoryLimit = Max<ui64>()) {
-    auto* core = &NSharedCache::TSharedCache::Get();
+    auto* core = &NSharedCache::TCache::Get();
     env.SendSync(new TEvents::TEvPoison, false, true);
     env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0));
     WaitEvent(env, NMemory::EvConsumerLimit);
@@ -318,7 +318,7 @@ void WakeupSharedCache(TMyEnvBase& env) {
 }
 
 void AssertResidentWithinLimit(TMyEnvBase& env, const THolder<TCacheCounters>& counters, ui64 limit) {
-    auto* core = &NSharedCache::TSharedCache::Get();
+    auto* core = &NSharedCache::TCache::Get();
     UNIT_ASSERT(core);
     const i64 softBound = static_cast<i64>(limit + (limit ? 1_MB : 0));
     const ui64 currentBound = core->CurrentLimit() + 1_MB;
@@ -389,7 +389,7 @@ Y_UNIT_TEST(Limits) {
     UNIT_ASSERT_LE(counters->ActiveLimitBytes->Val(), static_cast<i64>(32_MB));
     UNIT_ASSERT_VALUES_EQUAL(counters->MemLimitBytes->Val(), 100_MB);
 
-    auto* core = &NSharedCache::TSharedCache::Get();
+    auto* core = &NSharedCache::TCache::Get();
     const ui64 currentLimit = core->CurrentLimit();
 
     env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(6_MB));
@@ -465,7 +465,7 @@ Y_UNIT_TEST(Limits_Config) {
     env->Send(MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(1_MB));
     WaitEvent(env, NMemory::EvConsumerLimit);
     AssertResidentWithinLimit(env, counters, 1_MB);
-    auto* core = &NSharedCache::TSharedCache::Get();
+    auto* core = &NSharedCache::TCache::Get();
     UNIT_ASSERT_VALUES_EQUAL(core->CurrentLimit(), 2_MB);
     UNIT_ASSERT_VALUES_EQUAL(core->SoftLimit(), 1_MB);
     UNIT_ASSERT_VALUES_EQUAL(counters->MemLimitBytes->Val(), 1_MB);
@@ -1205,7 +1205,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Basics) {
     Cerr << "...waiting until first table compacted" << Endl;
     env.WaitFor<NFake::TEvCompacted>();
 
-    auto* core = &NSharedCache::TSharedCache::Get();
+    auto* core = &NSharedCache::TCache::Get();
     UNIT_ASSERT(core);
     UNIT_ASSERT_VALUES_EQUAL(core->SoftLimit(), softLimit);
     UNIT_ASSERT_VALUES_EQUAL(core->CurrentLimit(), hardLimit);
@@ -1792,7 +1792,7 @@ Y_UNIT_TEST(TryKeepInMemoryMode_Enabling) {
     Cerr << "...waiting until first table compacted" << Endl;
     env.WaitFor<NFake::TEvCompacted>();
 
-    auto* core = &NSharedCache::TSharedCache::Get();
+    auto* core = &NSharedCache::TCache::Get();
     UNIT_ASSERT(core);
     UNIT_ASSERT_VALUES_EQUAL(core->SoftLimit(), softLimit);
     UNIT_ASSERT_VALUES_EQUAL(core->CurrentLimit(), hardLimit);
@@ -2413,7 +2413,7 @@ Y_UNIT_TEST(ReviewR40TransactionHandleWorkingSetIsRejectedEndToEnd) {
     init->CompactionPolicy->MinDataPageSize = 128;
     env.SendSync(new NFake::TEvExecute{ init.Release() });
     SetupSharedCache(env, 128_KB, true, 0, 0);
-    auto& cache = TSharedCache::Get();
+    auto& cache = TCache::Get();
     const ui64 handleLimit = cache.TargetHandleCount() - 2;
     const ui32 rows = handleLimit + 32;
     for (ui32 key = 0; key < rows; ++key) {
@@ -2429,7 +2429,7 @@ Y_UNIT_TEST(ReviewR40TransactionHandleWorkingSetIsRejectedEndToEnd) {
     auto requests = env.Env.AddObserver<NSharedCache::TEvRequest>([&](auto& ev) {
         if (ev->Get()->WaitPad) {
             UNIT_ASSERT(ev->Get()->WaitPad->RetainedCollections.empty());
-            UNIT_ASSERT_LE(ev->Get()->Pages.size(), cache.TargetHandleCount() - TSharedCache::RequestHandleOverhead);
+            UNIT_ASSERT_LE(ev->Get()->Pages.size(), cache.TargetHandleCount() - TCache::RequestHandleOverhead);
         }
     });
     auto results = env.Env.AddObserver<NSharedCache::TEvResult>([&](auto& ev) {

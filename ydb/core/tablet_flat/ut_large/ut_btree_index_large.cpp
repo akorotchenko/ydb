@@ -1,4 +1,4 @@
-#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include "test/libs/table/test_writer.h"
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
 #include <library/cpp/testing/unittest/registar.h>

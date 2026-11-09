@@ -58,7 +58,7 @@ void TBlockIO::Inbox(TEventHandlePtr &eh)
         for (auto& page: Pages) {
             BlockStates.emplace_back(page.Size);
             if (Collection) {
-                auto& cache = NSharedCache::TSharedCache::Get();
+                auto& cache = NSharedCache::TCache::Get();
                 if (page.Type == NTable::NPage::EPage::Globs) {
                     cache.AccountMetadataBuffer(BlockStates.back().Data);
                 } else {

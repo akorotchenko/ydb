@@ -29,7 +29,7 @@ bool TProdTraits::InstallCache(void* cache) noexcept {
         return false;
     }
     auto& owner = AppData()->SharedCache;
-    auto* core = static_cast<TSharedCache*>(cache);
+    auto* core = static_cast<TCache*>(cache);
     if (owner && owner.Get() != core) {
         return false;
     }
@@ -72,14 +72,14 @@ void TProdTraits::NotifyResourcesAvailable() const noexcept {
     }
 }
 
-#define SHARED_CACHE_TEMPLATE template <class TTraits>
-#define TSharedCache TSharedCacheImpl<TTraits>
+#define CACHE_TEMPLATE template <class TTraits>
+#define TCache TCacheImpl<TTraits>
 #define TCacheItemRef TCacheItemRefImpl<TTraits>
 #define TCacheCollectionRef TCacheCollectionRefImpl<TTraits>
 #define TOperationItemRef TOperationItemRef<TTraits>
 
-SHARED_CACHE_TEMPLATE
-TSharedCache::TSharedCacheImpl(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits)
+CACHE_TEMPLATE
+TCache::TCacheImpl(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits)
     : TTraits(std::move(traits))
     , Space_(std::move(space))
     , Table_(*this)
@@ -93,14 +93,14 @@ TSharedCache::TSharedCacheImpl(THolder<TCacheSpace> space, ui64 hardLimit, TTrai
           .Context = this,
           .Function =
               [](void* context) noexcept {
-                  static_cast<TSharedCache*>(context)->NotifyResourcesAvailable();
+                  static_cast<TCache*>(context)->NotifyResourcesAvailable();
               },
       })
 {
     Space_->HazardDrainNotify_ = {
         .Context = this,
         .Function = [](void* context) noexcept {
-            static_cast<TSharedCache*>(context)->NotifyResourcesAvailable();
+            static_cast<TCache*>(context)->NotifyResourcesAvailable();
         },
     };
     if constexpr (std::is_same_v<TTraits, TTestTraits>) {
@@ -111,8 +111,8 @@ TSharedCache::TSharedCacheImpl(THolder<TCacheSpace> space, ui64 hardLimit, TTrai
     RefreshSoftLimit();
 }
 
-SHARED_CACHE_TEMPLATE
-TIntrusivePtr<TSharedCache> TSharedCache::Create(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits)
+CACHE_TEMPLATE
+TIntrusivePtr<TCache> TCache::Create(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits)
 {
     if (!space || hardLimit == 0 || hardLimit > space->ReservedConfiguration().Limit) {
         return {};
@@ -127,16 +127,16 @@ TIntrusivePtr<TSharedCache> TSharedCache::Create(THolder<TCacheSpace> space, ui6
                          Policy_.KeepMaxShare < 1.0 && Policy_.ResizeStep > 0.0 && Policy_.ResizeStep <= 1.0 &&
                          Policy_.MinHotSlots > 0 && Policy_.MinResizeStep > 0 &&
                          Policy_.MinHotSlots <= space->CurrentConfiguration().HotSlotCount() &&
-                         SharedCacheHotLayoutIsValid(Policy_.MinHotSlots));
-    TIntrusivePtr<TSharedCache> cache(new TSharedCache(std::move(space), hardLimit, std::move(traits)));
+                         CacheHotLayoutIsValid(Policy_.MinHotSlots));
+    TIntrusivePtr<TCache> cache(new TCache(std::move(space), hardLimit, std::move(traits)));
     if (!TTraits::InstallCache(cache.Get())) {
         return {};
     }
     return cache;
 }
 
-SHARED_CACHE_TEMPLATE
-TSharedCache::~TSharedCacheImpl() {
+CACHE_TEMPLATE
+TCache::~TCacheImpl() {
     // The actor system may already be destroyed when terminal sweeping releases payloads
     Memory_.DisarmResourceWait();
     const TSpaceView& space = Space_->SpaceView(Space_->CurrentSpaceState());
@@ -168,8 +168,8 @@ TSharedCache::~TSharedCacheImpl() {
     }
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::MatchesCandidateMetadata(
+CACHE_TEMPLATE
+bool TCache::MatchesCandidateMetadata(
     const TSpaceOperation& spaceOp, TCacheItem candidate, TCacheItem existing) const noexcept {
     const THandle& candidateHandle = spaceOp.Handles()[candidate.Index()];
     const THandle& existingHandle = spaceOp.Handles()[existing.Index()];
@@ -186,8 +186,8 @@ bool TSharedCache::MatchesCandidateMetadata(
                candidateHandle.Metadata.Page.Crc32 == existingHandle.Metadata.Page.Crc32);
 }
 
-SHARED_CACHE_TEMPLATE
-ui32 TSharedCache::AdvanceColdMembership(THandle& handle) noexcept {
+CACHE_TEMPLATE
+ui32 TCache::AdvanceColdMembership(THandle& handle) noexcept {
     ui32 expected = handle.ColdVersion.load(std::memory_order_relaxed);
     for (;;) {
         const ui32 desired = AdvanceColdVersion(expected & MaxItemVersion);
@@ -199,9 +199,9 @@ ui32 TSharedCache::AdvanceColdMembership(THandle& handle) noexcept {
     }
 }
 
-SHARED_CACHE_TEMPLATE
-TPageCacheItem TSharedCache::AllocatePage(TCollectionCacheItem collection, ui64 offset, ui64 size,
-    NTable::NPage::EPage type, ui32 crc32, EStickyState sticky) noexcept {
+CACHE_TEMPLATE
+TPageCacheItem TCache::AllocatePage(TCollectionCacheItem collection, ui64 offset, ui64 size, NTable::NPage::EPage type,
+    ui32 crc32, EStickyState sticky) noexcept {
     Y_DEBUG_ABORT_UNLESS(type != NTable::NPage::EPage::Undef);
     Y_DEBUG_ABORT_UNLESS(sticky == EStickyState::None || sticky == EStickyState::Sticky);
     const ui64 bytes = TCacheItems<TTraits>::AccountedPageBytes(size);
@@ -218,8 +218,8 @@ TPageCacheItem TSharedCache::AllocatePage(TCollectionCacheItem collection, ui64 
     return TPageCacheItem::FromValidated(cacheItem);
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::SetCollectionPagesCacheMode(TCollectionCacheItem collection, ECacheMode mode) noexcept {
+CACHE_TEMPLATE
+bool TCache::SetCollectionPagesCacheMode(TCollectionCacheItem collection, ECacheMode mode) noexcept {
     auto cacheOp = BeginOperation();
     TOperationItemRef collectionRef(cacheOp, cacheOp.TryAcquireStructural(collection.CacheItem()));
     if (!collectionRef) {
@@ -233,8 +233,8 @@ bool TSharedCache::SetCollectionPagesCacheMode(TCollectionCacheItem collection, 
     return cacheOp.Collections().SetPagesCacheMode(*handle.Body.Collection, mode);
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::SetCollectionSkipBTreeIndexV1Shadow(TCollectionCacheItem collection, bool skip) noexcept {
+CACHE_TEMPLATE
+bool TCache::SetCollectionSkipBTreeIndexV1Shadow(TCollectionCacheItem collection, bool skip) noexcept {
     auto cacheOp = BeginOperation();
     TOperationItemRef ref(cacheOp, cacheOp.TryAcquireStructural(collection.CacheItem()));
     if (!ref) {
@@ -248,8 +248,8 @@ bool TSharedCache::SetCollectionSkipBTreeIndexV1Shadow(TCollectionCacheItem coll
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::CanAllocateHandles(TArrayRef<const TCacheHandleRequirement> requirements) noexcept {
+CACHE_TEMPLATE
+bool TCache::CanAllocateHandles(TArrayRef<const TCacheHandleRequirement> requirements) noexcept {
     auto cacheOp = BeginOperation();
     ui64 missing = 0;
     THashMap<TLogoBlobID, THashSet<ui64>> seen;
@@ -278,8 +278,8 @@ bool TSharedCache::CanAllocateHandles(TArrayRef<const TCacheHandleRequirement> r
     return missing <= cacheOp.SpaceOperation().AvailableHandleCount();
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheItem> retainedCollections,
+CACHE_TEMPLATE
+bool TCache::WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheItem> retainedCollections,
     TArrayRef<const TCacheHandleRequirement> requirements) noexcept {
     auto cacheOp = BeginOperation();
     const ui64 handleLimit = TargetHandleCount() - 2;
@@ -324,16 +324,16 @@ bool TSharedCache::WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheIte
     return exceeds && handleLimit == TargetHandleCount() - 2 && byteLimit == CurrentLimit();
 }
 
-SHARED_CACHE_TEMPLATE
-THolder<TCollection> TSharedCache::PrepareCollection(
+CACHE_TEMPLATE
+THolder<TCollection> TCache::PrepareCollection(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, ECacheMode mode) {
     Y_ENSURE(collection);
     AccountMetadata(*collection);
     return THolder<TCollection>(new TCollection(std::move(collection), mode));
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::MakeReady(
+CACHE_TEMPLATE
+bool TCache::MakeReady(
     TCollectionCacheItem collection, THolder<TCollection>&& value, TCacheCollectionRef& ready) noexcept {
     auto cacheOp = BeginOperation();
     TOperationItemRef publisher(cacheOp, cacheOp.TryAcquireStructural(collection.CacheItem()));
@@ -345,8 +345,8 @@ bool TSharedCache::MakeReady(
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::TryDetachReleasedCollection(const TCacheCollectionRef& collection) noexcept {
+CACHE_TEMPLATE
+bool TCache::TryDetachReleasedCollection(const TCacheCollectionRef& collection) noexcept {
     if (!collection) {
         return false;
     }
@@ -354,8 +354,8 @@ bool TSharedCache::TryDetachReleasedCollection(const TCacheCollectionRef& collec
     return cacheOp.Collections().DetachReleased(Collections_.Registry(), collection.CacheItem().CacheItem());
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* registry, TCacheItem cacheItem,
+CACHE_TEMPLATE
+bool TCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* registry, TCacheItem cacheItem,
     THolder<TCollection>&& value) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     Y_DEBUG_ABORT_UNLESS(value);
@@ -363,7 +363,7 @@ bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* regi
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     Y_DEBUG_ABORT_UNLESS(cacheItem.Matches(state) && state.IsCollectionKind() && state.IsBegin());
-    Y_DEBUG_ABORT_UNLESS(LoadSharedCacheKey(handle, EItemKind::Collection) == TCacheKey::Collection(value->Id()));
+    Y_DEBUG_ABORT_UNLESS(LoadCacheKey(handle, EItemKind::Collection) == TCacheKey::Collection(value->Id()));
     Y_DEBUG_ABORT_UNLESS(handle.Metadata.PayloadBytes == value->AccountedBytes());
 
     const TLogoBlobID id = value->Id();
@@ -384,9 +384,9 @@ bool TSharedCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* regi
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-void TSharedCache::MakeReadyState(TSpaceOperation& spaceOp, TCacheItem item, EHandleState readyState,
-    TCollection* pageOwner, TKeepReservation* keepReservation) noexcept {
+CACHE_TEMPLATE
+void TCache::MakeReadyState(TSpaceOperation& spaceOp, TCacheItem item, EHandleState readyState, TCollection* pageOwner,
+    TKeepReservation* keepReservation) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     THandle& handle = spaceOp.Handles()[item.Index()];
     ui64 raw = handle.State.load(std::memory_order_relaxed);
@@ -477,8 +477,8 @@ void TSharedCache::MakeReadyState(TSpaceOperation& spaceOp, TCacheItem item, EHa
     }
 }
 
-SHARED_CACHE_TEMPLATE
-TCollectionCacheItem TSharedCache::AllocateCollection(const TLogoBlobID& id, ui64 bytes) noexcept {
+CACHE_TEMPLATE
+TCollectionCacheItem TCache::AllocateCollection(const TLogoBlobID& id, ui64 bytes) noexcept {
     Y_DEBUG_ABORT_UNLESS(bytes == 0);
     auto cacheOp = BeginOperation();
     const TCacheItem cacheItem = cacheOp.TryAllocateReservedItem(bytes);
@@ -489,8 +489,8 @@ TCollectionCacheItem TSharedCache::AllocateCollection(const TLogoBlobID& id, ui6
     return TCollectionCacheItem::FromValidated(cacheItem);
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::IsPageSticky(TPageCacheItem page) const noexcept {
+CACHE_TEMPLATE
+bool TCache::IsPageSticky(TPageCacheItem page) const noexcept {
     auto spaceOp = Space_->BeginOperation();
     TCacheItem item = page.CacheItem();
     for (;;) {
@@ -520,8 +520,8 @@ bool TSharedCache::IsPageSticky(TPageCacheItem page) const noexcept {
     }
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::AcquirePage(TPageCacheItem page, TCachePageRefImpl<TTraits>& result) noexcept {
+CACHE_TEMPLATE
+bool TCache::AcquirePage(TPageCacheItem page, TCachePageRefImpl<TTraits>& result) noexcept {
     result.Drop();
     auto cacheOp = BeginOperation();
     auto ref = AcquirePageItem(cacheOp.SpaceOperation(), page);
@@ -532,8 +532,8 @@ bool TSharedCache::AcquirePage(TPageCacheItem page, TCachePageRefImpl<TTraits>& 
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-TCacheItemRef TSharedCache::AcquirePageItem(TSpaceOperation& spaceOp, TPageCacheItem page) noexcept {
+CACHE_TEMPLATE
+TCacheItemRef TCache::AcquirePageItem(TSpaceOperation& spaceOp, TPageCacheItem page) noexcept {
     TCacheItem cacheItem = page.CacheItem();
     auto cacheOp = BindOperation(spaceOp);
     for (;;) {
@@ -577,8 +577,8 @@ TCacheItemRef TSharedCache::AcquirePageItem(TSpaceOperation& spaceOp, TPageCache
     }
 }
 
-SHARED_CACHE_TEMPLATE
-ECacheCollectionLookupStatus TSharedCache::FindCollection(
+CACHE_TEMPLATE
+ECacheCollectionLookupStatus TCache::FindCollection(
     TCollectionRegistry& registry, const TLogoBlobID& id, TCacheCollectionRef& collection) noexcept {
     collection.Drop();
     auto cacheOp = BeginOperation();
@@ -611,8 +611,8 @@ ECacheCollectionLookupStatus TSharedCache::FindCollection(
     }
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::AttachCollection(
+CACHE_TEMPLATE
+bool TCache::AttachCollection(
     TSpaceOperation& spaceOp, TCollectionRegistry& registry, const TCacheItemRef& ref) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     const TCacheItem item = ref.CacheItem();
@@ -624,8 +624,8 @@ bool TSharedCache::AttachCollection(
     return cacheOp.Collections().Attach(registry, item);
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate) noexcept {
+CACHE_TEMPLATE
+bool TCache::PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     const ui64 reservedBytes = TCacheItems<TTraits>::AccountedPageBytes(candidate.Size);
     bool reserved = true;
@@ -685,8 +685,8 @@ bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandida
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TCollectionInsertCandidate& candidate) noexcept {
+CACHE_TEMPLATE
+bool TCache::PrepareCandidate(TSpaceOperation& spaceOp, TCollectionInsertCandidate& candidate) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     Y_DEBUG_ABORT_UNLESS(candidate.Bytes == 0);
     const TCacheItem cacheItem = cacheOp.TryAllocateReservedItem(candidate.Bytes);
@@ -699,16 +699,16 @@ bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TCollectionInsertC
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::PrepareCandidate(TSpaceOperation& spaceOp, TCollectionValueCandidate& candidate) {
+CACHE_TEMPLATE
+bool TCache::PrepareCandidate(TSpaceOperation& spaceOp, TCollectionValueCandidate& candidate) {
     if (!candidate.Value) {
         candidate.Value = PrepareCollection(candidate.PageCollection, ECacheMode::Regular);
     }
     return PrepareCandidate(spaceOp, static_cast<TCollectionInsertCandidate&>(candidate));
 }
 
-SHARED_CACHE_TEMPLATE
-typename TSharedCache::TPageInsertCandidate TSharedCache::BuildPageInsertCandidate(
+CACHE_TEMPLATE
+typename TCache::TPageInsertCandidate TCache::BuildPageInsertCandidate(
     TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page, EStickyState sticky) noexcept {
     return {
         .Key = TCacheKey::Page(collection, static_cast<ui64>(page.Offset)),
@@ -719,8 +719,8 @@ typename TSharedCache::TPageInsertCandidate TSharedCache::BuildPageInsertCandida
     };
 }
 
-SHARED_CACHE_TEMPLATE
-ECacheResultStatus TSharedCache::FindOrInsert(TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page,
+CACHE_TEMPLATE
+ECacheResultStatus TCache::FindOrInsert(TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page,
     EStickyState sticky, TPageCacheItem& inserted, TCachePageRefImpl<TTraits>& hit) noexcept {
     Y_DEBUG_ABORT_UNLESS(page && page.Type != NTable::NPage::EPage::Undef);
     Y_DEBUG_ABORT_UNLESS(sticky == EStickyState::None || sticky == EStickyState::Sticky);
@@ -744,8 +744,8 @@ ECacheResultStatus TSharedCache::FindOrInsert(TCollectionCacheItem collection, c
     Y_UNREACHABLE();
 }
 
-SHARED_CACHE_TEMPLATE
-ECacheResultStatus TSharedCache::FindOrInsertPage(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate,
+CACHE_TEMPLATE
+ECacheResultStatus TCache::FindOrInsertPage(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate,
     TIntrusivePtr<TPageFetchWaiter> waiter, TCachePageRefImpl<TTraits>& hit, TPageFetchImpl<TTraits>& fetch) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     hit.Drop();
@@ -790,8 +790,8 @@ ECacheResultStatus TSharedCache::FindOrInsertPage(TSpaceOperation& spaceOp, TPag
     Y_UNREACHABLE();
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollection& collection,
+CACHE_TEMPLATE
+bool TCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollection& collection,
     TArrayRef<TCachePageRequestImpl<TTraits>> requests, TVector<TPageInsertCandidate>& candidates,
     ui64& reservedBytes) noexcept {
     auto cacheOp = BindOperation(spaceOp);
@@ -827,8 +827,8 @@ bool TSharedCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollection& colle
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& collection,
+CACHE_TEMPLATE
+bool TCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& collection,
     TVector<TPageInsertCandidate>& candidates, ui64 reservedBytes, bool waitForMemory,
     EPageAdmission admission) noexcept {
     auto cacheOp = BindOperation(spaceOp);
@@ -896,10 +896,9 @@ bool TSharedCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& coll
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
-    TArrayRef<TCachePageRequestImpl<TTraits>> requests, bool recordStats, bool waitForMemory,
-    EPageAdmission admission) noexcept {
+CACHE_TEMPLATE
+bool TCache::FindOrInsertBatch(TCollectionCacheItem collection, TArrayRef<TCachePageRequestImpl<TTraits>> requests,
+    bool recordStats, bool waitForMemory, EPageAdmission admission) noexcept {
     if (requests.empty()) {
         return true;
     }
@@ -968,8 +967,8 @@ bool TSharedCache::FindOrInsertBatch(TCollectionCacheItem collection,
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-ECacheResultStatus TSharedCache::FindOrInsert(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
+CACHE_TEMPLATE
+ECacheResultStatus TCache::FindOrInsert(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
     THolder<TCollection>& value, TCollectionCacheItem& inserted, TCacheCollectionRef& hit) {
     Y_DEBUG_ABORT_UNLESS(!value || value->PageCollection() == collection);
     inserted = {};
@@ -979,8 +978,8 @@ ECacheResultStatus TSharedCache::FindOrInsert(TIntrusiveConstPtr<NPageCollection
     return FindOrInsertCollection(cacheOp.SpaceOperation(), &Collections_.Registry(), candidate, inserted, hit);
 }
 
-SHARED_CACHE_TEMPLATE
-ECacheResultStatus TSharedCache::FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
+CACHE_TEMPLATE
+ECacheResultStatus TCache::FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
     const TCollectionLocation& collection, TCollectionCacheItem& inserted, TCacheCollectionRef& hit) noexcept {
     TCollectionInsertCandidate candidate{
         .Key = TCacheKey::Collection(collection.Id),
@@ -989,9 +988,9 @@ ECacheResultStatus TSharedCache::FindOrInsertCollection(TSpaceOperation& spaceOp
     return FindOrInsertCollection(spaceOp, registry, candidate, inserted, hit);
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 template <class TCandidate>
-ECacheResultStatus TSharedCache::FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
+ECacheResultStatus TCache::FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
     TCandidate& candidate, TCollectionCacheItem& inserted,
     TCacheCollectionRef& hit) noexcept(noexcept(PrepareCandidate(spaceOp, candidate))) {
     auto cacheOp = BindOperation(spaceOp);
@@ -1008,9 +1007,9 @@ ECacheResultStatus TSharedCache::FindOrInsertCollection(TSpaceOperation& spaceOp
     return status;
 }
 
-SHARED_CACHE_TEMPLATE
+CACHE_TEMPLATE
 template <class TKeyedCandidate>
-ECacheResultStatus TSharedCache::FindOrInsert(TSpaceOperation& spaceOp, TKeyedCandidate& candidate,
+ECacheResultStatus TCache::FindOrInsert(TSpaceOperation& spaceOp, TKeyedCandidate& candidate,
     TCacheItemRef& ref) noexcept(noexcept(PrepareCandidate(spaceOp, candidate))) {
     auto cacheOp = BindOperation(spaceOp);
     for (;;) {
@@ -1060,8 +1059,8 @@ ECacheResultStatus TSharedCache::FindOrInsert(TSpaceOperation& spaceOp, TKeyedCa
     }
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) noexcept {
+CACHE_TEMPLATE
+bool TCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     if (bytes == 0 && pages == 0) {
         return true;
@@ -1075,7 +1074,7 @@ bool TSharedCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) 
             Eviction_.MarkSoftLimitPressure();
             // Aging/resizing can make progress without freeing bytes. Bound cooperative work so
             // concurrent activity cannot keep a requester here instead of putting it on the wait path.
-            if (reclamationAttempts == SharedCacheTransitionWorkBatch) {
+            if (reclamationAttempts == CacheTransitionWorkBatch) {
                 NotifyResourcesAvailable();
                 return false;
             }
@@ -1093,23 +1092,23 @@ bool TSharedCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) 
     }
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::UpdateHardLimit(ui64 limit) noexcept {
+CACHE_TEMPLATE
+bool TCache::UpdateHardLimit(ui64 limit) noexcept {
     if (limit == 0 || limit < CurrentLimit() || limit > ReservationLimit()) {
         return false;
     }
 
     const TCacheCapacityConfig& current = Space_->CurrentConfiguration();
     TCacheCapacityConfig target;
-    ui8 minimumAddressBits = MinSharedCacheAddressBits;
+    ui8 minimumAddressBits = MinCacheAddressBits;
     while (TCacheCapacityConfig{ .AddressBits = minimumAddressBits }.HotSlotCount() < Policy_.MinHotSlots) {
         ++minimumAddressBits;
     }
-    if (!TryCalculateSharedCacheCapacity(
+    if (!TryCalculateCacheCapacity(
             limit, current.ExpectedPageSize, current.FixedBytes, Space_->HazardCount(), target) ||
         target.AddressBits < minimumAddressBits)
     {
-        if (!TryCalculateSharedCacheFootprint(
+        if (!TryCalculateCacheFootprint(
                 minimumAddressBits, current.ExpectedPageSize, current.FixedBytes, Space_->HazardCount(), target)) {
             return false;
         }
@@ -1125,8 +1124,8 @@ bool TSharedCache::UpdateHardLimit(ui64 limit) noexcept {
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::DrainHotResize() noexcept {
+CACHE_TEMPLATE
+bool TCache::DrainHotResize() noexcept {
     if (auto hotResize = HotResize_.TryLock()) {
         auto cacheOp = BeginOperation();
         return cacheOp.Eviction().DrainHotResize();
@@ -1134,8 +1133,8 @@ bool TSharedCache::DrainHotResize() noexcept {
     return false;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::ReclaimSpareHandle() noexcept {
+CACHE_TEMPLATE
+bool TCache::ReclaimSpareHandle() noexcept {
     auto cacheOp = BeginOperation();
     if (!cacheOp.SpaceOperation().ReclaimSpareHandle()) {
         return false;
@@ -1144,8 +1143,8 @@ bool TSharedCache::ReclaimSpareHandle() noexcept {
     return true;
 }
 
-SHARED_CACHE_TEMPLATE
-typename TSharedCache::TKeepLoadRoom TSharedCache::KeepLoadRoom() noexcept {
+CACHE_TEMPLATE
+typename TCache::TKeepLoadRoom TCache::KeepLoadRoom() noexcept {
     auto cacheOp = BeginOperation();
     const auto& keep = cacheOp.SpaceOperation().View().Tiers[ECacheTier::Keep];
     const THotRingLayout layout{ keep.EffectiveHotSlotCount() };
@@ -1157,8 +1156,8 @@ typename TSharedCache::TKeepLoadRoom TSharedCache::KeepLoadRoom() noexcept {
         pageLimit - Min(pageLimit, Memory_.KeepOwnedPages()) };
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::ReclaimForAdmission(ui64 bytes) noexcept {
+CACHE_TEMPLATE
+bool TCache::ReclaimForAdmission(ui64 bytes) noexcept {
     auto cacheOp = BeginOperation();
     bool progress = cacheOp.Eviction().ReclaimCold() || cacheOp.Eviction().ReclaimCold(ECacheTier::Keep);
     if (!progress) {
@@ -1169,8 +1168,8 @@ bool TSharedCache::ReclaimForAdmission(ui64 bytes) noexcept {
     return progress;
 }
 
-SHARED_CACHE_TEMPLATE
-bool TSharedCache::RunMaintenance() noexcept {
+CACHE_TEMPLATE
+bool TCache::RunMaintenance() noexcept {
     Y_DEBUG_ABORT_UNLESS(CurrentLimit() <= HardLimit());
     if (Eviction_.NeedsKeepTrim())
     {
@@ -1189,8 +1188,8 @@ bool TSharedCache::RunMaintenance() noexcept {
     return Eviction_.SweepModes();
 }
 
-SHARED_CACHE_TEMPLATE
-void TSharedCache::ReleaseReplacing(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
+CACHE_TEMPLATE
+void TCache::ReleaseReplacing(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
@@ -1212,8 +1211,8 @@ void TSharedCache::ReleaseReplacing(TSpaceOperation& spaceOp, TCacheItem cacheIt
     }
 }
 
-SHARED_CACHE_TEMPLATE
-void TSharedCache::ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
+CACHE_TEMPLATE
+void TCache::ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
     ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
@@ -1260,19 +1259,19 @@ void TSharedCache::ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheIte
 #undef TCacheCollectionRef
 #undef TCacheItemRef
 #undef TOperationItemRef
-#undef TSharedCache
-#undef SHARED_CACHE_TEMPLATE
+#undef TCache
+#undef CACHE_TEMPLATE
 
-template class TSharedCacheImpl<TProdTraits>;
-template class TSharedCacheImpl<TTestTraits>;
+template class TCacheImpl<TProdTraits>;
+template class TCacheImpl<TTestTraits>;
 
-template ECacheResultStatus TSharedCacheImpl<TProdTraits>::FindOrInsert(
-    TSpaceOperation&, TSharedCacheImpl<TProdTraits>::TCacheKeyedItem<true>&, TCacheItemRefImpl<TProdTraits>&) noexcept;
-template ECacheResultStatus TSharedCacheImpl<TProdTraits>::FindOrInsert(
-    TSpaceOperation&, TSharedCacheImpl<TProdTraits>::TCacheKeyedItem<false>&, TCacheItemRefImpl<TProdTraits>&) noexcept;
-template ECacheResultStatus TSharedCacheImpl<TTestTraits>::FindOrInsert(
-    TSpaceOperation&, TSharedCacheImpl<TTestTraits>::TCacheKeyedItem<true>&, TCacheItemRefImpl<TTestTraits>&) noexcept;
-template ECacheResultStatus TSharedCacheImpl<TTestTraits>::FindOrInsert(
-    TSpaceOperation&, TSharedCacheImpl<TTestTraits>::TCacheKeyedItem<false>&, TCacheItemRefImpl<TTestTraits>&) noexcept;
+template ECacheResultStatus TCacheImpl<TProdTraits>::FindOrInsert(
+    TSpaceOperation&, TCacheImpl<TProdTraits>::TCacheKeyedItem<true>&, TCacheItemRefImpl<TProdTraits>&) noexcept;
+template ECacheResultStatus TCacheImpl<TProdTraits>::FindOrInsert(
+    TSpaceOperation&, TCacheImpl<TProdTraits>::TCacheKeyedItem<false>&, TCacheItemRefImpl<TProdTraits>&) noexcept;
+template ECacheResultStatus TCacheImpl<TTestTraits>::FindOrInsert(
+    TSpaceOperation&, TCacheImpl<TTestTraits>::TCacheKeyedItem<true>&, TCacheItemRefImpl<TTestTraits>&) noexcept;
+template ECacheResultStatus TCacheImpl<TTestTraits>::FindOrInsert(
+    TSpaceOperation&, TCacheImpl<TTestTraits>::TCacheKeyedItem<false>&, TCacheItemRefImpl<TTestTraits>&) noexcept;
 
 } // namespace NKikimr::NSharedCache

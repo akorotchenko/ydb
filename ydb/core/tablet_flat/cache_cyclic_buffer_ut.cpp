@@ -44,7 +44,7 @@ private:
     TRingView View_;
 };
 
-Y_UNIT_TEST_SUITE(TSharedCacheCyclicBufferTest) {
+Y_UNIT_TEST_SUITE(TCacheCyclicBufferTest) {
     Y_UNIT_TEST(InitialAndWrapAround) {
         TTestRing<4> buffer;
 

@@ -4132,7 +4132,7 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_Follower) {
         env.WaitFor<NFake::TEvCompacted>();
 
         // Force metadata loads: direct core lookup can otherwise boot the follower without requests.
-        auto* core = &NSharedCache::TSharedCache::Get();
+        auto* core = &NSharedCache::TCache::Get();
         {
             TCacheCollectionRef collection;
             UNIT_ASSERT(core->Find(collectionId, collection) == ECacheResultStatus::Hit);
@@ -4515,7 +4515,7 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_Cold) {
         const ui64 sourceTablet = env.Tablet;
         env.SendSync(new TEvents::TEvPoison, false, true);
         env.WaitForGone();
-        auto& cache = NSharedCache::TSharedCache::Get();
+        auto& cache = NSharedCache::TCache::Get();
         SetSharedCacheSize(env, 0);
         for (ui32 step = 0; step < 400 && cache.PayloadUsage(); ++step) {
             WakeupSharedCache(env);
@@ -8843,7 +8843,7 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_BTreeIndex) {
 
         env.SendSync(new TEvents::TEvPoison, false, true);
         SetSharedCacheSize(env, 0);
-        auto* core = &NSharedCache::TSharedCache::Get();
+        auto* core = &NSharedCache::TCache::Get();
         for (ui32 step = 0; step < 400 && core->PayloadUsage() != 0; ++step) {
             WakeupSharedCache(env);
         }

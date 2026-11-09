@@ -11,7 +11,7 @@ class TSpaceOperation;
 template <class TTraits>
 class TCacheHotPolicy {
 public:
-    explicit TCacheHotPolicy(TSharedCacheImpl<TTraits>& cache) noexcept
+    explicit TCacheHotPolicy(TCacheImpl<TTraits>& cache) noexcept
         : Cache_(cache)
     {}
 
@@ -51,7 +51,7 @@ private:
         TSpaceOperation& spaceOp, const TCacheTierView& tier, EHotLevel level, TCacheItem item) noexcept;
 
 private:
-    TSharedCacheImpl<TTraits>& Cache_;
+    TCacheImpl<TTraits>& Cache_;
 };
 
 } // namespace NKikimr::NSharedCache

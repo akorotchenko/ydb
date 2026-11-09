@@ -13,7 +13,7 @@ template <class TTraits>
 TIntrusivePtr<TPageFetchState> TCacheFetches<TTraits>::TryAcquire(
     TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept {
     if (Cache_.Items_.BindOperation(spaceOp).TryAcquire(page.CacheItem(), true, owner.Get()) !=
-        TSharedCacheImpl<TTraits>::EAcquireStatus::Pending) {
+        TCacheImpl<TTraits>::EAcquireStatus::Pending) {
         return {};
     }
     TIntrusivePtr<TPageFetchState> fetch = spaceOp.Handles()[page.Index()].Body.Fetch;
@@ -128,7 +128,7 @@ void TCacheFetches<TTraits>::FinishFailed(TOperationItemRef<TTraits>& finalizerR
     const bool begun = Cache_.Table_.TryBeginErase(spaceOp, finalizerRef.Get(), completing);
     Y_DEBUG_ABORT_UNLESS(begun);
     Cache_.InvokeHook(ECacheHookPoint::AfterTombstoneOwnerClaim, cacheItem);
-    const TCacheKey key = LoadSharedCacheKey(handle, EItemKind::Page);
+    const TCacheKey key = LoadCacheKey(handle, EItemKind::Page);
     Cache_.Table_.FinishErase(spaceOp, cacheItem, key);
     TPageFetchState::DrainWaiters(waiters, [cacheItem](TIntrusivePtr<TPageFetchWaiter> waiter) {
         waiter->Complete(TPageCacheItem::FromValidated(cacheItem), EPageFetchCompletion::Failed);

@@ -21,7 +21,7 @@ class TCacheFetches {
 public:
     using TOperation = TCacheFetchesOperation<TTraits>;
 
-    explicit TCacheFetches(TSharedCacheImpl<TTraits>& cache) noexcept
+    explicit TCacheFetches(TCacheImpl<TTraits>& cache) noexcept
         : Cache_(cache)
     {}
 
@@ -61,7 +61,7 @@ private:
     bool Dispatch(TSpaceOperation& spaceOp, TCacheItem cacheItem, TPageFetchState& fetch) noexcept;
 
 private:
-    TSharedCacheImpl<TTraits>& Cache_;
+    TCacheImpl<TTraits>& Cache_;
 };
 
 // Leave operation constructors implicitly instantiated
@@ -100,16 +100,16 @@ public:
 
 private:
     friend class TCacheFetches<TTraits>;
-    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheImpl<TTraits>;
     friend class TCacheOperationView<TTraits>;
 
-    Y_FORCE_INLINE TCacheFetchesOperation(TSharedCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
+    Y_FORCE_INLINE TCacheFetchesOperation(TCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
         : Cache_(cache)
         , SpaceOp_(spaceOp)
     {}
 
 private:
-    TSharedCacheImpl<TTraits>& Cache_;
+    TCacheImpl<TTraits>& Cache_;
     TSpaceOperation& SpaceOp_;
 };
 
@@ -157,7 +157,7 @@ public:
         if (!FetchState_) {
             return false;
         }
-        TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+        TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
         auto cacheOp = cache.BeginOperation();
         return cacheOp.Fetches().ReserveMemory(FetchState_->Page().CacheItem(), *FetchState_);
     }
@@ -166,7 +166,7 @@ public:
         if (!FetchState_) {
             return false;
         }
-        TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+        TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
         auto cacheOp = cache.BeginOperation();
         return cacheOp.Fetches().Dispatch(FetchState_->Page().CacheItem(), *FetchState_);
     }
@@ -175,7 +175,7 @@ public:
     Y_FORCE_INLINE bool FailReady() noexcept;
 
 private:
-    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheImpl<TTraits>;
     friend class TCacheFetches<TTraits>;
 
     Y_FORCE_INLINE explicit TPageFetchImpl(TPageFetchState* fetch) noexcept
@@ -200,7 +200,7 @@ Y_FORCE_INLINE TPageFetchImpl<TTraits>& TPageFetchImpl<TTraits>::operator=(TPage
 template <class TTraits>
 Y_FORCE_INLINE NTable::NPage::TPageLocation TPageFetchImpl<TTraits>::Location() const noexcept {
     Y_DEBUG_ABORT_UNLESS(FetchState_);
-    TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+    TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
     auto spaceOp = cache.BeginOperation();
     const TCacheItem cacheItem = FetchState_->Page().CacheItem();
     Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
@@ -221,7 +221,7 @@ Y_FORCE_INLINE bool TPageFetchImpl<TTraits>::MakeReady(NActors::TSharedData&& da
     if (!FetchState_) {
         return false;
     }
-    TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+    TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
     bool ready;
     {
         auto cacheOp = cache.BeginOperation();
@@ -238,7 +238,7 @@ Y_FORCE_INLINE bool TPageFetchImpl<TTraits>::FailReady() noexcept {
     if (!FetchState_) {
         return false;
     }
-    TSharedCacheImpl<TTraits>* cache = TSharedCacheImpl<TTraits>::TryGet();
+    TCacheImpl<TTraits>* cache = TCacheImpl<TTraits>::TryGet();
     if (!cache) {
         // Missing actor context is terminal shutdown, as for native item references.
         FetchState_->AbandonWaiters();

@@ -15,7 +15,7 @@ enum class EShrinkCutStatus {
 template <class TTraits>
 class TCacheCapacity {
 public:
-    explicit TCacheCapacity(TSharedCacheImpl<TTraits>& cache) noexcept
+    explicit TCacheCapacity(TCacheImpl<TTraits>& cache) noexcept
         : Cache_(cache)
         , TargetHandleCount_(cache.Space_->CurrentConfiguration().HandleCount())
         , Target_(cache.Space_->CurrentConfiguration())
@@ -77,7 +77,7 @@ private:
 
 private:
     // Dependencies
-    TSharedCacheImpl<TTraits>& Cache_;
+    TCacheImpl<TTraits>& Cache_;
 
     // Capacity state
     std::atomic<ui64> TargetHandleCount_;

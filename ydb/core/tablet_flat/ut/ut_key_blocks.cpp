@@ -1,4 +1,4 @@
-#include <ydb/core/tablet_flat/test/libs/table/shared_cache_fixture.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include "ydb/core/tablet_flat/flat_table_key_blocks.h"
 #include "ydb/core/tablet_flat/flat_page_data.h"
 #include "ydb/core/tablet_flat/flat_part_index_iter_iface.h"

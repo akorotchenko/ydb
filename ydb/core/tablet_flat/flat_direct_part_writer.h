@@ -259,7 +259,7 @@ namespace NTabletFlatExecutor {
                 Y_ENSURE(res.PageCollections, "Direct write produced a part without page collections");
 
                 TVector<TCacheCollectionRef> pageCollections;
-                auto& sharedCache = NSharedCache::TSharedCache::Get();
+                auto& sharedCache = NSharedCache::TCache::Get();
                 for (auto& pageCollection : res.PageCollections) {
                     auto resultingPageCollection = sharedCache.AdmitCollection(pageCollection.PageCollection);
                     auto saveCompactedPages = MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);

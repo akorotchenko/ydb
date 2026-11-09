@@ -16,7 +16,7 @@
 #include <ydb/core/tablet_flat/test/libs/table/test_envs.h>
 #include <ydb/core/tablet_flat/test/libs/table/wrap_part.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_steps.h>
-#include <ydb/core/tablet_flat/test/libs/table/shared_cache_context.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_context.h>
 
 // ya test -r -D BENCHMARK_MAKE_LARGE_PART
 #ifndef BENCHMARK_MAKE_LARGE_PART

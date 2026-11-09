@@ -20,7 +20,7 @@ class TCacheCollections {
 public:
     using TOperation = TCacheCollectionsOperation<TTraits>;
 
-    explicit TCacheCollections(TSharedCacheImpl<TTraits>& cache) noexcept
+    explicit TCacheCollections(TCacheImpl<TTraits>& cache) noexcept
         : Cache_(cache)
     {}
 
@@ -50,7 +50,7 @@ public:
 
 private:
     friend class TCacheCollectionsOperation<TTraits>;
-    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheImpl<TTraits>;
 
     Y_FORCE_INLINE typename TCacheItems<TTraits>::TOperation Items(TSpaceOperation& spaceOp) const noexcept {
         return Cache_.Items_.BindOperation(spaceOp);
@@ -135,7 +135,7 @@ private:
         TSpaceOperation& spaceOp, TCollectionRegistry& registry, TFunctionRef<void(TCollection&)> callback) noexcept;
 
 private:
-    TSharedCacheImpl<TTraits>& Cache_;
+    TCacheImpl<TTraits>& Cache_;
     TIntrusivePtr<TCollectionRegistry> CollectionRegistry_ = new TCollectionRegistry;
 };
 
@@ -239,16 +239,16 @@ public:
 
 private:
     friend class TCacheCollections<TTraits>;
-    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheImpl<TTraits>;
     friend class TCacheOperationView<TTraits>;
 
-    Y_FORCE_INLINE TCacheCollectionsOperation(TSharedCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
+    Y_FORCE_INLINE TCacheCollectionsOperation(TCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
         : Cache_(cache)
         , SpaceOp_(spaceOp)
     {}
 
 private:
-    TSharedCacheImpl<TTraits>& Cache_;
+    TCacheImpl<TTraits>& Cache_;
     TSpaceOperation& SpaceOp_;
 };
 

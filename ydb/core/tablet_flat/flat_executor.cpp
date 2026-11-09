@@ -943,7 +943,7 @@ void TExecutor::AddPageCollection(const TCacheCollectionRef& pageCollection, ECa
 }
 
 TCacheCollectionRef TExecutor::FindPageCollection(const TLogoBlobID& id) const {
-    auto& cache = TSharedCache::Get();
+    auto& cache = TCache::Get();
     TCacheCollectionRef collection;
     cache.Find(id, collection);
     return collection;
@@ -1522,7 +1522,7 @@ void TExecutor::PrepareRawCollection(TPendingPartSwitch::TNewBundle& bundle, ui3
     auto* stage = bundle.GetStage<TPendingPartSwitch::TMetaStage>();
     TCacheCollectionRef ref;
     const auto& descriptor = stage->Descriptors.at(slot);
-    if (TSharedCache::Get().FindCollection(descriptor.Lead, ref) != NSharedCache::ECacheCollectionLookupStatus::Hit) {
+    if (TCache::Get().FindCollection(descriptor.Lead, ref) != NSharedCache::ECacheCollectionLookupStatus::Hit) {
         return;
     }
     const auto* packet = dynamic_cast<const NPageCollection::TPageCollection*>(ref->PageCollection().Get());

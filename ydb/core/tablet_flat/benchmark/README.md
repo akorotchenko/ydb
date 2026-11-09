@@ -1,11 +1,11 @@
-# Shared-cache comparison
+# Cache comparison
 
-The `TSharedCacheFixture` cases share one dataset, key hash and access order. They compare
+The `TCacheFixture` cases share one dataset, key hash and access order. They compare
 `std::unordered_map`, `THashMap`, and the shared cache in three groups:
 
 - Internal table diagnostic (`CacheTable*`): maps return the same token as the cache's table probe
   under `BeginOperation()`. Page readers use the owning cache API described below.
-- Owning lookup: maps copy a `TSharedData` owner; the cache returns a native `TSharedPageRef`.
+- Owning lookup: maps copy a `TSharedData` owner; the cache returns a native `TCachePageRef`.
   The result pointer is consumed and its owner released inside every measured iteration.
 - Owning lookup plus a byte read: the same lifetime operations also consume the first payload byte.
 
@@ -34,7 +34,7 @@ Before running, choose an allowed CPU, check its LLC size against the lookup wor
 pin the single-threaded process to that CPU, and record the CPU, compiler, flags and revision.
 Discard measurements if another build/test starts during the run.
 
-Select only `^TSharedCacheFixture/` with `--benchmark_filter`, use `--benchmark_repetitions=5`, and preserve
+Select only `^TCacheFixture/` with `--benchmark_filter`, use `--benchmark_repetitions=5`, and preserve
 JSON output. No timing result is claimed by this source change. Historical comparison results
 used a different revision, geometry and hardware; compare freshly built variants from this
 common harness before drawing performance conclusions.

@@ -1,6 +1,6 @@
 #include "app.h"
 
-#include <ydb/core/tablet_flat/test/libs/table/shared_cache_context.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_context.h>
 
 #include <library/cpp/getopt/last_getopt.h>
 #include <util/generic/yexception.h>

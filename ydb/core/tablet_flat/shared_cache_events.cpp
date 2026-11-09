@@ -8,7 +8,7 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
-TCacheCollectionRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitCollection(
+TCacheCollectionRefImpl<TTraits> TCacheImpl<TTraits>::AdmitCollection(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection)
     requires std::is_same_v<TTraits, TProdTraits>
 {
@@ -32,7 +32,7 @@ TCacheCollectionRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitCollection(
 }
 
 template <class TTraits>
-TCachePageRefImpl<TTraits> TSharedCacheImpl<TTraits>::AdmitPage(
+TCachePageRefImpl<TTraits> TCacheImpl<TTraits>::AdmitPage(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, NTable::NPage::TPageLocation location,
     NActors::TSharedData&& data, bool sticky)
     requires std::is_same_v<TTraits, TProdTraits>
@@ -46,14 +46,14 @@ public:
     void Complete(TPageCacheItem item, EPageFetchCompletion completion) noexcept override {
         Y_ABORT_UNLESS(completion == EPageFetchCompletion::Ready);
         // Acquire before the fetch releases its owner, so admission cannot race eviction.
-        Y_ABORT_UNLESS(TSharedCache::Get().AcquirePage(item, Page));
+        Y_ABORT_UNLESS(TCache::Get().AcquirePage(item, Page));
     }
 
     TCachePageRef Page;
 };
 
 TCachePageRef TEvSaveCompactedPages::AddPage(
-    TSharedCache& cachePages, NPageCollection::TPageData&& page, bool sticky, TSharedCache::EPageAdmission admission) {
+    TCache& cachePages, NPageCollection::TPageData&& page, bool sticky, TCache::EPageAdmission admission) {
     if (!Collection_) {
         Collection_ = cachePages.AdmitCollection(PageCollection);
         CacheItem = Collection_.CacheItem();
@@ -61,7 +61,7 @@ TCachePageRef TEvSaveCompactedPages::AddPage(
     Pages.push_back(page.Location);
     auto waiter = MakeIntrusive<TCompactedPageWaiter>();
     TCachePageRequest request(page.Location, waiter, sticky);
-    const bool admitted = admission == TSharedCache::EPageAdmission::Written
+    const bool admitted = admission == TCache::EPageAdmission::Written
                               ? cachePages.FindOrInsertWrittenBatch(CacheItem, { &request, 1 })
                               : cachePages.FindOrInsertBatch(CacheItem, { &request, 1 }, false);
     if (!admitted) {
@@ -288,7 +288,7 @@ void TRequestPageWaiter::Complete(TPageCacheItem page, EPageFetchCompletion comp
     TCachePageRef result;
     if (completion == EPageFetchCompletion::Ready) {
         TCachePageRef cachePage;
-        if (TSharedCache* cache = TSharedCache::TryGet()) {
+        if (TCache* cache = TCache::TryGet()) {
             if (cache->AcquirePage(page, cachePage)) {
                 result = std::move(cachePage);
             } else {
@@ -302,9 +302,9 @@ void TRequestPageWaiter::Complete(TPageCacheItem page, EPageFetchCompletion comp
     Completion_.Drop();
 }
 
-template TCacheCollectionRef TSharedCacheImpl<TProdTraits>::AdmitCollection(
+template TCacheCollectionRef TCacheImpl<TProdTraits>::AdmitCollection(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection);
-template TCachePageRef TSharedCacheImpl<TProdTraits>::AdmitPage(
+template TCachePageRef TCacheImpl<TProdTraits>::AdmitPage(
     TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, NTable::NPage::TPageLocation location,
     NActors::TSharedData&& data, bool sticky);
 

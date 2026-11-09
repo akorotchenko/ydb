@@ -557,7 +557,7 @@ struct TPage;
 class TCollection;
 
 template <class TTraits>
-class TSharedCacheImpl;
+class TCacheImpl;
 
 enum class EPageFetchCompletion {
     Pending,
@@ -605,13 +605,13 @@ private:
     friend class TCacheFetches;
 
     template <class>
-    friend class TSharedCacheImpl;
+    friend class TCacheImpl;
 
     template <class>
     friend class TPageFetchImpl;
 
     template <class>
-    friend class TSharedCacheImpl;
+    friend class TCacheImpl;
 
     void AbandonWaiters() noexcept;
 

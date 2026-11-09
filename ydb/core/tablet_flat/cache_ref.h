@@ -56,7 +56,7 @@ public:
 
 private:
     friend class TCacheTableImpl<TTraits>;
-    friend class TSharedCacheImpl<TTraits>;
+    friend class TCacheImpl<TTraits>;
     friend class TCacheItems<TTraits>;
     friend class TCachePageRefImpl<TTraits>;
     friend class TCacheCollectionRefImpl<TTraits>;
@@ -80,13 +80,13 @@ private:
     template <class TItem>
     static Y_FORCE_INLINE void Release(TItem item) noexcept {
         // A missing resolver is the explicit terminal-shutdown abandonment path
-        if (TSharedCacheImpl<TTraits>* cache = TSharedCacheImpl<TTraits>::TryGet()) {
+        if (TCacheImpl<TTraits>* cache = TCacheImpl<TTraits>::TryGet()) {
             cache->Items_.Release(item);
         }
     }
 
     static Y_FORCE_INLINE void Release(TSpaceOperation& spaceOp, TCacheItem item) noexcept {
-        auto cacheOp = TSharedCacheImpl<TTraits>::Get().BindOperation(spaceOp);
+        auto cacheOp = TCacheImpl<TTraits>::Get().BindOperation(spaceOp);
         cacheOp.ReleaseCleanup(item);
     }
 
@@ -202,7 +202,7 @@ public:
         if (!Ref_) {
             return {};
         }
-        TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+        TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
         return cache.AcquireMorePageRef(Ref_.CacheItem());
     }
 
@@ -222,7 +222,7 @@ public:
     }
 
     Y_FORCE_INLINE TLogoBlobID GetCollectionId() const noexcept {
-        TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+        TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
         auto cacheOp = cache.BeginOperation();
         const THandle& page = cacheOp.Handles()[CacheItem().Index()];
         return cacheOp.Collections().PageCollection(page)->Id();
@@ -238,7 +238,7 @@ public:
         if (!Ref_) {
             return false;
         }
-        TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+        TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
         return cache.IsPageSticky(CacheItem());
     }
 
@@ -301,7 +301,7 @@ public:
         if (!Ref_) {
             return {};
         }
-        TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+        TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
         return cache.AcquireMoreCollectionRef(Ref_.CacheItem());
     }
 
@@ -376,7 +376,7 @@ template <class TTraits>
 template <class TCallback>
 Y_FORCE_INLINE decltype(auto) TCachePageRefImpl<TTraits>::WithHandle(TCallback&& callback) const noexcept {
     Y_DEBUG_ABORT_UNLESS(Ref_);
-    TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+    TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
     const TCacheItem item = Ref_.CacheItem();
     const THandle& handle = cache.Space_->OwnedHandle(item);
     Y_DEBUG_ABORT_UNLESS([&] {
@@ -399,7 +399,7 @@ Y_FORCE_INLINE TCacheCollectionRefImpl<TTraits>& TCacheCollectionRefImpl<TTraits
 template <class TTraits>
 Y_FORCE_INLINE TCollection& TCacheCollectionRefImpl<TTraits>::GetCollection() const noexcept {
     Y_DEBUG_ABORT_UNLESS(Ref_);
-    TSharedCacheImpl<TTraits>& cache = TSharedCacheImpl<TTraits>::Get();
+    TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
     const THandle& handle = cache.Space_->OwnedHandle(Ref_.CacheItem());
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     Y_DEBUG_ABORT_UNLESS(Ref_.CacheItem().Matches(state) && state.IsCollectionKind() && state.Refs() != 0);
@@ -409,7 +409,7 @@ Y_FORCE_INLINE TCollection& TCacheCollectionRefImpl<TTraits>::GetCollection() co
 template <class TTraits>
 Y_FORCE_INLINE bool TCacheCollectionRefImpl<TTraits>::IsSoleReference() const noexcept {
     Y_DEBUG_ABORT_UNLESS(Ref_);
-    auto& cache = TSharedCacheImpl<TTraits>::Get();
+    auto& cache = TCacheImpl<TTraits>::Get();
     const THandleState state =
         THandleState::FromRaw(cache.Space_->OwnedHandle(Ref_.CacheItem()).State.load(std::memory_order_acquire));
     Y_DEBUG_ABORT_UNLESS(Ref_.CacheItem().Matches(state) && state.IsCollectionKind() && state.Refs() != 0);

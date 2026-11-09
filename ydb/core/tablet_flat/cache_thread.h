@@ -18,7 +18,7 @@ namespace NKikimr::NSharedCache {
 class TCacheSpace;
 struct TTestTraits;
 template <class TTraits>
-class TSharedCacheImpl;
+class TCacheImpl;
 
 inline constexpr ui64 SpaceHazardDrainWaiter = ui64{ 1 } << 31;
 inline constexpr ui32 MaxSpaceHazardActiveCount = static_cast<ui32>(SpaceHazardDrainWaiter - 1);
@@ -43,7 +43,7 @@ struct alignas(64) TSpaceHazard {
     // Threads update counts; drainers retag idle slots and arm old active slots for last-exit notification
     std::atomic<ui64> State{ 0 }; // {generation:32, drain-waiter:1, active-count:31}
     std::atomic<ui64> SpareItem{ 0 };
-    TSharedCacheImpl<TTestTraits>* TestCache = nullptr;
+    TCacheImpl<TTestTraits>* TestCache = nullptr;
     const TCacheSpace* Space = nullptr;
     bool PreloadReclaim = false; // Current thread's synchronous handle reclamation
 };

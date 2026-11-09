@@ -1,7 +1,7 @@
 #include <benchmark/benchmark.h>
 
 #include <ydb/core/tablet_flat/cache.h>
-#include <ydb/core/tablet_flat/test/libs/table/shared_cache_context.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_context.h>
 #include <ydb/library/actors/core/defs.h>
 
 #include <util/generic/hash.h>
@@ -102,16 +102,16 @@ namespace {
         const ui32 Pages_;
     };
 
-    class TSharedCacheFixture : public benchmark::Fixture {
+    class TCacheFixture : public benchmark::Fixture {
     public:
         void SetUp(benchmark::State& state) override {
             PageCount_ = static_cast<ui32>(state.range(0));
             Y_ENSURE(PageCount_ && !(PageCount_ & (PageCount_ - 1)));
             const ui8 addressBits = static_cast<ui8>(std::bit_width(ui64(PageCount_) * BucketsPerPage - 1));
             TCacheCapacityConfig capacity;
-            Y_ENSURE(TryCalculateSharedCacheFootprint(addressBits, PageSize, 0, NActors::MaxWorkers, capacity));
+            Y_ENSURE(TryCalculateCacheFootprint(addressBits, PageSize, 0, NActors::MaxWorkers, capacity));
             Context_ = MakeHolder<NTable::NTest::TTableCacheContext>(capacity);
-            Cache_ = &TSharedCache::Get();
+            Cache_ = &TCache::Get();
             PageCollection_ = MakeIntrusiveConst<TBenchmarkCollection>(PageCount_ * 2);
             Collection_ = Cache_->AdmitCollection(PageCollection_);
             const ui64 buckets = capacity.BucketCount();
@@ -246,7 +246,7 @@ namespace {
         }
 
         THolder<NTable::NTest::TTableCacheContext> Context_;
-        TSharedCache* Cache_ = nullptr;
+        TCache* Cache_ = nullptr;
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
         TCacheCollectionRef Collection_;
         TStdRawMap StdRaw_;
@@ -258,147 +258,147 @@ namespace {
         ui32 PageCount_ = 0;
     };
 
-    BENCHMARK_DEFINE_F(TSharedCacheFixture, StdRawHit)(benchmark::State& state) {
+    BENCHMARK_DEFINE_F(TCacheFixture, StdRawHit)(benchmark::State& state) {
         RunLookups(state, false, [this](ui64 offset) {
             return LookupRaw(StdRaw_, offset);
         });
     }
 
-    BENCHMARK_DEFINE_F(TSharedCacheFixture, YdbRawHit)(benchmark::State& state) {
+    BENCHMARK_DEFINE_F(TCacheFixture, YdbRawHit)(benchmark::State& state) {
         RunLookups(state, false, [this](ui64 offset) {
             return LookupRaw(YdbRaw_, offset);
         });
     }
 
-    BENCHMARK_DEFINE_F(TSharedCacheFixture, CacheTableHit)(benchmark::State& state) {
+    BENCHMARK_DEFINE_F(TCacheFixture, CacheTableHit)(benchmark::State& state) {
         RunLookups(state, false, [this](ui64 offset) {
             return LookupTable(offset);
         });
     }
 
-    BENCHMARK_DEFINE_F(TSharedCacheFixture, StdOwnedHit)(benchmark::State& state) {
+    BENCHMARK_DEFINE_F(TCacheFixture, StdOwnedHit)(benchmark::State& state) {
         RunLookups(state, false, [this](ui64 offset) {
             return LookupOwned<false>(StdOwned_, offset);
         });
     }
 
-    BENCHMARK_DEFINE_F(TSharedCacheFixture, YdbOwnedHit)(benchmark::State& state) {
+    BENCHMARK_DEFINE_F(TCacheFixture, YdbOwnedHit)(benchmark::State& state) {
         RunLookups(state, false, [this](ui64 offset) {
             return LookupOwned<false>(YdbOwned_, offset);
         });
     }
 
-    BENCHMARK_DEFINE_F(TSharedCacheFixture, CacheHit)(benchmark::State& state) {
+    BENCHMARK_DEFINE_F(TCacheFixture, CacheHit)(benchmark::State& state) {
         RunLookups(state, false, [this](ui64 offset) {
             return LookupCache<false>(offset);
         });
     }
 
-    BENCHMARK_DEFINE_F(TSharedCacheFixture, StdOwnedRead)(benchmark::State& state) {
+    BENCHMARK_DEFINE_F(TCacheFixture, StdOwnedRead)(benchmark::State& state) {
         RunLookups(state, false, [this](ui64 offset) {
             return LookupOwned<true>(StdOwned_, offset);
         });
     }
 
-    BENCHMARK_DEFINE_F(TSharedCacheFixture, YdbOwnedRead)(benchmark::State& state) {
+    BENCHMARK_DEFINE_F(TCacheFixture, YdbOwnedRead)(benchmark::State& state) {
         RunLookups(state, false, [this](ui64 offset) {
             return LookupOwned<true>(YdbOwned_, offset);
         });
     }
 
-    BENCHMARK_DEFINE_F(TSharedCacheFixture, CacheRead)(benchmark::State& state) {
+    BENCHMARK_DEFINE_F(TCacheFixture, CacheRead)(benchmark::State& state) {
         RunLookups(state, false, [this](ui64 offset) {
             return LookupCache<true>(offset);
         });
     }
 
-    BENCHMARK_DEFINE_F(TSharedCacheFixture, StdRawMiss)(benchmark::State& state) {
+    BENCHMARK_DEFINE_F(TCacheFixture, StdRawMiss)(benchmark::State& state) {
         RunLookups(state, true, [this](ui64 offset) {
             return LookupRaw(StdRaw_, offset);
         });
     }
 
-    BENCHMARK_DEFINE_F(TSharedCacheFixture, YdbRawMiss)(benchmark::State& state) {
+    BENCHMARK_DEFINE_F(TCacheFixture, YdbRawMiss)(benchmark::State& state) {
         RunLookups(state, true, [this](ui64 offset) {
             return LookupRaw(YdbRaw_, offset);
         });
     }
 
-    BENCHMARK_DEFINE_F(TSharedCacheFixture, CacheTableMiss)(benchmark::State& state) {
+    BENCHMARK_DEFINE_F(TCacheFixture, CacheTableMiss)(benchmark::State& state) {
         RunLookups(state, true, [this](ui64 offset) {
             return LookupTable(offset);
         });
     }
 
-    BENCHMARK_DEFINE_F(TSharedCacheFixture, CacheMiss)(benchmark::State& state) {
+    BENCHMARK_DEFINE_F(TCacheFixture, CacheMiss)(benchmark::State& state) {
         RunLookups(state, true, [this](ui64 offset) {
             return LookupCache<false>(offset);
         });
     }
 
-    BENCHMARK_REGISTER_F(TSharedCacheFixture, StdRawHit)
+    BENCHMARK_REGISTER_F(TCacheFixture, StdRawHit)
         ->Args({ ResidentPages, 0 })
         ->ArgNames({ "pages", "native_pins" })
         ->Iterations(ResidentPages)
         ->Unit(benchmark::kNanosecond);
-    BENCHMARK_REGISTER_F(TSharedCacheFixture, YdbRawHit)
+    BENCHMARK_REGISTER_F(TCacheFixture, YdbRawHit)
         ->Args({ ResidentPages, 0 })
         ->ArgNames({ "pages", "native_pins" })
         ->Iterations(ResidentPages)
         ->Unit(benchmark::kNanosecond);
-    BENCHMARK_REGISTER_F(TSharedCacheFixture, CacheTableHit)
+    BENCHMARK_REGISTER_F(TCacheFixture, CacheTableHit)
         ->Args({ ResidentPages, 0 })
         ->ArgNames({ "pages", "native_pins" })
         ->Iterations(ResidentPages)
         ->Unit(benchmark::kNanosecond);
-    BENCHMARK_REGISTER_F(TSharedCacheFixture, StdOwnedHit)
+    BENCHMARK_REGISTER_F(TCacheFixture, StdOwnedHit)
         ->Args({ ResidentPages, 0 })
         ->ArgNames({ "pages", "native_pins" })
         ->Iterations(ResidentPages)
         ->Unit(benchmark::kNanosecond);
-    BENCHMARK_REGISTER_F(TSharedCacheFixture, YdbOwnedHit)
+    BENCHMARK_REGISTER_F(TCacheFixture, YdbOwnedHit)
         ->Args({ ResidentPages, 0 })
         ->ArgNames({ "pages", "native_pins" })
         ->Iterations(ResidentPages)
         ->Unit(benchmark::kNanosecond);
-    BENCHMARK_REGISTER_F(TSharedCacheFixture, CacheHit)
-        ->Args({ ResidentPages, 0 })
-        ->Args({ ResidentPages, 1 })
-        ->ArgNames({ "pages", "native_pins" })
-        ->Iterations(ResidentPages)
-        ->Unit(benchmark::kNanosecond);
-    BENCHMARK_REGISTER_F(TSharedCacheFixture, StdOwnedRead)
-        ->Args({ ResidentPages, 0 })
-        ->ArgNames({ "pages", "native_pins" })
-        ->Iterations(ResidentPages)
-        ->Unit(benchmark::kNanosecond);
-    BENCHMARK_REGISTER_F(TSharedCacheFixture, YdbOwnedRead)
-        ->Args({ ResidentPages, 0 })
-        ->ArgNames({ "pages", "native_pins" })
-        ->Iterations(ResidentPages)
-        ->Unit(benchmark::kNanosecond);
-    BENCHMARK_REGISTER_F(TSharedCacheFixture, CacheRead)
+    BENCHMARK_REGISTER_F(TCacheFixture, CacheHit)
         ->Args({ ResidentPages, 0 })
         ->Args({ ResidentPages, 1 })
         ->ArgNames({ "pages", "native_pins" })
         ->Iterations(ResidentPages)
         ->Unit(benchmark::kNanosecond);
-    BENCHMARK_REGISTER_F(TSharedCacheFixture, StdRawMiss)
+    BENCHMARK_REGISTER_F(TCacheFixture, StdOwnedRead)
         ->Args({ ResidentPages, 0 })
         ->ArgNames({ "pages", "native_pins" })
         ->Iterations(ResidentPages)
         ->Unit(benchmark::kNanosecond);
-    BENCHMARK_REGISTER_F(TSharedCacheFixture, YdbRawMiss)
+    BENCHMARK_REGISTER_F(TCacheFixture, YdbOwnedRead)
         ->Args({ ResidentPages, 0 })
         ->ArgNames({ "pages", "native_pins" })
         ->Iterations(ResidentPages)
         ->Unit(benchmark::kNanosecond);
-    BENCHMARK_REGISTER_F(TSharedCacheFixture, CacheTableMiss)
+    BENCHMARK_REGISTER_F(TCacheFixture, CacheRead)
+        ->Args({ ResidentPages, 0 })
+        ->Args({ ResidentPages, 1 })
+        ->ArgNames({ "pages", "native_pins" })
+        ->Iterations(ResidentPages)
+        ->Unit(benchmark::kNanosecond);
+    BENCHMARK_REGISTER_F(TCacheFixture, StdRawMiss)
         ->Args({ ResidentPages, 0 })
         ->ArgNames({ "pages", "native_pins" })
         ->Iterations(ResidentPages)
         ->Unit(benchmark::kNanosecond);
-    BENCHMARK_REGISTER_F(TSharedCacheFixture, CacheMiss)
+    BENCHMARK_REGISTER_F(TCacheFixture, YdbRawMiss)
+        ->Args({ ResidentPages, 0 })
+        ->ArgNames({ "pages", "native_pins" })
+        ->Iterations(ResidentPages)
+        ->Unit(benchmark::kNanosecond);
+    BENCHMARK_REGISTER_F(TCacheFixture, CacheTableMiss)
+        ->Args({ ResidentPages, 0 })
+        ->ArgNames({ "pages", "native_pins" })
+        ->Iterations(ResidentPages)
+        ->Unit(benchmark::kNanosecond);
+    BENCHMARK_REGISTER_F(TCacheFixture, CacheMiss)
         ->Args({ ResidentPages, 0 })
         ->ArgNames({ "pages", "native_pins" })
         ->Iterations(ResidentPages)
