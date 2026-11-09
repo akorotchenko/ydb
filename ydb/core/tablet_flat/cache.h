@@ -57,17 +57,17 @@ struct TCachePageRequestImpl {
     }
 
     TCachePageRefImpl<TTraits>& Page() noexcept {
-        Y_ABORT_UNLESS(Status_ == ECacheResultStatus::Hit);
+        Y_DEBUG_ABORT_UNLESS(Status_ == ECacheResultStatus::Hit);
         return Storage_.Page;
     }
 
     const TCachePageRefImpl<TTraits>& Page() const noexcept {
-        Y_ABORT_UNLESS(Status_ == ECacheResultStatus::Hit);
+        Y_DEBUG_ABORT_UNLESS(Status_ == ECacheResultStatus::Hit);
         return Storage_.Page;
     }
 
     TPageFetchImpl<TTraits>& Fetch() noexcept {
-        Y_ABORT_UNLESS(Status_ == ECacheResultStatus::Inserted);
+        Y_DEBUG_ABORT_UNLESS(Status_ == ECacheResultStatus::Inserted);
         return Storage_.Fetch;
     }
 
