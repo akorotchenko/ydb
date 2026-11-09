@@ -265,7 +265,6 @@ Y_FORCE_INLINE TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMorePageR
         const THandleState expected = THandleState::FromRaw(expectedRaw);
         // The source owner protects this physical item, including a withdrawn or relocated predecessor.
         Y_DEBUG_ABORT_UNLESS(item.Matches(expected) && expected.IsPageKind() && expected.Refs() != 0);
-        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
         Cache_.InvokeHook(ECacheHookPoint::BeforePageRefClone, item);
         if (handle.State.compare_exchange_weak(
                 expectedRaw, expected.IncrementRefs().Raw(), std::memory_order_relaxed, std::memory_order_relaxed)) {
@@ -283,7 +282,6 @@ Y_FORCE_INLINE TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMoreColle
         const THandleState expected = THandleState::FromRaw(expectedRaw);
         Y_DEBUG_ABORT_UNLESS(item.Matches(expected) && expected.IsCollectionKind() &&
                              (expected.Refs() != 0 || expected.HasPageAttachment()) && handle.Body.Collection);
-        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
         Cache_.InvokeHook(ECacheHookPoint::BeforeCollectionRefClone, item);
         if (handle.State.compare_exchange_weak(
                 expectedRaw, expected.IncrementRefs().Raw(), std::memory_order_relaxed, std::memory_order_relaxed)) {
@@ -317,7 +315,6 @@ Y_FORCE_INLINE typename TCacheItems<TTraits>::EAcquireStatus TCacheItems<TTraits
             return EAcquireStatus::Stale;
         }
 
-        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
         THandleState desired = expected.IncrementRefs();
         const bool pending = expected.IsPending();
         if (expected.IsHot()) {
@@ -477,7 +474,7 @@ Y_FORCE_INLINE bool TCacheItems<TTraits>::TryReleaseItemRef(
     THandleState desired = expected.DecrementRefs();
     if (releaseCollection) {
         Y_DEBUG_ABORT_UNLESS(!expected.HasPageAttachment());
-        desired = desired.WithState(EHandleState::Hot).WithFrequency(0);
+        desired = desired.WithState(EHandleState::Hot).WithFrequency(0).WithShrinkWaiter(expected.HasShrinkWaiter());
     }
     const bool notifyShrink = expected.HasShrinkWaiter() && desired.Refs() == 0;
     if (notifyShrink) {
@@ -545,7 +542,6 @@ inline TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::TryAcquireItemRef(
             return {};
         }
 
-        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
         const THandleState desired = expected.IncrementRefs();
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_relaxed, std::memory_order_relaxed))

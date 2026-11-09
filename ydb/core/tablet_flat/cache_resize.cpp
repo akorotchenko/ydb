@@ -20,7 +20,6 @@ TCacheItemRef TCache::TryAcquirePageForRelocation(TSpaceOperation& spaceOp, ui32
         {
             return {};
         }
-        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
         const THandleState desired = expected.IncrementRefs();
         if (source.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed))
@@ -278,12 +277,16 @@ EShrinkCutStatus TCache::ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui32 inde
             }
         }
     }
-    // The probes above may race with retiering or release; register only against the current blocker
+    // Re-read after the probes: retiering or a final release may have removed the sampled blocker
     const auto blocked = THandleState::FromRaw(spaceOp.Handles()[index].State.load(std::memory_order_acquire));
     if (blocked != state) {
         return EShrinkCutStatus::Progress;
     }
-    if (blocked.IsHot() || (blocked.IsCollectionKind() && (blocked.IsSticky() || blocked.IsTombstone()))) {
+    // Ordinary Hot handles use Sticky=3; Sticky/Tombstone collections use overlay bit 27.
+    // Hot Sticky/Transition states have an active publisher that will notify on completion;
+    // overwriting their real mode with 3 would corrupt that operation.
+    if ((blocked.IsHot() && blocked.IsStickyNoneField()) ||
+        (blocked.IsCollectionKind() && (blocked.IsSticky() || blocked.IsTombstone()))) {
         if (blocked.Refs() != 0) {
             const TCacheItem item = TCacheItem::Make(blocked.Version(), index);
             if (blocked.IsCollectionKind()) {

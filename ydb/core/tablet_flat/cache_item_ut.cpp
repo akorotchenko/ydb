@@ -68,8 +68,10 @@ Y_UNIT_TEST_SUITE(TCacheItemTest) {
                 .WithShrinkWaiter(true);
         static_assert(
             sticky.HasPageAttachment() && sticky.HasShrinkWaiter() && sticky.Refs() == 2 && sticky.Version() == 13);
-        constexpr auto retired =
-            sticky.WithState(EHandleState::Tombstone).WithFrequency(0).WithPageAttachment(sticky.HasPageAttachment());
+        constexpr auto retired = sticky.WithState(EHandleState::Tombstone)
+                                     .WithFrequency(0)
+                                     .WithPageAttachment(sticky.HasPageAttachment())
+                                     .WithShrinkWaiter(sticky.HasShrinkWaiter());
         static_assert(retired.HasPageAttachment() && retired.HasShrinkWaiter() && retired.Refs() == 2);
         static_assert(!retired.WithPageAttachment(false).HasPageAttachment());
         constexpr auto hot = THandleState::Make(13, EHandleState::Hot, EItemKind::Collection, 1, EStickyState::None, 1);
@@ -81,22 +83,74 @@ Y_UNIT_TEST_SUITE(TCacheItemTest) {
         static_assert(!page.HasPageAttachment());
     }
 
-    Y_UNIT_TEST(ShrinkWaiterIsIndependentOfOtherHandleFields) {
-        static_assert(THandleState::ShrinkWaiterMask == (ui64{ 1 } << 23));
-        static_assert(MaxHandleRefs == (ui32{ 1 } << 23) - 1);
+    Y_UNIT_TEST(ShrinkWaiterEncodingsPreserveReferencesAndPolicy) {
+        static_assert(MaxHandleRefs == (ui32{ 1 } << 24) - 1);
+        static_assert(THandleState::CollectionShrinkWaiterMask == (ui64{ 1 } << 27));
         constexpr auto base = THandleState::Make(
             MaxItemVersion, EHandleState::KeepHot, EItemKind::Page, 3, EStickyState::None, MaxHandleRefs);
         constexpr auto waiting = base.WithShrinkWaiter(true);
         static_assert(!base.HasShrinkWaiter() && waiting.HasShrinkWaiter());
+        static_assert(waiting.Sticky() == EStickyState::ShrinkWaiter && waiting.IsStickyNoneField());
+        static_assert(!waiting.IsStickyField() && !waiting.IsTransitionField());
         static_assert(waiting.Refs() == MaxHandleRefs && waiting.Frequency() == 3);
-        static_assert(waiting.Raw() == (base.Raw() | THandleState::ShrinkWaiterMask));
+        static_assert(waiting.Raw() == (base.Raw() | THandleState::StickyMask));
         static_assert(waiting.DecrementRefs().IncrementRefs() == waiting);
         static_assert(waiting.WithRefs(0).HasShrinkWaiter());
         static_assert(waiting.WithCold(ECacheTier::Regular).HasShrinkWaiter());
+        static_assert(waiting.WithState(EHandleState::Replacing).HasShrinkWaiter());
+        static_assert(waiting.WithState(EHandleState::Replaced).HasShrinkWaiter());
         static_assert(waiting.WithState(EHandleState::Tombstone).HasShrinkWaiter());
         static_assert(waiting.WithShrinkWaiter(false) == base);
-        static_assert(
-            !THandleState::Make(0, EHandleState::Free, EItemKind::Page, 0, EStickyState::None, 0).HasShrinkWaiter());
+        for (auto sticky : { EStickyState::Sticky, EStickyState::Transition }) {
+            const auto realMode = base.WithSticky(sticky);
+            UNIT_ASSERT(!realMode.HasShrinkWaiter() && !realMode.IsStickyNoneField());
+            UNIT_ASSERT(realMode.WithShrinkWaiter(false) == realMode);
+        }
+    }
+
+    Y_UNIT_TEST(CollectionShrinkWaiterSurvivesOverlayTransitionsWithoutInventingHeat) {
+        constexpr auto hot = THandleState::Make(7, EHandleState::Hot, EItemKind::Collection, 3, EStickyState::None, 1);
+        static_assert(!hot.HasShrinkWaiter());
+        constexpr auto attached = hot.WithState(EHandleState::Sticky)
+                                      .WithSticky(EStickyState::Sticky)
+                                      .WithFrequency(0)
+                                      .WithPageAttachment(hot.HasPageAttachment())
+                                      .WithShrinkWaiter(hot.HasShrinkWaiter());
+        static_assert(!attached.HasShrinkWaiter() && !attached.HasPageAttachment());
+        constexpr auto waiting = hot.WithShrinkWaiter(true);
+        constexpr auto retained = waiting.WithState(EHandleState::Sticky)
+                                      .WithSticky(EStickyState::Sticky)
+                                      .WithFrequency(0)
+                                      .WithPageAttachment(true)
+                                      .WithShrinkWaiter(waiting.HasShrinkWaiter());
+        static_assert(retained.IsStickyField() && retained.HasPageAttachment() && retained.HasShrinkWaiter());
+        static_assert((retained.Raw() & THandleState::CollectionShrinkWaiterMask) != 0);
+        static_assert(retained.WithShrinkWaiter(false).IsStickyField());
+        static_assert(retained.WithShrinkWaiter(false).HasPageAttachment());
+        constexpr auto retired = waiting.WithState(EHandleState::Tombstone)
+                                     .WithFrequency(0)
+                                     .WithPageAttachment(false)
+                                     .WithShrinkWaiter(waiting.HasShrinkWaiter());
+        static_assert(retired.IsStickyNoneField() && retired.Sticky() == EStickyState::None);
+        static_assert(retired.HasShrinkWaiter() && !retired.HasPageAttachment());
+        constexpr auto hotAgain = retained.WithState(EHandleState::Hot)
+                                      .WithSticky(EStickyState::None)
+                                      .WithFrequency(0)
+                                      .WithShrinkWaiter(retained.HasShrinkWaiter());
+        static_assert(hotAgain.HasShrinkWaiter() && hotAgain.IsStickyNoneField() && hotAgain.Frequency() == 0);
+    }
+
+    Y_UNIT_TEST(ReferenceBoundaryPreservesTheWaiterAndOtherFields) {
+        constexpr auto belowOldLimit =
+            THandleState::Make(17, EHandleState::Hot, EItemKind::Page, 2, EStickyState::None, (ui32{ 1 } << 23) - 1);
+        constexpr auto aboveOldLimit = belowOldLimit.IncrementRefs();
+        static_assert(aboveOldLimit.Refs() == (ui32{ 1 } << 23));
+        static_assert(!aboveOldLimit.HasShrinkWaiter() && aboveOldLimit.Sticky() == EStickyState::None);
+        constexpr auto beforeMax = belowOldLimit.WithRefs(MaxHandleRefs - 1).WithShrinkWaiter(true);
+        constexpr auto atMax = beforeMax.IncrementRefs();
+        static_assert(atMax.Refs() == MaxHandleRefs && atMax.HasShrinkWaiter());
+        static_assert(atMax.DecrementRefs() == beforeMax);
+        static_assert(atMax.Version() == 17 && atMax.Frequency() == 2);
     }
 
     Y_UNIT_TEST(TierReadyTagsPreservePackedFields) {
@@ -109,7 +163,8 @@ Y_UNIT_TEST_SUITE(TCacheItemTest) {
         for (ui32 version : { ui32{ 0 }, MaxItemVersion }) {
             for (auto kind : { EItemKind::Page, EItemKind::Collection }) {
                 for (ui8 frequency = 0; frequency < 4; ++frequency) {
-                    for (auto sticky : { EStickyState::None, EStickyState::Sticky, EStickyState::Transition }) {
+                    for (auto sticky : { EStickyState::None, EStickyState::Sticky, EStickyState::Transition,
+                             EStickyState::ShrinkWaiter }) {
                         for (ui32 refs : { ui32{ 0 }, ui32{ 1 }, MaxHandleRefs }) {
                             const auto base =
                                 THandleState::Make(version, EHandleState::Cold, kind, frequency, sticky, refs);

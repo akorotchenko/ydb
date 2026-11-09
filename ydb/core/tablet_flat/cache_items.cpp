@@ -18,7 +18,6 @@ TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::TryAcquireRetiredItemRef(
         if (!cacheItem.Matches(state) || !state.IsTombstone() || state.Refs() == 0) {
             return {};
         }
-        Y_DEBUG_ABORT_UNLESS(state.Refs() < MaxHandleRefs);
         if (handle.State.compare_exchange_weak(
                 raw, state.IncrementRefs().Raw(), std::memory_order_acquire, std::memory_order_relaxed)) {
             return TCacheItemRefImpl<TTraits>(cacheItem);
@@ -29,12 +28,16 @@ TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::TryAcquireRetiredItemRef(
 template <class TTraits>
 bool TCacheItems<TTraits>::TryRegisterShrinkWait(
     TSpaceOperation& spaceOp, TCacheItem item, THandleState expected) noexcept {
-    if (!spaceOp.Contains(item) || !item.Matches(expected) || expected.Refs() == 0) {
+    const bool ordinary = expected.IsHot() && expected.IsStickyNoneField();
+    const bool collection = expected.IsCollectionKind() && (expected.IsSticky() || expected.IsTombstone());
+    if (!spaceOp.Contains(item) || !item.Matches(expected) || expected.Refs() == 0 || (!ordinary && !collection)) {
         return false;
     }
     Cache_.InvokeHook(ECacheHookPoint::BeforeShrinkWaitRegistration, item);
     ui64 raw = expected.Raw();
-    // Validate even an existing bit: a successful CAS orders registration against the final release
+    // The destination is value 3 for ordinary Hot items, or bit 27 for Sticky/Tombstone collections.
+    // Validate even an existing marker. A successful CAS confirms Refs>0 in the marked word;
+    // if releases have already left Refs=0, it fails and the caller retries instead of parking.
     return spaceOp.Handles()[item.Index()].State.compare_exchange_strong(
         raw, expected.WithShrinkWaiter(true).Raw(), std::memory_order_acq_rel, std::memory_order_acquire);
 }
@@ -53,7 +56,6 @@ TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::TryAcquireHotItemRef(
             !expected.IsStickyNoneField()) {
             return {};
         }
-        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
         const THandleState desired = expected.IncrementRefs();
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed))

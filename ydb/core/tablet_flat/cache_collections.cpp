@@ -279,8 +279,10 @@ void TCacheCollections<TTraits>::FinishCollectionRetain(TSpaceOperation& spaceOp
         if (expected.IsStickyField()) {
             return;
         }
-        const THandleState desired =
-            expected.WithSticky(EStickyState::Sticky).WithFrequency(0).WithPageAttachment(expected.HasPageAttachment());
+        const THandleState desired = expected.WithSticky(EStickyState::Sticky)
+                                         .WithFrequency(0)
+                                         .WithPageAttachment(expected.HasPageAttachment())
+                                         .WithShrinkWaiter(expected.HasShrinkWaiter());
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
         {
@@ -349,7 +351,8 @@ void TCacheCollections<TTraits>::FinishAttach(
         const THandleState desired = expected.WithState(EHandleState::Sticky)
                                          .WithSticky(EStickyState::Sticky)
                                          .WithFrequency(0)
-                                         .WithPageAttachment(expected.HasPageAttachment());
+                                         .WithPageAttachment(expected.HasPageAttachment())
+                                         .WithShrinkWaiter(expected.HasShrinkWaiter());
         Cache_.InvokeHook(ECacheHookPoint::BeforeCollectionAttachPublished, collectionItem);
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
@@ -918,8 +921,10 @@ void TCacheCollections<TTraits>::FinishDetach(
         const THandleState expected = THandleState::FromRaw(expectedRaw);
         Y_ABORT_UNLESS(collectionItem.Matches(expected) && expected.IsCollectionKind() && expected.IsSticky() &&
                        expected.IsTransitionField());
-        const THandleState desired =
-            expected.WithSticky(EStickyState::None).WithFrequency(0).WithPageAttachment(expected.HasPageAttachment());
+        const THandleState desired = expected.WithSticky(EStickyState::None)
+                                         .WithFrequency(0)
+                                         .WithPageAttachment(expected.HasPageAttachment())
+                                         .WithShrinkWaiter(expected.HasShrinkWaiter());
         if (handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
         {
@@ -956,7 +961,10 @@ bool TCacheCollections<TTraits>::TryClaimDeletion(TSpaceOperation& spaceOp, TCol
         }
         Cache_.InvokeHook(ECacheHookPoint::BeforeCollectionEraseClaim, collectionItem);
         if (Cache_.Table_.TryBeginErase(spaceOp, collectionItem, expected, owner)) {
-            const THandleState desired = expected.IncrementRefs().WithState(EHandleState::Tombstone).WithFrequency(0);
+            const THandleState desired = expected.IncrementRefs()
+                                             .WithState(EHandleState::Tombstone)
+                                             .WithFrequency(0)
+                                             .WithShrinkWaiter(expected.HasShrinkWaiter());
             Cache_.UpdateColdReclaimable(handle.Metadata.PayloadBytes, expected, desired);
             sourceState = expected;
             Cache_.InvokeHook(ECacheHookPoint::AfterTombstoneOwnerClaim, collectionItem);

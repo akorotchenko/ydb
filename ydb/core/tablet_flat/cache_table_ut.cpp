@@ -13083,6 +13083,13 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         }
         const auto blocked = TCacheTestAccess::HandleState(*fixture.Cache, page.Index());
         UNIT_ASSERT(blocked.IsHot() && blocked.IsStickyField());
+        UNIT_ASSERT(!TCacheTestAccess::RegisterShrinkWait(*fixture.Cache, page.CacheItem()));
+        {
+            auto cacheOp = fixture.Cache->BeginOperation();
+            UNIT_ASSERT(cacheOp.ReclaimShrinkHandle(page.Index()) == EShrinkCutStatus::Blocked);
+        }
+        UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()) == blocked);
+        UNIT_ASSERT(!blocked.HasShrinkWaiter());
         UNIT_ASSERT(!TCacheTestAccess::RelocatePage(*fixture.Cache, page));
         UNIT_ASSERT(!TCacheTestAccess::EvictFromHot(*fixture.Cache, page));
         const ui64 generation = fixture.Cache->AdmissionGeneration();

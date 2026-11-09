@@ -22,7 +22,7 @@ namespace NKikimr::NSharedCache {
 inline constexpr ui32 MaxItemVersion = (ui32{ 1 } << 31) - 1;
 // The current Cold membership is owned by a publisher, queue slot, or removed-ticket carrier
 inline constexpr ui32 ColdTicketOwnedMask = ui32{ 1 } << 31;
-inline constexpr ui32 MaxHandleRefs = (ui32{ 1 } << 23) - 1;
+inline constexpr ui32 MaxHandleRefs = (ui32{ 1 } << 24) - 1;
 inline constexpr ui32 ResizeMarkerIndex = 1;
 
 enum ECacheTier : ui8 {
@@ -42,6 +42,8 @@ enum class EStickyState : ui8 {
     Sticky = 1,
     // Page: withdrawn from the Sticky list for relocation. Collection: attachment/detachment in progress.
     Transition = 2,
+    // Ordinary shrink-wait encoding in bits 24..25; logical mode is still None
+    ShrinkWaiter = 3,
 };
 
 enum class EHandleState : ui8 {
@@ -64,7 +66,7 @@ enum class EHandleState : ui8 {
 };
 
 static_assert(static_cast<ui8>(EItemKind::Collection) <= 0x1);
-static_assert(static_cast<ui8>(EStickyState::Transition) <= 0x3);
+static_assert(static_cast<ui8>(EStickyState::ShrinkWaiter) <= 0x3);
 static_assert(static_cast<ui8>(EHandleState::WaitingForMemory) <= 0xF);
 static_assert(static_cast<ui8>(EHandleState::KeepHot) <= 0xF);
 
@@ -199,24 +201,27 @@ private:
 
 class THandleState {
 public:
-    // Packed layout, bit 0 is the least significant bit
-    //  0..22  Refs
-    //     23  ShrinkWaiter
-    // 24..25  Sticky
-    // 26..27  Frequency
+    // State word layout, bit 0 is the least significant bit
+    //  0..23  Refs
+    // 24..25  Sticky: None=0, Sticky=1, Transition=2, ordinary ShrinkWaiter=3
+    // 26..27  Frequency; overlaid for Sticky/Tombstone collections as described below
     //     28  Kind
     // 29..32  State
     // 33..63  Version
-    // Collection Sticky/Tombstone overlay: bit 26 PageAttachment, bit 27 reserved
-    static constexpr ui64 RefsMask = 0x00000000007FFFFFULL;
+    //
+    // Shrink waiter encoding:
+    // - Non-Sticky Hot/KeepHot: Sticky=3 (bits 24..25), still logically None.
+    // - Collection in Sticky/Tombstone: bit 27; bit 26 remains PageAttachment.
+    // The 1->0 CAS clears the marker, then requests a shrink retry.
+    static constexpr ui64 RefsMask = 0x0000000000FFFFFFULL;
     static constexpr ui32 RefsShift = 0;
-    static constexpr ui64 ShrinkWaiterMask = ui64{ 1 } << 23;
     static constexpr ui64 StickyMask = 0x0000000003000000ULL;
     static constexpr ui32 StickyShift = 24;
     static constexpr ui64 FrequencyMask = 0x000000000C000000ULL;
     static constexpr ui32 FrequencyShift = 26;
-    // Sticky and retired collections reuse a frequency bit for page retention
+    // This overlay is active only for collection handles in Sticky or Tombstone state
     static constexpr ui64 PageAttachmentMask = ui64{ 1 } << FrequencyShift;
+    static constexpr ui64 CollectionShrinkWaiterMask = PageAttachmentMask << 1;
     static constexpr ui64 KindMask = 0x0000000010000000ULL;
     static constexpr ui32 KindShift = 28;
     static constexpr ui64 StateMask = 0x00000001E0000000ULL;
@@ -325,13 +330,23 @@ public:
         return FromRaw(value ? Raw_ | PageAttachmentMask : Raw_ & ~PageAttachmentMask);
     }
 
-    // A shrink waiter is notified when the last native reference is released
+    // Read the semantic waiter from either encoding, including a marker carried into retirement
     constexpr bool HasShrinkWaiter() const noexcept {
-        return (Raw_ & ShrinkWaiterMask) != 0;
+        return Sticky() == EStickyState::ShrinkWaiter ||
+               ((IsSticky() || IsTombstone()) && IsCollectionKind() && (Raw_ & CollectionShrinkWaiterMask));
     }
 
+    // Save HasShrinkWaiter() before State/Frequency changes; apply WithShrinkWaiter() last.
     constexpr THandleState WithShrinkWaiter(bool value) const noexcept {
-        return FromRaw(value ? Raw_ | ShrinkWaiterMask : Raw_ & ~ShrinkWaiterMask);
+        if (IsCollectionKind() && (IsSticky() || IsTombstone())) {
+            const ui64 raw = Sticky() == EStickyState::ShrinkWaiter ? Raw_ & ~StickyMask : Raw_;
+            return FromRaw(value ? raw | CollectionShrinkWaiterMask : raw & ~CollectionShrinkWaiterMask);
+        }
+        if (value) {
+            Y_DEBUG_ABORT_UNLESS(IsStickyNoneField());
+            return WithSticky(EStickyState::ShrinkWaiter);
+        }
+        return Sticky() == EStickyState::ShrinkWaiter ? WithSticky(EStickyState::None) : *this;
     }
 
     constexpr bool IsReplacing() const noexcept {
@@ -367,7 +382,7 @@ public:
     }
 
     constexpr bool IsStickyNoneField() const noexcept {
-        return Sticky() == EStickyState::None;
+        return Sticky() == EStickyState::None || Sticky() == EStickyState::ShrinkWaiter;
     }
 
     constexpr bool IsStickyField() const noexcept {
@@ -423,6 +438,7 @@ public:
     }
 
     constexpr THandleState IncrementRefs() const noexcept {
+        Y_ABORT_UNLESS(Refs() < MaxHandleRefs, "Cache handle reference count overflow");
         return FromRaw(Raw_ + 1);
     }
 

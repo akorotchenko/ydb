@@ -215,8 +215,8 @@ void TBlockIO::Terminate(EStatus code)
     }
 
     auto *ev = new TEvData(code, PageCollection, RequestCookie);
-    // Both the actor and reply retain the canonical collection through their own lifetimes
-    ev->Collection = Collection.Acquire();
+    // Transfer the canonical owner to the reply before this actor terminates
+    ev->Collection = std::move(Collection);
 
     ev->Pages.reserve(Pages.size());
     for (auto index : xrange(Pages.size())) {
