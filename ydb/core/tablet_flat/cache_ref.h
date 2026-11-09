@@ -203,7 +203,7 @@ public:
             return {};
         }
         TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
-        return cache.AcquireMorePageRef(Ref_.CacheItem());
+        return TCachePageRefImpl(cache.Items_.AcquireMorePageRef(Ref_.CacheItem()));
     }
 
     Y_FORCE_INLINE NTable::NPage::TPageOffset GetOffset() const noexcept {
@@ -302,7 +302,7 @@ public:
             return {};
         }
         TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
-        return cache.AcquireMoreCollectionRef(Ref_.CacheItem());
+        return TCacheCollectionRefImpl(cache.Items_.AcquireMoreCollectionRef(Ref_.CacheItem()));
     }
 
     Y_FORCE_INLINE bool IsSoleReference() const noexcept;

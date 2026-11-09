@@ -42,6 +42,8 @@ enum class ECacheHookPoint {
     AfterHotEvictionPublished, // Payload is the evicted item, before category accounting.
     BeforeLastColdRefRelease, // Native identity, before the final Cold reference CAS
     BeforeShrinkWaitRegistration, // Referenced item, before registering a shrink waiter in its State
+    BeforePageRefClone, // Owned page, before increasing its native reference count
+    BeforeCollectionRefClone, // Owned collection, before increasing its native reference count
     BeforeHotPageRefRelease, // Owned Hot page, before the unguarded reference-release CAS
     BeforeLastCollectionRefRelease, // Collection, after sampling final-release notification eligibility
     BeforeColdExchange, // Payload is the Cold membership after occupancy accounting, before ring publication.

@@ -47,6 +47,8 @@ public:
 
 private:
     friend class TCacheItemsOperation<TTraits>;
+    friend class TCachePageRefImpl<TTraits>;
+    friend class TCacheCollectionRefImpl<TTraits>;
     // Structural reference acquisition
     TCacheItemRefImpl<TTraits> TryAcquireItemRef(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
@@ -56,8 +58,8 @@ private:
         TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending, TCacheItemRefImpl<TTraits>& ref) noexcept;
     TCacheItemRefImpl<TTraits> TryAcquireHotItemRef(
         TSpaceOperation& spaceOp, TCacheItem item, ECacheTier expectedTier) noexcept;
-    TCacheItemRefImpl<TTraits> AcquireMorePageRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
-    TCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
+    Y_FORCE_INLINE TCacheItemRefImpl<TTraits> AcquireMorePageRef(TCacheItem item) noexcept;
+    Y_FORCE_INLINE TCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TCacheItem item) noexcept;
 
     // Shrink waiting
     bool TryRegisterShrinkWait(TSpaceOperation& spaceOp, TCacheItem item, THandleState expected) noexcept;
@@ -141,12 +143,8 @@ public:
         return Cache_.Items_.TryAcquireHotItemRef(SpaceOp_, item, expectedTier);
     }
 
-    Y_FORCE_INLINE TCacheItemRefImpl<TTraits> AcquireMorePageRef(TCacheItem item) noexcept {
-        return Cache_.Items_.AcquireMorePageRef(SpaceOp_, item);
-    }
-
     Y_FORCE_INLINE TCacheItemRefImpl<TTraits> AcquireMoreCollectionRef(TCacheItem item) noexcept {
-        return Cache_.Items_.AcquireMoreCollectionRef(SpaceOp_, item);
+        return Cache_.Items_.AcquireMoreCollectionRef(item);
     }
 
     // Shrink waiting
@@ -259,6 +257,41 @@ TCacheCollectionRefImpl<TTraits> TCacheItems<TTraits>::BuildCollectionRef(
 }
 
 // Reference acquisition
+template <class TTraits>
+Y_FORCE_INLINE TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMorePageRef(TCacheItem item) noexcept {
+    THandle& handle = Cache_.Space_->OwnedHandle(item);
+    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        // The source owner protects this physical item, including a withdrawn or relocated predecessor.
+        Y_DEBUG_ABORT_UNLESS(item.Matches(expected) && expected.IsPageKind() && expected.Refs() != 0);
+        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
+        Cache_.InvokeHook(ECacheHookPoint::BeforePageRefClone, item);
+        if (handle.State.compare_exchange_weak(
+                expectedRaw, expected.IncrementRefs().Raw(), std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return TCacheItemRefImpl<TTraits>(item);
+        }
+    }
+}
+
+template <class TTraits>
+Y_FORCE_INLINE TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMoreCollectionRef(TCacheItem item) noexcept {
+    // Native ownership or a live page attachment protects this physical collection
+    THandle& handle = Cache_.Space_->OwnedHandle(item);
+    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        Y_DEBUG_ABORT_UNLESS(item.Matches(expected) && expected.IsCollectionKind() &&
+                             (expected.Refs() != 0 || expected.HasPageAttachment()) && handle.Body.Collection);
+        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
+        Cache_.InvokeHook(ECacheHookPoint::BeforeCollectionRefClone, item);
+        if (handle.State.compare_exchange_weak(
+                expectedRaw, expected.IncrementRefs().Raw(), std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return TCacheItemRefImpl<TTraits>(item);
+        }
+    }
+}
+
 template <class TTraits>
 Y_FORCE_INLINE typename TCacheItems<TTraits>::EAcquireStatus TCacheItems<TTraits>::TryAcquire(
     TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending, TCacheItemRefImpl<TTraits>& ref) noexcept {

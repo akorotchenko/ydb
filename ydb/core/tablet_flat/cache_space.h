@@ -887,7 +887,7 @@ private:
     template <class TTraits>
     friend class TCacheItems;
 
-    // The caller already owns a native reference to this physical handle
+    // The caller owns a native reference or page attachment protecting this physical handle
     Y_FORCE_INLINE THandle& OwnedHandle(TCacheItem item) noexcept {
         Y_DEBUG_ABORT_UNLESS(Handles_ && !item.IsNull() && item.Index() < ReservedCapacity_.HandleCount());
         return Handles_[item.Index()];

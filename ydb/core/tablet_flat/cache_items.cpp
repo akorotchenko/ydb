@@ -64,40 +64,6 @@ TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::TryAcquireHotItemRef(
 }
 
 template <class TTraits>
-TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMorePageRef(
-    TSpaceOperation& spaceOp, TCacheItem item) noexcept {
-    THandle& handle = spaceOp.Handles()[item.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        // The source owner protects this physical item, including a withdrawn or relocated predecessor.
-        Y_DEBUG_ABORT_UNLESS(item.Matches(expected) && expected.IsPageKind() && expected.Refs() != 0);
-        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, expected.IncrementRefs().Raw(), std::memory_order_relaxed, std::memory_order_relaxed)) {
-            return TCacheItemRefImpl<TTraits>(item);
-        }
-    }
-}
-
-template <class TTraits>
-TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMoreCollectionRef(
-    TSpaceOperation& spaceOp, TCacheItem item) noexcept {
-    THandle& handle = spaceOp.Handles()[item.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
-    for (;;) {
-        const THandleState expected = THandleState::FromRaw(expectedRaw);
-        Y_DEBUG_ABORT_UNLESS(item.Matches(expected) && expected.IsCollectionKind() &&
-                             (expected.Refs() != 0 || expected.HasPageAttachment()) && handle.Body.Collection);
-        Y_DEBUG_ABORT_UNLESS(expected.Refs() < MaxHandleRefs);
-        if (handle.State.compare_exchange_weak(
-                expectedRaw, expected.IncrementRefs().Raw(), std::memory_order_relaxed, std::memory_order_relaxed)) {
-            return TCacheItemRefImpl<TTraits>(item);
-        }
-    }
-}
-
-template <class TTraits>
 TCollection* TCacheItems<TTraits>::ReleaseTombstone(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
     auto cacheOp = Cache_.BindOperation(spaceOp);
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];

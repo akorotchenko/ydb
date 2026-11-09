@@ -1701,6 +1701,214 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         CheckHotPageRefReleaseFallback(EHotReleaseRace::Relocate);
     }
 
+    Y_UNIT_TEST(OwnedPageRefCloneSkipsHazardAcrossLifetimeTransitions) {
+        enum class EState {
+            Hot,
+            Cold,
+            Tombstone,
+            Replaced,
+        };
+        for (const auto state : { EState::Hot, EState::Cold, EState::Tombstone, EState::Replaced }) {
+            TFixture fixture;
+            auto& cache = *fixture.Cache;
+            const auto collection =
+                CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 167), ECacheMode::Regular);
+            TTestCachePageRef held;
+            const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+            switch (state) {
+                case EState::Hot:
+                    break;
+                case EState::Cold:
+                    UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, page));
+                    break;
+                case EState::Tombstone: {
+                    auto cacheOp = cache.BeginOperation();
+                    auto expected = TCacheTestAccess::HandleState(cache, page.Index());
+                    TOperationItemRef<TTestTraits> owner(cacheOp);
+                    UNIT_ASSERT(cacheOp.TryBeginErase(page.CacheItem(), expected, owner.Get()));
+                    cacheOp.FinishErase(page.CacheItem(), TCacheKey::Page(collection, 1));
+                    break;
+                }
+                case EState::Replaced:
+                    UNIT_ASSERT(TCacheTestAccess::RelocatePage(cache, page));
+                    break;
+            }
+            ui32 clones = 0;
+            TTestTraits hooks{ &clones, [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
+                                  if (point == ECacheHookPoint::BeforePageRefClone) {
+                                      Y_ABORT_UNLESS(
+                                          !SpaceHazardIsActive(TlsCacheHazard->State.load(std::memory_order_relaxed)));
+                                      ++*static_cast<ui32*>(context);
+                                  }
+                              } };
+            TCacheHookGuard guard(cache, hooks);
+            const auto before = TCacheTestAccess::HandleState(cache, page.Index());
+            auto clone = held.Acquire();
+            UNIT_ASSERT(clones >= 1);
+            UNIT_ASSERT(clone.CacheItem() == page);
+            UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()) == before.IncrementRefs());
+            UNIT_ASSERT_VALUES_EQUAL(clone.size(), held.size());
+            UNIT_ASSERT(clone.data() == held.data());
+            held.Drop();
+            UNIT_ASSERT_VALUES_EQUAL(clone.data()[0], 'p');
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, page.Index()).Refs(), 1);
+        }
+    }
+
+    Y_UNIT_TEST(OwnedPageRefCloneRetriesWithoutHazardAndPreservesShrinkWaiter) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 168), ECacheMode::Regular);
+        TTestCachePageRef held;
+        const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+        UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+        cache.ArmResourceWait();
+
+        struct TContext {
+            TTestCachePageRef& Held;
+            TTestCachePageRef Other;
+            ui32 Attempts = 0;
+            ui32 Notifications = 0;
+        } context{ held, {} };
+
+        TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem) noexcept {
+                              auto& context = *static_cast<TContext*>(ptr);
+                              if (point == ECacheHookPoint::BeforePageRefClone) {
+                                  Y_ABORT_UNLESS(
+                                      !SpaceHazardIsActive(TlsCacheHazard->State.load(std::memory_order_relaxed)));
+                                  if (++context.Attempts == 1) {
+                                      context.Other = context.Held.Acquire();
+                                  }
+                              } else if (point == ECacheHookPoint::ResourcesAvailable) {
+                                  ++context.Notifications;
+                              }
+                          } };
+        TCacheHookGuard guard(cache, hooks);
+        auto clone = held.Acquire();
+        UNIT_ASSERT(context.Attempts >= 3);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, page.Index()).Refs(), 3);
+        held.Drop();
+        context.Other.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 0);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
+        clone.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 1);
+        UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
+        cache.DisarmResourceWait();
+    }
+
+    Y_UNIT_TEST(OwnedCollectionRefCloneSkipsHazardAcrossLifetimeTransitions) {
+        enum class EState {
+            Sticky,
+            Detached,
+            Hot,
+            Cold,
+            Tombstone,
+        };
+        for (const auto state : { EState::Sticky, EState::Detached, EState::Hot, EState::Cold, EState::Tombstone }) {
+            TFixture fixture;
+            auto& cache = *fixture.Cache;
+            const TLogoBlobID id(111, 112, 169);
+            TCollectionCacheItem item;
+            TTestCacheCollectionRef held;
+            UNIT_ASSERT(cache.FindOrInsert({ .Id = id }, item, held) == ECacheResultStatus::Inserted);
+            UNIT_ASSERT(cache.MakeReady(item, MakeCollection(id)));
+            UNIT_ASSERT(cache.Find(id, held) == ECacheResultStatus::Hit);
+            if (state != EState::Sticky) {
+                UNIT_ASSERT(cache.DetachCollection(item));
+            }
+            if (state == EState::Hot || state == EState::Cold) {
+                held.Drop();
+                UNIT_ASSERT(cache.Find(id, held) == ECacheResultStatus::Hit);
+            }
+            if (state == EState::Cold) {
+                auto cacheOp = cache.BeginOperation();
+                UNIT_ASSERT(cacheOp.Eviction().EvictFromHot(item.Index()));
+            } else if (state == EState::Tombstone) {
+                auto cacheOp = cache.BeginOperation();
+                auto expected = TCacheTestAccess::HandleState(cache, item.Index());
+                TOperationItemRef<TTestTraits> owner(cacheOp);
+                UNIT_ASSERT(cacheOp.TryBeginErase(item.CacheItem(), expected, owner.Get()));
+                cacheOp.FinishErase(item.CacheItem(), TCacheKey::Collection(id));
+            }
+
+            struct TContext {
+                bool Cloning = false;
+                ui32 Attempts = 0;
+            } context;
+
+            TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem) noexcept {
+                                  auto& context = *static_cast<TContext*>(ptr);
+                                  if (point == ECacheHookPoint::BeforeCollectionRefClone && context.Cloning) {
+                                      Y_ABORT_UNLESS(
+                                          !SpaceHazardIsActive(TlsCacheHazard->State.load(std::memory_order_relaxed)));
+                                      ++context.Attempts;
+                                  }
+                              } };
+            TCacheHookGuard guard(cache, hooks);
+            const auto before = TCacheTestAccess::HandleState(cache, item.Index());
+            const TCollection* identity = held.Get();
+            context.Cloning = true;
+            auto clone = held.Acquire();
+            context.Cloning = false;
+            UNIT_ASSERT(context.Attempts >= 1);
+            UNIT_ASSERT(clone.CacheItem() == item && clone.Get() == identity);
+            UNIT_ASSERT(TCacheTestAccess::HandleState(cache, item.Index()) == before.IncrementRefs());
+            held.Drop();
+            UNIT_ASSERT(clone->Id() == id);
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, item.Index()).Refs(), 1);
+        }
+    }
+
+    Y_UNIT_TEST(OwnedCollectionRefCloneRetriesWithoutHazardAndPreservesShrinkWaiter) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const TLogoBlobID id(111, 112, 170);
+        TCollectionCacheItem item;
+        TTestCacheCollectionRef held;
+        UNIT_ASSERT(cache.FindOrInsert({ .Id = id }, item, held) == ECacheResultStatus::Inserted);
+        UNIT_ASSERT(cache.MakeReady(item, MakeCollection(id)));
+        UNIT_ASSERT(cache.Find(id, held) == ECacheResultStatus::Hit);
+        UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, item.CacheItem()));
+        cache.ArmResourceWait();
+
+        struct TContext {
+            TTestCacheCollectionRef& Held;
+            TTestCacheCollectionRef Other;
+            bool Cloning = false;
+            ui32 Attempts = 0;
+            ui32 Notifications = 0;
+        } context{ held, {} };
+
+        TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem) noexcept {
+                              auto& context = *static_cast<TContext*>(ptr);
+                              if (point == ECacheHookPoint::BeforeCollectionRefClone && context.Cloning) {
+                                  Y_ABORT_UNLESS(
+                                      !SpaceHazardIsActive(TlsCacheHazard->State.load(std::memory_order_relaxed)));
+                                  if (++context.Attempts == 1) {
+                                      context.Other = context.Held.Acquire();
+                                  }
+                              } else if (point == ECacheHookPoint::ResourcesAvailable) {
+                                  ++context.Notifications;
+                              }
+                          } };
+        TCacheHookGuard guard(cache, hooks);
+        context.Cloning = true;
+        auto clone = held.Acquire();
+        context.Cloning = false;
+        UNIT_ASSERT(context.Attempts >= 3);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, item.Index()).Refs(), 3);
+        held.Drop();
+        context.Other.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 0);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, item.Index()).HasShrinkWaiter());
+        clone.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 1);
+        UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, item.Index()).HasShrinkWaiter());
+        cache.DisarmResourceWait();
+    }
+
     Y_UNIT_TEST(HotPageRefReleaseAllowsPhysicalShrinkInsideNotification) {
         TFixture fixture(11, 2);
         auto& cache = *fixture.Cache;

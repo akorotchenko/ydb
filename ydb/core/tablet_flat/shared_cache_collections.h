@@ -26,7 +26,7 @@ public:
     void RawReady(const TActorId& sender, const TEvCollectionRawReady& result);
     void Data(const TActorId& sender, TEvCollectionData& result);
 
-    // The owner samples AdmissionGeneration before Pump and arms the union of both wait queues
+    // The owner arms the resource gate before Pump and disarms it only when both wait queues are empty
     void Pump();
     void Stop();
 

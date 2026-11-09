@@ -815,16 +815,6 @@ private:
 
     bool IsPageSticky(TPageCacheItem page) const noexcept;
 
-    Y_FORCE_INLINE TCachePageRefImpl<TTraits> AcquireMorePageRef(TCacheItem item) noexcept {
-        auto cacheOp = BeginOperation();
-        return cacheOp.BuildPageRef(cacheOp.Items().AcquireMorePageRef(item));
-    }
-
-    Y_FORCE_INLINE TCacheCollectionRefImpl<TTraits> AcquireMoreCollectionRef(TCacheItem item) noexcept {
-        auto cacheOp = BeginOperation();
-        return cacheOp.BuildCollectionRef(cacheOp.Items().AcquireMoreCollectionRef(item));
-    }
-
     bool AcquirePage(TPageCacheItem page, TCachePageRefImpl<TTraits>& result) noexcept;
 
     // May finalize or reclaim an item while its mappings are protected
