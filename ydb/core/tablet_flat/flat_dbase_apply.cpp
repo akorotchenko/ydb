@@ -54,6 +54,9 @@ namespace {
             case NPage::ECacheMode::Regular:
             case NPage::ECacheMode::TryKeepInMemory:
                 return true;
+            case NPage::ECacheMode::Sticky:
+                // Sticky is derived by the cache, not stored in family schemas
+                return false;
         }
         return false;
     }

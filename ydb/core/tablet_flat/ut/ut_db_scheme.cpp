@@ -269,6 +269,9 @@ Y_UNIT_TEST_SUITE(TScheme) {
             yexception, "Invalid pages cache policy value 256");
         UNIT_ASSERT_EXCEPTION_CONTAINS(apply([](auto& delta) { delta.SetCacheMode(65536); }),
             yexception, "Invalid cache mode value 65536");
+        UNIT_ASSERT_EXCEPTION_CONTAINS(apply([](auto& delta) {
+            delta.SetCacheMode(static_cast<ui32>(ECacheMode::Sticky));
+        }), yexception, "Invalid cache mode value");
     }
 }
 
