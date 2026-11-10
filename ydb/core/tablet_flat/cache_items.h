@@ -434,9 +434,18 @@ Y_FORCE_INLINE TCollection* TCacheItems<TTraits>::ReleaseItem(TSpaceOperation& s
                     cacheOp.Eviction().RouteOwnedHot(owned.Get(), EHotLevel::L1);
                 }
                 cacheItem = owned.CacheItem();
-                owned.Disarm();
                 handle = &spaceOp.Handles()[cacheItem.Index()];
-                expectedRaw = handle->State.load(std::memory_order_acquire);
+                THandleState checked = THandleState::FromRaw(handle->State.load(std::memory_order_acquire));
+                if (cacheItem.Matches(checked) && checked.IsPageKind() && checked.IsColdInTier(ECacheTier::Regular) &&
+                    checked.IsStickyNoneField() && checked.Refs() == 1 && cacheOp.Eviction().WantsKeepPage(*handle)) {
+                    // This owner is being released; only the exact last reference may retire an uncredited page
+                    if (cacheOp.TryBeginErase(owned.Get(), checked)) {
+                        cacheOp.Eviction().FinishPageErase(cacheItem);
+                        return nullptr;
+                    }
+                }
+                owned.Disarm();
+                expectedRaw = checked.Raw();
                 continue;
             }
         }

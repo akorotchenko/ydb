@@ -1823,7 +1823,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             if (valid && data.Pages[index].Offset == page.Location().Offset &&
                 data.Pages[index].Data.size() == page.Size())
             {
-                if (!page.MakeReady(std::move(data.Pages[index].Data))) {
+                auto pending = data.PendingBuffers.Take(data.Pages[index].Data.GetAllocationSize());
+                if (!page.MakeReady(std::move(data.Pages[index].Data), std::move(pending))) {
                     failed = true;
                 }
             } else {

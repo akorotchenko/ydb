@@ -15,6 +15,7 @@ namespace NKikimr::NSharedCache {
 enum class ECacheHookPoint {
     AfterPageRetierClaim,
     BeforeColdEraseClaim,
+    BeforeReferencedColdTicketReset,
     AfterLastColdRefReleased,
     AfterColdTicketClaim,
     BeforeRetirementAccounting,

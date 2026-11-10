@@ -77,13 +77,15 @@ bool TCacheEviction<TTraits>::ReconcilePageImpl(TSpaceOperation& spaceOp, TCache
                     incoming = Cache_.Memory_.TryReserveKeep(bytes, KeepLimit());
                 }
                 if (!incoming) {
-                    THandleState expected = before;
-                    if (!Cache_.Table_.TryBeginErase(spaceOp, owner, expected)) {
-                        raw = expected.Raw();
-                        continue;
+                    // The caller owns this indexed page; only its last-release path may retire it
+                    if (before.IsCold()) {
+                        return false;
                     }
-                    FinishPageErase(spaceOp, item);
-                    return true;
+                    if (TryEvictHot(handle, before, owner)) {
+                        return true;
+                    }
+                    raw = handle.State.load(std::memory_order_acquire);
+                    continue;
                 }
             }
             const auto after = before.WithState(
@@ -144,19 +146,18 @@ void TCacheEviction<TTraits>::RouteHot(TSpaceOperation& spaceOp, EHotLevel level
 
 template <class TTraits>
 bool TCacheEviction<TTraits>::TryEvictHot(
-    THandle& handle, THandleState before, TOperationItemRef<TTraits>& ref) noexcept {
+    THandle& handle, THandleState before, const TCacheItemRefImpl<TTraits>& owner) noexcept {
     ui64 raw = before.Raw();
     const auto after = before.WithState(THandleState::ColdState(before.Tier())).WithFrequency(0);
     if (!handle.State.compare_exchange_strong(raw, after.Raw(), std::memory_order_relaxed, std::memory_order_relaxed)) {
         return false;
     }
-    Cache_.InvokeHook(ECacheHookPoint::AfterHotEvictionPublished, ref.CacheItem());
+    Cache_.InvokeHook(ECacheHookPoint::AfterHotEvictionPublished, owner.CacheItem());
     const ui64 bytes = TCacheItems<TTraits>::PayloadBytes(handle, before.Kind());
     Cache_.AdvanceColdMembership(handle);
     Cache_.Memory_.Hot(before.Tier()).TransferBytesTo(Cache_.Memory_.Cold(before.Tier()), bytes);
     Cache_.Memory_.Hot(before.Tier()).TransferPageTo(Cache_.Memory_.Cold(before.Tier()), before.Kind());
     Cache_.Memory_.ReleaseRetainedBytes(bytes);
-    ref.Drop();
     return true;
 }
 
@@ -180,7 +181,7 @@ bool TCacheEviction<TTraits>::EvictFromHot(
         if (!item.Matches(state) || !state.IsHotInTier(expectedTier) || !state.IsStickyNoneField()) {
             return false;
         }
-        if (TryEvictHot(handle, state, ref)) {
+        if (TryEvictHot(handle, state, ref.Get())) {
             return true;
         }
     }
@@ -266,6 +267,7 @@ bool TCacheEviction<TTraits>::EraseCold(
         return false;
     }
     TCollection* pageCollection = nullptr;
+    auto cacheOp = Cache_.BindOperation(spaceOp);
 
     TOperationItemRef<TTraits> ownerRef(spaceOp);
     THandleState expected = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
@@ -277,6 +279,20 @@ bool TCacheEviction<TTraits>::EraseCold(
             return false;
         }
         const TCacheItem cacheItem = TCacheItem::Make(expected.Version(), coldItem.Index());
+        if (expected.Refs() != 0) {
+            TOperationItemRef<TTraits> held(spaceOp, cacheOp.TryAcquireStructural(cacheItem));
+            if (held) {
+                // Repair the consumed ticket before the last owner can release and republish it
+                Cache_.InvokeHook(ECacheHookPoint::BeforeReferencedColdTicketReset, cacheItem);
+                const auto current = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+                if (cacheItem.Matches(current) && current.IsColdInTier(expectedTier) && current.IsStickyNoneField()) {
+                    ui32 membership = coldItem.ColdVersion() | ColdTicketOwnedMask;
+                    handle.ColdVersion.compare_exchange_strong(membership, AdvanceColdVersion(coldItem.ColdVersion()),
+                        std::memory_order_release, std::memory_order_relaxed);
+                }
+            }
+            return false;
+        }
         Cache_.InvokeHook(ECacheHookPoint::BeforeColdEraseClaim, TCacheItem::FromRaw(coldItem.Raw()));
         if (Cache_.Table_.TryBeginErase(spaceOp, cacheItem, expected, ownerRef.Get())) {
             // The tombstone owner now pins the page and its collection during accounting and notification.

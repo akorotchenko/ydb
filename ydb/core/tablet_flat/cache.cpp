@@ -386,7 +386,7 @@ bool TCache::MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* registry, 
 
 CACHE_TEMPLATE
 void TCache::MakeReadyState(TSpaceOperation& spaceOp, TCacheItem item, EHandleState readyState, TCollection* pageOwner,
-    TKeepReservation* keepReservation) noexcept {
+    TKeepReservation* keepReservation, TCachePendingBuffers* pendingBuffers) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     THandle& handle = spaceOp.Handles()[item.Index()];
     ui64 raw = handle.State.load(std::memory_order_relaxed);
@@ -402,6 +402,9 @@ void TCache::MakeReadyState(TSpaceOperation& spaceOp, TCacheItem item, EHandleSt
     EHandleState accounted = EHandleState::Cold;
     // Count the installed payload before budget checks so its prepaid bytes are not treated as extra storage
     Memory_.AddResident(bytes);
+    if (pendingBuffers) {
+        pendingBuffers->Reset();
+    }
     for (;;) {
         const auto before = THandleState::FromRaw(raw);
         Y_DEBUG_ABORT_UNLESS(item.Matches(before) && (before.IsPending() || before.IsCompleting()));
@@ -638,7 +641,7 @@ bool TCache::PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandidate& ca
             ReleaseReservation(reservedBytes, 1);
         }
     } else if (candidate.Admission == EPageAdmission::Preload) {
-        if (!cacheOp.TryReserve(reservedBytes, 1)) {
+        if (!cacheOp.TryReservePreload(reservedBytes, 1)) {
             return false;
         }
         cacheItem = cacheOp.Items().AllocateForPreload();
@@ -855,7 +858,8 @@ bool TCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& collection
     if (admission == EPageAdmission::Written || admission == EPageAdmission::ReadAhead) {
         Memory_.AccountPageReservation(reservedBytes, preparedPages);
     } else {
-        reserved = cacheOp.TryReserve(reservedBytes, preparedPages);
+        reserved = admission == EPageAdmission::Preload ? cacheOp.TryReservePreload(reservedBytes, preparedPages)
+                                                        : cacheOp.TryReserve(reservedBytes, preparedPages);
     }
     if (!reserved && !waitForMemory) {
         return false;
@@ -1061,7 +1065,7 @@ ECacheResultStatus TCache::FindOrInsert(TSpaceOperation& spaceOp, TKeyedCandidat
 }
 
 CACHE_TEMPLATE
-bool TCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) noexcept {
+bool TCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages, bool preload) noexcept {
     auto cacheOp = BindOperation(spaceOp);
     if (bytes == 0 && pages == 0) {
         return true;
@@ -1076,14 +1080,19 @@ bool TCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) noexce
             return false;
         }
         if (ExceedsLimit(usage, currentLimit, bytes)) {
-            Eviction_.MarkSoftLimitPressure();
+            if (!preload) {
+                Eviction_.MarkSoftLimitPressure();
+            }
             // Aging/resizing can make progress without freeing bytes. Bound cooperative work so
             // concurrent activity cannot keep a requester here instead of putting it on the wait path.
             if (reclamationAttempts == CacheTransitionWorkBatch) {
-                NotifyResourcesAvailable();
+                if (!preload) {
+                    NotifyResourcesAvailable();
+                }
                 return false;
             }
-            if (!cacheOp.Eviction().Reclaim(bytes)) {
+            const bool progress = preload ? cacheOp.Eviction().ReclaimRegularPage() : cacheOp.Eviction().Reclaim(bytes);
+            if (!progress) {
                 return false;
             }
             ++reclamationAttempts;

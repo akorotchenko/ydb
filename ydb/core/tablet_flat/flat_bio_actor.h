@@ -55,6 +55,7 @@ namespace NBlockIO {
         };
 
         TVector<TLoadState> BlockStates;
+        NSharedCache::TCachePendingBuffers PendingBuffers;
         TAutoPtr<TPagesToBlobsConverter> PagesToBlobsConverter;
         ui64 Pending = 0;
         ui64 TotalOps = 0;

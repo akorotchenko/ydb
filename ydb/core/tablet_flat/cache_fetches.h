@@ -48,7 +48,8 @@ private:
     TIntrusivePtr<TPageFetchState> TryAcquire(
         TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept;
     THandle* TryGetPendingHandle(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept;
-    bool Complete(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch, NActors::TSharedData&& data) noexcept;
+    bool Complete(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch, NActors::TSharedData&& data,
+        TCachePendingBuffers&& pendingBuffers) noexcept;
     bool Fail(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept;
     void Release(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept;
 
@@ -74,9 +75,9 @@ public:
         return Cache_.Fetches_.TryAcquire(SpaceOp_, page, owner);
     }
 
-    Y_FORCE_INLINE bool Complete(
-        TOperationItemRef<TTraits>& owner, TPageFetchState& fetch, NActors::TSharedData&& data) noexcept {
-        return Cache_.Fetches_.Complete(owner, fetch, std::move(data));
+    Y_FORCE_INLINE bool Complete(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch, NActors::TSharedData&& data,
+        TCachePendingBuffers&& pendingBuffers) noexcept {
+        return Cache_.Fetches_.Complete(owner, fetch, std::move(data), std::move(pendingBuffers));
     }
 
     Y_FORCE_INLINE bool Fail(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept {
@@ -172,7 +173,7 @@ public:
         return cacheOp.Fetches().Dispatch(FetchState_->Page().CacheItem(), *FetchState_);
     }
 
-    Y_FORCE_INLINE bool MakeReady(NActors::TSharedData&& data) noexcept;
+    Y_FORCE_INLINE bool MakeReady(NActors::TSharedData&& data, TCachePendingBuffers pendingBuffers = {}) noexcept;
     Y_FORCE_INLINE bool FailReady() noexcept;
 
 private:
@@ -218,7 +219,8 @@ Y_FORCE_INLINE NTable::NPage::TPageLocation TPageFetchImpl<TTraits>::Location() 
 }
 
 template <class TTraits>
-Y_FORCE_INLINE bool TPageFetchImpl<TTraits>::MakeReady(NActors::TSharedData&& data) noexcept {
+Y_FORCE_INLINE bool TPageFetchImpl<TTraits>::MakeReady(
+    NActors::TSharedData&& data, TCachePendingBuffers pendingBuffers) noexcept {
     if (!FetchState_) {
         return false;
     }
@@ -228,7 +230,7 @@ Y_FORCE_INLINE bool TPageFetchImpl<TTraits>::MakeReady(NActors::TSharedData&& da
         auto cacheOp = cache.BeginOperation();
         // The fetch owns the insertion ref represented by FetchState_, without storing a second item identity.
         TOperationItemRef<TTraits> owner(cacheOp, FetchState_->Page().CacheItem());
-        ready = cacheOp.Fetches().Complete(owner, *FetchState_, std::move(data));
+        ready = cacheOp.Fetches().Complete(owner, *FetchState_, std::move(data), std::move(pendingBuffers));
     }
     FetchState_.Drop();
     return ready;

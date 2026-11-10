@@ -71,6 +71,7 @@ namespace NBlockIO {
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
         NSharedCache::TCacheCollectionRef Collection;
         TVector<NPageCollection::TLoadedPageData> Pages;
+        NSharedCache::TCachePendingBuffers PendingBuffers;
         const ui64 Cookie;
     };
 

@@ -40,6 +40,7 @@ public:
     std::atomic<ui64> Buffers{ 0 };
     std::atomic<ui64> MetadataBuffers{ 0 };
     std::atomic<ui64> Metadata{ 0 };
+    std::atomic<ui64> PendingBuffers{ 0 };
     TMetadataOwner MetadataOwner;
 
     size_t GetAllocationSize(const char* data) const noexcept override {
@@ -287,7 +288,74 @@ ui64 TCacheAccounting::MetadataBytes() const noexcept {
 }
 
 ui64 TCacheAccounting::GetMemoryUsage() const noexcept {
-    return Account_->Buffers.load(std::memory_order_relaxed) + Account_->Metadata.load(std::memory_order_relaxed);
+    return Account_->Buffers.load(std::memory_order_acquire) + Account_->Metadata.load(std::memory_order_relaxed);
+}
+
+ui64 TCacheAccounting::PendingBufferBytes() const noexcept {
+    return Account_->PendingBuffers.load(std::memory_order_acquire);
+}
+
+TCachePendingBuffers TCacheAccounting::TrackPendingBuffers() const noexcept {
+    return TCachePendingBuffers(Account_);
+}
+
+TCachePendingBuffers::TCachePendingBuffers() noexcept = default;
+
+TCachePendingBuffers::~TCachePendingBuffers() {
+    Reset();
+}
+
+TCachePendingBuffers::TCachePendingBuffers(TIntrusivePtr<TCacheAccount> account, ui64 bytes) noexcept
+    : Account_(std::move(account))
+    , Bytes_(bytes)
+{}
+
+TCachePendingBuffers::TCachePendingBuffers(TCachePendingBuffers&& other) noexcept
+    : Account_(std::move(other.Account_))
+    , Bytes_(std::exchange(other.Bytes_, 0))
+{}
+
+TCachePendingBuffers& TCachePendingBuffers::operator=(TCachePendingBuffers&& other) noexcept {
+    if (this != &other) {
+        Reset();
+        Account_ = std::move(other.Account_);
+        Bytes_ = std::exchange(other.Bytes_, 0);
+    }
+    return *this;
+}
+
+void TCachePendingBuffers::AccountBuffer(const TSharedData& buffer, bool metadata) {
+    Y_DEBUG_ABORT_UNLESS(Account_);
+    const ui64 bytes = buffer.GetAllocationSize();
+    Account_->PendingBuffers.fetch_add(bytes, std::memory_order_relaxed);
+    // Publish classification before the physical charge can be observed by maintenance
+    std::atomic_thread_fence(std::memory_order_release);
+    try {
+        TCacheAccounting(Account_).AccountBuffer(buffer, metadata);
+    } catch (...) {
+        Account_->PendingBuffers.fetch_sub(bytes, std::memory_order_release);
+        throw;
+    }
+    Bytes_ += bytes;
+}
+
+TCachePendingBuffers TCachePendingBuffers::Take(ui64 bytes) noexcept {
+    if (!Account_) {
+        return {};
+    }
+    Y_DEBUG_ABORT_UNLESS(bytes <= Bytes_);
+    Bytes_ -= bytes;
+    return TCachePendingBuffers(Account_, bytes);
+}
+
+void TCachePendingBuffers::Reset() noexcept {
+    if (Account_) {
+        // A successful fetch publishes Resident accounting before ending this classification
+        if (Bytes_ != 0) {
+            Account_->PendingBuffers.fetch_sub(std::exchange(Bytes_, 0), std::memory_order_release);
+        }
+        Account_.Drop();
+    }
 }
 
 } // namespace NKikimr::NSharedCache

@@ -1966,6 +1966,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Fetches->Unblock();
         auto read = sharedCache.Runtime.GrabEdgeEvent<TEvBlobStorage::TEvGet>(proxy, TDuration::Seconds(5));
         UNIT_ASSERT_VALUES_EQUAL(read->Sender, bio);
+        auto accounting = cache.ShareMemoryAccounting();
+        UNIT_ASSERT_VALUES_EQUAL(accounting.PendingBufferBytes(), PAGE_TOTAL_SIZE);
         collection.Drop();
         sharedCache.Unregister(sharedCache.Sender1);
         sharedCache.Send(sharedCache.Sender1, new TEvents::TEvPoison);
@@ -1978,6 +1980,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         observer.Drop();
         UNIT_ASSERT(cache.EraseCollection(item));
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 13 + PAGE_TOTAL_SIZE);
+        UNIT_ASSERT_VALUES_EQUAL(accounting.PendingBufferBytes(), PAGE_TOTAL_SIZE);
 
         TBlockEvents<NBlockIO::TEvData> terminal(sharedCache.Runtime);
         sharedCache.Runtime.Send(new IEventHandle(bio, sharedCache.Sender1, new TEvents::TEvPoison), 0, true);
@@ -1990,6 +1993,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT(terminal.front()->Get()->Collection.CacheItem() == item);
         UNIT_ASSERT_VALUES_EQUAL(terminal.front()->Get()->PageCollection.Get(), canonical.Get());
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 13);
+        UNIT_ASSERT_VALUES_EQUAL(accounting.PendingBufferBytes(), 0);
         terminal.clear();
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 13);
         UNIT_ASSERT_VALUES_EQUAL(original->MetadataReads.load(), 0);

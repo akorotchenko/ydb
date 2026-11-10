@@ -81,7 +81,8 @@ private:
     void RouteHot(TSpaceOperation& spaceOp, ECacheTier tier, EHotLevel level, TCacheItem item) noexcept;
     void RouteHot(TSpaceOperation& spaceOp, EHotLevel level, TCacheItem item) noexcept;
     void RouteOwnedHot(TSpaceOperation& spaceOp, TCacheItemRefImpl<TTraits>& owner, EHotLevel level) noexcept;
-    bool TryEvictHot(THandle& handle, THandleState state, TOperationItemRef<TTraits>& evictionRef) noexcept;
+    // The caller keeps its owner while Hot retention is removed
+    bool TryEvictHot(THandle& handle, THandleState state, const TCacheItemRefImpl<TTraits>& owner) noexcept;
 
     Y_FORCE_INLINE void ProcessHot(
         TSpaceOperation& spaceOp, ECacheTier tier, EHotLevel level, TCacheItem item) noexcept {

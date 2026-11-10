@@ -147,6 +147,10 @@ public:
         return Accounting_.Share();
     }
 
+    TCachePendingBuffers TrackPendingBuffers() const noexcept {
+        return Accounting_.TrackPendingBuffers();
+    }
+
     void AccountMetadata(const NPageCollection::IPageCollection& collection) const {
         Accounting_.AccountMetadata(collection);
     }
@@ -177,7 +181,7 @@ public:
         if (!fetch) {
             return false;
         }
-        return cacheOp.Fetches().Complete(owner, *fetch, std::move(data));
+        return cacheOp.Fetches().Complete(owner, *fetch, std::move(data), {});
     }
 
     Y_FORCE_INLINE bool FailReady(TPageCacheItem page) noexcept {
@@ -245,7 +249,7 @@ public:
         return FindOrInsertBatch(collection, requests, recordStats, waitForMemory, EPageAdmission::Bounded);
     }
 
-    // Optional preloads may reclaim Regular pages for handles, preserving resident Keep pages
+    // Optional preloads reclaim only Regular pages, preserving resident Keep pages
     Y_FORCE_INLINE bool FindOrInsertPreloadBatch(
         TCollectionCacheItem collection, TArrayRef<TCachePageRequestImpl<TTraits>> requests) noexcept {
         return FindOrInsertBatch(collection, requests, false, false, EPageAdmission::Preload);
@@ -455,10 +459,11 @@ public:
         return Memory_.StaticBytes() + Memory_.StaticDeltaBytes() + StorageBytes();
     }
 
-    // Soft retention uses the net gap between actual storage and the conservative resident page ledger
+    // Allocated fetch buffers are prepaid pages, not extra storage outside the page ledger
     ui64 RetentionLimit() const noexcept {
         const ui64 actual = Accounting_.GetMemoryUsage();
-        const ui64 gap = actual - Min(actual, Memory_.ResidentBytes());
+        const ui64 pending = Accounting_.PendingBufferBytes();
+        const ui64 gap = actual - Min(actual, pending + Memory_.ResidentBytes());
         const ui64 limit = SoftLimit();
         return limit - Min(limit, gap);
     }
@@ -659,7 +664,8 @@ private:
         THolder<TCollection>&& value) noexcept;
 
     void MakeReadyState(TSpaceOperation& spaceOp, TCacheItem cacheItem, EHandleState readyState = EHandleState::Hot,
-        TCollection* pageOwner = nullptr, TKeepReservation* keepReservation = nullptr) noexcept;
+        TCollection* pageOwner = nullptr, TKeepReservation* keepReservation = nullptr,
+        TCachePendingBuffers* pendingBuffers = nullptr) noexcept;
 
     template <class TLookup>
     Y_FORCE_INLINE ECacheResultStatus Find(
@@ -770,7 +776,7 @@ private:
         return !candidate.CacheItem.IsNull();
     }
 
-    bool TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages = 0) noexcept;
+    bool TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages = 0, bool preload = false) noexcept;
 
     Y_FORCE_INLINE void NotifyResourcesAvailable() noexcept {
         if (Memory_.NotifyResourcesAvailable()) {
@@ -1095,6 +1101,10 @@ public: // Cache helpers
 
     Y_FORCE_INLINE bool TryReserve(ui64 bytes, ui64 pages = 0) noexcept {
         return Cache_.TryReserve(SpaceOp_, bytes, pages);
+    }
+
+    Y_FORCE_INLINE bool TryReservePreload(ui64 bytes, ui64 pages = 0) noexcept {
+        return Cache_.TryReserve(SpaceOp_, bytes, pages, true);
     }
 
     Y_FORCE_INLINE void DiscardCandidate(TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes = 0) noexcept {

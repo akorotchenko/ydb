@@ -153,6 +153,7 @@ private:
     TCacheItemRefImpl<TTraits> Ref_;
 };
 
+// Ordinary eviction must keep a natively owned page findable and its payload valid
 template <class TTraits = TProdTraits>
 class TCachePageRefImpl : private TMoveOnly {
 public:

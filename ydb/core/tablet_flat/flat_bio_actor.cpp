@@ -54,16 +54,14 @@ void TBlockIO::Inbox(TEventHandlePtr &eh)
         Pages = std::move(ev->Pages);
         Y_ENSURE(Pages, "Got TFetch request without pages list");
         PagesToBlobsConverter = new TPagesToBlobsConverter(*PageCollection, Pages);
+        if (Collection) {
+            PendingBuffers = NSharedCache::TCache::Get().TrackPendingBuffers();
+        }
         BlockStates.reserve(Pages.size());
         for (auto& page: Pages) {
             BlockStates.emplace_back(page.Size);
             if (Collection) {
-                auto& cache = NSharedCache::TCache::Get();
-                if (page.Type == NTable::NPage::EPage::Globs) {
-                    cache.AccountMetadataBuffer(BlockStates.back().Data);
-                } else {
-                    cache.AccountBuffer(BlockStates.back().Data);
-                }
+                PendingBuffers.AccountBuffer(BlockStates.back().Data, page.Type == NTable::NPage::EPage::Globs);
             }
         }
 
@@ -217,6 +215,11 @@ void TBlockIO::Terminate(EStatus code)
     auto *ev = new TEvData(code, PageCollection, RequestCookie);
     // Transfer the canonical owner to the reply before this actor terminates
     ev->Collection = std::move(Collection);
+    if (code == NKikimrProto::OK) {
+        ev->PendingBuffers = std::move(PendingBuffers);
+    } else {
+        PendingBuffers.Reset();
+    }
 
     ev->Pages.reserve(Pages.size());
     for (auto index : xrange(Pages.size())) {

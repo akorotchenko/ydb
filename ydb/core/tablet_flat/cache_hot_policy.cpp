@@ -108,7 +108,7 @@ void TCacheHotPolicy<TTraits>::ProcessHotImpl(
             if (level != EHotLevel::L0) {
                 level = EHotLevel::L0;
             } else {
-                if (Cache_.Eviction_.TryEvictHot(handle, state, evictionRef)) {
+                if (Cache_.Eviction_.TryEvictHot(handle, state, evictionRef.Get())) {
                     return;
                 }
 

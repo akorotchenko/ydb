@@ -2,6 +2,7 @@
 
 #include "defs.h"
 #include "cache_budget.h"
+#include "cache_accounting.h"
 #include "flat_sausage_gut.h"
 
 #include <ydb/library/actors/core/actorid.h>
@@ -638,9 +639,10 @@ private:
     template <class TVisitor>
     void ForEachActiveWaiter(TVisitor&& visitor) const noexcept;
 
-    void SetReady(NActors::TSharedData&& data) noexcept {
+    void SetReady(NActors::TSharedData&& data, TCachePendingBuffers&& pendingBuffers) noexcept {
         Y_DEBUG_ABORT_UNLESS(data && Completion_.load(std::memory_order_relaxed) == EPageFetchCompletion::Pending);
         Data_ = std::move(data);
+        PendingBuffers_ = std::move(pendingBuffers);
         Completion_.store(EPageFetchCompletion::Ready, std::memory_order_release);
     }
 
@@ -673,6 +675,7 @@ private:
     std::atomic<TPageFetchWaiter*> Waiters_{ nullptr };
     std::atomic<EPageFetchCompletion> Completion_{ EPageFetchCompletion::Pending };
     NActors::TSharedData Data_;
+    TCachePendingBuffers PendingBuffers_;
 };
 
 struct alignas(64) THandle {

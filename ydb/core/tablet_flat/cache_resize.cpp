@@ -38,8 +38,8 @@ TCacheItem TCache::PreparePageReplacement(TSpaceOperation& spaceOp, TCacheItem s
     if (!restoreSticky && (!(sourceState.IsHot() || sourceState.IsCold()) || !sourceState.IsStickyNoneField())) {
         return {};
     }
-    // Allocate may reclaim this Cold source. Its native reference keeps the payload alive,
-    // but only the later Replacing claim can exclude logical deletion.
+    // The native owner protects this indexed source from eviction while preparing its replacement
+    // Explicit invalidation can still win before the Replacing claim
     const TCacheItem replacementItem = cacheOp.Allocate();
     if (replacementItem.IsNull()) {
         return {};

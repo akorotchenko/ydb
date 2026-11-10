@@ -20,6 +20,8 @@ public:
 };
 
 static_assert(std::is_nothrow_move_constructible_v<TCacheAccounting>);
+static_assert(std::is_nothrow_move_constructible_v<TCachePendingBuffers>);
+static_assert(!std::is_copy_constructible_v<TCachePendingBuffers>);
 
 namespace {
 
@@ -96,6 +98,52 @@ namespace {
 } // namespace
 
 Y_UNIT_TEST_SUITE(TCacheAccountingTest) {
+    Y_UNIT_TEST(PendingBuffersMoveAndSplitWithoutChangingAllocationLifetime) {
+        TCacheAccounting accounting;
+        auto first = TSharedData::Uninitialized(100);
+        auto second = TSharedData::Uninitialized(200);
+        const ui64 firstBytes = first.GetAllocationSize();
+        const ui64 secondBytes = second.GetAllocationSize();
+        auto pending = accounting.TrackPendingBuffers();
+        pending.AccountBuffer(first);
+        pending.AccountBuffer(second, true);
+        UNIT_ASSERT_VALUES_EQUAL(accounting.GetMemoryUsage(), firstBytes + secondBytes);
+        UNIT_ASSERT_VALUES_EQUAL(accounting.PendingBufferBytes(), firstBytes + secondBytes);
+        auto slice = pending.Take(firstBytes);
+        TCachePendingBuffers reply = std::move(pending);
+        pending.Reset();
+        UNIT_ASSERT_VALUES_EQUAL(accounting.PendingBufferBytes(), firstBytes + secondBytes);
+        slice.Reset();
+        UNIT_ASSERT_VALUES_EQUAL(accounting.PendingBufferBytes(), secondBytes);
+        reply.Reset();
+        UNIT_ASSERT_VALUES_EQUAL(accounting.PendingBufferBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(accounting.GetMemoryUsage(), firstBytes + secondBytes);
+        UNIT_ASSERT_VALUES_EQUAL(accounting.MetadataBytes(), secondBytes);
+        first = {};
+        second = {};
+        UNIT_ASSERT_VALUES_EQUAL(accounting.GetMemoryUsage(), 0);
+    }
+
+    Y_UNIT_TEST(PendingBuffersSurviveCacheAccountOwnerAndRefundAbandonedReplies) {
+        TCacheAccounting observer;
+        TCachePendingBuffers reply;
+        TSharedData retained;
+        {
+            TCacheAccounting accounting;
+            observer = accounting.Share();
+            retained = TSharedData::Uninitialized(100);
+            reply = accounting.TrackPendingBuffers();
+            reply.AccountBuffer(retained);
+        }
+        const ui64 bytes = retained.GetAllocationSize();
+        UNIT_ASSERT_VALUES_EQUAL(observer.PendingBufferBytes(), bytes);
+        reply = {};
+        UNIT_ASSERT_VALUES_EQUAL(observer.PendingBufferBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(observer.GetMemoryUsage(), bytes);
+        retained = {};
+        UNIT_ASSERT_VALUES_EQUAL(observer.GetMemoryUsage(), 0);
+    }
+
     Y_UNIT_TEST(EmptyBufferHasNoAllocationCharge) {
         TCacheAccounting accounting;
         accounting.AccountBuffer({});

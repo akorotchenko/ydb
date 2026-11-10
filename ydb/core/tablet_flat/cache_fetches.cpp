@@ -38,8 +38,8 @@ THandle* TCacheFetches<TTraits>::TryGetPendingHandle(
 }
 
 template <class TTraits>
-bool TCacheFetches<TTraits>::Complete(
-    TOperationItemRef<TTraits>& owner, TPageFetchState& fetch, NActors::TSharedData&& data) noexcept {
+bool TCacheFetches<TTraits>::Complete(TOperationItemRef<TTraits>& owner, TPageFetchState& fetch,
+    NActors::TSharedData&& data, TCachePendingBuffers&& pendingBuffers) noexcept {
     Y_DEBUG_ABORT_UNLESS(data);
     THandle* handle = TryGetPendingHandle(owner, fetch);
     if (!handle || THandleState::FromRaw(handle->State.load(std::memory_order_acquire)).IsWaitingForMemory()) {
@@ -57,7 +57,7 @@ bool TCacheFetches<TTraits>::Complete(
         Release(owner, fetch);
         return false;
     }
-    fetch.SetReady(std::move(data));
+    fetch.SetReady(std::move(data), std::move(pendingBuffers));
     // Drop the I/O-owner ref; the last pending releaser performs MakeReadyState.
     Release(owner, fetch);
     return true;
@@ -156,11 +156,12 @@ void TCacheFetches<TTraits>::Finish(
         Cache_.InvokeHook(ECacheHookPoint::BeforePageReadyState, page);
         NActors::TSharedData data = fetch.TakeData();
         TKeepReservation keep = std::move(fetch.KeepReservation_);
+        TCachePendingBuffers pending = std::move(fetch.PendingBuffers_);
         DeletePendingFetch(handle);
         new (&handle.Body.PageBuffer) NActors::TSharedData::TBuffer(std::move(data).Extract());
         TCollection* owner = Cache_.Collections_.BindOperation(spaceOp).PageCollection(handle);
         Cache_.Memory_.CompleteReservedPage();
-        Cache_.MakeReadyState(spaceOp, page, EHandleState::Hot, owner, &keep);
+        Cache_.MakeReadyState(spaceOp, page, EHandleState::Hot, owner, &keep, &pending);
     }
     Cache_.InvokeHook(ECacheHookPoint::BeforeReadyWaiters, page);
     TPageFetchState::DrainWaiters(waiters, [page](TIntrusivePtr<TPageFetchWaiter> waiter) {
