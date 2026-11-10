@@ -12351,7 +12351,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         };
         UNIT_ASSERT(!hotIsQueued());
 
-        // Consume the early wake and exhaust reclamation before the actor would re-arm
+        // Exhaust reclamation before re-arming; cooperative aging may also notify
         for (ui32 step = 0;; ++step) {
             UNIT_ASSERT(step < 1000);
             if (!fixture.Cache->ReclaimForAdmission(bytes)) {
@@ -12360,18 +12360,19 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         }
         UNIT_ASSERT(!fixture.Cache->CanReserve(bytes));
         UNIT_ASSERT(!fixture.Cache->EnforceCurrentLimit());
+        const ui32 notificationsBeforeRearm = observation.Notifications.load();
         const ui64 generation = fixture.Cache->AdmissionGeneration();
         fixture.Cache->ArmResourceWait();
         UNIT_ASSERT(!TCacheTestAccess::TryReserve(*fixture.Cache, bytes));
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), releaseForeignRef ? 1 : 0);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), notificationsBeforeRearm);
 
         observation.Gate.Slots[0].Release();
         lookup.Join();
         UNIT_ASSERT(found && found.CacheItem() == cold);
         UNIT_ASSERT(hotIsQueued());
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation + 1);
-        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), releaseForeignRef ? 2 : 1);
+        UNIT_ASSERT_VALUES_EQUAL(observation.Notifications.load(), notificationsBeforeRearm + 1);
         UNIT_ASSERT(!fixture.Cache->CanReserve(bytes));
 
         UNIT_ASSERT(TCacheTestAccess::TryReserve(*fixture.Cache, bytes));
