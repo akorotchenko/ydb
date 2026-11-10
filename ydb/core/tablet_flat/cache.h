@@ -251,6 +251,12 @@ public:
         return FindOrInsertBatch(collection, requests, false, false, EPageAdmission::Preload);
     }
 
+    // Forward readers retain their own working set, as writers retain already produced pages
+    Y_FORCE_INLINE bool FindOrInsertReadAheadBatch(TCollectionCacheItem collection,
+        TArrayRef<TCachePageRequestImpl<TTraits>> requests, bool recordStats = true) noexcept {
+        return FindOrInsertBatch(collection, requests, recordStats, false, EPageAdmission::ReadAhead);
+    }
+
     Y_FORCE_INLINE ui64 AvailableHandleCount() noexcept {
         return BeginOperation().SpaceOperation().AvailableHandleCount();
     }
@@ -308,6 +314,11 @@ public:
     Y_FORCE_INLINE bool TryReserveFetchBatch(TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept {
         auto cacheOp = BeginOperation();
         return cacheOp.Fetches().TryReserveBatch(pages);
+    }
+
+    Y_FORCE_INLINE void ReserveReadAheadBatch(TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept {
+        auto cacheOp = BeginOperation();
+        cacheOp.Fetches().TryReserveBatch(pages, true);
     }
 
     // Advisory read-only snapshots; actual admission must still acquire its resources
@@ -575,6 +586,7 @@ private:
         Bounded,
         Preload,
         Written,
+        ReadAhead,
     };
 
     struct TPageInsertCandidate {

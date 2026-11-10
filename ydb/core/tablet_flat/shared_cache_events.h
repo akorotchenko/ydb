@@ -185,6 +185,7 @@ namespace NKikimr::NSharedCache {
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
         TVector<TPageLocation> Pages;
         TVector<bool> Sticky; // Optional per-page admission hints supplied by the requester.
+        bool ReadAhead = false;
         TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad;
         NWilson::TTraceId TraceId;
         const ui64 Cookie;

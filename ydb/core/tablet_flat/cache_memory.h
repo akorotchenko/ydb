@@ -327,7 +327,7 @@ public:
     // The caller checks its current limit against usage before each attempt.
     bool TryReserve(ui64& usage, ui64 bytes, ui64 pages) noexcept;
 
-    void AccountWritten(ui64 bytes, ui64 pages) noexcept;
+    void AccountPageReservation(ui64 bytes, ui64 pages) noexcept;
 
     void ReleaseReservation(ui64 bytes, ui64 pages) noexcept {
         SubtractExactBytes(ReservedBytes_, bytes);
@@ -497,11 +497,11 @@ inline bool TCacheMemory::TryReserve(ui64& usage, ui64 bytes, ui64 pages) noexce
     return false;
 }
 
-inline void TCacheMemory::AccountWritten(ui64 bytes, ui64 pages) noexcept {
+inline void TCacheMemory::AccountPageReservation(ui64 bytes, ui64 pages) noexcept {
     if (bytes == 0 && pages == 0) {
         return;
     }
-    // The writer already owns these buffers; transfer their charge before publishing native page items.
+    // Written pages and forward reads are charged without checking the cache byte target
     PageUsage_.fetch_add(bytes, std::memory_order_relaxed);
     OverallUsage_.fetch_add(bytes, std::memory_order_relaxed);
     ReservedBytes_.fetch_add(bytes, std::memory_order_relaxed);

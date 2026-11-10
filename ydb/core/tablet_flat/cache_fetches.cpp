@@ -211,7 +211,7 @@ bool TCacheFetches<TTraits>::ReserveMemory(TSpaceOperation& spaceOp, TCacheItem 
 
 template <class TTraits>
 bool TCacheFetches<TTraits>::TryReserveBatch(
-    TSpaceOperation& spaceOp, TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept {
+    TSpaceOperation& spaceOp, TArrayRef<TPageFetchImpl<TTraits>> pages, bool readAhead) noexcept {
     TVector<TPageFetchState*> waiting;
     ui64 bytes = 0;
     for (auto& page : pages) {
@@ -227,7 +227,9 @@ bool TCacheFetches<TTraits>::TryReserveBatch(
     }
     // Reserve the missing batch as a whole; two non-transactional requests must not each
     // hold a partial batch while waiting for the other one's bytes.
-    if (!Cache_.TryReserve(spaceOp, bytes, waiting.size())) {
+    if (readAhead) {
+        Cache_.Memory_.AccountPageReservation(bytes, waiting.size());
+    } else if (!Cache_.TryReserve(spaceOp, bytes, waiting.size())) {
         return false;
     }
     for (auto* fetch : waiting) {

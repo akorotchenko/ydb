@@ -631,8 +631,8 @@ bool TCache::PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandidate& ca
     const ui64 reservedBytes = TCacheItems<TTraits>::AccountedPageBytes(candidate.Size);
     bool reserved = true;
     TCacheItem cacheItem;
-    if (candidate.Admission == EPageAdmission::Written) {
-        Memory_.AccountWritten(reservedBytes, 1);
+    if (candidate.Admission == EPageAdmission::Written || candidate.Admission == EPageAdmission::ReadAhead) {
+        Memory_.AccountPageReservation(reservedBytes, 1);
         cacheItem = cacheOp.Allocate();
         if (cacheItem.IsNull()) {
             ReleaseReservation(reservedBytes, 1);
@@ -852,8 +852,8 @@ bool TCache::AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& collection
         }
     }
     bool reserved = true;
-    if (admission == EPageAdmission::Written) {
-        Memory_.AccountWritten(reservedBytes, preparedPages);
+    if (admission == EPageAdmission::Written || admission == EPageAdmission::ReadAhead) {
+        Memory_.AccountPageReservation(reservedBytes, preparedPages);
     } else {
         reserved = cacheOp.TryReserve(reservedBytes, preparedPages);
     }

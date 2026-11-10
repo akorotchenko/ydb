@@ -518,7 +518,10 @@ namespace NOps {
                             << " cookie " << fetch.Cookie;
                     }
 
-                    Send(MakeSharedPageCacheId(), new NSharedCache::TEvRequest(Args.ReadPrio, std::move(fetch.PageCollection), std::move(fetch.Pages), fetch.Cookie));
+                    auto* request = new NSharedCache::TEvRequest(
+                        Args.ReadPrio, std::move(fetch.PageCollection), std::move(fetch.Pages), fetch.Cookie);
+                    request->ReadAhead = true;
+                    Send(MakeSharedPageCacheId(), request);
                 }
 
                 if (ready == NTable::EReady::Page)

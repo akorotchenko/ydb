@@ -5506,6 +5506,106 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         TCacheTestAccess::ReleaseReservation(*fixture.Cache, bytes);
     }
 
+    Y_UNIT_TEST(ReadAheadBatchAccountsPagesAboveTheCacheByteLimit) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(83, 84, 191), ECacheMode::Regular);
+        const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(cache.UpdateCurrentLimit(bytes));
+        std::array<TTestCachePageRef, 2> held;
+        TVector<TTestCachePageRequest> requests;
+        for (ui32 index = 0; index < held.size(); ++index) {
+            requests.emplace_back(
+                MakePageLocation(index), MakeIntrusive<TAcquiringPageFetchWaiter>(cache, held[index]));
+        }
+        UNIT_ASSERT(cache.FindOrInsertReadAheadBatch(collection, requests));
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), 2 * bytes);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 2 * bytes);
+        for (auto& request : requests) {
+            UNIT_ASSERT(request.Status() == ECacheResultStatus::Inserted);
+            auto& fetch = request.Fetch();
+            UNIT_ASSERT(fetch.Dispatch());
+            UNIT_ASSERT(fetch.MakeReady(MakePageData(fetch.CacheItem().Index())));
+        }
+        UNIT_ASSERT(held[0] && held[1]);
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 2 * bytes);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+    }
+
+    Y_UNIT_TEST(ReadAheadReservesAnExistingWaitingFetchOnlyOnce) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(83, 84, 192), ECacheMode::Regular);
+        const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(cache.UpdateCurrentLimit(bytes));
+        UNIT_ASSERT(TCacheTestAccess::TryReserve(cache, bytes));
+        std::atomic<ui32> completed = 0, ready = 0;
+        std::atomic<ui64> completedItem = 0;
+        TTestCachePageRequest original(MakePageLocation(0), new TTestPageFetchWaiter(completed, ready, completedItem));
+        UNIT_ASSERT(cache.FindOrInsertBatch(collection, { &original, 1 }, true, true));
+        TTestCachePageRequest readAhead(MakePageLocation(0), new TTestPageFetchWaiter(completed, ready, completedItem));
+        UNIT_ASSERT(cache.FindOrInsertReadAheadBatch(collection, { &readAhead, 1 }));
+        UNIT_ASSERT(readAhead.Status() == ECacheResultStatus::Pending);
+        TVector<TTestPageFetch> fetches;
+        fetches.push_back(std::move(original.Fetch()));
+        UNIT_ASSERT(!cache.TryReserveFetchBatch(fetches));
+        UNIT_ASSERT(!fetches[0].Dispatch());
+        cache.ReserveReadAheadBatch(fetches);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), 2 * bytes);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 1);
+        cache.ReserveReadAheadBatch(fetches);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), 2 * bytes);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 1);
+        UNIT_ASSERT(fetches[0].Dispatch());
+        UNIT_ASSERT(fetches[0].MakeReady(MakePageData(fetches[0].CacheItem().Index())));
+        UNIT_ASSERT_VALUES_EQUAL(completed.load(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(ready.load(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), bytes);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+        TCacheTestAccess::ReleaseReservation(cache, bytes);
+    }
+
+    Y_UNIT_TEST(FailedReadAheadFetchRefundsItsOverBudgetReservation) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(83, 84, 193), ECacheMode::Regular);
+        UNIT_ASSERT(cache.UpdateCurrentLimit(1));
+        std::atomic<ui32> completed = 0, ready = 0;
+        std::atomic<ui64> completedItem = 0;
+        TTestCachePageRequest request(MakePageLocation(0), new TTestPageFetchWaiter(completed, ready, completedItem));
+        UNIT_ASSERT(cache.FindOrInsertReadAheadBatch(collection, { &request, 1 }));
+        UNIT_ASSERT_GT(cache.ReservedBytes(), cache.CurrentLimit());
+        UNIT_ASSERT(request.Fetch().FailReady());
+        UNIT_ASSERT_VALUES_EQUAL(completed.load(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(ready.load(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
+    }
+
+    Y_UNIT_TEST(ReadAheadHandleFailureRefundsTheReservation) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(83, 84, 194), ECacheMode::Regular);
+        for (ui64 id = 1000; AvailableFreeHandles(cache) != 0; ++id) {
+            const TLogoBlobID label(83, 84, id);
+            const auto item = AllocateCollection(cache, TCacheKey::Collection(label));
+            UNIT_ASSERT(cache.MakeReady(item, MakeCollection(label)));
+        }
+        const ui64 usage = cache.PayloadUsage();
+        TTestCachePageRequest request(MakePageLocation(0), MakeIntrusive<TPageFetchWaiter>());
+        UNIT_ASSERT(!cache.FindOrInsertReadAheadBatch(collection, { &request, 1 }));
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), usage);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+    }
+
     Y_UNIT_TEST(MemoryWaitingBatchReservesAllPagesBeforeDispatch) {
         TFixture fixture;
         const TLogoBlobID id(83, 84, 97);

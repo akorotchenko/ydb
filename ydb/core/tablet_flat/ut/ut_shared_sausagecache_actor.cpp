@@ -434,10 +434,12 @@ struct TSharedPageCacheMock {
         return *this;
     }
 
-    TSharedPageCacheMock& Request(TActorId sender, TIntrusiveConstPtr<TPageCollectionMock> collection, TVector<TPageLocation> locations, EPriority priority = EPriority::Fast, ui64 eventCookie = 0,
-        TIntrusivePtr<TPagesWaitPad> waitPad = {}) {
+    TSharedPageCacheMock& Request(TActorId sender, TIntrusiveConstPtr<TPageCollectionMock> collection,
+        TVector<TPageLocation> locations, EPriority priority = EPriority::Fast, ui64 eventCookie = 0,
+        TIntrusivePtr<TPagesWaitPad> waitPad = {}, bool readAhead = false) {
         auto request = new TEvRequest(priority, collection, std::move(locations), ++RequestId);
         request->WaitPad = std::move(waitPad);
+        request->ReadAhead = readAhead;
         Send(sender, request, eventCookie ? eventCookie : ui64(ERequestTypeCookie::Transaction));
 
         TWaitForFirstEvent<TEvRequest> waiter(Runtime);
@@ -1674,6 +1676,63 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { page });
         sharedCache.CheckFetches({});
         sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { _P(1) } } });
+    }
+
+    Y_UNIT_TEST(ReadAheadFetchesAWholeBatchAboveTheCacheByteLimit) {
+        TSharedPageCacheMock sharedCache;
+        sharedCache.SetLimit(PAGE_TOTAL_SIZE, 0, PAGE_TOTAL_SIZE);
+        const TVector<TPageLocation> pages{ _P(0), _P(1) };
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, pages, EPriority::Bulk, 0, {}, true);
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, pages } });
+        auto& cache = TCache::Get();
+        UNIT_ASSERT_VALUES_EQUAL(cache.CurrentLimit(), PAGE_TOTAL_SIZE);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), 2 * PAGE_TOTAL_SIZE);
+        sharedCache.Provide(sharedCache.Collection1, pages);
+        auto held = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, pages } });
+        UNIT_ASSERT_VALUES_EQUAL(held.size(), 2);
+        UNIT_ASSERT_GT(cache.PayloadUsage(), cache.CurrentLimit());
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), 0);
+        sharedCache.CheckFetches({});
+    }
+
+    void CheckReadAheadJoinsFetch(bool waitingForMemory) {
+        TSharedPageCacheMock sharedCache;
+        sharedCache.SetLimit(PAGE_TOTAL_SIZE, 0, PAGE_TOTAL_SIZE);
+        THashMap<TPageId, TCachePageRef> held;
+        if (waitingForMemory) {
+            sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(0) });
+            sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(0) } } });
+            sharedCache.Provide(sharedCache.Collection1, { _P(0) });
+            held = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(0) } } });
+        }
+        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, { _P(1) });
+        const ui64 original = sharedCache.RequestId;
+        if (waitingForMemory) {
+            sharedCache.CheckFetches({});
+        } else {
+            sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(1) } } });
+        }
+        sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, { _P(1) }, EPriority::Bulk, 0, {}, true);
+        if (waitingForMemory) {
+            sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(1) } } });
+        } else {
+            sharedCache.CheckFetches({});
+        }
+        UNIT_ASSERT_VALUES_EQUAL(TCache::Get().ReservedBytes(), PAGE_TOTAL_SIZE);
+        sharedCache.Provide(sharedCache.Collection1, { _P(1) });
+        auto loaded = sharedCache.CheckResults({ TFetch{ original, sharedCache.Collection1, { _P(1) } },
+            TFetch{ original + 1, sharedCache.Collection1, { _P(1) } } });
+        UNIT_ASSERT_VALUES_EQUAL(loaded.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(TCache::Get().ReservedBytes(), 0);
+        sharedCache.CheckFetches({});
+    }
+
+    Y_UNIT_TEST(ReadAheadPromotesAMemoryWaitingFetchAtBulkPriority) {
+        CheckReadAheadJoinsFetch(true);
+    }
+
+    Y_UNIT_TEST(ReadAheadJoinsAnAlreadyReservedFetchWithoutChargingTwice) {
+        CheckReadAheadJoinsFetch(false);
     }
 
     Y_UNIT_TEST(CoreOversizedDemandFailsBeforeFetch) {

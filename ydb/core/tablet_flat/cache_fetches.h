@@ -57,7 +57,8 @@ private:
         bool reserved) noexcept;
 
     bool ReserveMemory(TSpaceOperation& spaceOp, TCacheItem item, TPageFetchState& fetch) noexcept;
-    bool TryReserveBatch(TSpaceOperation& spaceOp, TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept;
+    bool TryReserveBatch(
+        TSpaceOperation& spaceOp, TArrayRef<TPageFetchImpl<TTraits>> pages, bool readAhead = false) noexcept;
     bool Dispatch(TSpaceOperation& spaceOp, TCacheItem cacheItem, TPageFetchState& fetch) noexcept;
 
 private:
@@ -90,8 +91,8 @@ public:
         return Cache_.Fetches_.ReserveMemory(SpaceOp_, item, fetch);
     }
 
-    Y_FORCE_INLINE bool TryReserveBatch(TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept {
-        return Cache_.Fetches_.TryReserveBatch(SpaceOp_, pages);
+    Y_FORCE_INLINE bool TryReserveBatch(TArrayRef<TPageFetchImpl<TTraits>> pages, bool readAhead = false) noexcept {
+        return Cache_.Fetches_.TryReserveBatch(SpaceOp_, pages, readAhead);
     }
 
     Y_FORCE_INLINE bool Dispatch(TCacheItem item, TPageFetchState& fetch) noexcept {

@@ -108,6 +108,7 @@ struct TQueuedRequest {
     TVector<bool> Sticky;
     TVector<TIntrusivePtr<TRequestCompletion>> HandleRequirements;
     bool WaitingTransaction = false;
+    bool ReadAhead = false;
 };
 
 struct TRequestQueue {
@@ -886,6 +887,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         admission->Completion = completion;
         admission->CollectionItem = owner ? owner->CacheItem : TCollectionCacheItem{};
         admission->Priority = msg.Priority;
+        admission->ReadAhead = msg.ReadAhead;
         admission->TraceId = std::move(msg.TraceId);
         const auto& locations = completion->Locations();
         Y_ENSURE(msg.Sticky.empty() || msg.Sticky.size() == locations.size());
@@ -937,8 +939,14 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             requests.emplace_back(
                 locations[index], new TRequestPageWaiter(admission.Completion, index), admission.Sticky[index]);
         }
-        const bool admitted = preload ? Cache->FindOrInsertPreloadBatch(admission.CollectionItem, requests)
-                                      : Cache->FindOrInsertBatch(admission.CollectionItem, requests, recordStats, true);
+        bool admitted;
+        if (preload) {
+            admitted = Cache->FindOrInsertPreloadBatch(admission.CollectionItem, requests);
+        } else if (admission.ReadAhead) {
+            admitted = Cache->FindOrInsertReadAheadBatch(admission.CollectionItem, requests, recordStats);
+        } else {
+            admitted = Cache->FindOrInsertBatch(admission.CollectionItem, requests, recordStats, true);
+        }
         if (!admitted) {
             return false;
         }
@@ -1027,7 +1035,8 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                     toFetch.push_back(std::move(page.Fetch()));
                     [[fallthrough]];
                 case ECacheResultStatus::Pending:
-                    if (!QueueForPriority(admission.Priority) && page.Status() == ECacheResultStatus::Pending) {
+                    if ((admission.ReadAhead || !QueueForPriority(admission.Priority)) &&
+                        page.Status() == ECacheResultStatus::Pending) {
                         if (TPageFetch promoted =
                                 TakeQueuedPage(admission.PageCollection()->Label(), locations[index].Offset)) {
                             toFetch.push_back(std::move(promoted));
@@ -1049,7 +1058,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         admission.AdmissionIndices = std::move(unresolved);
         if (toFetch) {
             QueueFetch(std::move(toFetch), admission.Priority, admission.Sender, NWilson::TTraceId(admission.TraceId),
-                admission.Completion);
+                admission.Completion, admission.ReadAhead);
         }
         return admission.AdmissionIndices.empty() && !retryPreload;
     }
@@ -1065,15 +1074,22 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
     }
 
     void QueueFetch(TVector<TPageFetch>&& pages, NBlockIO::EPriority priority, const TActorId& sender,
-        NWilson::TTraceId traceId, TIntrusivePtr<TRequestCompletion> completion) {
+        NWilson::TTraceId traceId, TIntrusivePtr<TRequestCompletion> completion, bool readAhead) {
         Y_DEBUG_ABORT_UNLESS(completion->Collection());
         auto waiting = MakeHolder<TQueuedRequest>();
         waiting->Sender = sender;
         waiting->Completion = completion;
         waiting->Priority = priority;
         waiting->TraceId = NWilson::TTraceId(traceId);
+        waiting->ReadAhead = readAhead;
         TVector<TPageFetch> ready;
-        const bool reserved = Cache->TryReserveFetchBatch(pages);
+        bool reserved;
+        if (readAhead) {
+            Cache->ReserveReadAheadBatch(pages);
+            reserved = true;
+        } else {
+            reserved = Cache->TryReserveFetchBatch(pages);
+        }
 
         for (auto &page : pages) {
             if (reserved) {
@@ -1105,6 +1121,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             queued->Completion = std::move(completion);
             queued->Priority = priority;
             queued->TraceId = std::move(traceId);
+            queued->ReadAhead = readAhead;
             for (auto& page : ready) {
                 queued->Pages.push_back(std::move(page));
             }
@@ -1246,7 +1263,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             if (pages) {
                 const size_t before = ResourceWaits.size();
                 QueueFetch(std::move(pages), waiting->Priority, waiting->Sender, std::move(waiting->TraceId),
-                    waiting->Completion);
+                    waiting->Completion, waiting->ReadAhead);
                 if (ResourceWaits.size() > before) {
                     const auto& blocked = *ResourceWaits.back();
                     for (const auto& page : blocked.Pages) {
