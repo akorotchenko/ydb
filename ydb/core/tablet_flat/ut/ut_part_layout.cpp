@@ -499,7 +499,7 @@ namespace {
                 auto* data = pages[slot].FindPtr(location.Offset);
                 UNIT_ASSERT_C(data, "Fetch of an unknown page " << location << " of page collection " << slot);
                 auto page = cache.AdmitPage(fetch.PageCollection, location, TSharedData(*data),
-                    TLoader::NeedIn(location.Type) || location.Type == EPage::FlatIndex);
+                    NTable::TLoader::NeedIn(location.Type) || location.Type == EPage::FlatIndex);
                 UNIT_ASSERT(page);
                 loaded.emplace_back(location.Offset, location.Size, std::move(page));
             }
