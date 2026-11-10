@@ -10678,6 +10678,56 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
     }
+    Y_UNIT_TEST(OversizedReservationDoesNotEvictResidentsOrWakeWaiters) {
+        for (bool keep : { false, true }) {
+            TFixture fixture;
+            auto& cache = *fixture.Cache;
+            UNIT_ASSERT(ConfigureKeep(cache, 64_KB));
+            const auto collection = CreateModeCollection(cache, fixture.Registry, TLogoBlobID(541, 542, 1),
+                keep ? ECacheMode::TryKeepInMemory : ECacheMode::Regular);
+            const auto page = InsertReadyPage(cache, TCacheKey::Page(collection, 0));
+            UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, page));
+            const auto state = TCacheTestAccess::HandleState(cache, page.Index());
+            UNIT_ASSERT(state.IsColdInTier(keep ? ECacheTier::Keep : ECacheTier::Regular));
+            const ui64 bytes = cache.PayloadUsage();
+            UNIT_ASSERT(cache.UpdateCurrentLimit(bytes));
+
+            struct TObservation {
+                ui32 Reclaims = 0;
+                ui32 Notifications = 0;
+            } observation;
+
+            TTestTraits hooks{ &observation, [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
+                                  auto& observed = *static_cast<TObservation*>(context);
+                                  observed.Reclaims += point == ECacheHookPoint::AfterAdmissionReclaimStep;
+                                  observed.Notifications += point == ECacheHookPoint::ResourcesAvailable;
+                              } };
+            TCacheHookGuard guard(cache, hooks);
+            const ui64 generation = cache.AdmissionGeneration();
+            const ui64 keepBytes = cache.KeepOwnedBytes();
+            cache.ArmResourceWait();
+            UNIT_ASSERT(!TCacheTestAccess::TryReserve(cache, 2 * bytes, 2));
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, page.Index()).Raw(), state.Raw());
+            UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), bytes);
+            UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(cache.KeepOwnedBytes(), keepBytes);
+            UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation);
+            UNIT_ASSERT_VALUES_EQUAL(observation.Reclaims, 0);
+            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, 0);
+            cache.DisarmResourceWait();
+
+            // A later limit increase makes the same reservation possible without evicting the page
+            UNIT_ASSERT(cache.UpdateCurrentLimit(3 * bytes));
+            UNIT_ASSERT(TCacheTestAccess::TryReserve(cache, 2 * bytes, 2));
+            UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 3 * bytes);
+            UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), 2 * bytes);
+            UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 2);
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, page.Index()).Raw(), state.Raw());
+            TCacheTestAccess::ReleaseReservation(cache, 2 * bytes, 2);
+        }
+    }
+
     Y_UNIT_TEST(CurrentLimitRejectsReservationUntilHeldBufferIsReleased) {
         TFixture fixture;
         const auto collection = MakeCollectionCacheItem(541, 542);

@@ -1071,6 +1071,10 @@ bool TCache::TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages) noexce
     ui32 reclamationAttempts = 0;
     for (;;) {
         const ui64 currentLimit = CurrentLimit();
+        // Reclamation cannot make a reservation larger than the whole budget fit
+        if (bytes > currentLimit) {
+            return false;
+        }
         if (ExceedsLimit(usage, currentLimit, bytes)) {
             Eviction_.MarkSoftLimitPressure();
             // Aging/resizing can make progress without freeing bytes. Bound cooperative work so
