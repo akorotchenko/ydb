@@ -9078,7 +9078,9 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_CutTabletHistory) {
         env.SendSync(data.MakeScheme(std::move(policy)));
         env.SendSync(data.MakeRows(3000));
 
-        env.SendSync(new TEvents::TEvPoison, false, true);
+        // Both the tablet and its owner acknowledge shutdown
+        env.SendAsync(new TEvents::TEvPoison);
+        env.WaitForGone(2);
 
         // Booting with the flag off means nothing feeds the history cutter with the blobs of
         // already existing parts, so this tablet generation must never cut anything.
@@ -9099,7 +9101,8 @@ Y_UNIT_TEST_SUITE(TFlatTableExecutor_CutTabletHistory) {
         UNIT_ASSERT_VALUES_EQUAL(wasCutHistory, 0u);
 
         // The flag is latched at boot, so it only takes effect on the next one.
-        env.SendSync(new TEvents::TEvPoison, false, true);
+        env.SendAsync(new TEvents::TEvPoison);
+        env.WaitForGone(2);
         env.FireTablet(env.Edge, env.Tablet, [&env](const TActorId &tablet, TTabletStorageInfo *info) {
             return new TTestFlatTablet(env.Edge, tablet, info);
         }, 0, &starter);
