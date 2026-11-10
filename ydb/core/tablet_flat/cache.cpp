@@ -400,6 +400,8 @@ void TCache::MakeReadyState(TSpaceOperation& spaceOp, TCacheItem item, EHandleSt
     bool retained = false;
     bool retentionGuaranteed = false;
     EHandleState accounted = EHandleState::Cold;
+    // Count the installed payload before budget checks so its prepaid bytes are not treated as extra storage
+    Memory_.AddResident(bytes);
     for (;;) {
         const auto before = THandleState::FromRaw(raw);
         Y_DEBUG_ABORT_UNLESS(item.Matches(before) && (before.IsPending() || before.IsCompleting()));
@@ -440,7 +442,6 @@ void TCache::MakeReadyState(TSpaceOperation& spaceOp, TCacheItem item, EHandleSt
         const EHandleState destination =
             sticky ? EHandleState::Sticky : (hot ? THandleState::HotState(tier) : THandleState::ColdState(tier));
         if (!resident) {
-            Memory_.AddResident(bytes);
             auto& usage = Memory_.ResidentCategory(destination);
             usage.AddBytes(static_cast<i64>(bytes));
             usage.AddPage(initial.Kind());
