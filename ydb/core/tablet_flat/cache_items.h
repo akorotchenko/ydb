@@ -54,8 +54,8 @@ private:
 
     // Reference acquisition
     TCacheItemRefImpl<TTraits> TryAcquireRetiredItemRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
-    Y_FORCE_INLINE EAcquireStatus TryAcquire(
-        TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending, TCacheItemRefImpl<TTraits>& ref) noexcept;
+    Y_FORCE_INLINE EAcquireStatus TryAcquire(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending,
+        TCacheItemRefImpl<TTraits>& ref, bool demand = true) noexcept;
     TCacheItemRefImpl<TTraits> TryAcquireHotItemRef(
         TSpaceOperation& spaceOp, TCacheItem item, ECacheTier expectedTier) noexcept;
     Y_FORCE_INLINE TCacheItemRefImpl<TTraits> AcquireMorePageRef(TCacheItem item) noexcept;
@@ -135,8 +135,8 @@ public:
     }
 
     Y_FORCE_INLINE EAcquireStatus TryAcquire(
-        TCacheItem cacheItem, bool allowPending, TCacheItemRefImpl<TTraits>& ref) noexcept {
-        return Cache_.Items_.TryAcquire(SpaceOp_, cacheItem, allowPending, ref);
+        TCacheItem cacheItem, bool allowPending, TCacheItemRefImpl<TTraits>& ref, bool demand = true) noexcept {
+        return Cache_.Items_.TryAcquire(SpaceOp_, cacheItem, allowPending, ref, demand);
     }
 
     Y_FORCE_INLINE TCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TCacheItem item, ECacheTier expectedTier) noexcept {
@@ -291,8 +291,8 @@ Y_FORCE_INLINE TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMoreColle
 }
 
 template <class TTraits>
-Y_FORCE_INLINE typename TCacheItems<TTraits>::EAcquireStatus TCacheItems<TTraits>::TryAcquire(
-    TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending, TCacheItemRefImpl<TTraits>& ref) noexcept {
+Y_FORCE_INLINE typename TCacheItems<TTraits>::EAcquireStatus TCacheItems<TTraits>::TryAcquire(TSpaceOperation& spaceOp,
+    TCacheItem cacheItem, bool allowPending, TCacheItemRefImpl<TTraits>& ref, bool demand) noexcept {
     auto cacheOp = Cache_.BindOperation(spaceOp);
     if (!spaceOp.Contains(cacheItem)) {
         return EAcquireStatus::Stale;
@@ -317,7 +317,7 @@ Y_FORCE_INLINE typename TCacheItems<TTraits>::EAcquireStatus TCacheItems<TTraits
 
         THandleState desired = expected.IncrementRefs();
         const bool pending = expected.IsPending();
-        if (expected.IsHot()) {
+        if (expected.IsHot() && demand) {
             desired = desired.WithFrequency(Min<ui8>(expected.Frequency() + 1, 2));
         }
 
@@ -332,6 +332,13 @@ Y_FORCE_INLINE typename TCacheItems<TTraits>::EAcquireStatus TCacheItems<TTraits
         if (expected.IsCold() && expected.IsPageKind()) {
             TOperationItemRef<TTraits> owned(spaceOp, TCacheItemRefImpl<TTraits>(cacheItem));
             Cache_.InvokeHook(ECacheHookPoint::AfterColdRefAcquired, cacheItem);
+            if (!demand) {
+                if (cacheOp.Eviction().ReconcilePage(owned.Get())) {
+                    cacheOp.Eviction().RouteOwnedHot(owned.Get(), EHotLevel::L1);
+                }
+                ref = owned.Take();
+                return EAcquireStatus::Ready;
+            }
             const bool changed = cacheOp.Eviction().TouchPage(owned.Get());
             const TCacheItem current = owned.CacheItem();
             const bool promoted = cacheOp.Eviction().PromoteCold(current);
@@ -342,6 +349,9 @@ Y_FORCE_INLINE typename TCacheItems<TTraits>::EAcquireStatus TCacheItems<TTraits
             }
             ref = owned.Take();
             return EAcquireStatus::Ready;
+        }
+        if (pending && expected.IsPageKind() && demand) {
+            handle.Body.Fetch->HasDemand_.store(true, std::memory_order_relaxed);
         }
         ref = TCacheItemRefImpl<TTraits>(cacheItem);
         return pending ? EAcquireStatus::Pending : EAcquireStatus::Ready;

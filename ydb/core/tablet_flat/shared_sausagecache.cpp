@@ -1988,7 +1988,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
                 ECacheResultStatus status;
                 {
                     TCachePageRef page;
-                    status = Cache->Find(collection->CacheItem, static_cast<ui64>(location.Offset), page);
+                    status = Cache->FindForPreload(collection->CacheItem, static_cast<ui64>(location.Offset), page);
             }
             if (status == ECacheResultStatus::Hit) {
                 locationIt = pagesToLoad.erase(locationIt);

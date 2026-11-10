@@ -228,6 +228,10 @@ public:
     Y_FORCE_INLINE ECacheResultStatus Find(
         TCollectionCacheItem collection, ui64 offset, TCachePageRefImpl<TTraits>& page) noexcept;
 
+    // An owning presence probe for optional loads, without demand reclamation or reheating
+    Y_FORCE_INLINE ECacheResultStatus FindForPreload(
+        TCollectionCacheItem collection, ui64 offset, TCachePageRefImpl<TTraits>& page) noexcept;
+
     Y_FORCE_INLINE ECacheResultStatus Find(
         const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept;
 
@@ -249,7 +253,7 @@ public:
         return FindOrInsertBatch(collection, requests, recordStats, waitForMemory, EPageAdmission::Bounded);
     }
 
-    // Optional preloads reclaim only Regular pages, preserving resident Keep pages
+    // Optional admission reclaims only Regular pages
     Y_FORCE_INLINE bool FindOrInsertPreloadBatch(
         TCollectionCacheItem collection, TArrayRef<TCachePageRequestImpl<TTraits>> requests) noexcept {
         return FindOrInsertBatch(collection, requests, false, false, EPageAdmission::Preload);
@@ -669,7 +673,10 @@ private:
 
     template <class TLookup>
     Y_FORCE_INLINE ECacheResultStatus Find(
-        TOperationView& cacheOp, TLookup&& lookup, TCacheItemRefImpl<TTraits>& ref) noexcept;
+        TOperationView& cacheOp, TLookup&& lookup, TCacheItemRefImpl<TTraits>& ref, bool demand = true) noexcept;
+
+    Y_FORCE_INLINE ECacheResultStatus Find(
+        TCollectionCacheItem collection, ui64 offset, TCachePageRefImpl<TTraits>& page, bool demand) noexcept;
 
     ECacheCollectionLookupStatus FindCollection(
         TCollectionRegistry& registry, const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept;
@@ -942,7 +949,7 @@ public: // Cache table operations
     }
 
     Y_FORCE_INLINE ECacheResultStatus FindPage(
-        TCollectionCacheItem collection, ui64 offset, TCacheItemRefImpl<TTraits>& ref) noexcept {
+        TCollectionCacheItem collection, ui64 offset, TCacheItemRefImpl<TTraits>& ref, bool demand = true) noexcept {
         struct TLookup {
             TCacheOperationView& CacheOp;
             TCollectionCacheItem Collection;
@@ -953,7 +960,7 @@ public: // Cache table operations
             }
         };
 
-        return Cache_.Find(*this, TLookup{ *this, collection, offset }, ref);
+        return Cache_.Find(*this, TLookup{ *this, collection, offset }, ref, demand);
     }
 
     Y_FORCE_INLINE ECacheResultStatus FindCollection(const TLogoBlobID& id, TCacheItem& item) noexcept {
@@ -1006,8 +1013,8 @@ public: // Cache table operations
 
 public: // Cache helpers
     Y_FORCE_INLINE EAcquireStatus TryAcquire(
-        TCacheItem item, bool allowPending, TCacheItemRefImpl<TTraits>& ref) noexcept {
-        return Items().TryAcquire(item, allowPending, ref);
+        TCacheItem item, bool allowPending, TCacheItemRefImpl<TTraits>& ref, bool demand = true) noexcept {
+        return Items().TryAcquire(item, allowPending, ref, demand);
     }
 
     Y_FORCE_INLINE TCacheItemRefImpl<TTraits> TryAcquireStructural(TCacheItem item) noexcept {
@@ -1300,10 +1307,22 @@ Y_FORCE_INLINE void* TProdTraits::TryGetCache() noexcept {
 template <class TTraits>
 Y_FORCE_INLINE ECacheResultStatus TCacheImpl<TTraits>::Find(
     TCollectionCacheItem collection, ui64 offset, TCachePageRefImpl<TTraits>& page) noexcept {
+    return Find(collection, offset, page, true);
+}
+
+template <class TTraits>
+Y_FORCE_INLINE ECacheResultStatus TCacheImpl<TTraits>::FindForPreload(
+    TCollectionCacheItem collection, ui64 offset, TCachePageRefImpl<TTraits>& page) noexcept {
+    return Find(collection, offset, page, false);
+}
+
+template <class TTraits>
+Y_FORCE_INLINE ECacheResultStatus TCacheImpl<TTraits>::Find(
+    TCollectionCacheItem collection, ui64 offset, TCachePageRefImpl<TTraits>& page, bool demand) noexcept {
     page.Drop();
     auto cacheOp = BeginOperation();
     TOperationItemRef<TTraits> ref(cacheOp);
-    const ECacheResultStatus status = cacheOp.FindPage(collection, offset, ref.Get());
+    const ECacheResultStatus status = cacheOp.FindPage(collection, offset, ref.Get(), demand);
     if (status == ECacheResultStatus::Hit) {
         page = cacheOp.BuildPageRef(ref.Take());
     }
@@ -1326,7 +1345,7 @@ Y_FORCE_INLINE ECacheResultStatus TCacheImpl<TTraits>::Find(
 template <class TTraits>
 template <class TLookup>
 Y_FORCE_INLINE ECacheResultStatus TCacheImpl<TTraits>::Find(
-    TOperationView& cacheOp, TLookup&& lookup, TCacheItemRefImpl<TTraits>& ref) noexcept {
+    TOperationView& cacheOp, TLookup&& lookup, TCacheItemRefImpl<TTraits>& ref, bool demand) noexcept {
     for (;;) {
         TCacheItem cacheItem;
         const ECacheResultStatus status = lookup(cacheItem);
@@ -1335,7 +1354,7 @@ Y_FORCE_INLINE ECacheResultStatus TCacheImpl<TTraits>::Find(
         }
         Y_DEBUG_ABORT_UNLESS(status == ECacheResultStatus::Hit);
         TOperationItemRef<TTraits> acquired(cacheOp.SpaceOperation());
-        switch (cacheOp.TryAcquire(cacheItem, false, acquired.Get())) {
+        switch (cacheOp.TryAcquire(cacheItem, false, acquired.Get(), demand)) {
             case EAcquireStatus::Stale:
                 continue;
             case EAcquireStatus::Pending:
