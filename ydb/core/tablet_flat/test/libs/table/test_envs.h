@@ -289,7 +289,8 @@ namespace NTest {
             // Queues are: groups, outer, extern, historic groups
             const ui32 queueIndex = part->GroupsCount + (lob == ELargeObj::Extern ? 1 : 0);
 
-            return Get(part, queueIndex).DoLoad(TPageOffset::FromPageIndex(ref), EPage::Opaque, AheadLo, AheadHi);
+            auto got = Get(part, queueIndex).DoLoad(TPageOffset::FromPageIndex(ref), EPage::Opaque, AheadLo, AheadHi);
+            return got.Page ? TResult(got.Need, got.Page->BuildSharedData()) : TResult(got.Need, nullptr);
         }
 
         TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
