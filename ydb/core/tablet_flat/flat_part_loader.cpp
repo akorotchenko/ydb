@@ -37,6 +37,25 @@ void TLoader::SetPageCollection(ui32 slot, TCacheCollectionRef collection)
             "Page collection does not match slot " << slot);
     }
     PageCollections[slot] = std::move(collection);
+    if (RootPrepared) {
+        ApplyIndexSelection(slot);
+    }
+}
+
+void TLoader::ApplyIndexSelection(ui32 slot)
+{
+    const auto slots = GetSlots();
+    if (slot >= slots.SlotsCount()) {
+        return;
+    }
+    bool skip = false;
+    for (auto groupId : StrippedV1Shadows) {
+        if (slots.IndexSlot(groupId) == slot) {
+            skip = true;
+            break;
+        }
+    }
+    PageCollections[slot]->SetSkipBTreeIndexV1Shadow(skip);
 }
 
 void TLoader::PrepareRoot()
@@ -212,6 +231,11 @@ void TLoader::PrepareRoot()
     MaxRowVersion.Step = Root.GetMaxRowVersion().GetStep();
     MaxRowVersion.TxId = Root.GetMaxRowVersion().GetTxId();
 
+    for (ui32 slot : xrange(PageCollections.size())) {
+        if (PageCollections[slot]) {
+            ApplyIndexSelection(slot);
+        }
+    }
     RootPrepared = true;
 }
 
@@ -230,7 +254,7 @@ void TLoader::StageParseMeta()
 
         auto collection = TCache::Get().AdmitCollection(
             MakeIntrusiveConst<NPageCollection::TPageCollection>(comp.LargeGlobId, TSharedData(comp.RawMeta)));
-        PageCollections[i] = std::move(collection);
+        SetPageCollection(i, std::move(collection));
     }
 
     // Construct the outer blob slot as TOuterPageCollection if needed
@@ -241,7 +265,7 @@ void TLoader::StageParseMeta()
         auto cache = TCache::Get().AdmitCollection(
             MakeIntrusiveConst<NPageCollection::TOuterPageCollection>(comp.LargeGlobId, TSharedData(comp.RawMeta)));
 
-        PageCollections.back() = std::move(cache);
+        SetPageCollection(PageCollections.size() - 1, std::move(cache));
     }
 
     const auto slots = GetSlots();
@@ -264,14 +288,6 @@ void TLoader::StageParseMeta()
             << ", SeparateDescriptor " << PartLayout.SeparateDescriptorCollection
             << ", KeyIndexInDescriptor " << PartLayout.KeyIndexInDescriptor
             << ", GroupIndexesInDescriptor " << PartLayout.GroupIndexesInDescriptor);
-    }
-
-    // Shared cache skips dead V1 b-tree pages of the page collections with stripped V1 shadows
-    for (ui32 slot : xrange(slots.SlotsCount())) {
-        PageCollections[slot]->SetSkipBTreeIndexV1Shadow(false);
-    }
-    for (auto groupId : StrippedV1Shadows) {
-        PageCollections[slots.IndexSlot(groupId)]->SetSkipBTreeIndexV1Shadow(true);
     }
 
     TVector<TCacheCollectionRef> loaderCollections;

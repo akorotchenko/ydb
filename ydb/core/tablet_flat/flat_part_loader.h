@@ -310,6 +310,7 @@ namespace NTable {
             Y_ENSURE(Root.HasEpoch(), "TPart meta has no epoch info");
         }
 
+        void ApplyIndexSelection(ui32 slot);
         void StageParseMeta();
         TFetch StageCreatePartView(bool preloadIndex);
         TFetch StageSliceBounds();

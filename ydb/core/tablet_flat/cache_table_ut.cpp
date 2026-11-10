@@ -2114,7 +2114,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT(cache.DetachCollection(fixture.Item));
         fixture.Owner.Drop();
         UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, page));
-        UNIT_ASSERT(TCacheTestAccess::EraseCold(cache, MakeColdItem(cache, page.Index())));
+        UNIT_ASSERT(TCacheTestAccess::RetirePageResult(cache, page));
         UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()).IsTombstone());
         const auto state = TCacheTestAccess::HandleState(cache, fixture.Item.Index());
         UNIT_ASSERT(state.IsSticky() && state.HasPageAttachment());
@@ -2700,7 +2700,6 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         if (TCacheTestAccess::HandleState(*fixture.Cache, source.Index()).IsHot()) {
             UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, source));
         }
-        const auto coldItem = MakeColdItem(*fixture.Cache, source.Index());
         auto structural = TCacheTestAccess::AcquireStructural(*fixture.Cache, source.CacheItem());
         UNIT_ASSERT(structural);
         if (reclaimDuringAllocation) {
@@ -2717,23 +2716,25 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         struct TContext {
             TTestCache& Cache;
             TCollectionCacheItem Collection;
-            TColdCacheItem ColdItem;
+            TPageCacheItem Source;
             bool ReclaimDuringAllocation;
             bool Visited = false;
             bool Deleted = false;
-        } context{ *fixture.Cache, collection, coldItem, reclaimDuringAllocation };
+        } context{ *fixture.Cache, collection, source, reclaimDuringAllocation };
 
         TTestTraits hooks{ &context,
             [](void* ptr, ECacheHookPoint at, TCacheItem item) noexcept {
                 auto& ctx = *static_cast<TContext*>(ptr);
                 if (ctx.ReclaimDuringAllocation) {
-                    if (at == ECacheHookPoint::AfterTombstoneOwnerClaim && item.Index() == ctx.ColdItem.Index()) {
-                        ctx.Deleted = true;
+                    if (at == ECacheHookPoint::BeforeReferencedColdTicketReset && item == ctx.Source.CacheItem() &&
+                        !ctx.Visited) {
+                        ctx.Visited = true;
+                        ctx.Deleted = TCacheTestAccess::RetirePageResult(ctx.Cache, ctx.Source);
                     }
                 } else if (at == ECacheHookPoint::AfterPageCollectionStateChecked &&
                            item == ctx.Collection.CacheItem() && !ctx.Visited) {
                     ctx.Visited = true;
-                    ctx.Deleted = TCacheTestAccess::EraseCold(ctx.Cache, ctx.ColdItem);
+                    ctx.Deleted = TCacheTestAccess::RetirePageResult(ctx.Cache, ctx.Source);
                 }
             } };
         TCacheHookGuard guard(*fixture.Cache, hooks);
@@ -2762,7 +2763,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         ReviewRelocationLosesToDeletion(false);
     }
 
-    Y_UNIT_TEST(ReviewR10AllocationReclaimsRelocationSource) {
+    Y_UNIT_TEST(ReviewR10ExplicitDeletionDuringReplacementAllocation) {
         ReviewRelocationLosesToDeletion(true);
     }
 
@@ -3006,9 +3007,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         consumer.Join();
         UNIT_ASSERT(!reclaimed);
         UNIT_ASSERT(TCacheTestAccess::HandleState(*cache, source.Index()).IsCold());
-        UNIT_ASSERT(TCacheTestAccess::WithSpace(*cache, [&](TSpaceOperation& op) {
-            return TCacheTestAccess::BindOperation(*cache, op).Eviction().EraseCold(token, ECacheTier::Regular);
-        }));
+        UNIT_ASSERT(TCacheTestAccess::RetirePageResult(*cache, source));
         const auto state = TCacheTestAccess::HandleState(*cache, source.Index());
         const bool reusedEarly = state.IsFree();
         TPageCacheItem replacement;
@@ -5778,7 +5777,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
     }
 
-    Y_UNIT_TEST(MemoryWaitingAdmissionSurvivesEvictionAfterBatchPresenceCheck) {
+    Y_UNIT_TEST(MemoryWaitingAdmissionSurvivesInvalidationAfterBatchPresenceCheck) {
         TFixture fixture;
         const TLogoBlobID id(83, 84, 98);
         const auto collection = AllocateCollection(*fixture.Cache, TCacheKey::Collection(id));
@@ -5801,8 +5800,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                               if (point == ECacheHookPoint::AfterPageBatchPrepared && !context.Evicted) {
                                   context.Evicted = true;
                                   Y_ABORT_UNLESS(TCacheTestAccess::EvictFromHot(context.Cache, context.Page));
-                                  Y_ABORT_UNLESS(TCacheTestAccess::EraseCold(
-                                      context.Cache, MakeColdItem(context.Cache, context.Page.Index())));
+                                  Y_ABORT_UNLESS(TCacheTestAccess::RetirePageResult(context.Cache, context.Page));
                               }
                           } };
         TCacheHookGuard guard(*fixture.Cache, hooks);
@@ -15391,7 +15389,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT(state.IsFree());
         UNIT_ASSERT_VALUES_EQUAL(state.Version(), AdvanceItemVersion(pageVersion));
     }
-    Y_UNIT_TEST(PublicWriterStickysSuccessorPublishedBeforeReclaim) {
+    Y_UNIT_TEST(PublicWriterStickysSuccessorPublishedBeforeErase) {
         TFixture fixture;
         const auto keys = MakeAdjacentKeys(*fixture.Space, MakeCollectionCacheItem(4, 5), 400);
         const auto target = AllocatePage(*fixture.Cache, keys[0], 4096);
@@ -15420,7 +15418,8 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         });
 
         gate.Slots[0].Wait();
-        UNIT_ASSERT(fixture.Cache->ReclaimCold());
+        UNIT_ASSERT(!fixture.Cache->ReclaimCold());
+        UNIT_ASSERT(TCacheTestAccess::RetirePageResult(*fixture.Cache, target));
         const THandleState afterOwner = TCacheTestAccess::HandleState(*fixture.Cache, target.Index());
         UNIT_ASSERT(afterOwner.IsTombstone());
         UNIT_ASSERT_VALUES_EQUAL(afterOwner.Refs(), 1);
@@ -15445,7 +15444,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT(successor.Status == ECacheResultStatus::Hit);
         successor.Ref.Drop();
     }
-    Y_UNIT_TEST(PublicWriterRetriesAfterReclaimWinsBeforeLinkCas) {
+    Y_UNIT_TEST(PublicWriterRetriesAfterEraseWinsBeforeLinkCas) {
         TFixture fixture;
         const auto keys = MakeAdjacentKeys(*fixture.Space, MakeCollectionCacheItem(4, 5), 410);
         const auto target = AllocatePage(*fixture.Cache, keys[0], 4096);
@@ -15474,7 +15473,8 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         });
 
         gate.Slots[0].Wait();
-        UNIT_ASSERT(fixture.Cache->ReclaimCold());
+        UNIT_ASSERT(!fixture.Cache->ReclaimCold());
+        UNIT_ASSERT(TCacheTestAccess::RetirePageResult(*fixture.Cache, target));
         const THandleState afterOwner = TCacheTestAccess::HandleState(*fixture.Cache, target.Index());
         UNIT_ASSERT(afterOwner.IsTombstone());
         UNIT_ASSERT_VALUES_EQUAL(afterOwner.Refs(), 1);
@@ -16001,7 +16001,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT(fixture.Cache->Find(collection, 0, source) == ECacheResultStatus::Hit);
         const char* data = source.data();
         UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, item));
-        UNIT_ASSERT(TCacheTestAccess::EraseCold(*fixture.Cache, MakeColdItem(*fixture.Cache, item.Index())));
+        UNIT_ASSERT(TCacheTestAccess::RetirePageResult(*fixture.Cache, item));
         TTestCachePageRef absent;
         UNIT_ASSERT(fixture.Cache->Find(collection, 0, absent) == ECacheResultStatus::Miss);
 

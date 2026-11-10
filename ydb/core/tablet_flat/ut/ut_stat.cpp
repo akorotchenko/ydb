@@ -162,11 +162,11 @@ Y_UNIT_TEST_SUITE_F(BuildStatsPageLifetime, ::NKikimr::NTable::NTest::TTableCach
 
     class TStatsPageEnv : public TTestEnv {
     public:
-        TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        TCachePageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             if (StopAfterPages && Touched.size() >= StopAfterPages) {
                 throw TStopTraversal{};
             }
-            auto page = TTestEnv::TryGetPage(part, location, groupId);
+            auto page = TTestEnv::TryGetIndexPage(part, location, groupId);
             UNIT_ASSERT_C(page, "The statistics frontier exceeded its configured page budget");
             if (Touched.insert(location.Offset).second) {
                 ReadBytes += page.size() + TSharedData::OverheadSize;
@@ -260,7 +260,7 @@ Y_UNIT_TEST_SUITE_F(BuildStatsPageLifetime, ::NKikimr::NTable::NTest::TTableCach
         UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
         {
             const auto root = GetBTreeRootLocation(part->IndexPages.GetBTree({}), collection, collection);
-            auto page = referenceEnv.TryGetPage(part.Get(), root, {});
+            auto page = referenceEnv.TryGetIndexPage(part.Get(), root, {});
             UNIT_ASSERT(page);
             const char* pageData = page.data();
             const size_t pageSize = page.size();
@@ -280,7 +280,7 @@ Y_UNIT_TEST_SUITE_F(BuildStatsPageLifetime, ::NKikimr::NTable::NTest::TTableCach
                 NSharedCache::TCacheCollectionRef collectionRef;
                 UNIT_ASSERT(cache.Find(collection->Label(), collectionRef) == NSharedCache::ECacheResultStatus::Hit);
                 UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collectionRef.CacheItem(), NPage::ECacheMode::Sticky));
-                auto stickyPage = referenceEnv.TryGetPage(part.Get(), root, {});
+                auto stickyPage = referenceEnv.TryGetIndexPage(part.Get(), root, {});
                 UNIT_ASSERT(stickyPage.IsSticky());
                 stickyPage.Drop();
                 UNIT_ASSERT_VALUES_EQUAL(tracker.WorkingSet().Bytes, 0);
@@ -360,10 +360,10 @@ Y_UNIT_TEST_SUITE_F(BuildStatsPageLifetime, ::NKikimr::NTable::NTest::TTableCach
                 : Tracker(tracker)
             {}
 
-            TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+            TCachePageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 const auto workingSet = Tracker.WorkingSet();
                 SawRetainedIndex |= workingSet.Pages != 0;
-                return TTestEnv::TryGetPage(part, location, groupId);
+                return TTestEnv::TryGetIndexPage(part, location, groupId);
             }
 
             NStats::TPageTracker& Tracker;

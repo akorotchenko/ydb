@@ -39,6 +39,7 @@ namespace {
         bool Grouped = false;
         bool Dual = false;
         ui32 Step = 1;
+        TPartLayout Layout;
     };
 
     TBundle::TResult WritePart(TWriteOptions options = {}, TVector<NPageCollection::TGlob>* blobs = nullptr) {
@@ -49,7 +50,9 @@ namespace {
         const auto scheme = layout.RowScheme();
         const auto tags = scheme->Tags();
         NTabletFlatExecutor::NWriter::TConf conf;
-        conf.Groups.resize(options.Grouped ? 2 : 1);
+        const ui32 groups = options.Grouped ? 2 : 1;
+        const TPartSlots slots(groups, options.Layout);
+        conf.Groups.resize(slots.SlotsCount());
         for (auto& group : conf.Groups) {
             group.Channel = 1;
             group.MaxBlobSize = 4096;
@@ -64,7 +67,8 @@ namespace {
         TBundle bundle(TLogoBlobID(77, 1, options.Step, 0, 0, 0), conf);
 
         NPage::TConf pages{ true, 512 };
-        pages.Groups.resize(conf.Groups.size());
+        pages.Groups.resize(groups);
+        pages.Layout = options.Layout;
         pages.WriteBTreeIndexV2 = options.Dual;
         pages.WriteFlatIndex = !options.Dual;
         for (auto& group : pages.Groups) {
@@ -491,6 +495,40 @@ Y_UNIT_TEST_SUITE_F(TPartLoaderRoot, NTest::TTableCacheTest) {
         const auto& index = result.Part->IndexPages.BTreeGroups.at(0);
         UNIT_ASSERT(index.HasRootV2() && !index.HasRootV1());
         UNIT_ASSERT(root->PageCollection()->SkipBTreeIndexV1Shadow());
+    }
+
+    Y_UNIT_TEST(LateIndexCollectionsUseThePreparedRootSelection) {
+        for (bool rawTail : { false, true }) {
+            auto& flags = AppData()->FeatureFlags;
+            flags.SetEnableLocalDBBtreeIndex(true);
+            flags.SetEnableLocalDBFlatIndex(true);
+            flags.SetEnableLocalDBBtreeIndexV2(true);
+            auto written = WritePart({ .Grouped = true, .Dual = true, .Step = rawTail ? 2u : 1u,
+                .Layout = { .SeparateDescriptorCollection = true, .KeyIndexInDescriptor = false,
+                    .GroupIndexesInDescriptor = false } });
+            UNIT_ASSERT_VALUES_EQUAL(written.PageCollections.size(), 3);
+            TLoader loader(Components(written, rawTail));
+            auto root = AdmitCollection(written, 0);
+            loader.SetPageCollection(0, root.Acquire());
+            loader.PrepareRoot();
+            UNIT_ASSERT(!root->PageCollection()->SkipBTreeIndexV1Shadow());
+            flags.SetEnableLocalDBBtreeIndexV2(false);
+            if (!rawTail) {
+                for (ui32 slot = 1; slot < written.PageCollections.size(); ++slot) {
+                    auto collection = AdmitCollection(written, slot);
+                    loader.SetPageCollection(slot, collection.Acquire());
+                    UNIT_ASSERT(collection->PageCollection()->SkipBTreeIndexV1Shadow());
+                }
+            }
+            auto result = Finish(loader, written);
+            UNIT_ASSERT(!result.Part->GetPageCollection(0)->SkipBTreeIndexV1Shadow());
+            for (ui32 slot = 1; slot < written.PageCollections.size(); ++slot) {
+                UNIT_ASSERT(result.Part->GetPageCollection(slot)->SkipBTreeIndexV1Shadow());
+            }
+            for (const auto& index : result.Part->IndexPages.BTreeGroups) {
+                UNIT_ASSERT(index.HasRootV2() && !index.HasRootV1());
+            }
+        }
     }
 
     Y_UNIT_TEST(PreservesRawAndFullyPrebuiltRunPaths) {
