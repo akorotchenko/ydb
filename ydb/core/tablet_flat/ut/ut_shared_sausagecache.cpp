@@ -1710,12 +1710,21 @@ Y_UNIT_TEST(TryKeepInMemoryMode_TableLargerThanMemory) {
 Y_UNIT_TEST(TryKeepInMemoryMode_ReloadEvictedPage_Touched) {
     // Regression: reloading a touched page into a full in-memory tier must not keep evicting partners.
     // Precondition: the table is larger than the in-memory tier, so the tier stays full.
-    // Detector: no new evictions while the workload only re-reads already resident pages.
+    // Detector: bounded scan reloads and no fetches or evictions during idle maintenance.
     TMyEnvBase env;
     env->SetLogPriority(NKikimrServices::TABLET_SAUSAGECACHE, NActors::NLog::PRI_TRACE);
     env->SetLogPriority(NKikimrServices::TABLET_EXECUTOR, NActors::NLog::PRI_TRACE);
     env->SetLogPriority(NKikimrServices::TX_DATASHARD, NActors::NLog::PRI_TRACE);
     auto counters = GetSharedPageCounters(env);
+    i64 evictedPages = 0;
+    i64 fetchedPages = 0;
+    auto observer = env.Env.AddObserver([&](TAutoPtr<IEventHandle>& ev) {
+        if (ev->GetTypeRewrite() == TEvKeepPageEvicted::EventType) {
+            ++evictedPages;
+        } else if (ev->GetTypeRewrite() == NBlockIO::TEvFetch::EventType) {
+            fetchedPages += ev->Get<NBlockIO::TEvFetch>()->Pages.size();
+        }
+    });
 
     env.FireDummyTablet(ui32(NFake::TDummy::EFlg::Comp));
     SetupSharedCache(env, 2_MB, true);
@@ -1728,10 +1737,15 @@ Y_UNIT_TEST(TryKeepInMemoryMode_ReloadEvictedPage_Touched) {
     }
     env.SendSync(new NFake::TEvCompact(TableId));
     env.WaitFor<NFake::TEvCompacted>();
+    WaitInFlyDrain(env, counters);
 
-    // The in-memory tier is full: target in-memory reserved exceeds the cache capacity.
+    // The oversized table fills the assigned Keep budget
     UNIT_ASSERT_GT(counters->TargetInMemoryBytes->Val(), static_cast<i64>(0_MB));
-    UNIT_ASSERT_GE(counters->ActiveInMemoryBytes->Val(), static_cast<i64>(2_MB - 1_MB / 2));
+    const i64 keepLimit = TCache::Get().KeepLimit();
+    UNIT_ASSERT_GT(keepLimit, 0);
+    UNIT_ASSERT_GT(counters->TargetInMemoryBytes->Val(), keepLimit);
+    UNIT_ASSERT_GE(counters->ActiveInMemoryBytes->Val(), keepLimit * 3 / 4);
+    UNIT_ASSERT_LE(counters->ActiveInMemoryBytes->Val(), keepLimit);
     LogCounters(counters);
 
     // A scan over the table: the first pass populates and exercises the in-memory tier, retries
@@ -1744,29 +1758,37 @@ Y_UNIT_TEST(TryKeepInMemoryMode_ReloadEvictedPage_Touched) {
     UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 200);
 
     // Repeated scans must not turn into runaway eviction churn (the table is ~10x the cache).
-    const i64 evictOpsAfterLoad = counters->S3FIFOEvictOps->Val();
+    WaitInFlyDrain(env, counters);
+    env->SimulateSleep(TDuration::MilliSeconds(1));
+    const i64 evictionsAfterLoad = evictedPages;
+    const i64 fetchesAfterLoad = fetchedPages;
     for (ui32 round = 0; round < 20; ++round) {
         retried = {};
         for (i64 key = 199; key >= 0; --key) {
             DoReadRows(env, new TTxReadRows(TableId, key, retried), true);
         }
         UNIT_ASSERT_VALUES_EQUAL(retried.at(0), 200);
-        // Each WakeupSharedCache forces a ProcessGCList pass.
+        // Each WakeupSharedCache forces a cache maintenance pass
         WakeupSharedCache(env);
     }
     LogCounters(counters);
 
-    // Measured steady state is ~1 eviction per reloaded page (~200 per round); allow 3x margin.
-    const i64 evictOpsGrowth = counters->S3FIFOEvictOps->Val() - evictOpsAfterLoad;
-    UNIT_ASSERT_LE(evictOpsGrowth, static_cast<i64>(20 * 200 * 3));
-    UNIT_ASSERT_LE(counters->EvictedPages->Val(), static_cast<i64>(10000));
+    // Allow at most three fetches or evictions per scanned row
+    WaitInFlyDrain(env, counters);
+    env->SimulateSleep(TDuration::MilliSeconds(1));
+    UNIT_ASSERT_LE(evictedPages - evictionsAfterLoad, static_cast<i64>(20 * 200 * 3));
+    UNIT_ASSERT_LE(fetchedPages - fetchesAfterLoad, static_cast<i64>(20 * 200 * 3));
+    UNIT_ASSERT_LE(evictedPages, static_cast<i64>(10000));
 
-    // GC passes alone, with no new reads, must not keep evicting: the guard refuses the reload.
-    const i64 evictOpsBeforeIdle = counters->S3FIFOEvictOps->Val();
+    // Idle maintenance must not start reloads or evict partners
+    const i64 evictionsBeforeIdle = evictedPages;
+    const i64 fetchesBeforeIdle = fetchedPages;
     for (ui32 i = 0; i < 10; ++i) {
         WakeupSharedCache(env);
     }
-    UNIT_ASSERT_VALUES_EQUAL(counters->S3FIFOEvictOps->Val(), evictOpsBeforeIdle);
+    env->SimulateSleep(TDuration::MilliSeconds(1));
+    UNIT_ASSERT_VALUES_EQUAL(evictedPages, evictionsBeforeIdle);
+    UNIT_ASSERT_VALUES_EQUAL(fetchedPages, fetchesBeforeIdle);
 }
 
 Y_UNIT_TEST(TryKeepInMemoryMode_Enabling) {
