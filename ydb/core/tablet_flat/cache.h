@@ -555,6 +555,7 @@ private:
     friend class TCacheTableImpl<TTraits>;
     friend class TCacheItems<TTraits>;
     friend class TCachePageRefImpl<TTraits>;
+    friend class TPageFetchImpl<TTraits>;
     friend class TCacheCollectionRefImpl<TTraits>;
     friend class TCacheFetches<TTraits>;
     friend class TCacheCollections<TTraits>;

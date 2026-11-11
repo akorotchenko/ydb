@@ -1132,7 +1132,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection1, { location });
         auto loaded = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1) } } });
         auto collection = TCache::Get().AdmitCollection(sharedCache.Collection1);
-        auto page = collection->TryGetPage(location);
+        auto cacheOp = TCache::Get().BeginOperation();
+        auto page = collection->TryGetPage(cacheOp, location);
         UNIT_ASSERT(page);
         UNIT_ASSERT_VALUES_EQUAL(page.size(), 10);
     }

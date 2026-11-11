@@ -222,12 +222,7 @@ public:
         });
     }
 
-    Y_FORCE_INLINE TLogoBlobID GetCollectionId() const noexcept {
-        TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
-        auto cacheOp = cache.BeginOperation();
-        const THandle& page = cacheOp.Handles()[CacheItem().Index()];
-        return cacheOp.Collections().PageCollection(page)->Id();
-    }
+    Y_FORCE_INLINE TLogoBlobID GetCollectionId() const noexcept;
 
     Y_FORCE_INLINE NTable::NPage::EPage GetType() const noexcept {
         return WithHandle([](const THandle& handle) {
@@ -395,6 +390,21 @@ Y_FORCE_INLINE TCacheCollectionRefImpl<TTraits>& TCacheCollectionRefImpl<TTraits
         Ref_ = std::move(other.Ref_);
     }
     return *this;
+}
+
+template <class TTraits>
+Y_FORCE_INLINE TLogoBlobID TCachePageRefImpl<TTraits>::GetCollectionId() const noexcept {
+    return WithHandle([](const THandle& page) {
+        TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
+        const TCacheItem item = TCacheItem::FromRaw(page.Key0.load(std::memory_order_relaxed));
+        // The owned page retains its collection's handle and metadata through its page attachment
+        const auto& collection = cache.Space_->OwnedHandle(item);
+        Y_DEBUG_ABORT_UNLESS([&] {
+            const THandleState state = THandleState::FromRaw(collection.State.load(std::memory_order_acquire));
+            return item.Matches(state) && state.IsCollectionKind() && collection.Body.Collection;
+        }());
+        return collection.Body.Collection->Id();
+    });
 }
 
 template <class TTraits>

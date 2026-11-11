@@ -71,6 +71,7 @@ public:
 public:
     TResult Do(TCells key1, TCells key2, TRowId beginRowId, TRowId endRowId,
             const TKeyCellDefaults &keyDefaults, ui64 itemsLimit, ui64 bytesLimit) const override {
+        auto readScope = Env->BeginRead();
         endRowId++; // current interface accepts inclusive row2 bound
 
         bool ready = true, overshot = true, hasValidRowsRange = Groups || IncludeHistory;
@@ -242,6 +243,7 @@ public:
 
     TResult DoReverse(TCells key1, TCells key2, TRowId endRowId, TRowId beginRowId,
             const TKeyCellDefaults &keyDefaults, ui64 itemsLimit, ui64 bytesLimit) const override {
+        auto readScope = Env->BeginRead();
         endRowId++; // current interface accepts inclusive row1 bound
 
         bool ready = true, overshot = true, hasValidRowsRange = Groups || IncludeHistory;

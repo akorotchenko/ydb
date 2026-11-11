@@ -84,8 +84,9 @@ namespace NTable {
                 auto savedPage = savedPages.find(location.Offset);
 
                 if (savedPage == savedPages.end() || !savedPage->second) {
+                    auto cacheOp = TCache::Get().BeginOperation();
                     if (auto page = PageCollections[slot]->TryGetPage(
-                            location, NeedIn(location.Type) || location.Type == EPage::FlatIndex)) {
+                            cacheOp, location, NeedIn(location.Type) || location.Type == EPage::FlatIndex)) {
                         // Retain the page while decoding, even if its cache entry is withdrawn.
                         AddSavedPage(slot, location.Offset, std::move(page));
                         savedPage = savedPages.find(location.Offset);

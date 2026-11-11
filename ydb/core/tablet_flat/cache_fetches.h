@@ -203,10 +203,9 @@ template <class TTraits>
 Y_FORCE_INLINE NTable::NPage::TPageLocation TPageFetchImpl<TTraits>::Location() const noexcept {
     Y_DEBUG_ABORT_UNLESS(FetchState_);
     TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
-    auto spaceOp = cache.BeginOperation();
     const TCacheItem cacheItem = FetchState_->Page().CacheItem();
-    Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem));
-    const THandle& handle = spaceOp.Handles()[cacheItem.Index()];
+    // The fetch owner retains its pending native reference until completion or failure
+    const THandle& handle = cache.Space_->OwnedHandle(cacheItem);
     const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
     Y_DEBUG_ABORT_UNLESS(
         cacheItem.Matches(state) && state.IsPageKind() && state.IsPending() && handle.Body.Fetch == FetchState_.Get());

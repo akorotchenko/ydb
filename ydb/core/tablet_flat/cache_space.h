@@ -883,6 +883,8 @@ private:
     template <class TTraits>
     friend class TCachePageRefImpl;
     template <class TTraits>
+    friend class TPageFetchImpl;
+    template <class TTraits>
     friend class TCacheCollectionRefImpl;
     template <class TTraits>
     friend class TCacheItems;

@@ -613,6 +613,7 @@ bool TKeyBlockIterator::HasColdParts() const {
 }
 
 EReady TKeyBlockIterator::Seek(TArrayRef<const TCell> key, bool inclusive) {
+    auto readScope = State->Env.Inner->BeginRead();
     State->Target = FromSeek(key, inclusive);
     State->Telemetry.UnitsTotal = 0;
     State->Telemetry.UnitsMemtable = 0;
@@ -624,6 +625,7 @@ EReady TKeyBlockIterator::Next() {
     if (State->Ready == EReady::Gone) {
         return EReady::Gone;
     }
+    auto readScope = State->Env.Inner->BeginRead();
     State->Target = EndOf(State->Block.Bounds);
     return State->ReadUnit();
 }

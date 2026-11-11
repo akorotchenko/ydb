@@ -111,7 +111,7 @@ public:
         Y_ENSURE(NPage::IsIndexPage(location.Type));
 
         PagesSize += location.Size;
-        if (auto cached = info->TryGetPage(location)) {
+        if (auto cacheOp = TCache::Get().BeginOperation(); auto cached = info->TryGetPage(cacheOp, location)) {
             return cached;
         }
 

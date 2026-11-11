@@ -12,6 +12,7 @@
 #include <ydb/core/util/pb.h>
 #include <util/generic/hash_set.h>
 #include <ydb/core/tablet_flat/protos/flat_executor.pb.h>
+#include <optional>
 
 namespace NKikimr {
 namespace NTabletFlatExecutor {
@@ -88,6 +89,18 @@ namespace NTabletFlatExecutor {
     private:
         using THashSetOfLocation = THashSet<TPageLocation, NTable::NPage::TPageLocationByOffsetHash>;
 
+        bool DoBeginRead() noexcept override {
+            if (ReadOperation_) {
+                return false;
+            }
+            ReadOperation_.emplace(TCache::Get().BeginOperation());
+            return true;
+        }
+
+        void DoEndRead() noexcept override {
+            ReadOperation_.reset();
+        }
+
         void ToLoadPage(const TPageLocation& location, TCollection* pageCollection) {
             auto res = ToLoad[pageCollection->Id()].insert(location);
             if (res.second) {
@@ -100,7 +113,8 @@ namespace NTabletFlatExecutor {
 
         TCachePageRef TryGetPage(const TPageLocation& location, TCollection* pageCollection)
         {
-            auto sharedBody = pageCollection->TryGetPage(location);
+            auto readScope = BeginRead();
+            auto sharedBody = pageCollection->TryGetPage(*ReadOperation_, location);
 
             if (!sharedBody) {
                 ToLoadPage(location, pageCollection);
@@ -133,6 +147,7 @@ namespace NTabletFlatExecutor {
 
     private:
         TSeat& Seat;
+        std::optional<TCache::TOperation> ReadOperation_;
 
         THashMap<TLogoBlobID, THashSetOfLocation> ToLoad;
 

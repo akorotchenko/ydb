@@ -495,13 +495,10 @@ TCollectionCacheItem TCache::AllocateCollection(const TLogoBlobID& id, ui64 byte
 
 CACHE_TEMPLATE
 bool TCache::IsPageSticky(TPageCacheItem page) const noexcept {
-    auto spaceOp = Space_->BeginOperation();
+    // The caller's native owner protects the handle and its retained replacement chain
     TCacheItem item = page.CacheItem();
     for (;;) {
-        if (!spaceOp.Contains(item)) {
-            return false;
-        }
-        const THandle& handle = spaceOp.Handles()[item.Index()];
+        const THandle& handle = Space_->OwnedHandle(item);
         const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
         if (!item.Matches(state) || !state.IsPageKind()) {
             return false;

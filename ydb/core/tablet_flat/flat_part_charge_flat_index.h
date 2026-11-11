@@ -46,6 +46,7 @@ namespace NTable {
         TResult Do(const TCells key1, const TCells key2, TRowId row1, TRowId row2,
                 const TKeyCellDefaults &keyDefaults, ui64 itemsLimit, ui64 bytesLimit) const override
         {
+            auto readScope = Env->BeginRead();
             auto index = Index.TryLoadRaw();
             if (!index) {
                 return {
@@ -132,6 +133,7 @@ namespace NTable {
         TResult DoReverse(const TCells key1, const TCells key2, TRowId row1, TRowId row2,
                 const TKeyCellDefaults &keyDefaults, ui64 itemsLimit, ui64 bytesLimit) const override
         {
+            auto readScope = Env->BeginRead();
             auto index = Index.TryLoadRaw();
             if (!index) {
                 return {

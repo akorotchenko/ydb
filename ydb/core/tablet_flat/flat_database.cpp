@@ -278,6 +278,7 @@ void TDatabase::CalculateReadSize(TSizeEnv& env, ui32 table, TRawVals minKey, TR
 {
     CheckReadAllowed(table);
 
+    auto readScope = Env->BeginRead();
     TSelectStats stats;
     Require(table)->Precharge(minKey, maxKey, tags, &env, flg, items, bytes, direction, snapshot, stats);
 }

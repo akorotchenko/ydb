@@ -58,6 +58,32 @@ namespace NTable {
 
         virtual ~IPages() = default;
 
+        class TReadScope {
+        public:
+            TReadScope(const TReadScope&) = delete;
+            TReadScope& operator=(const TReadScope&) = delete;
+
+            ~TReadScope() {
+                if (Env_) {
+                    Env_->DoEndRead();
+                }
+            }
+
+        private:
+            friend struct IPages;
+
+            explicit TReadScope(IPages* env) noexcept
+                : Env_(env)
+            {}
+
+            IPages* Env_;
+        };
+
+        // Lexical scopes reuse the outer read operation and end before waiting for pages
+        [[nodiscard]] TReadScope BeginRead() noexcept {
+            return TReadScope(DoBeginRead() ? this : nullptr);
+        }
+
         struct TResult : private TMoveOnly {
             TResult(bool need, const TSharedData* data)
                 : Need(need)
@@ -198,6 +224,13 @@ namespace NTable {
         virtual void OnRollbackChanges() {
             // nothing by default
         }
+
+    protected:
+        virtual bool DoBeginRead() noexcept {
+            return false;
+        }
+
+        virtual void DoEndRead() noexcept {}
     };
 
 }
