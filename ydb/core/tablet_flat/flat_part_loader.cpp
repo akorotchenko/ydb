@@ -323,34 +323,37 @@ TLoader::TFetch TLoader::StageCreatePartView(bool preloadIndex)
                                 : getIndexPage(meta.RootV1PageId(), groupId);
     };
 
-    if (BTreeGroupIndexes) {
-        if (preloadIndex) {
-            // Note: preload root nodes only because we don't want to have multiple restarts here
-            for (ui32 groupIndex : xrange(BTreeGroupIndexes.size())) {
-                const auto& meta = BTreeGroupIndexes[groupIndex];
-                if (meta.LevelCount()) getMetaPage(meta, NPage::TGroupId(groupIndex));
+    {
+        auto readScope = LoaderEnv->BeginRead();
+        if (BTreeGroupIndexes) {
+            if (preloadIndex) {
+                // Note: preload root nodes only because we don't want to have multiple restarts here
+                for (ui32 groupIndex : xrange(BTreeGroupIndexes.size())) {
+                    const auto& meta = BTreeGroupIndexes[groupIndex];
+                    if (meta.LevelCount()) getMetaPage(meta, NPage::TGroupId(groupIndex));
+                }
+                for (ui32 groupIndex : xrange(BTreeHistoricIndexes.size())) {
+                    const auto& meta = BTreeHistoricIndexes[groupIndex];
+                    if (meta.LevelCount()) getMetaPage(meta, NPage::TGroupId(groupIndex, true));
+                }
             }
-            for (ui32 groupIndex : xrange(BTreeHistoricIndexes.size())) {
-                const auto& meta = BTreeHistoricIndexes[groupIndex];
-                if (meta.LevelCount()) getMetaPage(meta, NPage::TGroupId(groupIndex, true));
+        } else if (FlatGroupIndexes) {
+            for (ui32 groupIndex : xrange(FlatGroupIndexes.size())) {
+                getIndexPage(FlatGroupIndexes[groupIndex], NPage::TGroupId(groupIndex));
+            }
+            for (ui32 groupIndex : xrange(FlatHistoricIndexes.size())) {
+                getIndexPage(FlatHistoricIndexes[groupIndex], NPage::TGroupId(groupIndex, true));
             }
         }
-    } else if (FlatGroupIndexes) {
-        for (ui32 groupIndex : xrange(FlatGroupIndexes.size())) {
-            getIndexPage(FlatGroupIndexes[groupIndex], NPage::TGroupId(groupIndex));
-        }
-        for (ui32 groupIndex : xrange(FlatHistoricIndexes.size())) {
-            getIndexPage(FlatHistoricIndexes[groupIndex], NPage::TGroupId(groupIndex, true));
-        }
-    }
 
-    for (auto pageId: { SchemeId, GlobsId, SmallId, LargeId, ByKeyId, GarbageStatsId, TxIdStatsId }) {
-        Y_DEBUG_ABORT_UNLESS(pageId == Max<TPageId>() || NeedIn(PageCollections[slots.DescriptorSlot()]->GetPageType(pageId)));
-        getPage(pageId);
-    }
+        for (auto pageId: { SchemeId, GlobsId, SmallId, LargeId, ByKeyId, GarbageStatsId, TxIdStatsId }) {
+            Y_DEBUG_ABORT_UNLESS(pageId == Max<TPageId>() || NeedIn(PageCollections[slots.DescriptorSlot()]->GetPageType(pageId)));
+            getPage(pageId);
+        }
 
-    for (const auto& meta : ByKeyPrefixMetas) {
-        getPage(meta.PageId);
+        for (const auto& meta : ByKeyPrefixMetas) {
+            getPage(meta.PageId);
+        }
     }
 
     if (auto fetch = LoaderEnv->GetFetch()) {
@@ -538,17 +541,20 @@ TLoader::TFetch TLoader::StagePreloadData()
         }
 
         bool anyMissed = false;
-        for (auto& item : PreloadBTreeWalkers) {
-            if (!item.Walker) {
-                continue;
-            }
+        {
+            auto readScope = LoaderEnv->BeginRead();
+            for (auto& item : PreloadBTreeWalkers) {
+                if (!item.Walker) {
+                    continue;
+                }
 
-            if (item.Walker->Step(
-                    PartView.Part.Get(), LoaderEnv.Get(), item.GroupId, item.SkipDataPages))
-            {
-                item.Walker.Reset();
-            } else {
-                anyMissed = true;
+                if (item.Walker->Step(
+                        PartView.Part.Get(), LoaderEnv.Get(), item.GroupId, item.SkipDataPages))
+                {
+                    item.Walker.Reset();
+                } else {
+                    anyMissed = true;
+                }
             }
         }
 
@@ -563,15 +569,18 @@ TLoader::TFetch TLoader::StagePreloadData()
 
     // V1 path: all pages of the page collections with data and index pages of the main group
     TSet<ui32> slots{ partStore->DataSlot({}), partStore->IndexSlot({}) };
-    for (ui32 slot : slots) {
-        auto pageCollection = partStore->PageCollections[slot]->PageCollection();
-        auto total = pageCollection->MetaPages();
+    {
+        auto readScope = LoaderEnv->BeginRead();
+        for (ui32 slot : slots) {
+            auto pageCollection = partStore->PageCollections[slot]->PageCollection();
+            auto total = pageCollection->MetaPages();
 
-        for (TPageId pageId : xrange(total)) {
-            if (NPageCollection::IsDeadPage(*pageCollection, pageId)) {
-                continue;
+            for (TPageId pageId : xrange(total)) {
+                if (NPageCollection::IsDeadPage(*pageCollection, pageId)) {
+                    continue;
+                }
+                LoaderEnv->TryGetSlotPage(slot, pageCollection->GetLocation(pageId));
             }
-            LoaderEnv->TryGetSlotPage(slot, pageCollection->GetLocation(pageId));
         }
     }
 

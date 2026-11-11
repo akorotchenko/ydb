@@ -11,6 +11,7 @@
 #include <util/generic/hash.h>
 #include <util/generic/hash_set.h>
 #include <util/stream/mem.h>
+#include <optional>
 
 namespace NKikimr {
 namespace NTable {
@@ -84,22 +85,30 @@ namespace NTable {
                 auto savedPage = savedPages.find(location.Offset);
 
                 if (savedPage == savedPages.end() || !savedPage->second) {
-                    auto cacheOp = TCache::Get().BeginOperation();
+                    auto readScope = BeginRead();
+                    if (!ReadOperation_) {
+                        ReadOperation_.emplace(TCache::Get().BeginOperation());
+                    }
                     if (auto page = PageCollections[slot]->TryGetPage(
-                            cacheOp, location, NeedIn(location.Type) || location.Type == EPage::FlatIndex)) {
+                            *ReadOperation_, location, NeedIn(location.Type) || location.Type == EPage::FlatIndex)) {
                         // Retain the page while decoding, even if its cache entry is withdrawn.
                         AddSavedPage(slot, location.Offset, std::move(page));
                         savedPage = savedPages.find(location.Offset);
                     }
                 }
 
+                TCachePageRef result;
                 if (savedPage != savedPages.end() && savedPage->second) {
-                    return savedPage->second.Acquire();
+                    result = savedPage->second.Acquire();
                 } else {
                     auto [it, inserted] = NeedPages[slot].emplace(location);
                     Y_DEBUG_ABORT_UNLESS(inserted || *it == location);
-                    return {};
                 }
+                // Saved-page visits also bound how long an opened native view stays active
+                if (ReadOperation_ && ++ReadPageCount_ == ReadBatchSize) {
+                    ReleaseReadOperation();
+                }
+                return result;
             }
 
             void EnsureNoNeedPages() const
@@ -154,6 +163,24 @@ namespace NTable {
             }
 
         private:
+            bool DoBeginRead() noexcept override {
+                if (ReadScopeActive_) {
+                    return false;
+                }
+                ReadScopeActive_ = true;
+                return true;
+            }
+
+            void DoEndRead() noexcept override {
+                ReleaseReadOperation();
+                ReadScopeActive_ = false;
+            }
+
+            void ReleaseReadOperation() noexcept {
+                ReadOperation_.reset();
+                ReadPageCount_ = 0;
+            }
+
             void AddSavedPage(ui32 slot, TPageOffset offset, TCachePageRef&& page)
             {
                 SavedPages[slot][offset] = std::move(page);
@@ -168,6 +195,11 @@ namespace NTable {
             const TPart* Part = nullptr;
             const TVector<TCacheCollectionRef> PageCollections;
             const TPartSlots Slots;
+            // A logical scope may contain only saved pages and need no native operation
+            bool ReadScopeActive_ = false;
+            std::optional<TCache::TOperation> ReadOperation_;
+            ui32 ReadPageCount_ = 0;
+            static constexpr ui32 ReadBatchSize = 1024;
             TVector<THashMap<TPageOffset, TCachePageRef>> SavedPages;
             // Dedup by offset — keep Size/Type for the fetch request
             TVector<THashSet<TPageLocation, NPage::TPageLocationByOffsetHash, TPageLocationByOffsetEq>> NeedPages;

@@ -118,8 +118,47 @@ namespace {
         return NSharedCache::TCache::Get().AdmitCollection(written.PageCollections.at(slot).PageCollection);
     }
 
+    TCacheCollectionRef AdmitReadCollection(const TBundle::TResult& written) {
+        const auto* source =
+            dynamic_cast<const NPageCollection::TPageCollection*>(written.PageCollections.front().PageCollection.Get());
+        UNIT_ASSERT(source);
+        auto id = source->LargeGlobId;
+        id.Lead = TLogoBlobID(77, 1, 201, 0, id.Lead.BlobSize(), id.Lead.Cookie());
+        auto& cache = TCache::Get();
+        auto collection = cache.AdmitCollection(
+            MakeIntrusiveConst<NPageCollection::TPageCollection>(id, TSharedData(source->Meta.Raw)));
+        UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collection.CacheItem(), NPage::ECacheMode::Regular));
+        return collection;
+    }
+
+    TVector<const NPageCollection::TPageData*> DataPages(const TBundle::TResult& written) {
+        TVector<const NPageCollection::TPageData*> result;
+        for (const auto* pages :
+            { &written.PageCollections.front().StickyPages, &written.PageCollections.front().RegularPages }) {
+            for (const auto& page : *pages) {
+                if (page.Location.Type == EPage::DataPage) {
+                    result.push_back(&page);
+                }
+            }
+        }
+        UNIT_ASSERT(result.size() >= 2);
+        return result;
+    }
+
+    TLoader::TLoaderEnv MakeReadEnv(TCacheCollectionRef collection) {
+        TVector<TCacheCollectionRef> collections;
+        collections.push_back(std::move(collection));
+        return TLoader::TLoaderEnv(std::move(collections), TPartSlots(1, {}));
+    }
+
+    ui32 ActiveLoaderOperations() {
+        return NSharedCache::SpaceHazardActiveCount(
+            NSharedCache::TlsCacheHazard->State.load(std::memory_order_relaxed));
+    }
+
     TPartView Finish(TLoader& loader, const TBundle::TResult& written) {
         while (auto fetch = loader.Run({ .PreloadIndex = false, .PreloadData = false })) {
+            UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
             TVector<NSharedCache::TEvResult::TLoaded> pages;
             for (const auto& location : fetch.Pages) {
                 const NPageCollection::TPageData* source = nullptr;
@@ -143,6 +182,7 @@ namespace {
             }
             loader.Save(std::move(pages));
         }
+        UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
         return loader.Result();
     }
 
@@ -437,6 +477,80 @@ Y_UNIT_TEST_SUITE(TColdPartCollectionMetadata) {
         auto failed = fixture.Runtime.GrabEdgeEvent<TColdAccess::TEvFailed>(fixture.Second, TDuration::Seconds(5));
         UNIT_ASSERT(failed->Get()->Label == cold->Label);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Failures, 1);
+    }
+}
+
+Y_UNIT_TEST_SUITE_F(TPartLoaderReadScopes, NTest::TTableCacheTest) {
+    Y_UNIT_TEST(SavedPagesNeedNoNativeOperation) {
+        const auto written = WritePart();
+        const auto pages = DataPages(written);
+        auto collection = AdmitReadCollection(written);
+        auto env = MakeReadEnv(collection.Acquire());
+        UNIT_ASSERT(!env.TryGetSlotPage(0, pages[0]->Location));
+        UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
+        const auto fetch = env.GetFetch();
+        UNIT_ASSERT_VALUES_EQUAL(fetch.Pages.size(), 1);
+        auto page =
+            TCache::Get().AdmitPage(collection->PageCollection(), pages[0]->Location, TSharedData(pages[0]->Data));
+        UNIT_ASSERT(page);
+        NSharedCache::TEvResult::TLoaded loaded(pages[0]->Location.Offset, pages[0]->Location.Size, std::move(page));
+        env.Save(std::move(loaded));
+        env.EnsureNoNeedPages();
+
+        auto scope = env.BeginRead();
+        UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
+        UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
+        UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
+    }
+
+    Y_UNIT_TEST(NestedScopesReuseALazilyOpenedOperation) {
+        const auto written = WritePart();
+        const auto pages = DataPages(written);
+        auto collection = AdmitReadCollection(written);
+        auto page =
+            TCache::Get().AdmitPage(collection->PageCollection(), pages[0]->Location, TSharedData(pages[0]->Data));
+        UNIT_ASSERT(page);
+        auto env = MakeReadEnv(collection.Acquire());
+        {
+            auto outer = env.BeginRead();
+            UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
+            {
+                auto inner = env.BeginRead();
+                UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
+                UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 1);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 1);
+            UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
+            UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 1);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
+        UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
+        UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
+    }
+
+    Y_UNIT_TEST(SavedPageVisitsReleaseTheGuardAndTheNextMissReopensIt) {
+        const auto written = WritePart();
+        const auto pages = DataPages(written);
+        auto collection = AdmitReadCollection(written);
+        auto page =
+            TCache::Get().AdmitPage(collection->PageCollection(), pages[0]->Location, TSharedData(pages[0]->Data));
+        UNIT_ASSERT(page);
+        auto env = MakeReadEnv(collection.Acquire());
+        {
+            auto scope = env.BeginRead();
+            for (ui32 visit = 0; visit < 1024; ++visit) {
+                UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
+                UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), visit + 1 == 1024 ? 0 : 1);
+            }
+            UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
+            UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
+            UNIT_ASSERT(!env.TryGetSlotPage(0, pages[1]->Location));
+            UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 1);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
+        const auto fetch = env.GetFetch();
+        UNIT_ASSERT_VALUES_EQUAL(fetch.Pages.size(), 1);
+        UNIT_ASSERT(fetch.Pages.front() == pages[1]->Location);
     }
 }
 
