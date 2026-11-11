@@ -321,7 +321,14 @@ ui32 TSpaceOperation::TryAllocateHandle() noexcept {
 }
 
 TSpaceOperation TSpaceOperation::BeginSlow(
-    std::atomic<ui64>& spaceState, TSpaceHazard& hazard, const TSpaceViews& views) noexcept {
+    std::atomic<ui64>& spaceState, TSpaceHazard& hazard, const TSpaceViews& views, ui64 previousState) noexcept {
+    if (SpaceHazardIsActive(previousState)) {
+        // The existing outer scope pins the minimum generation; the increment is already registered
+        const auto entryState = TSpaceState::FromRaw(spaceState.load(std::memory_order_acquire));
+        return TSpaceOperation(hazard, entryState, views[entryState.Generation() % SpaceViewBankCount]);
+    }
+    // Roll back entry through a closed idle gate, waking a drainer that observed this provisional count
+    LeaveHazard(hazard);
     // Acquire the gate before reading the current view so a closed idle generation cannot reopen
     for (;;) {
         ui64 hazardState = hazard.State.load(std::memory_order_acquire);

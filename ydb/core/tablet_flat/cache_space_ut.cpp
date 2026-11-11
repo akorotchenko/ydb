@@ -105,7 +105,8 @@ public:
     }
 
     template <class TCallback>
-    static TSpaceOperation BeginOnHazardWithHook(TCacheSpace& space, ui32 index, TCallback&& callback) noexcept {
+    static TSpaceOperation BeginOnHazardWithHook(TCacheSpace& space, ui32 index, TCallback&& callback) noexcept(
+        noexcept(std::forward<TCallback>(callback)())) {
         return TSpaceOperation::BeginWithHook(
             space.SpaceState_, Hazard(space, index), space.SpaceViews_, std::forward<TCallback>(callback));
     }
@@ -1923,6 +1924,112 @@ Y_UNIT_TEST_SUITE(TCacheSpaceTest) {
         auto current = TCacheSpaceTestAccess::BeginOnHazard(*space, 0);
         UNIT_ASSERT_VALUES_EQUAL(current.EntryGeneration(), 1);
         UNIT_ASSERT_VALUES_EQUAL(current.View().Generation, 1);
+    }
+
+    Y_UNIT_TEST(EntryThroughClosedIdleGateRollsBackBeforeUsingTheCurrentView) {
+        for (bool resumeDrain : { false, true }) {
+            TCacheCapacityConfig capacity;
+            UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
+            auto [threads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
+            auto& hazard = TCacheSpaceTestAccess::Hazard(*space, 0);
+            UNIT_ASSERT(TCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+            hazard.State.fetch_or(SpaceHazardDrainWaiter, std::memory_order_acq_rel);
+
+            struct TContext {
+                TCacheSpace& Space;
+                bool ResumeDrain;
+                ui32 Notifications = 0;
+                ui32 Cursor = 0;
+                bool Drained = false;
+            } context{ *space, resumeDrain };
+
+            TCacheSpaceTestAccess::SetHazardDrainNotify(
+                *space, { &context, [](void* ptr) noexcept {
+                             auto& ctx = *static_cast<TContext*>(ptr);
+                             ++ctx.Notifications;
+                             if (ctx.ResumeDrain) {
+                                 ctx.Drained = TCacheSpaceTestAccess::TryDrainBefore(ctx.Space, 1, ctx.Cursor);
+                             }
+                         } });
+            ui32 hookCalls = 0;
+            {
+                auto operation = TCacheSpaceTestAccess::BeginOnHazardWithHook(*space, 0, [&]() noexcept {
+                    ++hookCalls;
+                    UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard.State.load()), 1);
+                    UNIT_ASSERT_VALUES_EQUAL(SpaceHazardGeneration(hazard.State.load()), 1);
+                    UNIT_ASSERT(!(hazard.State.load() & SpaceHazardDrainWaiter));
+                });
+                UNIT_ASSERT_VALUES_EQUAL(operation.EntryGeneration(), 1);
+                UNIT_ASSERT_VALUES_EQUAL(operation.View().Generation, 1);
+                UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 1);
+                UNIT_ASSERT_VALUES_EQUAL(hookCalls, 1);
+                UNIT_ASSERT_VALUES_EQUAL(context.Drained, resumeDrain);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard.State.load()), 0);
+            UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 1);
+            ui32 cursor = 0;
+            UNIT_ASSERT(TCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+            UNIT_ASSERT_VALUES_EQUAL(cursor, 1);
+        }
+    }
+
+    Y_UNIT_TEST(NestedEntryThroughArmedDrainKeepsTheOuterGeneration) {
+        TCacheCapacityConfig capacity;
+        UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
+        auto [threads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
+        auto& hazard = TCacheSpaceTestAccess::Hazard(*space, 0);
+        ui32 notifications = 0;
+        TCacheSpaceTestAccess::SetHazardDrainNotify(*space, { &notifications, [](void* ptr) noexcept {
+                                                                 ++*static_cast<ui32*>(ptr);
+                                                             } });
+        auto outer = MakeHolder<TSpaceOperation>(TCacheSpaceTestAccess::BeginOnHazard(*space, 0));
+        UNIT_ASSERT(TCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+        ui32 cursor = 0;
+        UNIT_ASSERT(!TCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+        ui32 hookCalls = 0;
+        {
+            auto nested = TCacheSpaceTestAccess::BeginOnHazardWithHook(*space, 0, [&]() noexcept {
+                ++hookCalls;
+            });
+            UNIT_ASSERT_VALUES_EQUAL(nested.EntryGeneration(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(nested.View().Generation, 1);
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardGeneration(hazard.State.load()), 0);
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard.State.load()), 2);
+            UNIT_ASSERT(hazard.State.load() & SpaceHazardDrainWaiter);
+            UNIT_ASSERT_VALUES_EQUAL(hookCalls, 0);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard.State.load()), 1);
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 0);
+        outer.Reset();
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        UNIT_ASSERT(TCacheSpaceTestAccess::TryDrainBefore(*space, 1, cursor));
+    }
+
+    Y_UNIT_TEST(EntryHookFailureReleasesOnlyTheAcceptedIncrement) {
+        struct TEntryStopped {};
+
+        for (bool closed : { false, true }) {
+            TCacheCapacityConfig capacity;
+            UNIT_ASSERT(TryCalculateCacheFootprint(5, 4096, 0, 1, capacity));
+            auto [threads, space] = TCacheThreadTestAccess::MakeSpace(capacity, capacity, 1);
+            auto& hazard = TCacheSpaceTestAccess::Hazard(*space, 0);
+            ui32 notifications = 0;
+            TCacheSpaceTestAccess::SetHazardDrainNotify(*space, { &notifications, [](void* ptr) noexcept {
+                                                                     ++*static_cast<ui32*>(ptr);
+                                                                 } });
+            if (closed) {
+                UNIT_ASSERT(TCacheSpaceTestAccess::AdvanceSpaceGeneration(*space));
+                hazard.State.fetch_or(SpaceHazardDrainWaiter, std::memory_order_acq_rel);
+            }
+            ui32 hookCalls = 0;
+            UNIT_ASSERT_EXCEPTION(TCacheSpaceTestAccess::BeginOnHazardWithHook(*space, 0, [&] {
+                ++hookCalls;
+                throw TEntryStopped{};
+            }), TEntryStopped);
+            UNIT_ASSERT_VALUES_EQUAL(hookCalls, 1);
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard.State.load()), 0);
+            UNIT_ASSERT_VALUES_EQUAL(notifications, closed ? 1 : 0);
+        }
     }
 
     Y_UNIT_TEST(IdleHazardRetagRejectsDelayedRegistrationBeforeBankReuse) {

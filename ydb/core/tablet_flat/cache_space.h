@@ -646,7 +646,7 @@ private:
         TAfterIncrement&& afterIncrement) noexcept(noexcept(std::forward<TAfterIncrement>(afterIncrement)()));
 
     static TSpaceOperation BeginSlow(
-        std::atomic<ui64>& spaceState, TSpaceHazard& hazard, const TSpaceViews& views) noexcept;
+        std::atomic<ui64>& spaceState, TSpaceHazard& hazard, const TSpaceViews& views, ui64 previousState) noexcept;
 
     static Y_FORCE_INLINE void LeaveHazard(TSpaceHazard& hazard) noexcept;
 
@@ -995,10 +995,9 @@ template <bool WithHook, class TAfterIncrement>
 Y_FORCE_INLINE TSpaceOperation TSpaceOperation::BeginImpl(std::atomic<ui64>& spaceState, TSpaceHazard& hazard,
     const TSpaceViews& views,
     TAfterIncrement&& afterIncrement) noexcept(noexcept(std::forward<TAfterIncrement>(afterIncrement)())) {
-    ui64 hazardState = hazard.State.load(std::memory_order_relaxed);
-    if (Y_LIKELY(static_cast<ui32>(hazardState) == 0) &&
-        Y_LIKELY(hazard.State.compare_exchange_strong(
-            hazardState, hazardState + 1, std::memory_order_acq_rel, std::memory_order_relaxed))) {
+    const ui64 hazardState = hazard.State.fetch_add(1, std::memory_order_acq_rel);
+    Y_DEBUG_ABORT_UNLESS(SpaceHazardActiveCount(hazardState) != MaxSpaceHazardActiveCount);
+    if (Y_LIKELY(static_cast<ui32>(hazardState) == 0)) {
         const TSpaceView& view = views[SpaceHazardGeneration(hazardState) % SpaceViewBankCount];
         const TSpaceState entryState =
             TSpaceState::FromRaw((hazardState & TSpaceState::GenerationMask) | view.BucketMask);
@@ -1008,7 +1007,7 @@ Y_FORCE_INLINE TSpaceOperation TSpaceOperation::BeginImpl(std::atomic<ui64>& spa
         }
         return operation;
     }
-    auto operation = BeginSlow(spaceState, hazard, views);
+    auto operation = BeginSlow(spaceState, hazard, views, hazardState);
     if constexpr (WithHook) {
         if (!SpaceHazardIsActive(hazardState)) {
             std::forward<TAfterIncrement>(afterIncrement)();
