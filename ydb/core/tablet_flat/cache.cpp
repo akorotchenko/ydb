@@ -522,18 +522,6 @@ bool TCache::IsPageSticky(TPageCacheItem page) const noexcept {
 }
 
 CACHE_TEMPLATE
-bool TCache::AcquirePage(TPageCacheItem page, TCachePageRefImpl<TTraits>& result) noexcept {
-    result.Drop();
-    auto cacheOp = BeginOperation();
-    auto ref = AcquirePageItem(cacheOp.SpaceOperation(), page);
-    if (!ref) {
-        return false;
-    }
-    result = cacheOp.BuildPageRef(std::move(ref));
-    return true;
-}
-
-CACHE_TEMPLATE
 TCacheItemRef TCache::AcquirePageItem(TSpaceOperation& spaceOp, TPageCacheItem page) noexcept {
     TCacheItem cacheItem = page.CacheItem();
     auto cacheOp = BindOperation(spaceOp);

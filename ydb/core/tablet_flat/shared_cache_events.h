@@ -451,7 +451,7 @@ namespace NKikimr::NSharedCache {
             return *Completion_;
         }
 
-        void Complete(TPageCacheItem page, EPageFetchCompletion completion) noexcept override;
+        void Complete(TSpaceOperation* spaceOp, TPageCacheItem page, EPageFetchCompletion completion) noexcept override;
 
     private:
         TIntrusivePtr<TRequestCompletion> Completion_;

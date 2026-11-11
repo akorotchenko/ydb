@@ -3012,7 +3012,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         std::thread callback([&] {
             noCacheContext = TCache::TryGet() == nullptr;
             if (noCacheContext) {
-                waiter->Complete({}, EPageFetchCompletion::Ready);
+                waiter->Complete(nullptr, {}, EPageFetchCompletion::Ready);
             }
         });
         callback.join();
@@ -3029,7 +3029,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             .Pages = { _P(1) },
         });
         TIntrusivePtr<TPageFetchWaiter> waiter = new TRequestPageWaiter(completion, 0);
-        waiter->Complete({}, EPageFetchCompletion::Failed);
+        waiter->Complete(nullptr, {}, EPageFetchCompletion::Failed);
 
         sharedCache.Runtime.WaitFor("failed request completion", [&] {
             return sharedCache.Results.size() == 1;
@@ -3051,16 +3051,16 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         TIntrusivePtr<TPageFetchWaiter> failed = new TRequestPageWaiter(completion, 0);
         TIntrusivePtr<TPageFetchWaiter> firstPending = new TRequestPageWaiter(completion, 1);
         TIntrusivePtr<TPageFetchWaiter> secondPending = new TRequestPageWaiter(completion, 2);
-        failed->Complete({}, EPageFetchCompletion::Failed);
+        failed->Complete(nullptr, {}, EPageFetchCompletion::Failed);
         sharedCache.CheckResults({ TFetch{ 91, sharedCache.Collection1, {} } }, NKikimrProto::ERROR);
         UNIT_ASSERT(!firstPending->IsActive());
         UNIT_ASSERT(!secondPending->IsActive());
 
         std::thread first([&] {
-            firstPending->Complete({}, EPageFetchCompletion::Failed);
+            firstPending->Complete(nullptr, {}, EPageFetchCompletion::Failed);
         });
         std::thread second([&] {
-            secondPending->Complete({}, EPageFetchCompletion::Failed);
+            secondPending->Complete(nullptr, {}, EPageFetchCompletion::Failed);
         });
         first.join();
         second.join();
@@ -5446,7 +5446,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             const auto state =
                 THandleState::FromRaw(cacheOp.Handles()[readyItem.Index()].State.load(std::memory_order_relaxed));
             UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 0);
-            UNIT_ASSERT(foreignFetch.FailReady());
+            UNIT_ASSERT(foreignFetch.FailReady(cacheOp));
         } else {
             UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
             for (auto& owner : foreignCollections) {

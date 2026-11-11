@@ -10,18 +10,6 @@
 namespace NKikimr::NSharedCache {
 
 template <class TTraits>
-TIntrusivePtr<TPageFetchState> TCacheFetches<TTraits>::TryAcquire(
-    TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept {
-    if (Cache_.Items_.BindOperation(spaceOp).TryAcquire(page.CacheItem(), true, owner.Get(), true) !=
-        TCacheImpl<TTraits>::EAcquireStatus::Pending) {
-        return {};
-    }
-    TIntrusivePtr<TPageFetchState> fetch = spaceOp.Handles()[page.Index()].Body.Fetch;
-    Y_DEBUG_ABORT_UNLESS(fetch);
-    return fetch;
-}
-
-template <class TTraits>
 THandle* TCacheFetches<TTraits>::TryGetPendingHandle(
     TOperationItemRef<TTraits>& owner, TPageFetchState& fetch) noexcept {
     Y_DEBUG_ABORT_UNLESS(owner);
@@ -130,8 +118,8 @@ void TCacheFetches<TTraits>::FinishFailed(TOperationItemRef<TTraits>& finalizerR
     Cache_.InvokeHook(ECacheHookPoint::AfterTombstoneOwnerClaim, cacheItem);
     const TCacheKey key = LoadCacheKey(handle, EItemKind::Page);
     Cache_.Table_.FinishErase(spaceOp, cacheItem, key);
-    TPageFetchState::DrainWaiters(waiters, [cacheItem](TIntrusivePtr<TPageFetchWaiter> waiter) {
-        waiter->Complete(TPageCacheItem::FromValidated(cacheItem), EPageFetchCompletion::Failed);
+    TPageFetchState::DrainWaiters(waiters, [&spaceOp, cacheItem](TIntrusivePtr<TPageFetchWaiter> waiter) {
+        waiter->Complete(&spaceOp, TPageCacheItem::FromValidated(cacheItem), EPageFetchCompletion::Failed);
     });
 }
 
@@ -165,8 +153,8 @@ void TCacheFetches<TTraits>::Finish(
         Cache_.MakeReadyState(spaceOp, page, EHandleState::Hot, owner, &keep, &pending);
     }
     Cache_.InvokeHook(ECacheHookPoint::BeforeReadyWaiters, page);
-    TPageFetchState::DrainWaiters(waiters, [page](TIntrusivePtr<TPageFetchWaiter> waiter) {
-        waiter->Complete(TPageCacheItem::FromValidated(page), EPageFetchCompletion::Ready);
+    TPageFetchState::DrainWaiters(waiters, [&spaceOp, page](TIntrusivePtr<TPageFetchWaiter> waiter) {
+        waiter->Complete(&spaceOp, TPageCacheItem::FromValidated(page), EPageFetchCompletion::Ready);
     });
     // Callbacks own their immutable results now; follow any relocation before enforcing placement
     TOperationItemRef<TTraits> current(spaceOp, Cache_.AcquirePageItem(spaceOp, TPageCacheItem::FromValidated(page)));
@@ -180,36 +168,6 @@ void TCacheFetches<TTraits>::Finish(
         }
     }
     Cache_.NotifyResourcesAvailable();
-}
-
-template <class TTraits>
-bool TCacheFetches<TTraits>::ReserveMemory(TSpaceOperation& spaceOp, TCacheItem item, TPageFetchState& fetch) noexcept {
-    THandle& handle = spaceOp.Handles()[item.Index()];
-    ui64 raw = handle.State.load(std::memory_order_acquire);
-    THandleState state = THandleState::FromRaw(raw);
-    if (!MatchesPendingFetch(handle, state, item, fetch)) {
-        return false;
-    }
-    if (!state.IsWaitingForMemory()) {
-        return true;
-    }
-    const ui64 bytes = TCacheItems<TTraits>::PageBytes(handle);
-    if (!Cache_.TryReserve(spaceOp, bytes, 1)) {
-        return false;
-    }
-    // Only the move-only fetch owner reserves memory. Subscribers may change refs/Sticky concurrently.
-    for (;;) {
-        state = THandleState::FromRaw(raw);
-        if (!MatchesPendingFetch(handle, state, item, fetch) || !state.IsWaitingForMemory()) {
-            Cache_.ReleaseReservation(bytes, 1);
-            return false;
-        }
-        if (handle.State.compare_exchange_weak(raw, state.WithState(EHandleState::Begin).Raw(),
-                std::memory_order_release, std::memory_order_relaxed)) {
-            fetch.KeepReservation_.MarkPending();
-            return true;
-        }
-    }
 }
 
 template <class TTraits>

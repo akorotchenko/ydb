@@ -43,10 +43,12 @@ TCachePageRefImpl<TTraits> TCacheImpl<TTraits>::AdmitPage(
 
 class TCompactedPageWaiter final : public TPageFetchWaiter {
 public:
-    void Complete(TPageCacheItem item, EPageFetchCompletion completion) noexcept override {
+    void Complete(TSpaceOperation* spaceOp, TPageCacheItem item, EPageFetchCompletion completion) noexcept override {
         Y_ABORT_UNLESS(completion == EPageFetchCompletion::Ready);
+        Y_DEBUG_ABORT_UNLESS(spaceOp);
+        auto cacheOp = TCache::Get().BindOperation(*spaceOp);
         // Acquire before the fetch releases its owner, so admission cannot race eviction.
-        Y_ABORT_UNLESS(TCache::Get().AcquirePage(item, Page));
+        Y_ABORT_UNLESS(cacheOp.AcquirePage(item, Page));
     }
 
     TCachePageRef Page;
@@ -72,7 +74,8 @@ TCachePageRef TEvSaveCompactedPages::AddPage(
         return std::move(request.Page());
     }
     Y_ENSURE(request.Status() == ECacheResultStatus::Inserted);
-    Y_ENSURE(request.Fetch().MakeReady(std::move(page.Data)));
+    auto cacheOp = cachePages.BeginOperation();
+    Y_ENSURE(request.Fetch().MakeReady(cacheOp, std::move(page.Data)));
     return std::move(waiter->Page);
 }
 
@@ -284,12 +287,14 @@ void TRequestCompletion::SendResult(THolder<TEvResult> result) noexcept {
     ActorSystem_->Send(ReplyTo_, result.Release(), 0, EventCookie_);
 }
 
-void TRequestPageWaiter::Complete(TPageCacheItem page, EPageFetchCompletion completion) noexcept {
+void TRequestPageWaiter::Complete(
+    TSpaceOperation* spaceOp, TPageCacheItem page, EPageFetchCompletion completion) noexcept {
     TCachePageRef result;
     if (completion == EPageFetchCompletion::Ready) {
         TCachePageRef cachePage;
-        if (TCache* cache = TCache::TryGet()) {
-            if (cache->AcquirePage(page, cachePage)) {
+        if (TCache* cache = TCache::TryGet(); cache && spaceOp) {
+            auto cacheOp = cache->BindOperation(*spaceOp);
+            if (cacheOp.AcquirePage(page, cachePage)) {
                 result = std::move(cachePage);
             } else {
                 completion = EPageFetchCompletion::Failed;

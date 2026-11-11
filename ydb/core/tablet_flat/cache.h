@@ -174,26 +174,6 @@ public:
         return static_cast<TCacheImpl*>(TTraits::TryGetCache());
     }
 
-    Y_FORCE_INLINE bool MakeReady(TPageCacheItem page, NActors::TSharedData&& data) noexcept {
-        auto cacheOp = BeginOperation();
-        TOperationItemRef<TTraits> owner(cacheOp);
-        TIntrusivePtr<TPageFetchState> fetch = cacheOp.Fetches().TryAcquire(page, owner);
-        if (!fetch) {
-            return false;
-        }
-        return cacheOp.Fetches().Complete(owner, *fetch, std::move(data), {});
-    }
-
-    Y_FORCE_INLINE bool FailReady(TPageCacheItem page) noexcept {
-        auto cacheOp = BeginOperation();
-        TOperationItemRef<TTraits> owner(cacheOp);
-        TIntrusivePtr<TPageFetchState> fetch = cacheOp.Fetches().TryAcquire(page, owner);
-        if (!fetch) {
-            return false;
-        }
-        return cacheOp.Fetches().Fail(owner, *fetch);
-    }
-
     Y_FORCE_INLINE bool MakeReady(TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept {
         return MakeReady(Collections_.Registry(), collection, std::move(value));
     }
@@ -841,8 +821,6 @@ private:
 
     bool IsPageSticky(TPageCacheItem page) const noexcept;
 
-    bool AcquirePage(TPageCacheItem page, TCachePageRefImpl<TTraits>& result) noexcept;
-
     // May finalize or reclaim an item while its mappings are protected
     void ReleaseCleanup(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
         auto cacheOp = BindOperation(spaceOp);
@@ -1130,6 +1108,8 @@ public: // Cache helpers
         return Items().BuildPageRef(std::move(ref));
     }
 
+    Y_FORCE_INLINE bool AcquirePage(TPageCacheItem page, TCachePageRefImpl<TTraits>& result) noexcept;
+
     Y_FORCE_INLINE TCacheCollectionRefImpl<TTraits> BuildCollectionRef(
         TCacheItemRefImpl<TTraits>&& ref) const noexcept {
         Y_DEBUG_ABORT_UNLESS(&TCacheImpl<TTraits>::Get() == &Cache_);
@@ -1294,6 +1274,18 @@ using TCachePageRequest = TCachePageRequestImpl<>;
 using TCache = TCacheImpl<>;
 
 // Inline implementations
+
+template <class TTraits>
+Y_FORCE_INLINE bool TCacheOperationView<TTraits>::AcquirePage(
+    TPageCacheItem page, TCachePageRefImpl<TTraits>& result) noexcept {
+    result.Drop();
+    auto ref = Cache_.AcquirePageItem(SpaceOp_, page);
+    if (!ref) {
+        return false;
+    }
+    result = BuildPageRef(std::move(ref));
+    return true;
+}
 
 Y_FORCE_INLINE void* TProdTraits::TryGetCache() noexcept {
     NActors::TActorSystem* actorSystem =

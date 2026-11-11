@@ -1783,12 +1783,12 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         TVector<TPageLocation> locations;
         locations.reserve(pages.size());
         ui64 bytes = 0;
-        for (TPageFetch& page : pages) {
+        for (auto cacheOp = Cache->BeginOperation(); TPageFetch & page : pages) {
             const TPageLocation location = page.Location();
             Y_ENSURE(bytes <= Max<ui64>() - location.Size);
             bytes += location.Size;
             locations.push_back(location);
-            Y_ENSURE(page.Dispatch());
+            Y_ENSURE(page.Dispatch(cacheOp));
         }
         auto* request = new NBlockIO::TEvFetch(priority, collection.Acquire(), std::move(locations), bytes);
         request->TraceId = std::move(traceId);
@@ -1818,25 +1818,28 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         const bool valid = data.Status == NKikimrProto::OK && data.PageCollection->Label() == fetch.CollectionId &&
                            data.Pages.size() == fetch.Pages.size();
         bool failed = false;
-        for (ui32 index = 0; index < fetch.Pages.size(); ++index) {
-            TPageFetch& page = fetch.Pages[index];
-            if (valid && data.Pages[index].Offset == page.Location().Offset &&
-                data.Pages[index].Data.size() == page.Size())
-            {
-                auto pending = data.PendingBuffers.Take(data.Pages[index].Data.GetAllocationSize());
-                if (!page.MakeReady(std::move(data.Pages[index].Data), std::move(pending))) {
+        {
+            auto cacheOp = Cache->BeginOperation();
+            for (ui32 index = 0; index < fetch.Pages.size(); ++index) {
+                TPageFetch& page = fetch.Pages[index];
+                if (valid && data.Pages[index].Offset == page.Location().Offset &&
+                    data.Pages[index].Data.size() == page.Size())
+                {
+                    auto pending = data.PendingBuffers.Take(data.Pages[index].Data.GetAllocationSize());
+                    if (!page.MakeReady(cacheOp, std::move(data.Pages[index].Data), std::move(pending))) {
+                        failed = true;
+                    }
+                } else {
                     failed = true;
-                }
-            } else {
-                failed = true;
-                page.FailReady();
+                    page.FailReady(cacheOp);
                 }
             }
+        }
 
-            if (failed) {
-                PruneQueues();
-            }
-            if (fetch.QueueCookie == EBlockIOFetchTypeCookie::AsyncQueue) {
+        if (failed) {
+            PruneQueues();
+        }
+        if (fetch.QueueCookie == EBlockIOFetchTypeCookie::AsyncQueue) {
             Y_ENSURE(AsyncRequests.InFly >= fetch.Bytes);
             AsyncRequests.InFly -= fetch.Bytes;
             RequestFromQueue(AsyncRequests);

@@ -574,6 +574,7 @@ public:
 
 struct TPage;
 class TCollection;
+class TSpaceOperation;
 
 template <class TTraits>
 class TCacheImpl;
@@ -590,7 +591,8 @@ public:
         return true;
     }
 
-    virtual void Complete(TPageCacheItem, EPageFetchCompletion) noexcept {}
+    // The operation is borrowed for this callback; terminal failure may have no operation
+    virtual void Complete(TSpaceOperation*, TPageCacheItem, EPageFetchCompletion) noexcept {}
 
 private:
     friend class TPageFetchState;
@@ -751,7 +753,7 @@ static_assert(offsetof(THandle, NextInOwner) == 60);
 
 inline TPageFetchState::~TPageFetchState() {
     CloseWaiters([this](TIntrusivePtr<TPageFetchWaiter> waiter) {
-        waiter->Complete(Page_, EPageFetchCompletion::Failed);
+        waiter->Complete(nullptr, Page_, EPageFetchCompletion::Failed);
     });
 }
 
