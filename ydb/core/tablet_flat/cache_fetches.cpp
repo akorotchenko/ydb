@@ -12,7 +12,7 @@ namespace NKikimr::NSharedCache {
 template <class TTraits>
 TIntrusivePtr<TPageFetchState> TCacheFetches<TTraits>::TryAcquire(
     TSpaceOperation& spaceOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept {
-    if (Cache_.Items_.BindOperation(spaceOp).TryAcquire(page.CacheItem(), true, owner.Get(), false) !=
+    if (Cache_.Items_.BindOperation(spaceOp).TryAcquire(page.CacheItem(), true, owner.Get(), true) !=
         TCacheImpl<TTraits>::EAcquireStatus::Pending) {
         return {};
     }
@@ -152,7 +152,7 @@ void TCacheFetches<TTraits>::Finish(
     }
 
     Y_DEBUG_ABORT_UNLESS(reserved && fetch.Completion() == EPageFetchCompletion::Ready);
-    const bool demand = fetch.HasDemand_.load(std::memory_order_relaxed);
+    const bool preload = fetch.Preload_.load(std::memory_order_relaxed);
     {
         Cache_.InvokeHook(ECacheHookPoint::BeforePageReadyState, page);
         NActors::TSharedData data = fetch.TakeData();
@@ -172,7 +172,7 @@ void TCacheFetches<TTraits>::Finish(
     TOperationItemRef<TTraits> current(spaceOp, Cache_.AcquirePageItem(spaceOp, TPageCacheItem::FromValidated(page)));
     Cache_.InvokeHook(ECacheHookPoint::BeforeReadyReconcile, current.CacheItem());
     auto eviction = Cache_.Eviction_.BindOperation(spaceOp);
-    if (current && (demand ? eviction.TouchPage(current.Get()) : eviction.ReconcilePage(current.Get()))) {
+    if (current && (preload ? eviction.ReconcilePage(current.Get()) : eviction.TouchPage(current.Get()))) {
         const auto state =
             THandleState::FromRaw(spaceOp.Handles()[current.CacheItem().Index()].State.load(std::memory_order_acquire));
         if (state.IsHot()) {

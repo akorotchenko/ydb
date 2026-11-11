@@ -1041,11 +1041,11 @@ ECacheResultStatus TCache::FindOrInsert(TSpaceOperation& spaceOp, TKeyedCandidat
         }
 
         TOperationItemRef acquired(spaceOp);
-        bool demand = true;
+        bool preload = false;
         if constexpr (std::is_same_v<TKeyedCandidate, TPageInsertCandidate>) {
-            demand = candidate.Admission != EPageAdmission::Preload;
+            preload = candidate.Admission == EPageAdmission::Preload;
         }
-        const EAcquireStatus acquireStatus = cacheOp.TryAcquire(cacheItem, true, acquired.Get(), demand);
+        const EAcquireStatus acquireStatus = cacheOp.TryAcquire(cacheItem, true, acquired.Get(), preload);
         if (acquireStatus == EAcquireStatus::Stale) {
             Y_DEBUG_ABORT_UNLESS(!inserted);
             continue;

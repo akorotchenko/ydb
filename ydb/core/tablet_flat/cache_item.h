@@ -674,8 +674,8 @@ private:
     const TPageCacheItem Page_;
     std::atomic<TPageFetchWaiter*> Waiters_{ nullptr };
     std::atomic<EPageFetchCompletion> Completion_{ EPageFetchCompletion::Pending };
-    // A real requester upgrades a coalesced optional load before releasing its pending reference
-    std::atomic<bool> HasDemand_{ false };
+    // Cleared permanently when an ordinary requester acquires the pending page
+    std::atomic<bool> Preload_{ true };
     NActors::TSharedData Data_;
     TCachePendingBuffers PendingBuffers_;
 };
