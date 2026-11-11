@@ -1,6 +1,7 @@
 #pragma once
 
 #include "test_store.h"
+#include <ydb/core/tablet_flat/test/libs/table/cache_context.h>
 #include <ydb/core/tablet_flat/cache.h>
 #include <ydb/core/tablet_flat/flat_fwd_blobs.h>
 #include <ydb/core/tablet_flat/flat_fwd_cache.h>
@@ -141,7 +142,7 @@ namespace NTest {
             auto* data = storedPart->Store->GetPage(slot, location.Offset);
             auto* collection = storedPart->GetPageCollection(slot);
             const auto actual = collection->GetLocation(ResolvePageId(part, location, slot));
-            return TCache::Get().AdmitPage(storedPart->PageColls.at(slot), actual, TSharedData(*data));
+            return NTable::NTest::AdmitPage(TCache::Get(), storedPart->PageColls.at(slot), actual, TSharedData(*data));
         }
 
         ui32 ResolvePageId(const TPart *part, const TPageLocation& location, ui32 slot) const {

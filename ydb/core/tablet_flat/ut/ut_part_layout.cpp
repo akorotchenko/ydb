@@ -470,7 +470,7 @@ namespace {
                 }
             }
             collections.push_back(cachedPart ? cachedPart.As<NTable::TPartStore>()->PageCollections[slot].Acquire()
-                                             : cache.AdmitCollection(written.PageCollection));
+                                             : NTable::NTest::AdmitCollection(cache, written.PageCollection));
         }
         collections.resize(collections.size() - dropSlots);
 
@@ -498,7 +498,7 @@ namespace {
             for (const auto& location : fetch.Pages) {
                 auto* data = pages[slot].FindPtr(location.Offset);
                 UNIT_ASSERT_C(data, "Fetch of an unknown page " << location << " of page collection " << slot);
-                auto page = cache.AdmitPage(fetch.PageCollection, location, TSharedData(*data),
+                auto page = NTable::NTest::AdmitPage(cache, fetch.PageCollection, location, TSharedData(*data),
                     NTable::TLoader::NeedIn(location.Type) || location.Type == EPage::FlatIndex);
                 UNIT_ASSERT(page);
                 loaded.emplace_back(location.Offset, location.Size, std::move(page));

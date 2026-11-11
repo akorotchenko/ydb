@@ -27,6 +27,10 @@ TLoader::TLoader(TPartComponents components, TVector<TCacheCollectionRef> prebui
 
 TLoader::~TLoader() { }
 
+TCacheCollectionRef TLoader::AdmitCollection(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection) {
+    return TCache::Get().BeginOperation().AdmitCollection(std::move(collection));
+}
+
 void TLoader::SetPageCollection(ui32 slot, TCacheCollectionRef collection)
 {
     Y_ENSURE(Stage == EStage::Meta, "Part metadata loading has already completed");
@@ -69,7 +73,7 @@ void TLoader::PrepareRoot()
         auto& comp = Components.PageCollectionComponents[0];
         Y_ENSURE(comp.RawMeta, "Slot 0 has no raw meta data");
 
-        auto cache = TCache::Get().AdmitCollection(
+        auto cache = AdmitCollection(
             MakeIntrusiveConst<NPageCollection::TPageCollection>(comp.LargeGlobId, TSharedData(comp.RawMeta)));
 
         PageCollections[0] = std::move(cache);
@@ -252,7 +256,7 @@ void TLoader::StageParseMeta()
         auto& comp = Components.PageCollectionComponents[i];
         Y_ENSURE(comp.RawMeta, "Slot " << i << " has no raw meta data");
 
-        auto collection = TCache::Get().AdmitCollection(
+        auto collection = AdmitCollection(
             MakeIntrusiveConst<NPageCollection::TPageCollection>(comp.LargeGlobId, TSharedData(comp.RawMeta)));
         SetPageCollection(i, std::move(collection));
     }
@@ -262,7 +266,7 @@ void TLoader::StageParseMeta()
         auto& comp = Components.PageCollectionComponents.back();
         Y_ENSURE(comp.RawMeta, "Outer blob slot has no raw meta data");
 
-        auto cache = TCache::Get().AdmitCollection(
+        auto cache = AdmitCollection(
             MakeIntrusiveConst<NPageCollection::TOuterPageCollection>(comp.LargeGlobId, TSharedData(comp.RawMeta)));
 
         SetPageCollection(PageCollections.size() - 1, std::move(cache));
@@ -459,7 +463,7 @@ TLoader::TFetch TLoader::StageCreatePartView(bool preloadIndex)
     if (partStore->Blobs) {
         Y_ENSURE(partStore->Large, "Cannot use blobs without frames");
 
-        partStore->Pseudo = TCache::Get().AdmitCollection(partStore->Blobs);
+        partStore->Pseudo = AdmitCollection(partStore->Blobs);
     }
 
     auto overlay = TOverlay::Decode(Legacy, Opaque);
@@ -585,6 +589,18 @@ TLoader::TFetch TLoader::StagePreloadData()
     }
 
     return LoaderEnv->GetFetch();
+}
+
+void TLoader::TLoaderEnv::Save(NPageCollection::TPageData&& page) {
+    auto& needPages = NeedPages.at(FetchSlot);
+    auto it = needPages.find(TPageLocation(page.Location.Offset));
+    Y_ENSURE(it != needPages.end(), "Got unknown decoder page");
+    needPages.erase(it);
+    auto data = std::move(page.Data);
+    auto cacheOp = TCache::Get().BeginOperation();
+    auto collection = cacheOp.AdmitCollection(PageCollections.at(FetchSlot)->PageCollection());
+    SavedPages.at(FetchSlot)[page.Location.Offset] = cacheOp.AdmitPage(collection.CacheItem(), page.Location,
+        std::move(data), NeedIn(page.Location.Type) || page.Location.Type == EPage::FlatIndex);
 }
 
 void TLoader::Save(TVector<NSharedCache::TEvResult::TLoaded>&& pages)

@@ -20,6 +20,8 @@
 
 namespace NKikimr::NSharedCache {
 
+inline constexpr ui32 CacheOperationBatchSize = 1024;
+
 struct TCacheHandleRequirement {
     TLogoBlobID CollectionId;
     TArrayRef<const NTable::NPage::TPageLocation> Pages;
@@ -162,13 +164,6 @@ public:
     void AccountMetadataBuffer(const TSharedData& buffer) const {
         Accounting_.AccountMetadataBuffer(buffer);
     }
-
-    TCacheCollectionRefImpl<TTraits> AdmitCollection(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection)
-        requires std::is_same_v<TTraits, TProdTraits>;
-
-    TCachePageRefImpl<TTraits> AdmitPage(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
-        NTable::NPage::TPageLocation location, NActors::TSharedData&& data, bool sticky = false)
-        requires std::is_same_v<TTraits, TProdTraits>;
 
     static TCacheImpl* TryGet() noexcept {
         return static_cast<TCacheImpl*>(TTraits::TryGetCache());
@@ -721,16 +716,20 @@ private:
     bool AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& collection, TVector<TPageInsertCandidate>& candidates,
         ui64 reservedBytes, bool waitForMemory, EPageAdmission admission) noexcept;
 
-    Y_FORCE_INLINE bool FindOrInsertWrittenBatch(
-        TCollectionCacheItem collection, TArrayRef<TCachePageRequestImpl<TTraits>> requests) noexcept {
-        return FindOrInsertBatch(collection, requests, false, false, EPageAdmission::Written);
-    }
-
     bool FindOrInsertBatch(TCollectionCacheItem collection, TArrayRef<TCachePageRequestImpl<TTraits>> requests,
         bool recordStats, bool waitForMemory, EPageAdmission admission) noexcept;
+    bool FindOrInsertBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection,
+        TArrayRef<TCachePageRequestImpl<TTraits>> requests, bool recordStats, bool waitForMemory,
+        EPageAdmission admission) noexcept;
     ECacheResultStatus FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
         const TCollectionLocation& collection, TCollectionCacheItem& inserted,
         TCacheCollectionRefImpl<TTraits>& hit) noexcept;
+
+    TCacheCollectionRefImpl<TTraits> AdmitCollection(
+        TSpaceOperation& spaceOp, TIntrusiveConstPtr<NPageCollection::IPageCollection> collection);
+    TCachePageRefImpl<TTraits> AdmitPage(TSpaceOperation& spaceOp, TCollectionCacheItem collection,
+        NTable::NPage::TPageLocation location, NActors::TSharedData&& data, bool sticky, EPageAdmission admission)
+        requires std::is_same_v<TTraits, TProdTraits>;
 
     template <class TCandidate>
     ECacheResultStatus FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
@@ -986,6 +985,25 @@ public: // Cache table operations
     }
 
 public: // Cache helpers
+    Y_FORCE_INLINE TCacheCollectionRefImpl<TTraits> AdmitCollection(
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> collection) {
+        return Cache_.AdmitCollection(SpaceOp_, std::move(collection));
+    }
+
+    Y_FORCE_INLINE TCachePageRefImpl<TTraits> AdmitPage(TCollectionCacheItem collection,
+        NTable::NPage::TPageLocation location, NActors::TSharedData&& data, bool sticky = false)
+        requires std::is_same_v<TTraits, TProdTraits>
+    {
+        return Cache_.AdmitPage(SpaceOp_, collection, location, std::move(data), sticky, EPageAdmission::Bounded);
+    }
+
+    Y_FORCE_INLINE TCachePageRefImpl<TTraits> AdmitWrittenPage(TCollectionCacheItem collection,
+        NTable::NPage::TPageLocation location, NActors::TSharedData&& data, bool sticky = false)
+        requires std::is_same_v<TTraits, TProdTraits>
+    {
+        return Cache_.AdmitPage(SpaceOp_, collection, location, std::move(data), sticky, EPageAdmission::Written);
+    }
+
     Y_FORCE_INLINE ui64 AvailableHandleCount() const noexcept {
         return SpaceOp_.AvailableHandleCount();
     }
@@ -1049,6 +1067,18 @@ public: // Cache helpers
         TIntrusivePtr<TPageFetchWaiter> waiter, TCachePageRefImpl<TTraits>& hit,
         TPageFetchImpl<TTraits>& fetch) noexcept {
         return Cache_.FindOrInsertPage(SpaceOp_, candidate, std::move(waiter), hit, fetch);
+    }
+
+    Y_FORCE_INLINE bool FindOrInsertBatch(TCollectionCacheItem collection,
+        TArrayRef<TCachePageRequestImpl<TTraits>> requests, bool recordStats = true,
+        bool waitForMemory = false) noexcept {
+        return Cache_.FindOrInsertBatch(
+            SpaceOp_, collection, requests, recordStats, waitForMemory, EPageAdmission::Bounded);
+    }
+
+    Y_FORCE_INLINE bool FindOrInsertWrittenBatch(
+        TCollectionCacheItem collection, TArrayRef<TCachePageRequestImpl<TTraits>> requests) noexcept {
+        return Cache_.FindOrInsertBatch(SpaceOp_, collection, requests, false, false, EPageAdmission::Written);
     }
 
     Y_FORCE_INLINE bool PreparePageBatch(TCollection& collection, TArrayRef<TCachePageRequestImpl<TTraits>> requests,

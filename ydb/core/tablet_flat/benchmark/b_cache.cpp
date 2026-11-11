@@ -117,7 +117,7 @@ namespace {
             Context_ = MakeHolder<NTable::NTest::TTableCacheContext>(capacity);
             Cache_ = &TCache::Get();
             PageCollection_ = MakeIntrusiveConst<TBenchmarkCollection>(PageCount_ * 2);
-            Collection_ = Cache_->AdmitCollection(PageCollection_);
+            Collection_ = NTable::NTest::AdmitCollection(*Cache_, PageCollection_);
             const ui64 buckets = capacity.BucketCount();
             StdRaw_.reserve(buckets);
             YdbRaw_.reserve(buckets);
@@ -132,7 +132,7 @@ namespace {
                 auto data = NActors::TSharedData::Uninitialized(PageSize);
                 std::memset(data.mutable_data(), page & 0xff, PageSize);
                 auto shared = data;
-                auto ref = Cache_->AdmitPage(PageCollection_, location, std::move(data));
+                auto ref = NTable::NTest::AdmitPage(*Cache_, PageCollection_, location, std::move(data));
                 Y_ENSURE(ref);
                 const auto item = ref.CacheItem().CacheItem();
                 StdRaw_.emplace(key, item);

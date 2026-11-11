@@ -248,6 +248,7 @@ public:
 private:
     friend class TCacheItems<TTraits>;
     friend class TRequestCompletion;
+    friend struct TEvSaveCompactedPages;
 
     // Transfer an existing native owner without acquiring another reference
     Y_FORCE_INLINE TCacheItem TakeNativeRef() noexcept {

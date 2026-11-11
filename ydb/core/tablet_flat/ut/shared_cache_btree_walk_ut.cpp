@@ -85,7 +85,8 @@ namespace {
         TVector<ui32> LookupBatches;
 
         TWalkHostMock() {
-            Collection = TCache::Get().AdmitCollection(MakeIntrusiveConst<TPageCollectionStub>(TLogoBlobID(1, 1, 1)));
+            Collection = NTable::NTest::AdmitCollection(
+                TCache::Get(), MakeIntrusiveConst<TPageCollectionStub>(TLogoBlobID(1, 1, 1)));
             Collection->EnsureActorState();
             auto& cache = TCache::Get();
             UNIT_ASSERT(cache.SetCollectionPagesCacheMode(Collection.CacheItem(), ECacheMode::Regular));

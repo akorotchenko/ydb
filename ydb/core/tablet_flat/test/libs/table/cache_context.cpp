@@ -14,6 +14,18 @@ namespace {
     }
 } // namespace
 
+TCacheCollectionRef AdmitCollection(TCache& cache, TIntrusiveConstPtr<NPageCollection::IPageCollection> collection) {
+    return cache.BeginOperation().AdmitCollection(std::move(collection));
+}
+
+TCachePageRef AdmitPage(TCache& cache, TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
+    NPage::TPageLocation location, NActors::TSharedData&& data, bool sticky) {
+    NPageCollection::TPageData page(location, std::move(data));
+    auto cacheOp = cache.BeginOperation();
+    auto owner = cacheOp.AdmitCollection(std::move(collection));
+    return cacheOp.AdmitPage(owner.CacheItem(), page.Location, std::move(page.Data), sticky);
+}
+
 TTableCacheContext::TTableCacheContext()
     : TTableCacheContext(DefaultCapacity())
 {}

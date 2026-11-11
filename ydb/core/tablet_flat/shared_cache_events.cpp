@@ -3,80 +3,35 @@
 
 #include <ydb/library/actors/core/actorsystem.h>
 
-#include <thread>
-
 namespace NKikimr::NSharedCache {
 
-template <class TTraits>
-TCacheCollectionRefImpl<TTraits> TCacheImpl<TTraits>::AdmitCollection(
-    TIntrusiveConstPtr<NPageCollection::IPageCollection> collection)
-    requires std::is_same_v<TTraits, TProdTraits>
-{
-    THolder<TCollection> value;
-    TCollectionCacheItem inserted;
-    TCacheCollectionRefImpl<TTraits> hit;
-    auto status = FindOrInsert(collection, value, inserted, hit);
-    while (status == ECacheResultStatus::Pending) {
-        // A concurrent metadata publisher completes synchronously; share its ready collection.
-        std::this_thread::yield();
-        status = FindOrInsert(collection, value, inserted, hit);
-    }
-    if (status == ECacheResultStatus::Inserted) {
-        Y_ENSURE(MakeReady(inserted, std::move(value), hit));
-    } else {
-        Y_ENSURE(status == ECacheResultStatus::Hit);
-        Y_ENSURE(hit->PageCollection()->IsCompatible(*collection), "Conflicting collection metadata descriptor");
-        hit->SetSkipBTreeIndexV1Shadow(collection->SkipBTreeIndexV1Shadow());
-    }
-    return hit;
-}
-
-template <class TTraits>
-TCachePageRefImpl<TTraits> TCacheImpl<TTraits>::AdmitPage(
-    TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, NTable::NPage::TPageLocation location,
-    NActors::TSharedData&& data, bool sticky)
-    requires std::is_same_v<TTraits, TProdTraits>
-{
-    TEvSaveCompactedPages admission(std::move(collection));
-    return admission.AddPage(*this, NPageCollection::TPageData(location, std::move(data)), sticky);
-}
-
-class TCompactedPageWaiter final : public TPageFetchWaiter {
-public:
-    void Complete(TSpaceOperation* spaceOp, TPageCacheItem item, EPageFetchCompletion completion) noexcept override {
-        Y_ABORT_UNLESS(completion == EPageFetchCompletion::Ready);
-        Y_DEBUG_ABORT_UNLESS(spaceOp);
-        auto cacheOp = TCache::Get().BindOperation(*spaceOp);
-        // Acquire before the fetch releases its owner, so admission cannot race eviction.
-        Y_ABORT_UNLESS(cacheOp.AcquirePage(item, Page));
-    }
-
-    TCachePageRef Page;
-};
-
-TCachePageRef TEvSaveCompactedPages::AddPage(
-    TCache& cachePages, NPageCollection::TPageData&& page, bool sticky, TCache::EPageAdmission admission) {
+void TEvSaveCompactedPages::EnsureCollection(TCache& cache) {
     if (!Collection_) {
-        Collection_ = cachePages.AdmitCollection(PageCollection);
+        auto cacheOp = cache.BeginOperation();
+        Collection_ = cacheOp.AdmitCollection(PageCollection);
         CacheItem = Collection_.CacheItem();
     }
+}
+
+TCachePageRef TEvSaveCompactedPages::AddPage(
+    TCacheOperationView<TProdTraits>& cacheOp, NPageCollection::TPageData&& page, bool sticky) {
     Pages.push_back(page.Location);
-    auto waiter = MakeIntrusive<TCompactedPageWaiter>();
-    TCachePageRequest request(page.Location, waiter, sticky);
-    const bool admitted = admission == TCache::EPageAdmission::Written
-                              ? cachePages.FindOrInsertWrittenBatch(CacheItem, { &request, 1 })
-                              : cachePages.FindOrInsertBatch(CacheItem, { &request, 1 }, false);
-    if (!admitted) {
-        Y_ENSURE(!sticky, "Cannot admit Sticky compacted page " << page.Location.Offset);
-        return {};
+    return cacheOp.AdmitPage(CacheItem, page.Location, std::move(page.Data), sticky);
+}
+
+void TEvSaveCompactedPages::AddWrittenPages(TCache& cache, TArrayRef<NPageCollection::TPageData> pages, bool sticky) {
+    if (pages.empty()) {
+        return;
     }
-    if (request.Status() == ECacheResultStatus::Hit) {
-        return std::move(request.Page());
+    EnsureCollection(cache);
+    for (size_t next = 0; next < pages.size();) {
+        const size_t end = next + Min<size_t>(CacheOperationBatchSize, pages.size() - next);
+        for (auto cacheOp = cache.BeginOperation(); next < end; ++next) {
+            auto page = AddWrittenPage(cacheOp, std::move(pages[next]), sticky);
+            // Release this producer's owner under the same guard, including Sticky/Cold cleanup
+            TOperationItemRef<TProdTraits> owner(cacheOp.SpaceOperation(), page.TakeNativeRef());
+        }
     }
-    Y_ENSURE(request.Status() == ECacheResultStatus::Inserted);
-    auto cacheOp = cachePages.BeginOperation();
-    Y_ENSURE(request.Fetch().MakeReady(cacheOp, std::move(page.Data)));
-    return std::move(waiter->Page);
 }
 
 TRequestCompletion::TRequestCompletion(TRequestCompletionParams&& params) noexcept
@@ -306,11 +261,5 @@ void TRequestPageWaiter::Complete(
     Completion_->Complete(Index_, std::move(result), completion);
     Completion_.Drop();
 }
-
-template TCacheCollectionRef TCacheImpl<TProdTraits>::AdmitCollection(
-    TIntrusiveConstPtr<NPageCollection::IPageCollection> collection);
-template TCachePageRef TCacheImpl<TProdTraits>::AdmitPage(
-    TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, NTable::NPage::TPageLocation location,
-    NActors::TSharedData&& data, bool sticky);
 
 } // namespace NKikimr::NSharedCache

@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/cache_context.h>
 #include <ydb/core/tablet_flat/shared_cache_collections.h>
 #include <ydb/core/tablet_flat/shared_sausagecache.h>
 #include <ydb/core/tablet_flat/cache_thread_test.h>
@@ -410,7 +411,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         for (ui32 cookie = 100; cache.AvailableHandleCount() != 0; ++cookie) {
             auto item = fixture.Metadata(cookie);
             auto packet = MakeIntrusiveConst<NPageCollection::TPageCollection>(item.Descriptor, std::move(item.Raw));
-            held.push_back(cache.AdmitCollection(std::move(packet)));
+            held.push_back(NTable::NTest::AdmitCollection(cache, std::move(packet)));
         }
 
         const auto waitingMetadata = fixture.Metadata(1000000);
@@ -433,16 +434,23 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
             MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
         const auto location = packet->GetLocation(0);
         auto& cache = TCache::Get();
-        TEvSaveCompactedPages writer(packet);
+        TEvSaveCompactedPages writer(NTable::NTest::AdmitCollection(cache, packet));
         UNIT_ASSERT(cache.UpdateCurrentLimit(1));
-        UNIT_ASSERT(
-            !writer.AddPage(cache, NPageCollection::TPageData(location, TSharedData::Copy(TString(64, 'x'))), false));
+        {
+            auto cacheOp = cache.BeginOperation();
+            UNIT_ASSERT(!writer.AddPage(
+                cacheOp, NPageCollection::TPageData(location, TSharedData::Copy(TString(64, 'x'))), false));
+        }
         fixture.Drain();
         UNIT_ASSERT_VALUES_EQUAL(fixture.RegisteredCollections(), 1);
 
         UNIT_ASSERT(cache.UpdateCurrentLimit(8_MB));
-        auto page =
-            writer.AddPage(cache, NPageCollection::TPageData(location, TSharedData::Copy(TString(64, 'x'))), false);
+        TCachePageRef page;
+        {
+            auto cacheOp = cache.BeginOperation();
+            page = writer.AddPage(
+                cacheOp, NPageCollection::TPageData(location, TSharedData::Copy(TString(64, 'x'))), false);
+        }
         UNIT_ASSERT(page);
     }
 
@@ -454,9 +462,12 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         const auto location = packet->GetLocation(0);
         TCachePageRef page;
         {
-            TEvSaveCompactedPages writer(packet);
-            page = writer.AddWrittenPage(
-                TCache::Get(), NPageCollection::TPageData(location, TSharedData::Copy(TString(64, 'x'))), true);
+            TEvSaveCompactedPages writer(NTable::NTest::AdmitCollection(TCache::Get(), packet));
+            {
+                auto cacheOp = TCache::Get().BeginOperation();
+                page = writer.AddWrittenPage(
+                    cacheOp, NPageCollection::TPageData(location, TSharedData::Copy(TString(64, 'x'))), true);
+            }
             UNIT_ASSERT(page);
             fixture.Drain();
             UNIT_ASSERT_VALUES_EQUAL(fixture.RegisteredCollections(), 1);
@@ -488,7 +499,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
 
         auto packet =
             MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
-        auto replacement = TCache::Get().AdmitCollection(packet);
+        auto replacement = NTable::NTest::AdmitCollection(TCache::Get(), packet);
         UNIT_ASSERT(replacement.CacheItem() != item);
         UNIT_ASSERT(TCache::Get().DetachCollection(replacement.CacheItem()));
         auto newUnknown = fixture.Load(metadata, ECollectionLoadKind::Unknown, 3);
@@ -725,7 +736,7 @@ Y_UNIT_TEST_SUITE(TSharedCacheCollections) {
         auto writer =
             MakeIntrusiveConst<NPageCollection::TPageCollection>(metadata.Descriptor, TSharedData(metadata.Raw));
         writer->SetSkipBTreeIndexV1Shadow(true);
-        auto canonical = TCache::Get().AdmitCollection(writer);
+        auto canonical = NTable::NTest::AdmitCollection(TCache::Get(), writer);
         const ui64 canonicalBytes = writer->GetMetadataMemoryUsage();
         UNIT_ASSERT_VALUES_EQUAL(TCache::Get().StorageBytes(), losingBytes + canonicalBytes);
         auto result = fixture.Result();

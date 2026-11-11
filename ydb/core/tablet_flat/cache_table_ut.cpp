@@ -64,7 +64,8 @@ public:
 
     static bool FindOrInsertWrittenBatch(
         TTestCache& cache, TCollectionCacheItem collection, TArrayRef<TTestCachePageRequest> requests) noexcept {
-        return cache.FindOrInsertWrittenBatch(collection, requests);
+        auto cacheOp = cache.BeginOperation();
+        return cacheOp.FindOrInsertWrittenBatch(collection, requests);
     }
 
     static bool MakeReady(TTestCache& cache, TCollectionRegistry& registry, TCollectionCacheItem collection,
@@ -1475,6 +1476,105 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         TCollectionRegistry Registry;
         TIntrusivePtr<TTestCache> Cache;
     };
+
+    Y_UNIT_TEST(OperationCollectionAdmissionReturnsCanonicalReadyOwner) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const TLogoBlobID id(295, 297, 4);
+        auto source = MakeIntrusiveConst<TTestPageCollection>(id, size_t{ 0 });
+        TTestCacheCollectionRef ready;
+        {
+            auto cacheOp = cache.BeginOperation();
+            ready = cacheOp.AdmitCollection(source);
+            UNIT_ASSERT(ready && ready->Id() == id);
+            const auto* canonical = ready.Get();
+            ready = cacheOp.AdmitCollection(ready->PageCollection());
+            UNIT_ASSERT(ready.Get() == canonical);
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazard->State.load()), 1);
+        }
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
+        UNIT_ASSERT(ready->Id() == id);
+        UNIT_ASSERT(cache.DetachCollection(ready.CacheItem()));
+        {
+            auto cacheOp = cache.BeginOperation();
+            auto attached = cacheOp.AdmitCollection(source);
+            UNIT_ASSERT(attached.Get() == ready.Get());
+            UNIT_ASSERT(attached.CacheItem() == ready.CacheItem());
+        }
+    }
+
+    Y_UNIT_TEST(OperationCollectionAdmissionRetriesConcurrentPublication) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const TLogoBlobID id(295, 297, 5);
+        TCollectionCacheItem inserted;
+        TTestCacheCollectionRef pending;
+        UNIT_ASSERT(cache.FindOrInsert({ .Id = id }, inserted, pending) == ECacheResultStatus::Inserted);
+        auto source = MakeIntrusiveConst<TTestPageCollection>(id, size_t{ 0 });
+        TCacheGate gate;
+        gate.Slots[0].Arm(ECacheHookPoint::BeforeCollectionAdmissionRetry);
+        TCacheHookGuard guard(cache, gate.Hooks);
+        TTestCacheCollectionRef ready;
+        bool oneOperation = false;
+        TGateThread worker(gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazard);
+            TlsCacheHazard = &TCacheThreadTestAccess::Hazard(cache, 0);
+            Y_DEFER {
+                TlsCacheHazard = nullptr;
+            };
+            auto cacheOp = cache.BeginOperation();
+            ready = cacheOp.AdmitCollection(source);
+            oneOperation = SpaceHazardActiveCount(TlsCacheHazard->State.load()) == 1;
+        });
+        gate.Slots[0].Wait();
+        TTestCacheCollectionRef published;
+        UNIT_ASSERT(cache.MakeReady(inserted, cache.PrepareCollection(source), published));
+        gate.Slots[0].Release();
+        worker.Join();
+        UNIT_ASSERT(ready && ready.Get() == published.Get());
+        UNIT_ASSERT(ready.CacheItem() == inserted);
+        UNIT_ASSERT(oneOperation);
+    }
+
+    Y_UNIT_TEST(EmptyAdmissionBatchesDoNotRequireAThreadOperation) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        {
+            auto* hazard = std::exchange(TlsCacheHazard, nullptr);
+            Y_DEFER {
+                TlsCacheHazard = hazard;
+            };
+            UNIT_ASSERT(cache.FindOrInsertBatch({}, {}));
+            UNIT_ASSERT(cache.FindOrInsertPreloadBatch({}, {}));
+            UNIT_ASSERT(cache.FindOrInsertReadAheadBatch({}, {}));
+        }
+        auto cacheOp = cache.BeginOperation();
+        UNIT_ASSERT(cacheOp.FindOrInsertBatch({}, {}));
+        UNIT_ASSERT(cacheOp.FindOrInsertWrittenBatch({}, {}));
+        UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazard->State.load()), 1);
+    }
+
+    Y_UNIT_TEST(AdmissionAndCompletionShareTheCallerOperation) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(295, 297, 3), ECacheMode::Regular);
+        TTestCachePageRef page;
+        auto waiter = MakeIntrusive<TAcquiringPageFetchWaiter>(cache, page);
+        TTestCachePageRequest request(MakePageLocation(0), waiter);
+        {
+            auto cacheOp = cache.BeginOperation();
+            UNIT_ASSERT(cacheOp.FindOrInsertBatch(collection, { &request, 1 }, false));
+            UNIT_ASSERT(request.Status() == ECacheResultStatus::Inserted);
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazard->State.load()), 1);
+            const auto item = request.Fetch().CacheItem();
+            UNIT_ASSERT(request.Fetch().MakeReady(cacheOp, MakePageData(item.Index())));
+            UNIT_ASSERT_VALUES_EQUAL(waiter->OperationDepth(), 1);
+        }
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
+        UNIT_ASSERT(waiter->Ready() && page);
+        UNIT_ASSERT_VALUES_EQUAL(page.size(), 4096);
+    }
 
     Y_UNIT_TEST(FetchBatchSharesDispatchAndCompletionOperations) {
         TFixture fixture;

@@ -78,6 +78,7 @@ enum class ECacheHookPoint {
     BeforeCollectionAttachClaim, // Payload is the collection before its transition claim CAS.
     BeforeCollectionAttachPublished, // Payload is the collection before its attached-state CAS.
     BeforeCollectionRefAcquired, // Collection found in the table, before acquiring its native reference
+    BeforeCollectionAdmissionRetry, // No item payload; synchronous admission found a concurrent publisher/attachment
     CollectionReady, // Collection published and its constructor holder released
     CollectionReleased, // Collection identity after an enabling ownership release
 };

@@ -152,24 +152,39 @@ namespace NKikimr::NSharedCache {
         TVector<TPageLocation> Pages;
         TCollectionCacheItem CacheItem;
 
-        Y_FORCE_INLINE TCachePageRef AddPage(TCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
-            return AddPage(cachePages, std::move(page), sticky, TCache::EPageAdmission::Bounded);
-        }
+        TCachePageRef AddPage(
+            TCacheOperationView<TProdTraits>& cacheOp, NPageCollection::TPageData&& page, bool sticky);
 
         Y_FORCE_INLINE TCachePageRef AddWrittenPage(
-            TCache& cachePages, NPageCollection::TPageData&& page, bool sticky) {
-            return AddPage(cachePages, std::move(page), sticky, TCache::EPageAdmission::Written);
+            TCacheOperationView<TProdTraits>& cacheOp, NPageCollection::TPageData&& page, bool sticky) {
+            Pages.push_back(page.Location);
+            return cacheOp.AdmitWrittenPage(CacheItem, page.Location, std::move(page.Data), sticky);
+        }
+
+        void AddWrittenPages(TCache& cache, TArrayRef<NPageCollection::TPageData> pages, bool sticky);
+
+        void PrepareCollection(TCache& cache) {
+            EnsureCollection(cache);
+        }
+
+        const TCacheCollectionRef& Collection() const noexcept {
+            return Collection_;
         }
 
         TEvSaveCompactedPages(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection)
             : PageCollection(std::move(pageCollection))
         {}
 
+        explicit TEvSaveCompactedPages(TCacheCollectionRef collection)
+            : PageCollection(collection->PageCollection())
+            , CacheItem(collection.CacheItem())
+            , Collection_(std::move(collection))
+        {}
+
     private:
         TCacheCollectionRef Collection_;
 
-        TCachePageRef AddPage(
-            TCache& cachePages, NPageCollection::TPageData&& page, bool sticky, TCache::EPageAdmission admission);
+        void EnsureCollection(TCache& cache);
     };
 
     struct TEvRequest : public TEventLocal<TEvRequest, EvRequest> {

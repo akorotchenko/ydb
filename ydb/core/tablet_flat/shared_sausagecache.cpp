@@ -1993,7 +1993,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             while (locationIt != pagesToLoad.end() && pagesToRequest.size() < pageLimit && !budgetBlocked) {
                 auto cacheOp = Cache->BeginOperation();
                 // Bound the guard by visits too, including hits and pages already in flight
-                for (size_t visited = 0; visited < MaxPreloadBatchLocations && locationIt != pagesToLoad.end() &&
+                for (size_t visited = 0; visited < CacheOperationBatchSize && locationIt != pagesToLoad.end() &&
                                          pagesToRequest.size() < pageLimit;
                      ++visited) {
                     const TPageLocation location = *locationIt;

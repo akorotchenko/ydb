@@ -717,10 +717,19 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
             UNIT_ASSERT_GT(pressureBytes, NActors::TSharedData::OverheadSize);
             const auto pressureLocation = NTable::NPage::TPageLocation::FromPageIndex(collection->Total(),
                 pressureBytes - NActors::TSharedData::OverheadSize, NTable::NPage::EPage::DataPage);
-            NSharedCache::TEvSaveCompactedPages pressureAdmission(collection);
-            auto foreign = pressureAdmission.AddWrittenPage(
-                cache, NPageCollection::TPageData(pressureLocation,
-                           NActors::TSharedData::Uninitialized(pressureLocation.Size)), false);
+            TCacheCollectionRef metadata;
+            {
+                auto cacheOp = cache.BeginOperation();
+                metadata = cacheOp.AdmitCollection(collection);
+            }
+            NSharedCache::TEvSaveCompactedPages pressureAdmission(std::move(metadata));
+            TCachePageRef foreign;
+            {
+                auto cacheOp = cache.BeginOperation();
+                foreign = pressureAdmission.AddWrittenPage(
+                    cacheOp, NPageCollection::TPageData(pressureLocation,
+                                 NActors::TSharedData::Uninitialized(pressureLocation.Size)), false);
+            }
             UNIT_ASSERT(foreign && !foreign.IsSticky());
             requests.Unblock(1);
             runtime.WaitFor("statistics resource pressure", [&] {

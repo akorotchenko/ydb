@@ -115,7 +115,8 @@ namespace {
     }
 
     TCacheCollectionRef AdmitCollection(const TBundle::TResult& written, ui32 slot) {
-        return NSharedCache::TCache::Get().AdmitCollection(written.PageCollections.at(slot).PageCollection);
+        return NTable::NTest::AdmitCollection(
+            NSharedCache::TCache::Get(), written.PageCollections.at(slot).PageCollection);
     }
 
     TCacheCollectionRef AdmitReadCollection(const TBundle::TResult& written) {
@@ -125,8 +126,8 @@ namespace {
         auto id = source->LargeGlobId;
         id.Lead = TLogoBlobID(77, 1, 201, 0, id.Lead.BlobSize(), id.Lead.Cookie());
         auto& cache = TCache::Get();
-        auto collection = cache.AdmitCollection(
-            MakeIntrusiveConst<NPageCollection::TPageCollection>(id, TSharedData(source->Meta.Raw)));
+        auto collection = NTable::NTest::AdmitCollection(
+            cache, MakeIntrusiveConst<NPageCollection::TPageCollection>(id, TSharedData(source->Meta.Raw)));
         UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collection.CacheItem(), NPage::ECacheMode::Regular));
         return collection;
     }
@@ -175,8 +176,8 @@ namespace {
                     }
                 }
                 UNIT_ASSERT_C(source, "Requested page was not captured by the real writer");
-                auto page = NSharedCache::TCache::Get().AdmitPage(
-                    fetch.PageCollection, location, TSharedData(source->Data), true);
+                auto page = NTable::NTest::AdmitPage(
+                    NSharedCache::TCache::Get(), fetch.PageCollection, location, TSharedData(source->Data), true);
                 UNIT_ASSERT(page);
                 pages.emplace_back(location.Offset, location.Size, std::move(page));
             }
@@ -245,11 +246,11 @@ namespace {
         void Warm(const TBundle::TResult& written) {
             auto& cache = NSharedCache::TCache::Get();
             for (const auto& collection : written.PageCollections) {
-                auto metadata = cache.AdmitCollection(collection.PageCollection);
+                auto metadata = NTable::NTest::AdmitCollection(cache, collection.PageCollection);
                 for (const auto* group : { &collection.StickyPages, &collection.RegularPages }) {
                     for (const auto& data : *group) {
-                        auto page =
-                            cache.AdmitPage(collection.PageCollection, data.Location, TSharedData(data.Data), true);
+                        auto page = NTable::NTest::AdmitPage(
+                            cache, collection.PageCollection, data.Location, TSharedData(data.Data), true);
                         UNIT_ASSERT(page);
                     }
                 }
@@ -306,7 +307,7 @@ Y_UNIT_TEST_SUITE(TColdPartCollectionMetadata) {
         auto& cache = NSharedCache::TCache::Get();
         TVector<TCacheCollectionRef> metadata;
         for (const auto& collection : written.PageCollections) {
-            metadata.push_back(cache.AdmitCollection(collection.PageCollection));
+            metadata.push_back(NTable::NTest::AdmitCollection(cache, collection.PageCollection));
         }
         UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
 
@@ -490,8 +491,8 @@ Y_UNIT_TEST_SUITE_F(TPartLoaderReadScopes, NTest::TTableCacheTest) {
         UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
         const auto fetch = env.GetFetch();
         UNIT_ASSERT_VALUES_EQUAL(fetch.Pages.size(), 1);
-        auto page =
-            TCache::Get().AdmitPage(collection->PageCollection(), pages[0]->Location, TSharedData(pages[0]->Data));
+        auto page = NTable::NTest::AdmitPage(
+            TCache::Get(), collection->PageCollection(), pages[0]->Location, TSharedData(pages[0]->Data));
         UNIT_ASSERT(page);
         NSharedCache::TEvResult::TLoaded loaded(pages[0]->Location.Offset, pages[0]->Location.Size, std::move(page));
         env.Save(std::move(loaded));
@@ -507,8 +508,8 @@ Y_UNIT_TEST_SUITE_F(TPartLoaderReadScopes, NTest::TTableCacheTest) {
         const auto written = WritePart();
         const auto pages = DataPages(written);
         auto collection = AdmitReadCollection(written);
-        auto page =
-            TCache::Get().AdmitPage(collection->PageCollection(), pages[0]->Location, TSharedData(pages[0]->Data));
+        auto page = NTable::NTest::AdmitPage(
+            TCache::Get(), collection->PageCollection(), pages[0]->Location, TSharedData(pages[0]->Data));
         UNIT_ASSERT(page);
         auto env = MakeReadEnv(collection.Acquire());
         {
@@ -532,15 +533,16 @@ Y_UNIT_TEST_SUITE_F(TPartLoaderReadScopes, NTest::TTableCacheTest) {
         const auto written = WritePart();
         const auto pages = DataPages(written);
         auto collection = AdmitReadCollection(written);
-        auto page =
-            TCache::Get().AdmitPage(collection->PageCollection(), pages[0]->Location, TSharedData(pages[0]->Data));
+        auto page = NTable::NTest::AdmitPage(
+            TCache::Get(), collection->PageCollection(), pages[0]->Location, TSharedData(pages[0]->Data));
         UNIT_ASSERT(page);
         auto env = MakeReadEnv(collection.Acquire());
         {
             auto scope = env.BeginRead();
-            for (ui32 visit = 0; visit < 1024; ++visit) {
+            for (ui32 visit = 0; visit < NSharedCache::CacheOperationBatchSize; ++visit) {
                 UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
-                UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), visit + 1 == 1024 ? 0 : 1);
+                UNIT_ASSERT_VALUES_EQUAL(
+                    ActiveLoaderOperations(), visit + 1 == NSharedCache::CacheOperationBatchSize ? 0 : 1);
             }
             UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
             UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);

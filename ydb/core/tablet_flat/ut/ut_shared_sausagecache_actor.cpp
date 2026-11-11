@@ -117,6 +117,18 @@ static TPageLocation _P(ui32 id, EPage type = EPage::DataPage) {
     return TPageLocation::FromPageIndex(id, 10, type, id + 1);
 }
 
+static TCachePageRef AddWrittenPage(
+    TEvSaveCompactedPages& writer, TCache& cache, NPageCollection::TPageData&& page, bool sticky) {
+    auto cacheOp = cache.BeginOperation();
+    return writer.AddWrittenPage(cacheOp, std::move(page), sticky);
+}
+
+static TCachePageRef AddPage(
+    TEvSaveCompactedPages& writer, TCache& cache, NPageCollection::TPageData&& page, bool sticky) {
+    auto cacheOp = cache.BeginOperation();
+    return writer.AddPage(cacheOp, std::move(page), sticky);
+}
+
 struct TPageCollectionMock : public IPageCollection {
     // Page-policy fixtures use page-only budgets; accounting cases supply their own footprint
     TPageCollectionMock(ui64 id, ui32 totalPages, TSharedData raw = {}, ui64 fixedMetadataBytes = 0,
@@ -683,9 +695,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         Y_DEFER {
             sharedCache.Runtime.SetEventFilter(std::move(previousFilter));
         };
-        auto collection = cache.AdmitCollection(source);
+        auto collection = NTable::NTest::AdmitCollection(cache, source);
         UNIT_ASSERT(ready && collection.CacheItem() == notified);
-        auto joined = cache.AdmitCollection(source);
+        auto joined = NTable::NTest::AdmitCollection(cache, source);
         UNIT_ASSERT(joined.Get() == collection.Get());
         UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
     }
@@ -729,14 +741,14 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             sharedCache.Attach(sharedCache.Sender1, source, ownerMode);
             UNIT_ASSERT(cache.Find(id, result) == ECacheResultStatus::Hit);
         } else {
-            result = cache.AdmitCollection(source);
+            result = NTable::NTest::AdmitCollection(cache, source);
         }
         UNIT_ASSERT(seenReady);
         UNIT_ASSERT(actorCreates || ownerModePublished);
         UNIT_ASSERT(result->GetCacheMode() == ownerMode);
         UNIT_ASSERT(initialMode == ECacheMode::Regular);
         UNIT_ASSERT_VALUES_EQUAL(result->KeepGeneration(), ownerMode == ECacheMode::TryKeepInMemory ? 1 : 0);
-        auto joined = cache.AdmitCollection(source);
+        auto joined = NTable::NTest::AdmitCollection(cache, source);
         UNIT_ASSERT(joined.CacheItem() == result.CacheItem());
         UNIT_ASSERT(joined->GetCacheMode() == ownerMode);
     }
@@ -764,7 +776,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             UNIT_ASSERT_VALUES_EQUAL(TActivationContext::ActorSystem(), sharedCache.Runtime.GetActorSystem(0));
             UNIT_ASSERT_VALUES_EQUAL(&TCache::Get(), sharedCache.Runtime.GetAppData().SharedCache.Get());
             auto source = MakeIntrusiveConst<TPageCollectionMock>(ui64{ 19762 }, ui32{ 1 });
-            auto page = TCache::Get().AdmitPage(source, _P(0), TSharedData::Copy(TString(10, 'q')));
+            auto page = NTable::NTest::AdmitPage(TCache::Get(), source, _P(0), TSharedData::Copy(TString(10, 'q')));
             UNIT_ASSERT(page);
             auto* result = new TEvResult(source, NKikimrProto::OK, 0);
             result->Pages.emplace_back(_P(0).Offset, page.size(), std::move(page));
@@ -1091,8 +1103,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto& pages = TCache::Get();
         auto* actorSystem = &CacheContext().ActorSystem();
         TIntrusiveConstPtr<TPageCollectionMock> source = new TPageCollectionMock(19761, 1);
-        auto collection = pages.AdmitCollection(source);
-        auto page = pages.AdmitPage(source, _P(0), TSharedData::Copy(TString(10, 's')));
+        auto collection = NTable::NTest::AdmitCollection(pages, source);
+        auto page = NTable::NTest::AdmitPage(pages, source, _P(0), TSharedData::Copy(TString(10, 's')));
         UNIT_ASSERT(page);
         const auto item = page.CacheItem();
         const char* data = page.data();
@@ -1131,7 +1143,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { location } } });
         sharedCache.Provide(sharedCache.Collection1, { location });
         auto loaded = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1) } } });
-        auto collection = TCache::Get().AdmitCollection(sharedCache.Collection1);
+        auto collection = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1);
         auto cacheOp = TCache::Get().BeginOperation();
         auto page = collection->TryGetPage(cacheOp, location);
         UNIT_ASSERT(page);
@@ -1248,11 +1260,13 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
                 }
                 if (++notifications == 1) {
                     // This update coalesces before the actor acknowledges the first notification
-                    second = cache.AdmitPage(sharedCache.Collection1, _P(1), TSharedData::Copy(TString(10, 'b')));
+                    second = NTable::NTest::AdmitPage(
+                        cache, sharedCache.Collection1, _P(1), TSharedData::Copy(TString(10, 'b')));
                     UNIT_ASSERT(second);
                 }
             });
-        auto first = cache.AdmitPage(sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'a')));
+        auto first =
+            NTable::NTest::AdmitPage(cache, sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'a')));
         UNIT_ASSERT(first);
         sharedCache.Runtime.WaitFor("coalesced collection byte statistics", [&] {
             return stats->Read().SharedBodyBytes == 2 * PAGE_TOTAL_SIZE;
@@ -1260,7 +1274,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
         UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
 
-        auto third = cache.AdmitPage(sharedCache.Collection1, _P(2), TSharedData::Copy(TString(10, 'c')));
+        auto third =
+            NTable::NTest::AdmitPage(cache, sharedCache.Collection1, _P(2), TSharedData::Copy(TString(10, 'c')));
         UNIT_ASSERT(third);
         sharedCache.Runtime.WaitFor("collection byte notification after acknowledgement", [&] {
             return stats->Read().SharedBodyBytes == 3 * PAGE_TOTAL_SIZE;
@@ -1403,8 +1418,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         config.SetMemoryLimit(128_MB);
         TSharedPageCacheMock sharedCache(config);
         const TPageLocation location = _P(1, EPage::DataPage);
-        auto saved = MakeHolder<TEvSaveCompactedPages>(sharedCache.Collection1);
-        auto page = saved->AddPage(TCache::Get(), { location, TSharedData::Copy(TString(10, 'x')) }, true);
+        auto saved =
+            MakeHolder<TEvSaveCompactedPages>(NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1));
+        auto page = AddPage(*saved, TCache::Get(), { location, TSharedData::Copy(TString(10, 'x')) }, true);
         UNIT_ASSERT(page && page.IsSticky());
         page.Drop();
         sharedCache.Send(sharedCache.Sender1, saved.Release());
@@ -1423,6 +1439,73 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { _P(1) } } });
     }
 
+    Y_UNIT_TEST(WrittenPageChunksReleaseProducerReferences) {
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        TSharedPageCacheMock sharedCache(config);
+        auto& cache = TCache::Get();
+        constexpr ui32 pageCount = CacheOperationBatchSize + 1;
+        sharedCache.Collection1 = MakeIntrusiveConst<TPageCollectionMock>(1ul, pageCount);
+        auto collection = NTable::NTest::AdmitCollection(cache, sharedCache.Collection1);
+        UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collection.CacheItem(), ECacheMode::Regular));
+        TEvSaveCompactedPages saved(collection.Acquire());
+        TVector<NPageCollection::TPageData> pages;
+        for (ui32 page = 0; page < pageCount; ++page) {
+            pages.emplace_back(_P(page), TSharedData::Copy(TString(10, 'w')));
+        }
+        UNIT_ASSERT(cache.UpdateCurrentLimit(1));
+        saved.AddWrittenPages(cache, pages, true);
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
+        UNIT_ASSERT_VALUES_EQUAL(saved.Pages.size(), pageCount);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), pageCount * PAGE_TOTAL_SIZE);
+        for (ui32 page : { 0u, CacheOperationBatchSize - 1, CacheOperationBatchSize }) {
+            UNIT_ASSERT(saved.Pages[page] == _P(page));
+            UNIT_ASSERT(!pages[page].Data);
+            auto cacheOp = cache.BeginOperation();
+            TCacheItem item;
+            UNIT_ASSERT(cacheOp.FindPage(collection.CacheItem(), static_cast<ui64>(_P(page).Offset), item) ==
+                        ECacheResultStatus::Hit);
+            const auto state = THandleState::FromRaw(cacheOp.SpaceOperation().Handles()[item.Index()].State.load());
+            UNIT_ASSERT(state.IsSticky());
+            UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 0);
+        }
+    }
+
+    Y_UNIT_TEST(WrittenPageChunksPreserveDuplicatesAndStickyHints) {
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        TSharedPageCacheMock sharedCache(config);
+        auto& cache = TCache::Get();
+        TEvSaveCompactedPages empty(sharedCache.Collection1);
+        empty.AddWrittenPages(cache, {}, false);
+        UNIT_ASSERT(empty.Pages.empty() && !empty.CacheItem);
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
+        auto collection = NTable::NTest::AdmitCollection(cache, sharedCache.Collection1);
+        UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collection.CacheItem(), ECacheMode::Regular));
+        TEvSaveCompactedPages saved(collection.Acquire());
+        TVector<NPageCollection::TPageData> sticky;
+        sticky.emplace_back(_P(0), TSharedData::Copy(TString(10, 's')));
+        TVector<NPageCollection::TPageData> regular;
+        regular.emplace_back(_P(1), TSharedData::Copy(TString(10, 'r')));
+        regular.emplace_back(_P(0), TSharedData::Copy(TString(10, 's')));
+        saved.AddWrittenPages(cache, sticky, true);
+        saved.AddWrittenPages(cache, regular, false);
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
+        UNIT_ASSERT_VALUES_EQUAL(saved.Pages.size(), 3);
+        UNIT_ASSERT(saved.Pages[0] == _P(0) && saved.Pages[1] == _P(1) && saved.Pages[2] == _P(0));
+        TCachePageRef first;
+        TCachePageRef second;
+        UNIT_ASSERT(
+            cache.Find(collection.CacheItem(), static_cast<ui64>(_P(0).Offset), first) == ECacheResultStatus::Hit);
+        UNIT_ASSERT(
+            cache.Find(collection.CacheItem(), static_cast<ui64>(_P(1).Offset), second) == ECacheResultStatus::Hit);
+        UNIT_ASSERT(first.IsSticky() && !second.IsSticky());
+        UNIT_ASSERT_VALUES_EQUAL(first.data()[0], 's');
+        UNIT_ASSERT_VALUES_EQUAL(second.data()[0], 'r');
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 2 * PAGE_TOTAL_SIZE);
+    }
+
     void ReviewWrittenAdmission(bool stickyInput) {
         TSharedPageCacheMock sharedCache;
         sharedCache.SetLimit(2 * PAGE_TOTAL_SIZE, 0, 2 * PAGE_TOTAL_SIZE);
@@ -1439,15 +1522,15 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto& cache = TCache::Get();
         const ui64 handles = cache.PhysicalHandleCount();
         const ui64 overallBefore = cache.OverallUsage();
-        TEvSaveCompactedPages saved(sharedCache.Collection2);
+        TEvSaveCompactedPages saved(NTable::NTest::AdmitCollection(cache, sharedCache.Collection2));
         TPageData refused(_P(0), TSharedData::Copy(TString(10, 'w')));
-        UNIT_ASSERT(!saved.AddPage(cache, std::move(refused), false));
+        UNIT_ASSERT(!AddPage(saved, cache, std::move(refused), false));
         UNIT_ASSERT_VALUES_EQUAL(refused.Data.size(), 10);
         const char* pointer = refused.Data.data();
-        auto sticky = saved.AddWrittenPage(cache, std::move(refused), true);
+        auto sticky = AddWrittenPage(saved, cache, std::move(refused), true);
         UNIT_ASSERT(sticky && sticky.IsSticky());
         UNIT_ASSERT_VALUES_EQUAL(sticky.data(), pointer);
-        auto regular = saved.AddWrittenPage(cache, { _P(1), TSharedData::Copy(TString(10, 'n')) }, false);
+        auto regular = AddWrittenPage(saved, cache, { _P(1), TSharedData::Copy(TString(10, 'n')) }, false);
         UNIT_ASSERT(regular && !regular.IsSticky());
         UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 4 * PAGE_TOTAL_SIZE);
         UNIT_ASSERT_VALUES_EQUAL(cache.OverallUsage(), overallBefore + 2 * PAGE_TOTAL_SIZE);
@@ -1455,7 +1538,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
         UNIT_ASSERT_VALUES_EQUAL(cache.CurrentLimit(), 2 * PAGE_TOTAL_SIZE);
         UNIT_ASSERT_VALUES_EQUAL(cache.PhysicalHandleCount(), handles);
-        UNIT_ASSERT(!cache.AdmitPage(sharedCache.Collection2, _P(2), TSharedData::Copy(TString(10, 'b'))));
+        UNIT_ASSERT(
+            !NTable::NTest::AdmitPage(cache, sharedCache.Collection2, _P(2), TSharedData::Copy(TString(10, 'b'))));
         UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 4 * PAGE_TOTAL_SIZE);
         regular.Drop();
         sharedCache.Wakeup();
@@ -1481,9 +1565,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(CoreCompactedBufferRemainsAccountedUntilLastReference) {
         TSharedPageCacheMock sharedCache;
-        auto saved = MakeHolder<TEvSaveCompactedPages>(sharedCache.Collection1);
+        auto saved =
+            MakeHolder<TEvSaveCompactedPages>(NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1));
         const TPageLocation location = _P(1, EPage::DataPage);
-        auto page = saved->AddPage(TCache::Get(), { location, TSharedData::Copy(TString(10, 'x')) }, false);
+        auto page = AddPage(*saved, TCache::Get(), { location, TSharedData::Copy(TString(10, 'x')) }, false);
         UNIT_ASSERT(page && !page.IsSticky());
         TCachePageRef pinned = std::move(page);
         UNIT_ASSERT(!page && pinned);
@@ -1526,10 +1611,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
     Y_UNIT_TEST(CoreSavedCollectionFollowsPageReclamation) {
         for (bool retainPartOwnership : { false, true }) {
             TSharedPageCacheMock sharedCache(TSharedPageCacheMock::DefaultConfig(), true);
-            auto ownership = TCache::Get().AdmitCollection(sharedCache.Collection1);
+            auto ownership = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1);
             const TPageLocation location = _P(1, EPage::DataPage);
-            auto saved = MakeHolder<TEvSaveCompactedPages>(sharedCache.Collection1);
-            auto page = saved->AddPage(TCache::Get(), { location, TSharedData::Copy(TString(10, 'x')) }, true);
+            auto saved = MakeHolder<TEvSaveCompactedPages>(
+                NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1));
+            auto page = AddPage(*saved, TCache::Get(), { location, TSharedData::Copy(TString(10, 'x')) }, true);
             UNIT_ASSERT(page && page.IsSticky());
             if (!retainPartOwnership) {
                 ownership.Drop();
@@ -1601,10 +1687,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto heldPages = sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection2, expectedPages } });
         UNIT_ASSERT_VALUES_EQUAL(heldPages.size(), 150);
 
-        auto saved = MakeHolder<TEvSaveCompactedPages>(sharedCache.Collection1);
+        auto saved =
+            MakeHolder<TEvSaveCompactedPages>(NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1));
         for (ui32 index = 0; index < 160; ++index) {
             const TPageLocation location = _P(index, EPage::DataPage);
-            auto page = saved->AddPage(TCache::Get(), { location, TSharedData::Copy(TString(10, 'x')) }, false);
+            auto page = AddPage(*saved, TCache::Get(), { location, TSharedData::Copy(TString(10, 'x')) }, false);
             UNIT_ASSERT(!page || !page.IsSticky());
         }
         sharedCache.Send(sharedCache.Sender1, saved.Release());
@@ -1781,8 +1868,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             MakeIntrusive<TPageCollectionMock>(ui64{ 7 }, ui32{ 1 }, TSharedData{}, ui64{ 13 });
         TIntrusiveConstPtr<TPageCollectionMock> duplicate =
             MakeIntrusive<TPageCollectionMock>(ui64{ 7 }, ui32{ 1 }, TSharedData{}, ui64{ 19 });
-        auto owner = cache.AdmitCollection(canonical);
-        auto hit = cache.AdmitCollection(duplicate);
+        auto owner = NTable::NTest::AdmitCollection(cache, canonical);
+        auto hit = NTable::NTest::AdmitCollection(cache, duplicate);
         UNIT_ASSERT(owner.CacheItem() == hit.CacheItem());
         UNIT_ASSERT_VALUES_EQUAL(hit->PageCollection().Get(), canonical.Get());
         UNIT_ASSERT_VALUES_EQUAL(canonical->MetadataReads.load(), 1);
@@ -1824,7 +1911,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             MakeIntrusive<TPageCollectionMock>(ui64{ 8 }, ui32{ 1 }, TSharedData{}, Max<ui64>());
         const ui64 handles = cache.AvailableHandleCount();
         // Track rejects the negative footprint before allocating or publishing a Begin item
-        UNIT_ASSERT_EXCEPTION(cache.AdmitCollection(invalid), yexception);
+        UNIT_ASSERT_EXCEPTION(NTable::NTest::AdmitCollection(cache, invalid), yexception);
         UNIT_ASSERT_VALUES_EQUAL(invalid->MetadataReads.load(), 1);
         TCacheCollectionRef missing;
         UNIT_ASSERT(cache.Find(invalid->Label(), missing) == ECacheResultStatus::Miss);
@@ -1832,7 +1919,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 0);
         TIntrusiveConstPtr<TPageCollectionMock> valid =
             MakeIntrusive<TPageCollectionMock>(ui64{ 8 }, ui32{ 1 }, TSharedData{}, ui64{ 13 });
-        auto owner = cache.AdmitCollection(valid);
+        auto owner = NTable::NTest::AdmitCollection(cache, valid);
         UNIT_ASSERT(owner);
         UNIT_ASSERT_VALUES_EQUAL(owner->PageCollection().Get(), valid.Get());
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 13);
@@ -1905,8 +1992,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         TIntrusiveConstPtr<TPageCollectionMock> descriptor =
             MakeIntrusive<TPageCollectionMock>(ui64{ 14 }, ui32{ 2 }, TSharedData{}, ui64{ 13 });
         auto raw = TSharedData::Uninitialized(10);
-        auto first = cache.AdmitPage(descriptor, _P(0), TSharedData(raw));
-        auto second = cache.AdmitPage(descriptor, _P(1), TSharedData(raw));
+        auto first = NTable::NTest::AdmitPage(cache, descriptor, _P(0), TSharedData(raw));
+        auto second = NTable::NTest::AdmitPage(cache, descriptor, _P(1), TSharedData(raw));
         UNIT_ASSERT(first && second);
         UNIT_ASSERT_VALUES_EQUAL(cache.BufferBytes(), raw.GetAllocationSize());
         UNIT_ASSERT_VALUES_EQUAL(cache.MetadataBytes(), 13);
@@ -1948,7 +2035,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         TIntrusiveConstPtr<TPageCollectionMock> canonical(std::move(mutableCanonical));
         TIntrusiveConstPtr<TPageCollectionMock> original(std::move(mutableOriginal));
         auto& cache = TCache::Get();
-        auto collection = cache.AdmitCollection(canonical);
+        auto collection = NTable::NTest::AdmitCollection(cache, canonical);
         const auto item = collection.CacheItem();
         const auto proxy = sharedCache.Runtime.AllocateEdgeActor();
         sharedCache.Runtime.RegisterService(MakeBlobStorageProxyID(group), proxy);
@@ -2021,7 +2108,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 19);
         TIntrusiveConstPtr<TPageCollectionMock> descriptor =
             MakeIntrusive<TPageCollectionMock>(ui64{ 12 }, ui32{ 1 }, TSharedData{}, ui64{ 13 });
-        auto canonical = cache.AdmitCollection(descriptor);
+        auto canonical = NTable::NTest::AdmitCollection(cache, descriptor);
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 32);
         UNIT_ASSERT(completion->BindCollection(canonical.Acquire()));
         UNIT_ASSERT(completion->Collection().CacheItem() == canonical.CacheItem());
@@ -2029,8 +2116,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 32);
         seed.Reset();
         UNIT_ASSERT_VALUES_EQUAL(cache.StorageBytes(), 13);
-        auto other = cache.AdmitCollection(
-            TIntrusiveConstPtr<TPageCollectionMock>(MakeIntrusive<TPageCollectionMock>(ui64{ 13 }, ui32{ 1 })));
+        auto other = NTable::NTest::AdmitCollection(
+            cache, TIntrusiveConstPtr<TPageCollectionMock>(MakeIntrusive<TPageCollectionMock>(ui64{ 13 }, ui32{ 1 })));
         UNIT_ASSERT(!completion->BindCollection(std::move(other)));
         UNIT_ASSERT(completion->Collection().CacheItem() == canonical.CacheItem());
         completion->Cancel(TRequestCompletion::EReplyMode::Now);
@@ -2042,7 +2129,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         TSharedPageCacheMock sharedCache;
         TIntrusiveConstPtr<TPageCollectionMock> canonical =
             MakeIntrusive<TPageCollectionMock>(ui64{ 11 }, ui32{ 1 }, TSharedData{}, ui64{ 13 });
-        auto collection = TCache::Get().AdmitCollection(canonical);
+        auto collection = NTable::NTest::AdmitCollection(TCache::Get(), canonical);
         TIntrusiveConstPtr<TPageCollectionMock> seed = new TPageCollectionMock(11, 1, TSharedData{}, 19, &destroyed);
         auto* request = new TEvRequest(EPriority::Fast, seed, { _P(0) }, ++sharedCache.RequestId);
         seed.Reset();
@@ -2065,7 +2152,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         mutableConflicting->BlobGroup = 78;
         TIntrusiveConstPtr<TPageCollectionMock> canonical(std::move(mutableCanonical));
         TIntrusiveConstPtr<TPageCollectionMock> conflicting(std::move(mutableConflicting));
-        auto collection = cache.AdmitCollection(canonical);
+        auto collection = NTable::NTest::AdmitCollection(cache, canonical);
         sharedCache.Request(sharedCache.Sender1, conflicting, { _P(0) });
         sharedCache.Runtime.WaitFor("incompatible collection reply", [&] {
             return !sharedCache.Results.empty();
@@ -2476,7 +2563,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             .EventCookie = 17,
             .ExecutorGeneration = 19,
             .RequestId = 23,
-            .Collection = TCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1),
             .Pages = locations,
             .Cookie = 29,
         });
@@ -2526,11 +2613,12 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = cache.AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(cache, sharedCache.Collection1),
             .Pages = { _P(0) },
             .Cookie = 94,
         });
-        auto page = cache.AdmitPage(sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'x')));
+        auto page =
+            NTable::NTest::AdmitPage(cache, sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'x')));
         const auto item = page.CacheItem();
         TRequestCompletionTestAccess::AfterReplyClaim(*completion, 0, std::move(page), [&] {
             switch (action) {
@@ -2584,12 +2672,13 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = cache.AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(cache, sharedCache.Collection1),
             .Pages = { _P(0) },
             .WaitPad = waitPad,
             .Cookie = 95,
         });
-        auto page = cache.AdmitPage(sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'x')));
+        auto page =
+            NTable::NTest::AdmitPage(cache, sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'x')));
         if (afterPublication) {
             TRequestCompletionTestAccess::AfterPublish(*completion, 0, std::move(page), [&] {
                 completion->Cancel();
@@ -2616,7 +2705,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = TCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1),
             .Pages = { _P(0), _P(1) },
             .Cookie = 96,
         });
@@ -2633,7 +2722,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = TCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1),
             .Pages = { _P(0) },
             .Cookie = 97,
         });
@@ -2652,7 +2741,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = TCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1),
             .Pages = { _P(0), _P(1) },
             .Cookie = 101,
         });
@@ -2670,7 +2759,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = TCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1),
             .Pages = { _P(0) },
         });
         completion->Cancel();
@@ -2690,7 +2779,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = TCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1),
             .Pages = { _P(0) },
         });
         TRequestCompletionTestAccess::AfterFailureClaim(*completion, [&] {
@@ -2716,11 +2805,12 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = cache.AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(cache, sharedCache.Collection1),
             .Pages = { _P(0), _P(0) },
             .Cookie = 98,
         });
-        auto first = cache.AdmitPage(sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'x')));
+        auto first =
+            NTable::NTest::AdmitPage(cache, sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'x')));
         auto second = first.Acquire();
         const auto item = first.CacheItem();
         completion->Complete(1, std::move(second), EPageFetchCompletion::Ready);
@@ -2773,10 +2863,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = cache.AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(cache, sharedCache.Collection1),
             .Pages = { _P(0), _P(1) },
         });
-        auto page = cache.AdmitPage(sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'x')));
+        auto page =
+            NTable::NTest::AdmitPage(cache, sharedCache.Collection1, _P(0), TSharedData::Copy(TString(10, 'x')));
         UNIT_ASSERT(page);
         completion->Complete(0, std::move(page), EPageFetchCompletion::Ready);
         UNIT_ASSERT(cache.BufferBytes() > before);
@@ -2791,7 +2882,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
                 .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
                 .ReplyTo = sharedCache.Sender1,
-                .Collection = TCache::Get().AdmitCollection(sharedCache.Collection1),
+                .Collection = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1),
                 .Pages = { _P(0), _P(1) },
                 .Cookie = iteration,
             });
@@ -2844,7 +2935,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = TCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1),
             .Pages = { _P(0) },
         });
         TRequestCompletionTestAccess::AfterCancelReplyClaim(*completion, [&] {
@@ -2864,7 +2955,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = TCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1),
             .Pages = { _P(0) },
         });
         completion->PostponeForResources();
@@ -2938,7 +3029,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = TCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1),
             .Pages = { _P(0), _P(1), _P(2), _P(3) },
             .Cookie = cookie,
         });
@@ -2947,10 +3038,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             probe.Completion = nullptr;
             completion->Cancel();
         };
-        auto page = cache.AdmitPage(sharedCache.Collection1, _P(0), probe.Allocate(_P(0).Size));
+        auto page = NTable::NTest::AdmitPage(cache, sharedCache.Collection1, _P(0), probe.Allocate(_P(0).Size));
         UNIT_ASSERT(page);
         completion->Complete(0, std::move(page), EPageFetchCompletion::Ready);
-        auto secondPage = cache.AdmitPage(sharedCache.Collection1, _P(1), probe.Allocate(_P(1).Size));
+        auto secondPage = NTable::NTest::AdmitPage(cache, sharedCache.Collection1, _P(1), probe.Allocate(_P(1).Size));
         UNIT_ASSERT(secondPage);
         completion->Complete(1, std::move(secondPage), EPageFetchCompletion::Ready);
         UNIT_ASSERT_VALUES_EQUAL(probe.Releases, 0);
@@ -2999,7 +3090,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(RequestPageWaiterReportsFirstFailureWithoutCacheContext) {
         TSharedPageCacheMock sharedCache;
-        auto canonical = TCache::Get().AdmitCollection(sharedCache.Collection1);
+        auto canonical = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1);
         auto completion = MakeIntrusive<TRequestCompletion>(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
@@ -3025,7 +3116,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         TIntrusivePtr<TRequestCompletion> completion = new TRequestCompletion(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = TCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1),
             .Pages = { _P(1) },
         });
         TIntrusivePtr<TPageFetchWaiter> waiter = new TRequestPageWaiter(completion, 0);
@@ -3044,7 +3135,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         TIntrusivePtr<TRequestCompletion> completion = new TRequestCompletion(TRequestCompletionParams{
             .ActorSystem = sharedCache.Runtime.GetActorSystem(0),
             .ReplyTo = sharedCache.Sender1,
-            .Collection = TCache::Get().AdmitCollection(sharedCache.Collection1),
+            .Collection = NTable::NTest::AdmitCollection(TCache::Get(), sharedCache.Collection1),
             .Pages = { _P(1), _P(2), _P(3) },
             .Cookie = 91,
         });
@@ -3146,7 +3237,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         auto& core = TCache::Get();
         TVector<TCachePageRef> held;
         for (ui32 index = 0; index < core.TargetHandleCount(); ++index) {
-            auto page = core.AdmitPage(sharedCache.Collection1, _P(index), TSharedData::Copy(TString(10, 'x')));
+            auto page =
+                NTable::NTest::AdmitPage(core, sharedCache.Collection1, _P(index), TSharedData::Copy(TString(10, 'x')));
             if (!page) {
                 break;
             }
@@ -3231,13 +3323,14 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
     Y_UNIT_TEST(ReviewR20IndependentStickyPressureCanClearWithSubsetAlive) {
         TSharedPageCacheMock sharedCache(ReviewHandlePressureConfig(), true);
         auto& core = TCache::Get();
-        auto pseudo = core.AdmitCollection(sharedCache.Collection2);
+        auto pseudo = NTable::NTest::AdmitCollection(core, sharedCache.Collection2);
         sharedCache.Collection1 = new TPageCollectionMock(1, 10000);
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {}, true, false, false);
         TCacheCollectionRef main;
         { UNIT_ASSERT(core.Find(sharedCache.Collection1->Label(), main) == ECacheResultStatus::Hit); }
         for (ui32 index = 0; index < core.TargetHandleCount() - 4; ++index) {
-            auto page = core.AdmitPage(sharedCache.Collection1, _P(index), TSharedData::Copy(TString(10, 'x')), true);
+            auto page = NTable::NTest::AdmitPage(
+                core, sharedCache.Collection1, _P(index), TSharedData::Copy(TString(10, 'x')), true);
             UNIT_ASSERT(page && page.IsSticky());
         }
         UNIT_ASSERT_LT(core.PayloadUsage() + PAGE_TOTAL_SIZE, core.CurrentLimit());
@@ -3591,7 +3684,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         TVector<TCacheCollectionRef> foreignCollections;
         for (ui64 id = 100; cache.CanAllocateHandles({ &requirement, 1 }); ++id) {
             UNIT_ASSERT(foreignCollections.size() < cache.TargetHandleCount());
-            foreignCollections.push_back(cache.AdmitCollection(MakeIntrusiveConst<TPageCollectionMock>(id, 1u)));
+            foreignCollections.push_back(
+                NTable::NTest::AdmitCollection(cache, MakeIntrusiveConst<TPageCollectionMock>(id, 1u)));
         }
         for (const auto& foreign : foreignCollections) {
             UNIT_ASSERT(cache.DetachCollection(foreign.CacheItem()));
@@ -3650,7 +3744,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         TVector<TCacheCollectionRef> foreignCollections;
         for (ui64 id = 100; cache.CanAllocateHandles({ &requirement, 1 }); ++id) {
             UNIT_ASSERT(foreignCollections.size() < cache.TargetHandleCount());
-            foreignCollections.push_back(cache.AdmitCollection(MakeIntrusiveConst<TPageCollectionMock>(id, 1u)));
+            foreignCollections.push_back(
+                NTable::NTest::AdmitCollection(cache, MakeIntrusiveConst<TPageCollectionMock>(id, 1u)));
         }
         for (const auto& foreign : foreignCollections) {
             UNIT_ASSERT(cache.DetachCollection(foreign.CacheItem()));
@@ -5188,19 +5283,20 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         config.SetInMemoryInFlyLimit(1_MB);
         TSharedPageCacheMock sharedCache(config);
         auto& cache = TCache::Get();
-        const ui32 cachedPages = MaxPreloadBatchLocations + 1;
+        const ui32 cachedPages = CacheOperationBatchSize + 1;
         const ui32 pageCount = cachedPages + 1;
         const ui64 keepBytes = pageCount * PAGE_TOTAL_SIZE;
         sharedCache.SetLimit(keepBytes * 5 / 2);
         sharedCache.PrepareKeepStorage(keepBytes);
         UNIT_ASSERT(cache.BeginOperation().KeepLoadRoom().Pages > pageCount);
         sharedCache.Collection1 = MakeIntrusiveConst<TPageCollectionMock>(1ul, pageCount);
-        auto collection = cache.AdmitCollection(sharedCache.Collection1);
+        auto collection = NTable::NTest::AdmitCollection(cache, sharedCache.Collection1);
         UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collection.CacheItem(), ECacheMode::Regular));
         TVector<TCachePageRef> owned;
         owned.reserve(cachedPages);
         for (ui32 page = 0; page < cachedPages; ++page) {
-            auto loaded = cache.AdmitPage(sharedCache.Collection1, _P(page), TSharedData::Copy(TString(10, 'p')));
+            auto loaded =
+                NTable::NTest::AdmitPage(cache, sharedCache.Collection1, _P(page), TSharedData::Copy(TString(10, 'p')));
             UNIT_ASSERT(loaded);
             owned.push_back(std::move(loaded));
         }
@@ -5355,11 +5451,12 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             sharedCache.Collection2 = MakeIntrusiveConst<TPageCollectionMock>(2ul, regularPages);
             sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular);
             sharedCache.Attach(sharedCache.Sender2, sharedCache.Collection2, ECacheMode::Regular);
-            auto retained =
-                cache.AdmitPage(sharedCache.Collection1, _P(adoptedOffset), TSharedData::Copy(TString(10, 'x')));
+            auto retained = NTable::NTest::AdmitPage(
+                cache, sharedCache.Collection1, _P(adoptedOffset), TSharedData::Copy(TString(10, 'x')));
             UNIT_ASSERT(retained);
             for (ui32 page = 0; page < regularPages; ++page) {
-                auto regular = cache.AdmitPage(sharedCache.Collection2, _P(page), TSharedData::Copy(TString(10, 'x')));
+                auto regular = NTable::NTest::AdmitPage(
+                    cache, sharedCache.Collection2, _P(page), TSharedData::Copy(TString(10, 'x')));
                 UNIT_ASSERT(regular);
             }
             // A Cold hit adopts the existing page before fresh-page admission
@@ -5377,7 +5474,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             retained.Drop();
             TVector<TCacheCollectionRef> heldCollections;
             for (ui64 id = 100; cache.AvailableHandleCount() != 0; ++id) {
-                auto held = cache.AdmitCollection(MakeIntrusiveConst<TPageCollectionMock>(id, 1u));
+                auto held = NTable::NTest::AdmitCollection(cache, MakeIntrusiveConst<TPageCollectionMock>(id, 1u));
                 UNIT_ASSERT(held);
                 heldCollections.push_back(std::move(held));
             }
@@ -5446,7 +5543,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             }
             raced = true;
             if (pendingPage) {
-                auto ready = cache.AdmitPage(collection, _P(0), TSharedData::Copy(TString(10, 'x')));
+                auto ready = NTable::NTest::AdmitPage(cache, collection, _P(0), TSharedData::Copy(TString(10, 'x')));
                 Y_ABORT_UNLESS(ready);
                 readyItem = ready.CacheItem();
                 TCachePageRequest request(_P(1), MakeIntrusive<TPageFetchWaiter>());
@@ -5456,7 +5553,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             } else {
                 for (ui64 foreignId = 100; cache.AvailableHandleCount() > 1; ++foreignId) {
                     foreignCollections.push_back(
-                        cache.AdmitCollection(MakeIntrusiveConst<TPageCollectionMock>(foreignId, 1u)));
+                        NTable::NTest::AdmitCollection(cache, MakeIntrusiveConst<TPageCollectionMock>(foreignId, 1u)));
                 }
             }
             return true;
@@ -5589,7 +5686,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             UNIT_ASSERT(body.size() + TSharedData::OverheadSize <= pageBytes / 2);
         }
         const auto rootLocation = TPageLocation::FromPageIndex(0, body.size(), EPage::BTreeIndexV2, 1);
-        auto root = cache.AdmitPage(index, rootLocation, std::move(body));
+        auto root = NTable::NTest::AdmitPage(cache, index, rootLocation, std::move(body));
         UNIT_ASSERT(root);
         root.Drop();
         sharedCache.Runtime.SimulateSleep(TDuration::MilliSeconds(1));
@@ -5611,7 +5708,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             return false;
         });
         if (admissionRace) {
-            const auto indexItem = cache.AdmitCollection(index).CacheItem();
+            const auto indexItem = NTable::NTest::AdmitCollection(cache, index).CacheItem();
             const auto indexRefs = [&cache, indexItem] {
                 auto cacheOp = cache.BeginOperation();
                 return THandleState::FromRaw(cacheOp.Handles()[indexItem.Index()].State.load(std::memory_order_relaxed))
@@ -5630,7 +5727,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
                     const TCacheHandleRequirement requirement{ seed.IndexCollectionId, missing };
                     for (ui64 id = 100; cache.CanAllocateHandles({ &requirement, 1 }); ++id) {
                         foreignCollections.push_back(
-                            cache.AdmitCollection(MakeIntrusiveConst<TPageCollectionMock>(id, 1u)));
+                            NTable::NTest::AdmitCollection(cache, MakeIntrusiveConst<TPageCollectionMock>(id, 1u)));
                     }
                     const TCacheHandleRequirement one{ seed.IndexCollectionId, { missing, 1 } };
                     Y_ABORT_UNLESS(cache.CanAllocateHandles({ &one, 1 }));
@@ -5638,7 +5735,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
                     Y_ABORT_UNLESS(cache.CanReserve(2 * pageBytes));
                     auto foreign = MakeIntrusiveConst<TPageCollectionMock>(100ul, 1u);
                     const auto location = TPageLocation::FromPageIndex(0, pageSize, EPage::DataPage, 1);
-                    foreignPage = cache.AdmitPage(foreign, location, TSharedData::Copy(TString(pageSize, 'p')));
+                    foreignPage =
+                        NTable::NTest::AdmitPage(cache, foreign, location, TSharedData::Copy(TString(pageSize, 'p')));
                     Y_ABORT_UNLESS(foreignPage);
                 }
                 return true;

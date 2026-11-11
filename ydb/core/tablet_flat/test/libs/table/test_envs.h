@@ -1,6 +1,7 @@
 #pragma once
 
 #include "test_part.h"
+#include <ydb/core/tablet_flat/test/libs/table/cache_context.h>
 #include <ydb/core/tablet_flat/flat_table_misc.h>
 #include <ydb/core/tablet_flat/flat_fwd_cache.h>
 #include <ydb/core/tablet_flat/flat_fwd_blobs.h>
@@ -204,14 +205,16 @@ namespace NTest {
                 {
                     for (auto &fetchEntry: IndexFetch) {
                         auto* pageData = Store->GetPage(IndexRoom, fetchEntry.Offset);
-                        auto ref = TCache::Get().AdmitPage(IndexPageCollection, fetchEntry, TSharedData(*pageData));
+                        auto ref = NTable::NTest::AdmitPage(
+                            TCache::Get(), IndexPageCollection, fetchEntry, TSharedData(*pageData));
                         PageLoadingLogic->Fill(std::move(ref), fetchEntry.Type);
                     }
                 }
                 {
                     for (auto &fetchEntry: GroupFetch) {
                         auto* pageData = Store->GetPage(GroupRoom, fetchEntry.Offset);
-                        auto ref = TCache::Get().AdmitPage(GroupPageCollection, fetchEntry, TSharedData(*pageData));
+                        auto ref = NTable::NTest::AdmitPage(
+                            TCache::Get(), GroupPageCollection, fetchEntry, TSharedData(*pageData));
                         PageLoadingLogic->Fill(std::move(ref), fetchEntry.Type);
                     }
                 }

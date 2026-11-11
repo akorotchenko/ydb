@@ -12,6 +12,7 @@
 #include <util/system/spinlock.h>
 
 #include <type_traits>
+#include <thread>
 #include <utility>
 
 namespace NKikimr::NSharedCache {
@@ -23,6 +24,19 @@ namespace {
     }
 
 } // anonymous namespace
+
+class TCompactedPageWaiter final : public TPageFetchWaiter {
+public:
+    void Complete(TSpaceOperation* spaceOp, TPageCacheItem item, EPageFetchCompletion completion) noexcept override {
+        Y_ABORT_UNLESS(completion == EPageFetchCompletion::Ready);
+        Y_DEBUG_ABORT_UNLESS(spaceOp);
+        auto cacheOp = TCache::Get().BindOperation(*spaceOp);
+        // Acquire before the fetch releases its owner, so admission cannot race eviction.
+        Y_ABORT_UNLESS(cacheOp.AcquirePage(item, Page));
+    }
+
+    TCachePageRef Page;
+};
 
 bool TProdTraits::InstallCache(void* cache) noexcept {
     if (!HasAppData()) {
@@ -893,15 +907,27 @@ bool TCache::FindOrInsertBatch(TCollectionCacheItem collection, TArrayRef<TCache
         return true;
     }
 
+    auto cacheOp = BeginOperation();
+    return FindOrInsertBatch(cacheOp.SpaceOperation(), collection, requests, recordStats, waitForMemory, admission);
+}
+
+CACHE_TEMPLATE
+bool TCache::FindOrInsertBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection,
+    TArrayRef<TCachePageRequestImpl<TTraits>> requests, bool recordStats, bool waitForMemory,
+    EPageAdmission admission) noexcept {
+    if (requests.empty()) {
+        return true;
+    }
+
     TVector<TPageInsertCandidate> candidates;
     ui64 reservedBytes;
 
-    auto cacheOp = BeginOperation();
-    TOperationItemRef collectionRef(cacheOp, cacheOp.TryAcquireStructural(collection.CacheItem()));
+    auto cacheOp = BindOperation(spaceOp);
+    TOperationItemRef collectionRef(spaceOp, cacheOp.TryAcquireStructural(collection.CacheItem()));
     if (!collectionRef) {
         return false;
     }
-    THandle& collectionHandle = cacheOp.Handles()[collection.Index()];
+    THandle& collectionHandle = spaceOp.Handles()[collection.Index()];
     const THandleState collectionState = THandleState::FromRaw(collectionHandle.State.load(std::memory_order_acquire));
     if (!collection.Matches(collectionState) || !collectionState.IsSticky() || !collectionState.IsStickyField() ||
         !collectionHandle.Body.Collection) {
@@ -966,6 +992,59 @@ ECacheResultStatus TCache::FindOrInsert(TIntrusiveConstPtr<NPageCollection::IPag
     TCollectionValueCandidate candidate(collection, value);
     auto cacheOp = BeginOperation();
     return FindOrInsertCollection(cacheOp.SpaceOperation(), &Collections_.Registry(), candidate, inserted, hit);
+}
+
+CACHE_TEMPLATE
+TCacheCollectionRefImpl<TTraits> TCache::AdmitCollection(
+    TSpaceOperation& spaceOp, TIntrusiveConstPtr<NPageCollection::IPageCollection> collection) {
+    TCacheCollectionRef ready;
+    THolder<TCollection> value;
+    TCollectionValueCandidate candidate(collection, value);
+    for (;;) {
+        TCollectionCacheItem inserted;
+        const auto status = FindOrInsertCollection(spaceOp, &Collections_.Registry(), candidate, inserted, ready);
+        if (status == ECacheResultStatus::Pending) {
+            // Retry concurrent in-memory publication or attachment; there is no I/O to wait for
+            InvokeHook(ECacheHookPoint::BeforeCollectionAdmissionRetry, TCacheItem{});
+            std::this_thread::yield();
+            continue;
+        }
+        if (status == ECacheResultStatus::Inserted) {
+            auto cacheOp = BindOperation(spaceOp);
+            TOperationItemRef publisher(spaceOp, cacheOp.TryAcquireStructural(inserted.CacheItem()));
+            Y_DEBUG_ABORT_UNLESS(publisher);
+            Y_ENSURE(cacheOp.MakeReady(&Collections_.Registry(), inserted.CacheItem(), std::move(value)));
+            ready = cacheOp.BuildCollectionRef(publisher.Take());
+        } else {
+            Y_ENSURE(status == ECacheResultStatus::Hit);
+            Y_ENSURE(ready->PageCollection()->IsCompatible(*collection), "Conflicting collection metadata descriptor");
+            Collections_.SetSkipBTreeIndexV1Shadow(*ready, collection->SkipBTreeIndexV1Shadow());
+        }
+        return ready;
+    }
+}
+
+CACHE_TEMPLATE
+TCachePageRefImpl<TTraits> TCache::AdmitPage(TSpaceOperation& spaceOp, TCollectionCacheItem collection,
+    NTable::NPage::TPageLocation location, NActors::TSharedData&& data, bool sticky, EPageAdmission admission)
+    requires std::is_same_v<TTraits, TProdTraits>
+{
+    auto cacheOp = BindOperation(spaceOp);
+    auto waiter = MakeIntrusive<TCompactedPageWaiter>();
+    TCachePageRequestImpl<TTraits> request(location, waiter, sticky);
+    const bool admitted = admission == EPageAdmission::Written
+                              ? cacheOp.FindOrInsertWrittenBatch(collection, { &request, 1 })
+                              : cacheOp.FindOrInsertBatch(collection, { &request, 1 }, false);
+    if (!admitted) {
+        Y_ENSURE(!sticky, "Cannot admit Sticky compacted page " << location.Offset);
+        return {};
+    }
+    if (request.Status() == ECacheResultStatus::Hit) {
+        return std::move(request.Page());
+    }
+    Y_ENSURE(request.Status() == ECacheResultStatus::Inserted);
+    Y_ENSURE(request.Fetch().MakeReady(cacheOp, std::move(data)));
+    return std::move(waiter->Page);
 }
 
 CACHE_TEMPLATE

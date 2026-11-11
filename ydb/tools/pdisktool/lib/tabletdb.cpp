@@ -149,8 +149,9 @@ public:
     TCacheCollectionRef AdmitCollection(NPageCollection::TLargeGlobId id, TSharedData meta) {
         auto& entry = Cache[id.Lead];
         if (!entry.Collection) {
-            entry.Collection = TCache::Get().AdmitCollection(
-                MakeIntrusiveConst<NPageCollection::TPageCollection>(std::move(id), std::move(meta)));
+            const auto descriptor =
+                MakeIntrusiveConst<NPageCollection::TPageCollection>(std::move(id), std::move(meta));
+            entry.Collection = TCache::Get().BeginOperation().AdmitCollection(descriptor);
         }
         return entry.Collection.Acquire();
     }
@@ -244,7 +245,11 @@ public:
         for (;;) {
             const ui64 usage = cache.PayloadUsage();
             // Admission bounds its reclamation work; keep the input for another synchronous attempt.
-            page = cache.AdmitPage(pageCollection, location, TSharedData(data));
+            {
+                auto cacheOp = cache.BeginOperation();
+                collection = cacheOp.AdmitCollection(pageCollection);
+                page = cacheOp.AdmitPage(collection.CacheItem(), location, TSharedData(data));
+            }
             if (page) {
                 break;
             }

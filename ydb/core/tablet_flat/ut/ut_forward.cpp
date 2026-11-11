@@ -154,8 +154,8 @@ namespace {
                 }
 
                 const TPageLocation location(qp.Offset, qp.Size, EPage::Opaque);
-                auto ref =
-                    TCache::Get().AdmitPage(BlobsPageCollection, location, TSharedData::Copy(TString(qp.Size, 'x')));
+                auto ref = NTable::NTest::AdmitPage(
+                    TCache::Get(), BlobsPageCollection, location, TSharedData::Copy(TString(qp.Size, 'x')));
                 load.emplace_back(std::move(ref));
             }
 
@@ -686,8 +686,8 @@ Y_UNIT_TEST_SUITE_F(NFwd_TLoadedPagesCircularBuffer, ::NKikimr::NTable::NTest::T
 
             auto page = NFwd::TPage(TPageOffset::FromPageIndex(pageId * 1), pageId * 10 + 1, pageId * 100, pageId * 1000);
             const TPageLocation location(page.Offset, page.Size, EPage::Opaque);
-            page.SharedPageRef =
-                TCache::Get().AdmitPage(collection, location, TSharedData::Copy(TString(page.Size, 'x')));
+            page.SharedPageRef = NTable::NTest::AdmitPage(
+                TCache::Get(), collection, location, TSharedData::Copy(TString(page.Size, 'x')));
 
             auto result = buffer.Emplace(page);
             UNIT_ASSERT_VALUES_EQUAL(result, pageId >= 5 ? (pageId - 5) * 10 + 1 : 0);

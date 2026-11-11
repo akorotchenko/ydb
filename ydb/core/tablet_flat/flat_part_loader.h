@@ -105,7 +105,7 @@ namespace NTable {
                     Y_DEBUG_ABORT_UNLESS(inserted || *it == location);
                 }
                 // Saved-page visits also bound how long an opened native view stays active
-                if (ReadOperation_ && ++ReadPageCount_ == ReadBatchSize) {
+                if (ReadOperation_ && ++ReadPageCount_ == NSharedCache::CacheOperationBatchSize) {
                     ReleaseReadOperation();
                 }
                 return result;
@@ -142,15 +142,7 @@ namespace NTable {
                 return {};
             }
 
-            void Save(NPageCollection::TPageData&& page) {
-                auto& needPages = NeedPages.at(FetchSlot);
-                auto it = needPages.find(TPageLocation(page.Location.Offset));
-                Y_ENSURE(it != needPages.end(), "Got unknown decoder page");
-                needPages.erase(it);
-                SavedPages.at(FetchSlot)[page.Location.Offset] =
-                    TCache::Get().AdmitPage(PageCollections.at(FetchSlot)->PageCollection(), page.Location,
-                        std::move(page.Data), NeedIn(page.Location.Type) || page.Location.Type == EPage::FlatIndex);
-            }
+            void Save(NPageCollection::TPageData&& page);
 
             void Save(NSharedCache::TEvResult::TLoaded&& loaded)
             {
@@ -199,7 +191,6 @@ namespace NTable {
             bool ReadScopeActive_ = false;
             std::optional<TCache::TOperation> ReadOperation_;
             ui32 ReadPageCount_ = 0;
-            static constexpr ui32 ReadBatchSize = 1024;
             TVector<THashMap<TPageOffset, TCachePageRef>> SavedPages;
             // Dedup by offset — keep Size/Type for the fetch request
             TVector<THashSet<TPageLocation, NPage::TPageLocationByOffsetHash, TPageLocationByOffsetEq>> NeedPages;
@@ -344,6 +335,7 @@ namespace NTable {
         }
 
         void ApplyIndexSelection(ui32 slot);
+        TCacheCollectionRef AdmitCollection(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection);
         void StageParseMeta();
         TFetch StageCreatePartView(bool preloadIndex);
         TFetch StageSliceBounds();

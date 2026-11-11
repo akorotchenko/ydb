@@ -718,7 +718,7 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
                 }
                 auto page = location;
                 page.Type = NTable::NPage::EPage::DataPage;
-                return TCache::Get().AdmitPage(Collection, page, TSharedData(it->second));
+                return NTable::NTest::AdmitPage(TCache::Get(), Collection, page, TSharedData(it->second));
             }
 
             TCachePageRef TryGetIndexPage(
