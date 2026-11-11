@@ -1947,6 +1947,10 @@ Y_UNIT_TEST_SUITE(TCacheSpaceTest) {
                 *space, { &context, [](void* ptr) noexcept {
                              auto& ctx = *static_cast<TContext*>(ptr);
                              ++ctx.Notifications;
+                             const ui64 idle = TCacheSpaceTestAccess::Hazard(ctx.Space, 0).State.load();
+                             UNIT_ASSERT(!SpaceHazardIsActive(idle));
+                             UNIT_ASSERT_VALUES_EQUAL(SpaceHazardGeneration(idle), 1);
+                             UNIT_ASSERT(!(idle & SpaceHazardDrainWaiter));
                              if (ctx.ResumeDrain) {
                                  ctx.Drained = TCacheSpaceTestAccess::TryDrainBefore(ctx.Space, 1, ctx.Cursor);
                              }

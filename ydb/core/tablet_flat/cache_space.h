@@ -650,7 +650,7 @@ private:
 
     static Y_FORCE_INLINE void LeaveHazard(TSpaceHazard& hazard) noexcept;
 
-    static void NotifyHazardDrained(TSpaceHazard& hazard) noexcept;
+    static void NotifyHazardDrained(TSpaceHazard& hazard, ui64 idleState) noexcept;
 
     static Y_FORCE_INLINE constexpr ui64 PackHazardState(ui64 generation, ui32 activeCount) noexcept {
         return (generation << 32) | activeCount;
@@ -1021,7 +1021,7 @@ Y_FORCE_INLINE void TSpaceOperation::LeaveHazard(TSpaceHazard& hazard) noexcept 
     const ui32 activeCount = SpaceHazardActiveCount(state);
     Y_DEBUG_ABORT_UNLESS(activeCount != 0);
     if (Y_UNLIKELY(activeCount == 1 && (state & SpaceHazardDrainWaiter))) {
-        NotifyHazardDrained(hazard);
+        NotifyHazardDrained(hazard, state - 1);
     }
 }
 

@@ -345,8 +345,14 @@ TSpaceOperation TSpaceOperation::BeginSlow(
     }
 }
 
-void TSpaceOperation::NotifyHazardDrained(TSpaceHazard& hazard) noexcept {
+void TSpaceOperation::NotifyHazardDrained(TSpaceHazard& hazard, ui64 idleState) noexcept {
     Y_DEBUG_ABORT_UNLESS(hazard.Space);
+    // Acquire the drainer's publication before selecting the generation for this idle gate
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const auto current = TSpaceState::FromRaw(hazard.Space->SpaceState_.load(std::memory_order_acquire));
+    // Close the stale idle gate before a later arm-before-probe can create a provisional wakeup
+    hazard.State.compare_exchange_strong(
+        idleState, PackHazardState(current.Generation(), 0), std::memory_order_acq_rel, std::memory_order_relaxed);
     const auto& notify = hazard.Space->HazardDrainNotify_;
     if (notify.Function) {
         notify.Function(notify.Context);
