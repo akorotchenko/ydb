@@ -1139,7 +1139,12 @@ bool TCache::DrainHotResize() noexcept {
 CACHE_TEMPLATE
 bool TCache::ReclaimSpareHandle() noexcept {
     auto cacheOp = BeginOperation();
-    if (!cacheOp.SpaceOperation().ReclaimSpareHandle()) {
+    return cacheOp.ReclaimSpareHandle();
+}
+
+CACHE_TEMPLATE
+bool TCache::ReclaimSpareHandle(TSpaceOperation& spaceOp) noexcept {
+    if (!spaceOp.ReclaimSpareHandle()) {
         return false;
     }
     NotifyResourcesAvailable();
@@ -1147,9 +1152,8 @@ bool TCache::ReclaimSpareHandle() noexcept {
 }
 
 CACHE_TEMPLATE
-typename TCache::TKeepLoadRoom TCache::KeepLoadRoom() noexcept {
-    auto cacheOp = BeginOperation();
-    const auto& keep = cacheOp.SpaceOperation().View().Tiers[ECacheTier::Keep];
+typename TCache::TKeepLoadRoom TCache::KeepLoadRoom(TSpaceOperation& spaceOp) noexcept {
+    const auto& keep = spaceOp.View().Tiers[ECacheTier::Keep];
     const THotRingLayout layout{ keep.EffectiveHotSlotCount() };
     // Fresh preload pages initially use L1/L0; empty upper levels are not admission room
     const ui64 slots = keep.ColdStorage.SlotCount + layout.Ring(EHotLevel::L0).Size + layout.Ring(EHotLevel::L1).Size;

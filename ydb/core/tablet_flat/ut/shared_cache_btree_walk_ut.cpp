@@ -82,6 +82,7 @@ namespace {
         ui32 CollectionLookups = 0;
         TLogoBlobID FetchWalkCollectionId;
         bool AllowFetch = false;
+        TVector<ui32> LookupBatches;
 
         TWalkHostMock() {
             Collection = TCache::Get().AdmitCollection(MakeIntrusiveConst<TPageCollectionStub>(TLogoBlobID(1, 1, 1)));
@@ -105,7 +106,14 @@ namespace {
             return PendingInMemoryPages;
         }
 
-        NActors::TSharedData FindPage(TCollection&, TPageOffset offset) override {
+        TCache::TOperation BeginOperation() override {
+            LookupBatches.push_back(0);
+            return TCache::Get().BeginOperation();
+        }
+
+        NActors::TSharedData FindPage(TCacheOperationView<TProdTraits>&, TCollection&, TPageOffset offset) override {
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazard->State.load()), 1);
+            ++LookupBatches.back();
             if (const auto* page = CorePages.FindPtr(offset)) {
                 return *page;
             }
@@ -113,6 +121,7 @@ namespace {
         }
 
         void FetchIndexLevel(TCollection&, TVector<TPageLocation>&&, const TLogoBlobID& walkCollectionId) override {
+            UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
             UNIT_ASSERT_C(AllowFetch, "Unexpected index fetch");
             FetchWalkCollectionId = walkCollectionId;
         }
@@ -167,6 +176,34 @@ namespace {
 } // namespace
 
 Y_UNIT_TEST_SUITE_F(TCacheBTreeWalkController, ::NKikimr::NTable::NTest::TTableCacheTest) {
+    Y_UNIT_TEST(MissingIndexBatchSharesOneOperationAndReleasesBeforeFetch) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        host.AllowFetch = true;
+
+        const auto data1 = TPageLocation::FromByteOffset(4000, 10, EPage::DataPage, 1);
+        const auto data2 = TPageLocation::FromByteOffset(5000, 10, EPage::DataPage, 2);
+        const auto leafBody = MakeNode(data1, data2);
+        const auto leaf1 = TPageLocation::FromByteOffset(2000, leafBody.size(), EPage::BTreeIndexV2, 3);
+        const auto leaf2 = TPageLocation::FromByteOffset(3000, leafBody.size(), EPage::BTreeIndexV2, 4);
+        auto rootBody = MakeNode(leaf1, leaf2);
+        auto seed = MakeSeed(host, 0);
+        seed.IndexCollectionId = host.Collection->Id();
+        seed.Root = TPageLocation::FromByteOffset(1000, rootBody.size(), EPage::BTreeIndexV2, 5);
+        seed.LevelCount = 2;
+        seed.QueueDataPages = false;
+        host.AddLoadedNode(seed.Root, std::move(rootBody));
+
+        walks.UpdateSeeds(*host.Collection, owner, { seed });
+        walks.Advance();
+        UNIT_ASSERT_VALUES_EQUAL(host.LookupBatches.size(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(host.LookupBatches[0], 1);
+        UNIT_ASSERT_VALUES_EQUAL(host.LookupBatches[1], 3);
+        UNIT_ASSERT(host.FetchWalkCollectionId == host.Collection->Id());
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
+    }
+
     Y_UNIT_TEST(CoreKeepIndexUsesPendingQueueAndParsesReadyPage) {
         TWalkHostMock host;
         TCacheBTreeWalkController walks(host);

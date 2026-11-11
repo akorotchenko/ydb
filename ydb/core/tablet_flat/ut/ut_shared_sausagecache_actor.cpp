@@ -3453,7 +3453,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         }, TDuration::Seconds(5));
         held.pop_back();
         auto& cache = TCache::Get();
-        UNIT_ASSERT(cache.AvailableHandleCount() != 0 || cache.ReclaimForPreload());
+        UNIT_ASSERT(cache.AvailableHandleCount() != 0 || cache.BeginOperation().Eviction().ReclaimRegularPage());
         sharedCache.Send(sharedCache.Sender2, new TKikimrEvents::TEvWakeup(ui64(EWakeupTag::DoGCScheduled)));
         sharedCache.CheckFetches({});
         UNIT_ASSERT(sharedCache.Results.empty());
@@ -5182,6 +5182,38 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.CheckFetches({});
     }
 
+    Y_UNIT_TEST(KeepPreloadContinuesPastAFullChunkOfHits) {
+        auto config = TSharedPageCacheMock::DefaultConfig();
+        config.SetMemoryLimit(128_MB);
+        config.SetInMemoryInFlyLimit(1_MB);
+        TSharedPageCacheMock sharedCache(config);
+        auto& cache = TCache::Get();
+        const ui32 cachedPages = MaxPreloadBatchLocations + 1;
+        const ui32 pageCount = cachedPages + 1;
+        const ui64 keepBytes = pageCount * PAGE_TOTAL_SIZE;
+        sharedCache.SetLimit(keepBytes * 5 / 2);
+        sharedCache.PrepareKeepStorage(keepBytes);
+        UNIT_ASSERT(cache.BeginOperation().KeepLoadRoom().Pages > pageCount);
+        sharedCache.Collection1 = MakeIntrusiveConst<TPageCollectionMock>(1ul, pageCount);
+        auto collection = cache.AdmitCollection(sharedCache.Collection1);
+        UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collection.CacheItem(), ECacheMode::Regular));
+        TVector<TCachePageRef> owned;
+        owned.reserve(cachedPages);
+        for (ui32 page = 0; page < cachedPages; ++page) {
+            auto loaded = cache.AdmitPage(sharedCache.Collection1, _P(page), TSharedData::Copy(TString(10, 'p')));
+            UNIT_ASSERT(loaded);
+            owned.push_back(std::move(loaded));
+        }
+
+        sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(cachedPages) } } });
+        sharedCache.Provide(sharedCache.Collection1, { _P(cachedPages) }, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
+        sharedCache.CheckFetches({});
+        sharedCache.CheckResults({});
+        UNIT_ASSERT_VALUES_EQUAL(cache.KeepResidentPageBytes(), pageCount * PAGE_TOTAL_SIZE);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
+    }
+
     void CheckKeepPreloadBatchLimit(ui64 initialLimit, ui32 pageCount, bool growBeforeCompletion) {
         auto config = TSharedPageCacheMock::DefaultConfig();
         config.SetMemoryLimit(initialLimit);
@@ -5192,7 +5224,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.SetLimit(softLimit);
         sharedCache.PrepareKeepStorage(keepBytes);
         auto& cache = TCache::Get();
-        const ui64 pageLimit = Min<ui64>(MaxPreloadBatchLocations, cache.KeepLoadRoom().Pages);
+        const ui64 pageLimit = Min<ui64>(MaxPreloadBatchLocations, cache.BeginOperation().KeepLoadRoom().Pages);
         UNIT_ASSERT(pageCount > pageLimit);
         sharedCache.Collection1 = MakeIntrusiveConst<TPageCollectionMock>(1ul, pageCount);
         TVector<TPageLocation> first;
@@ -5244,7 +5276,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.SetLimit(keepBytes * 5 / 2);
         sharedCache.PrepareKeepStorage(keepBytes);
         auto& cache = TCache::Get();
-        const ui64 pageLimit = cache.KeepLoadRoom().Pages;
+        const ui64 pageLimit = cache.BeginOperation().KeepLoadRoom().Pages;
         UNIT_ASSERT(pageLimit > InFlightPageCount && pageLimit <= 2 * InFlightPageCount);
         UNIT_ASSERT(pageLimit < pageCount);
         sharedCache.Collection1 = MakeIntrusiveConst<TPageCollectionMock>(1ul, pageCount);

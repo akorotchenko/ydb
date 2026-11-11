@@ -198,13 +198,18 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         }
     }
 
-    NActors::TSharedData FindPage(TCollection& collection, TPageOffset offset) override {
+    TCache::TOperation BeginOperation() override {
+        return Cache->BeginOperation();
+    }
+
+    NActors::TSharedData FindPage(
+        TCacheOperationView<TProdTraits>& cacheOp, TCollection& collection, TPageOffset offset) override {
         if (!collection.CacheItem) {
             return {};
         }
-        TCachePageRef page;
-        if (Cache->Find(collection.CacheItem, static_cast<ui64>(offset), page) == ECacheResultStatus::Hit) {
-            return page.BuildSharedData();
+        TOperationItemRef<TProdTraits> page(cacheOp.SpaceOperation());
+        if (cacheOp.FindPage(collection.CacheItem, static_cast<ui64>(offset), page.Get()) == ECacheResultStatus::Hit) {
+            return cacheOp.BuildPageRef(page.Take()).BuildSharedData();
         }
         return {};
     }
@@ -1985,54 +1990,60 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
             ui64 requestBytes = 0;
             bool budgetBlocked = false;
             auto locationIt = pagesToLoad.begin();
-            while (locationIt != pagesToLoad.end() && pagesToRequest.size() < pageLimit)
-            {
-                const TPageLocation location = *locationIt;
-                ECacheResultStatus status;
-                {
-                    TCachePageRef page;
-                    status = Cache->FindForPreload(collection->CacheItem, static_cast<ui64>(location.Offset), page);
-            }
-            if (status == ECacheResultStatus::Hit) {
-                locationIt = pagesToLoad.erase(locationIt);
-                Walks.IndexPagesChanged(collectionId);
-                ScheduleContinuation();
-                continue;
-            }
-            if (status == ECacheResultStatus::Pending || IsKeepPreloadInFlight(*collection, location.Offset))
-            {
-                    ++locationIt;
-                    continue;
+            while (locationIt != pagesToLoad.end() && pagesToRequest.size() < pageLimit && !budgetBlocked) {
+                auto cacheOp = Cache->BeginOperation();
+                // Bound the guard by visits too, including hits and pages already in flight
+                for (size_t visited = 0; visited < MaxPreloadBatchLocations && locationIt != pagesToLoad.end() &&
+                                         pagesToRequest.size() < pageLimit;
+                     ++visited) {
+                    const TPageLocation location = *locationIt;
+                    ECacheResultStatus status;
+                    {
+                        TOperationItemRef<TProdTraits> page(cacheOp.SpaceOperation());
+                        status = cacheOp.FindForPreload(
+                            collection->CacheItem, static_cast<ui64>(location.Offset), page.Get());
+                    }
+                    if (status == ECacheResultStatus::Hit) {
+                        locationIt = pagesToLoad.erase(locationIt);
+                        Walks.IndexPagesChanged(collectionId);
+                        ScheduleContinuation();
+                        continue;
+                    }
+                    if (status == ECacheResultStatus::Pending || IsKeepPreloadInFlight(*collection, location.Offset)) {
+                        ++locationIt;
+                        continue;
+                    }
+                    const ui64 pageBytes = KeepPageBytes(location);
+                    // Existing hits may acquire Keep credits; exclude this batch's unsubmitted promises
+                    const auto room = cacheOp.KeepLoadRoom();
+                    if (pageBytes > remainingBytes || pageBytes > room.Bytes - Min(room.Bytes, requestBytes) ||
+                        pagesToRequest.size() >= room.Pages) {
+                        budgetBlocked = true;
+                        break;
+                    }
+                    if (remainingHandles == 0) {
+                        const ui64 available = cacheOp.AvailableHandleCount();
+                        remainingHandles = available - Min<ui64>(available, pagesToRequest.size());
+                    }
+                    if (remainingHandles == 0 &&
+                        (cacheOp.ReclaimSpareHandle() || cacheOp.Eviction().ReclaimRegularPage())) {
+                        const ui64 available = cacheOp.AvailableHandleCount();
+                        remainingHandles = available - Min<ui64>(available, pagesToRequest.size());
+                    }
+                    if (remainingHandles == 0) {
+                        budgetBlocked = true;
+                        break;
+                    }
+                    remainingBytes -= pageBytes;
+                    --remainingHandles;
+                    requestBytes += pageBytes;
+                    pagesToRequest.push_back(location);
+                    locationIt = pagesToLoad.erase(locationIt);
                 }
-                const ui64 pageBytes = KeepPageBytes(location);
-                // Existing hits may acquire Keep credits; exclude this batch's unsubmitted promises
-                const auto room = Cache->KeepLoadRoom();
-                if (pageBytes > remainingBytes || pageBytes > room.Bytes - Min(room.Bytes, requestBytes) ||
-                    pagesToRequest.size() >= room.Pages) {
-                    budgetBlocked = true;
-                    break;
-                }
-                if (remainingHandles == 0) {
-                    const ui64 available = Cache->AvailableHandleCount();
-                    remainingHandles = available - Min<ui64>(available, pagesToRequest.size());
-                }
-                if (remainingHandles == 0 && (Cache->ReclaimSpareHandle() || Cache->ReclaimForPreload())) {
-                    const ui64 available = Cache->AvailableHandleCount();
-                    remainingHandles = available - Min<ui64>(available, pagesToRequest.size());
-                }
-                if (remainingHandles == 0) {
-                    budgetBlocked = true;
-                    break;
-                }
-                remainingBytes -= pageBytes;
-                --remainingHandles;
-                requestBytes += pageBytes;
-                pagesToRequest.push_back(location);
-                locationIt = pagesToLoad.erase(locationIt);
             }
 
             // A trailing hit may have adopted a Keep page after the last missing-page probe
-            const auto room = Cache->KeepLoadRoom();
+            const auto room = Cache->BeginOperation().KeepLoadRoom();
             while (pagesToRequest.size() > room.Pages || requestBytes > room.Bytes) {
                 const auto location = pagesToRequest.back();
                 pagesToRequest.pop_back();

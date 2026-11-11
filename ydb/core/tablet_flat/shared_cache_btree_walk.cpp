@@ -244,16 +244,22 @@ void TCacheBTreeWalkController::AdvanceWalk(TCacheBTreeWalk& walk, const TLogoBl
         }
 
         const TPageLocation location = walk.CurrentLevel[walk.Next];
-        NActors::TSharedData coreData = Host.FindPage(*indexCollection, location.Offset);
-        if (!coreData) {
-            TVector<TPageLocation> toRequest;
-            for (size_t i = walk.Next; i < walk.BatchEnd; ++i) {
-                const auto& batchLocation = walk.CurrentLevel[i];
-                if (!Host.FindPage(*indexCollection, batchLocation.Offset)) {
-                    toRequest.push_back(batchLocation);
+        NActors::TSharedData coreData;
+        TVector<TPageLocation> toRequest;
+        {
+            auto cacheOp = Host.BeginOperation();
+            coreData = Host.FindPage(cacheOp, *indexCollection, location.Offset);
+            if (!coreData) {
+                for (size_t i = walk.Next; i < walk.BatchEnd; ++i) {
+                    const auto& batchLocation = walk.CurrentLevel[i];
+                    if (!Host.FindPage(cacheOp, *indexCollection, batchLocation.Offset)) {
+                        toRequest.push_back(batchLocation);
+                    }
                 }
             }
+        }
 
+        if (!coreData) {
             // Index pages always live in the main group; its mode decides how they are fetched.
             if (indexCollection->GetCacheMode() == ECacheMode::TryKeepInMemory) {
                 // Wait for loader progress; a self-continuation cannot unblock a capacity-limited index read.

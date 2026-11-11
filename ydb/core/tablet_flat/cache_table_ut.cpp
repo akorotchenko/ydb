@@ -157,6 +157,18 @@ public:
         return cacheOp.AcquirePage(page, result);
     }
 
+    static ECacheResultStatus FindForPreload(
+        TTestCache& cache, TCollectionCacheItem collection, ui64 offset, TTestCachePageRef& page) noexcept {
+        page.Drop();
+        auto cacheOp = cache.BeginOperation();
+        TOperationItemRef<TTestTraits> ref(cacheOp);
+        const auto status = cacheOp.FindForPreload(collection, offset, ref.Get());
+        if (status == ECacheResultStatus::Hit) {
+            page = cacheOp.BuildPageRef(ref.Take());
+        }
+        return status;
+    }
+
     static TIntrusivePtr<TPageFetchState> AcquireFetch(
         TTestCache::TOperation& cacheOp, TPageCacheItem page, TOperationItemRef<TTestTraits>& owner) noexcept {
         if (cacheOp.TryAcquire(page.CacheItem(), true, owner.Get(), true) != TTestCache::EAcquireStatus::Pending) {
@@ -5187,7 +5199,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), freeHandles);
         if (freeHandles == 0) {
             const ui64 generation = fixture.Cache->AdmissionGeneration();
-            UNIT_ASSERT(!fixture.Cache->ReclaimForPreload());
+            UNIT_ASSERT(!fixture.Cache->BeginOperation().Eviction().ReclaimRegularPage());
             UNIT_ASSERT(!TlsCacheHazard->PreloadReclaim);
             UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);
         }
@@ -5316,7 +5328,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                     UNIT_ASSERT_VALUES_EQUAL(request.Page().data(), owner.data());
                 } else {
                     TTestCachePageRef found;
-                    UNIT_ASSERT(cache.FindForPreload(regular, 0, found) == ECacheResultStatus::Hit);
+                    UNIT_ASSERT(TCacheTestAccess::FindForPreload(cache, regular, 0, found) == ECacheResultStatus::Hit);
                     UNIT_ASSERT(found.CacheItem() == page);
                     UNIT_ASSERT_VALUES_EQUAL(found.data(), owner.data());
                 }
@@ -5363,7 +5375,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             } };
         TCacheHookGuard guard(cache, hooks);
         TTestCachePageRef found;
-        UNIT_ASSERT(cache.FindForPreload(collection, 0, found) == ECacheResultStatus::Hit);
+        UNIT_ASSERT(TCacheTestAccess::FindForPreload(cache, collection, 0, found) == ECacheResultStatus::Hit);
         UNIT_ASSERT(context.Visited && found.CacheItem() == page);
         found.Drop();
         UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()).IsHotInTier(ECacheTier::Keep));
@@ -5778,7 +5790,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                 }
             } };
         TCacheHookGuard guard(*fixture.Cache, hooks);
-        UNIT_ASSERT(!fixture.Cache->ReclaimForPreload());
+        UNIT_ASSERT(!fixture.Cache->BeginOperation().Eviction().ReclaimRegularPage());
         UNIT_ASSERT(context.Reheated);
         AssertPageHit(*fixture.Cache, TCacheKey::Page(collection, 1), page);
         UNIT_ASSERT(!TlsCacheHazard->PreloadReclaim);
@@ -6734,7 +6746,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepPendingBytes(), bytes);
         const ui64 generation = fixture.Cache->AdmissionGeneration();
         for (ui32 probe = 0; probe < 32; ++probe) {
-            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepLoadRoom().Bytes, 0);
+            UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->BeginOperation().KeepLoadRoom().Bytes, 0);
         }
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepOwnedBytes(), bytes);
         UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->AdmissionGeneration(), generation);

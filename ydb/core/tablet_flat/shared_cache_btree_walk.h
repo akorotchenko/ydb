@@ -76,7 +76,9 @@ public:
 
     virtual TCollection* FindCollection(const TLogoBlobID& id) = 0;
     virtual TPendingInMemoryPages& PendingPages() = 0;
-    virtual NActors::TSharedData FindPage(TCollection& collection, TPageOffset offset) = 0;
+    virtual TCache::TOperation BeginOperation() = 0;
+    virtual NActors::TSharedData FindPage(
+        TCacheOperationView<TProdTraits>& cacheOp, TCollection& collection, TPageOffset offset) = 0;
     // Regular-mode index reads; in-memory index reads go through PendingPages.
     virtual void FetchIndexLevel(TCollection& collection, TVector<NTable::NPage::TPageLocation>&& locations,
         const TLogoBlobID& walkCollectionId) = 0;
