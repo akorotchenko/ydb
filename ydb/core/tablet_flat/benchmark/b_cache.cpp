@@ -5,6 +5,7 @@
 #include <ydb/library/actors/core/defs.h>
 
 #include <util/generic/hash.h>
+#include <util/system/env.h>
 
 #include <algorithm>
 #include <bit>
@@ -105,6 +106,9 @@ namespace {
     class TCacheFixture : public benchmark::Fixture {
     public:
         void SetUp(benchmark::State& state) override {
+            const TString noOperation = GetEnv("LFCACHE_BENCH_NO_OPERATION");
+            Y_ENSURE(noOperation.empty() || noOperation == "1");
+            NoOperation_ = noOperation == "1";
             PageCount_ = static_cast<ui32>(state.range(0));
             Y_ENSURE(PageCount_ && !(PageCount_ & (PageCount_ - 1)));
             const ui8 addressBits = static_cast<ui8>(std::bit_width(ui64(PageCount_) * BucketsPerPage - 1));
@@ -147,6 +151,14 @@ namespace {
                     return;
                 }
             }
+            if (!CheckHotWorkingSet(state, "before timing")) {
+                return;
+            }
+            if (NoOperation_) {
+                // Amortize entry/exit outside the timed loop while keeping the mapping protected
+                Operation_ = MakeHolder<TCache::TOperation>(Cache_->BeginOperation());
+            }
+            state.counters["OperationWrap"] = NoOperation_ ? 0 : 1;
             Order_.resize(PageCount_);
             std::iota(Order_.begin(), Order_.end(), 0u);
             std::mt19937_64 random(AccessSeed);
@@ -161,6 +173,7 @@ namespace {
         }
 
         void TearDown(benchmark::State&) override {
+            Operation_.Reset();
             TStdRawMap().swap(StdRaw_);
             TYdbRawMap().swap(YdbRaw_);
             TStdOwnedMap().swap(StdOwned_);
@@ -174,8 +187,24 @@ namespace {
         }
 
     protected:
+        bool CheckHotWorkingSet(benchmark::State& state, const char* phase) const {
+            const ui64 hot = Cache_->HotPages();
+            const ui64 cold = Cache_->ColdPages();
+            const bool before = TStringBuf(phase) == "before timing";
+            state.counters[before ? "HotPagesBefore" : "HotPagesAfter"] = hot;
+            state.counters[before ? "ColdPagesBefore" : "ColdPagesAfter"] = cold;
+            if (hot != PageCount_ || cold != 0) {
+                state.SkipWithError(phase);
+                return false;
+            }
+            return true;
+        }
+
         template <class TLookup>
         void RunLookups(benchmark::State& state, bool miss, TLookup&& lookup) {
+            if (state.skipped()) {
+                return;
+            }
             const auto expected = miss ? ECacheResultStatus::Miss : ECacheResultStatus::Hit;
             ui32 cursor = 0;
             for (auto _ : state) {
@@ -188,6 +217,7 @@ namespace {
                 cursor = (cursor + 1) & (PageCount_ - 1);
             }
             state.SetItemsProcessed(state.iterations());
+            CheckHotWorkingSet(state, "after timing");
         }
 
         template <class TMap>
@@ -218,21 +248,8 @@ namespace {
             return ECacheResultStatus::Hit;
         }
 
-        ECacheResultStatus LookupTable(ui64 offset) {
-            auto operation = Cache_->BeginOperation();
-            TCacheItem item;
-            const auto status = operation.FindPage(Collection_.CacheItem(), offset, item);
-            if (status == ECacheResultStatus::Hit) {
-                ui64 value = item.Raw();
-                benchmark::DoNotOptimize(value);
-            }
-            return status;
-        }
-
         template <bool Read>
-        ECacheResultStatus LookupCache(ui64 offset) {
-            TCachePageRef page;
-            const auto status = Cache_->Find(Collection_.CacheItem(), offset, page);
+        static ECacheResultStatus ConsumePage(TCachePageRef& page, ECacheResultStatus status) {
             if (status == ECacheResultStatus::Hit) {
                 if constexpr (Read) {
                     char value = page.data()[0];
@@ -243,6 +260,68 @@ namespace {
                 }
             }
             return status;
+        }
+
+        template <bool Read>
+        ECacheResultStatus LookupCache(ui64 offset) {
+            TCachePageRef page;
+            const auto status = Cache_->Find(Collection_.CacheItem(), offset, page);
+            return ConsumePage<Read>(page, status);
+        }
+
+        template <bool Read>
+        ECacheResultStatus LookupCache(TCache::TOperation& operation, ui64 offset) {
+            TCachePageRef page;
+            TOperationItemRef<TProdTraits> ref(operation);
+            const auto status = operation.FindPage(Collection_.CacheItem(), offset, ref.Get());
+            if (status == ECacheResultStatus::Hit) {
+                page = operation.BuildPageRef(ref.Take());
+            }
+            return ConsumePage<Read>(page, status);
+        }
+
+        ECacheResultStatus LookupTable(TCache::TOperation& operation, ui64 offset) {
+            TCacheItem item;
+            const auto status = operation.FindPage(Collection_.CacheItem(), offset, item);
+            if (status == ECacheResultStatus::Hit) {
+                ui64 value = item.Raw();
+                benchmark::DoNotOptimize(value);
+            }
+            return status;
+        }
+
+        template <bool Read>
+        void RunCacheLookups(benchmark::State& state, bool miss = false) {
+            if (state.skipped()) {
+                return;
+            }
+            if (NoOperation_) {
+                auto& operation = *Operation_;
+                RunLookups(state, miss, [this, &operation](ui64 offset) {
+                    return LookupCache<Read>(operation, offset);
+                });
+            } else {
+                RunLookups(state, miss, [this](ui64 offset) {
+                    return LookupCache<Read>(offset);
+                });
+            }
+        }
+
+        void RunTableLookups(benchmark::State& state, bool miss = false) {
+            if (state.skipped()) {
+                return;
+            }
+            if (NoOperation_) {
+                auto& operation = *Operation_;
+                RunLookups(state, miss, [this, &operation](ui64 offset) {
+                    return LookupTable(operation, offset);
+                });
+            } else {
+                RunLookups(state, miss, [this](ui64 offset) {
+                    auto operation = Cache_->BeginOperation();
+                    return LookupTable(operation, offset);
+                });
+            }
         }
 
         THolder<NTable::NTest::TTableCacheContext> Context_;
@@ -256,6 +335,8 @@ namespace {
         TVector<TCachePageRef> Pinned_;
         TVector<ui32> Order_;
         ui32 PageCount_ = 0;
+        bool NoOperation_ = false;
+        THolder<TCache::TOperation> Operation_;
     };
 
     BENCHMARK_DEFINE_F(TCacheFixture, StdRawHit)(benchmark::State& state) {
@@ -271,9 +352,7 @@ namespace {
     }
 
     BENCHMARK_DEFINE_F(TCacheFixture, CacheTableHit)(benchmark::State& state) {
-        RunLookups(state, false, [this](ui64 offset) {
-            return LookupTable(offset);
-        });
+        RunTableLookups(state);
     }
 
     BENCHMARK_DEFINE_F(TCacheFixture, StdOwnedHit)(benchmark::State& state) {
@@ -289,9 +368,7 @@ namespace {
     }
 
     BENCHMARK_DEFINE_F(TCacheFixture, CacheHit)(benchmark::State& state) {
-        RunLookups(state, false, [this](ui64 offset) {
-            return LookupCache<false>(offset);
-        });
+        RunCacheLookups<false>(state);
     }
 
     BENCHMARK_DEFINE_F(TCacheFixture, StdOwnedRead)(benchmark::State& state) {
@@ -307,9 +384,7 @@ namespace {
     }
 
     BENCHMARK_DEFINE_F(TCacheFixture, CacheRead)(benchmark::State& state) {
-        RunLookups(state, false, [this](ui64 offset) {
-            return LookupCache<true>(offset);
-        });
+        RunCacheLookups<true>(state);
     }
 
     BENCHMARK_DEFINE_F(TCacheFixture, StdRawMiss)(benchmark::State& state) {
@@ -325,15 +400,11 @@ namespace {
     }
 
     BENCHMARK_DEFINE_F(TCacheFixture, CacheTableMiss)(benchmark::State& state) {
-        RunLookups(state, true, [this](ui64 offset) {
-            return LookupTable(offset);
-        });
+        RunTableLookups(state, true);
     }
 
     BENCHMARK_DEFINE_F(TCacheFixture, CacheMiss)(benchmark::State& state) {
-        RunLookups(state, true, [this](ui64 offset) {
-            return LookupCache<false>(offset);
-        });
+        RunCacheLookups<false>(state, true);
     }
 
     BENCHMARK_REGISTER_F(TCacheFixture, StdRawHit)
