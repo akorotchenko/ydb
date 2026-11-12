@@ -23,12 +23,29 @@ using TTestCache = TCacheImpl<TTestTraits>;
 using EResizeStep = TCacheTableImpl<TTestTraits>::EResizeStep;
 using TTestCacheItemRef = TCacheItemRefImpl<TTestTraits>;
 using TTestCachePageRef = TCachePageRefImpl<TTestTraits>;
+using TTestCachePageConstRef = TCachePageConstRefImpl<TTestTraits>;
 using TTestCacheCollectionRef = TCacheCollectionRefImpl<TTestTraits>;
 using TTestPageFetch = TPageFetchImpl<TTestTraits>;
 using TTestCachePageRequest = TCachePageRequestImpl<TTestTraits>;
 
 static_assert(sizeof(TTestCacheItemRef) == sizeof(TCacheItem));
 static_assert(sizeof(TTestCachePageRef) == 8);
+static_assert(sizeof(TTestCachePageConstRef) == 8);
+static_assert(sizeof(TCachePageConstRef) == 8);
+static_assert(std::is_trivially_copyable_v<TTestCachePageConstRef>);
+static_assert(std::is_trivially_destructible_v<TTestCachePageConstRef>);
+static_assert(!std::is_copy_constructible_v<TTestCachePageRef>);
+static_assert(!std::is_constructible_v<TTestCachePageConstRef, TCacheItem>);
+static_assert(!std::is_convertible_v<TTestCachePageRef&, TTestCachePageConstRef>);
+
+template <class T>
+concept CCanBorrowPage = requires(T&& page) { std::forward<T>(page).Borrow(); };
+
+static_assert(CCanBorrowPage<TTestCachePageRef&>);
+static_assert(CCanBorrowPage<const TTestCachePageRef&>);
+static_assert(!CCanBorrowPage<TTestCachePageRef>);
+static_assert(!CCanBorrowPage<const TTestCachePageRef>);
+
 static_assert(sizeof(TTestCacheCollectionRef) == sizeof(TCacheItem));
 static_assert(!std::is_move_constructible_v<TTransition>);
 static_assert(!std::is_move_assignable_v<TTransition>);
@@ -16431,6 +16448,77 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         movedPage.Drop();
         movedCollection.Drop();
     }
+    Y_UNIT_TEST(PageConstRefCopiesAndReadsDoNotAcquireOwnership) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const TLogoBlobID id(311, 312, 1);
+        const auto collection = CreateModeCollection(cache, fixture.Registry, id, ECacheMode::Regular);
+        const auto item = InsertReadyPage(cache, TCacheKey::Page(collection, 17));
+        TTestCachePageRef owner;
+        UNIT_ASSERT(cache.Find(collection, 17, owner) == ECacheResultStatus::Hit);
+        const auto refs = TCacheTestAccess::HandleState(cache, item.Index()).Refs();
+        const auto* data = owner.data();
+        {
+            const auto view = owner.Borrow();
+            auto copy = view;
+            TTestCachePageConstRef assigned;
+            assigned = copy;
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, item.Index()).Refs(), refs);
+            auto borrowed = owner.Borrow();
+            UNIT_ASSERT(borrowed && assigned);
+            UNIT_ASSERT(assigned.CacheItem() == item);
+            UNIT_ASSERT_VALUES_EQUAL(assigned.data(), data);
+            UNIT_ASSERT_VALUES_EQUAL(borrowed.size(), 4096);
+            UNIT_ASSERT(borrowed.GetOffset() == owner.GetOffset());
+            UNIT_ASSERT(borrowed.GetLocation() == owner.GetLocation());
+            UNIT_ASSERT(borrowed.GetCollectionId() == id);
+            UNIT_ASSERT(borrowed.GetType() == NTable::NPage::EPage::DataPage);
+            UNIT_ASSERT(!borrowed.IsSticky());
+            TTestCachePageConstRef empty;
+            UNIT_ASSERT(!empty && empty.size() == 0 && !empty.IsSticky());
+        }
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, item.Index()).Refs(), refs);
+        owner.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, item.Index()).Refs(), 0);
+    }
+
+    Y_UNIT_TEST(PageConstRefSurvivesOwnerMovesAndOperationRenewal) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(311, 312, 2), ECacheMode::Regular);
+        const auto item = InsertReadyPage(cache, TCacheKey::Page(collection, 19));
+        TTestCachePageRef owner;
+        UNIT_ASSERT(cache.Find(collection, 19, owner) == ECacheResultStatus::Hit);
+        auto view = owner.Borrow();
+        const auto* data = view.data();
+        const auto refs = TCacheTestAccess::HandleState(cache, item.Index()).Refs();
+        TVector<TTestCachePageRef> owners;
+        owners.emplace_back(std::move(owner));
+        owners.reserve(16);
+        UNIT_ASSERT(!owner);
+        {
+            auto batch = cache.BeginOpBatch();
+            const auto nextGeneration = TCacheTestAccess::CurrentSpaceState(*fixture.Space).Generation() + 1;
+            UNIT_ASSERT(TCacheTestAccess::AdvanceSpaceGeneration(cache));
+            UNIT_ASSERT(!TCacheTestAccess::TryDrainBefore(cache, nextGeneration));
+            for (ui32 visit = 0; visit < CacheOperationBatchSize; ++visit) {
+                view = batch.ProcessPage([&](auto&) {
+                    return owners.front().Borrow();
+                });
+                UNIT_ASSERT_VALUES_EQUAL(view.data(), data);
+            }
+            UNIT_ASSERT(TCacheTestAccess::TryDrainBefore(cache, nextGeneration));
+        }
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
+        UNIT_ASSERT(view.CacheItem() == item);
+        UNIT_ASSERT_VALUES_EQUAL(view.data(), data);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, item.Index()).Refs(), refs);
+        view = {};
+        owners.clear();
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, item.Index()).Refs(), 0);
+    }
+
     Y_UNIT_TEST(PageRefSnapshotSurvivesAliasRelease) {
         TFixture fixture(6, 8, 7);
         const auto key = TCacheKey::Page(MakeCollectionCacheItem(51, 52), 0);
@@ -16530,6 +16618,14 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             UNIT_ASSERT_VALUES_EQUAL(pinned.data()[0], static_cast<char>(inserted.Index()));
             UNIT_ASSERT_VALUES_EQUAL(pinned.size(), 4096);
             UNIT_ASSERT(pinned.GetType() == NTable::NPage::EPage::DataPage);
+            auto borrowed = pinned.Borrow();
+            auto copy = borrowed;
+            UNIT_ASSERT(copy.CacheItem() == pinned.CacheItem());
+            UNIT_ASSERT_VALUES_EQUAL(copy.data(), pinned.data());
+            UNIT_ASSERT_VALUES_EQUAL(copy.size(), pinned.size());
+            UNIT_ASSERT(copy.GetLocation() == pinned.GetLocation());
+            UNIT_ASSERT(copy.GetType() == pinned.GetType());
+            UNIT_ASSERT(copy.IsSticky() == pinned.IsSticky());
         }
         UNIT_ASSERT_VALUES_EQUAL(pinned.BuildSharedData().size(), 4096);
         UNIT_ASSERT_VALUES_EQUAL(pinned.BuildSharedData().data()[0], static_cast<char>(inserted.Index()));

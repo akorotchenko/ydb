@@ -153,29 +153,19 @@ private:
     TCacheItemRefImpl<TTraits> Ref_;
 };
 
-// Ordinary eviction must keep a natively owned page findable and its payload valid
+// The native owner must outlive every copy of this borrowed token
 template <class TTraits = TProdTraits>
-class TCachePageRefImpl : private TMoveOnly {
+class TCachePageConstRefImpl {
 public:
-    TCachePageRefImpl() noexcept = default;
-
-    Y_FORCE_INLINE ~TCachePageRefImpl() noexcept {
-        Drop();
-    }
-
-    Y_FORCE_INLINE TCachePageRefImpl(TCachePageRefImpl&& other) noexcept
-        : Ref_(std::move(other.Ref_))
-    {}
-
-    Y_FORCE_INLINE TCachePageRefImpl& operator=(TCachePageRefImpl&& other) noexcept;
+    TCachePageConstRefImpl() noexcept = default;
 
     explicit operator bool() const noexcept {
-        return bool(Ref_);
+        return !CacheItem_.IsNull();
     }
 
     Y_FORCE_INLINE TPageCacheItem CacheItem() const noexcept {
-        Y_DEBUG_ABORT_UNLESS(Ref_);
-        return TPageCacheItem::FromValidated(Ref_.CacheItem_);
+        Y_DEBUG_ABORT_UNLESS(*this);
+        return TPageCacheItem::FromValidated(CacheItem_);
     }
 
     Y_FORCE_INLINE const char* data() const noexcept {
@@ -185,26 +175,12 @@ public:
     }
 
     Y_FORCE_INLINE size_t size() const noexcept {
-        if (!Ref_) {
+        if (!*this) {
             return 0;
         }
         return WithHandle([](const THandle& handle) {
             return handle.Key2OrSize.load(std::memory_order_relaxed);
         });
-    }
-
-    Y_FORCE_INLINE NActors::TSharedData BuildSharedData() const noexcept {
-        return WithHandle([](const THandle& handle) {
-            return handle.Body.PageBuffer.Share(handle.Key2OrSize.load(std::memory_order_relaxed));
-        });
-    }
-    // Construct an independent owner only when moving or borrowing cannot preserve the required lifetime.
-    Y_FORCE_INLINE TCachePageRefImpl Acquire() const& noexcept {
-        if (!Ref_) {
-            return {};
-        }
-        TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
-        return TCachePageRefImpl(cache.Items_.AcquireMorePageRef(Ref_.CacheItem()));
     }
 
     Y_FORCE_INLINE NTable::NPage::TPageOffset GetOffset() const noexcept {
@@ -231,11 +207,96 @@ public:
     }
 
     Y_FORCE_INLINE bool IsSticky() const noexcept {
-        if (!Ref_) {
+        if (!*this) {
             return false;
         }
+        return TCacheImpl<TTraits>::Get().IsPageSticky(CacheItem());
+    }
+
+private:
+    friend class TCachePageRefImpl<TTraits>;
+
+    Y_FORCE_INLINE explicit TCachePageConstRefImpl(TCacheItem cacheItem) noexcept
+        : CacheItem_(cacheItem)
+    {}
+
+    template <class TCallback>
+    Y_FORCE_INLINE decltype(auto) WithHandle(TCallback&& callback) const noexcept;
+
+    TCacheItem CacheItem_;
+};
+
+// Ordinary eviction must keep a natively owned page findable and its payload valid
+template <class TTraits = TProdTraits>
+class TCachePageRefImpl : private TMoveOnly {
+public:
+    TCachePageRefImpl() noexcept = default;
+
+    Y_FORCE_INLINE ~TCachePageRefImpl() noexcept {
+        Drop();
+    }
+
+    Y_FORCE_INLINE TCachePageRefImpl(TCachePageRefImpl&& other) noexcept
+        : Ref_(std::move(other.Ref_))
+    {}
+
+    Y_FORCE_INLINE TCachePageRefImpl& operator=(TCachePageRefImpl&& other) noexcept;
+
+    explicit operator bool() const noexcept {
+        return bool(Ref_);
+    }
+
+    Y_FORCE_INLINE TPageCacheItem CacheItem() const noexcept {
+        Y_DEBUG_ABORT_UNLESS(Ref_);
+        return TPageCacheItem::FromValidated(Ref_.CacheItem_);
+    }
+
+    Y_FORCE_INLINE const char* data() const noexcept {
+        return Borrow().data();
+    }
+
+    Y_FORCE_INLINE size_t size() const noexcept {
+        return Borrow().size();
+    }
+
+    Y_FORCE_INLINE NActors::TSharedData BuildSharedData() const noexcept {
+        return WithHandle([](const THandle& handle) {
+            return handle.Body.PageBuffer.Share(handle.Key2OrSize.load(std::memory_order_relaxed));
+        });
+    }
+    // Construct an independent owner only when moving or borrowing cannot preserve the required lifetime.
+    Y_FORCE_INLINE TCachePageRefImpl Acquire() const& noexcept {
+        if (!Ref_) {
+            return {};
+        }
         TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
-        return cache.IsPageSticky(CacheItem());
+        return TCachePageRefImpl(cache.Items_.AcquireMorePageRef(Ref_.CacheItem()));
+    }
+
+    Y_FORCE_INLINE TCachePageConstRefImpl<TTraits> Borrow() const& noexcept {
+        return TCachePageConstRefImpl<TTraits>(Ref_.CacheItem());
+    }
+
+    TCachePageConstRefImpl<TTraits> Borrow() const&& = delete;
+
+    Y_FORCE_INLINE NTable::NPage::TPageOffset GetOffset() const noexcept {
+        return Borrow().GetOffset();
+    }
+
+    Y_FORCE_INLINE NTable::NPage::TPageLocation GetLocation() const noexcept {
+        return Borrow().GetLocation();
+    }
+
+    Y_FORCE_INLINE TLogoBlobID GetCollectionId() const noexcept {
+        return Borrow().GetCollectionId();
+    }
+
+    Y_FORCE_INLINE NTable::NPage::EPage GetType() const noexcept {
+        return Borrow().GetType();
+    }
+
+    Y_FORCE_INLINE bool IsSticky() const noexcept {
+        return Borrow().IsSticky();
     }
 
     Y_FORCE_INLINE void Drop() noexcept {
@@ -371,16 +432,22 @@ Y_FORCE_INLINE TCachePageRefImpl<TTraits>& TCachePageRefImpl<TTraits>::operator=
 
 template <class TTraits>
 template <class TCallback>
-Y_FORCE_INLINE decltype(auto) TCachePageRefImpl<TTraits>::WithHandle(TCallback&& callback) const noexcept {
-    Y_DEBUG_ABORT_UNLESS(Ref_);
+Y_FORCE_INLINE decltype(auto) TCachePageConstRefImpl<TTraits>::WithHandle(TCallback&& callback) const noexcept {
+    Y_DEBUG_ABORT_UNLESS(*this);
     TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
-    const TCacheItem item = Ref_.CacheItem();
+    const TCacheItem item = CacheItem_;
     const THandle& handle = cache.Space_->OwnedHandle(item);
     Y_DEBUG_ABORT_UNLESS([&] {
         const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
         return item.Matches(state) && state.IsPageKind() && state.Refs() != 0;
     }());
     return std::forward<TCallback>(callback)(handle);
+}
+
+template <class TTraits>
+template <class TCallback>
+Y_FORCE_INLINE decltype(auto) TCachePageRefImpl<TTraits>::WithHandle(TCallback&& callback) const noexcept {
+    return Borrow().WithHandle(std::forward<TCallback>(callback));
 }
 
 template <class TTraits>
@@ -394,11 +461,11 @@ Y_FORCE_INLINE TCacheCollectionRefImpl<TTraits>& TCacheCollectionRefImpl<TTraits
 }
 
 template <class TTraits>
-Y_FORCE_INLINE TLogoBlobID TCachePageRefImpl<TTraits>::GetCollectionId() const noexcept {
+Y_FORCE_INLINE TLogoBlobID TCachePageConstRefImpl<TTraits>::GetCollectionId() const noexcept {
     return WithHandle([](const THandle& page) {
         TCacheImpl<TTraits>& cache = TCacheImpl<TTraits>::Get();
         const TCacheItem item = TCacheItem::FromRaw(page.Key0.load(std::memory_order_relaxed));
-        // The owned page retains its collection's handle and metadata through its page attachment
+        // The page owner retains its collection's handle and metadata through its page attachment
         const auto& collection = cache.Space_->OwnedHandle(item);
         Y_DEBUG_ABORT_UNLESS([&] {
             const THandleState state = THandleState::FromRaw(collection.State.load(std::memory_order_acquire));

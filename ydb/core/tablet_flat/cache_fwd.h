@@ -38,11 +38,14 @@ using TCache = TCacheImpl<TProdTraits>;
 template <class TTraits>
 class TCachePageRefImpl;
 template <class TTraits>
+class TCachePageConstRefImpl;
+template <class TTraits>
 class TCacheCollectionRefImpl;
 template <class TTraits>
 class TPageFetchImpl;
 
 using TCachePageRef = TCachePageRefImpl<TProdTraits>;
+using TCachePageConstRef = TCachePageConstRefImpl<TProdTraits>;
 using TCacheCollectionRef = TCacheCollectionRefImpl<TProdTraits>;
 using TPageFetch = TPageFetchImpl<TProdTraits>;
 
@@ -52,6 +55,7 @@ namespace NKikimr {
 
 using NSharedCache::TCache;
 using NSharedCache::TCacheCollectionRef;
+using NSharedCache::TCachePageConstRef;
 using NSharedCache::TCachePageRef;
 
 } // namespace NKikimr
