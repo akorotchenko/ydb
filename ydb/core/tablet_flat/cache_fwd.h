@@ -22,6 +22,8 @@ class TCacheImpl;
 template <class TTraits>
 class TCacheOperation;
 template <class TTraits>
+class TCacheOpBatch;
+template <class TTraits>
 class TCacheOperationView;
 template <class TTraits>
 class TCacheItemsOperation;

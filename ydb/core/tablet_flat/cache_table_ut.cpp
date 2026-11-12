@@ -525,6 +525,15 @@ public:
         return space.CurrentSpaceState();
     }
 
+    static bool AdvanceSpaceGeneration(TTestCache& cache) noexcept {
+        return cache.Space_->AdvanceSpaceGeneration();
+    }
+
+    static bool TryDrainBefore(TTestCache& cache, ui32 generation) noexcept {
+        ui32 cursor = 0;
+        return cache.Space_->TryDrainBefore(generation, cursor);
+    }
+
     static TBucketResizeState BucketResizeState(const TCacheSpace& space) noexcept {
         return space.BucketResizeState();
     }
@@ -1476,6 +1485,65 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         TCollectionRegistry Registry;
         TIntrusivePtr<TTestCache> Cache;
     };
+
+    Y_UNIT_TEST(OpBatchRenewsTheNativeViewAtPageBoundaries) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const ui32 firstGeneration = TCacheTestAccess::CurrentSpaceState(*fixture.Space).Generation();
+        std::optional<TTestCache::TOpBatch> batch;
+        batch.emplace(cache.BeginOpBatch());
+        UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazard->State.load()), 1);
+        for (ui32 step = 1; step <= 2; ++step) {
+            const ui32 nextGeneration = firstGeneration + step;
+            UNIT_ASSERT(TCacheTestAccess::AdvanceSpaceGeneration(cache));
+            UNIT_ASSERT(!TCacheTestAccess::TryDrainBefore(cache, nextGeneration));
+            for (ui32 visit = 0; visit < CacheOperationBatchSize; ++visit) {
+                batch->ProcessPage([&](auto& cacheOp) {
+                    UNIT_ASSERT_VALUES_EQUAL(cacheOp.EntryGeneration(), nextGeneration - 1);
+                    UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazard->State.load()), 1);
+                });
+            }
+            UNIT_ASSERT(TCacheTestAccess::TryDrainBefore(cache, nextGeneration));
+        }
+        const auto generation = batch->ProcessPage([](auto& cacheOp) {
+            return cacheOp.EntryGeneration();
+        });
+        UNIT_ASSERT_VALUES_EQUAL(generation, firstGeneration + 2);
+        batch.reset();
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
+    }
+
+    Y_UNIT_TEST(OpBatchReturnsNativeOwnersAndReleasesOnExceptions) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(295, 297, 6), ECacheMode::Regular);
+        const auto page = InsertReadyPage(cache, TCacheKey::Page(collection, 1));
+        TTestCachePageRef held;
+        {
+            auto batch = cache.BeginOpBatch();
+            for (ui32 visit = 0; visit < CacheOperationBatchSize - 1; ++visit) {
+                batch.ProcessPage([](auto&) {
+                });
+            }
+            held = batch.ProcessPage([&](auto& cacheOp) {
+                TOperationItemRef<TTestTraits> ref(cacheOp.SpaceOperation());
+                UNIT_ASSERT(cacheOp.FindPage(collection, 1, ref.Get()) == ECacheResultStatus::Hit);
+                return cacheOp.BuildPageRef(ref.Take());
+            });
+            UNIT_ASSERT(held && held.CacheItem() == page);
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazard->State.load()), 1);
+        }
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
+        UNIT_ASSERT(held.data() && held.size());
+        UNIT_ASSERT_EXCEPTION([&] {
+            auto batch = cache.BeginOpBatch();
+            batch.ProcessPage([](auto&) {
+                ythrow yexception() << "page action failure";
+            });
+        }(), yexception);
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
+    }
 
     Y_UNIT_TEST(OperationCollectionAdmissionReturnsCanonicalReadyOwner) {
         TFixture fixture;

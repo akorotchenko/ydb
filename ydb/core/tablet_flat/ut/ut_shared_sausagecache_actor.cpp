@@ -1454,7 +1454,12 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             pages.emplace_back(_P(page), TSharedData::Copy(TString(10, 'w')));
         }
         UNIT_ASSERT(cache.UpdateCurrentLimit(1));
-        saved.AddWrittenPages(cache, pages, true);
+        {
+            auto batch = cache.BeginOpBatch();
+            constexpr ui32 prefix = CacheOperationBatchSize - 1;
+            saved.AddWrittenBatch(batch, { pages.data(), prefix }, true);
+            saved.AddWrittenBatch(batch, { pages.data() + prefix, pages.size() - prefix }, true);
+        }
         UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
         UNIT_ASSERT_VALUES_EQUAL(saved.Pages.size(), pageCount);
         UNIT_ASSERT_VALUES_EQUAL(cache.ReservedPages(), 0);
@@ -1478,7 +1483,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         TSharedPageCacheMock sharedCache(config);
         auto& cache = TCache::Get();
         TEvSaveCompactedPages empty(sharedCache.Collection1);
-        empty.AddWrittenPages(cache, {}, false);
+        {
+            auto batch = cache.BeginOpBatch();
+            empty.AddWrittenBatch(batch, {}, false);
+        }
         UNIT_ASSERT(empty.Pages.empty() && !empty.CacheItem);
         UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
         auto collection = NTable::NTest::AdmitCollection(cache, sharedCache.Collection1);
@@ -1489,8 +1497,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         TVector<NPageCollection::TPageData> regular;
         regular.emplace_back(_P(1), TSharedData::Copy(TString(10, 'r')));
         regular.emplace_back(_P(0), TSharedData::Copy(TString(10, 's')));
-        saved.AddWrittenPages(cache, sticky, true);
-        saved.AddWrittenPages(cache, regular, false);
+        {
+            auto batch = cache.BeginOpBatch();
+            saved.AddWrittenBatch(batch, sticky, true);
+            saved.AddWrittenBatch(batch, regular, false);
+        }
         UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazard->State.load()));
         UNIT_ASSERT_VALUES_EQUAL(saved.Pages.size(), 3);
         UNIT_ASSERT(saved.Pages[0] == _P(0) && saved.Pages[1] == _P(1) && saved.Pages[2] == _P(0));

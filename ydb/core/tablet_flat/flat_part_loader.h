@@ -82,30 +82,28 @@ namespace NTable {
                 Y_ENSURE(slot < Slots.SlotsCount(), "Unsupported page collection " << slot);
 
                 auto readScope = BeginOpBatch();
-                auto& savedPages = SavedPages[slot];
-                auto savedPage = savedPages.find(location.Offset);
+                return OpBatch_->ProcessPage([&](auto& cacheOp) {
+                    auto& savedPages = SavedPages[slot];
+                    auto savedPage = savedPages.find(location.Offset);
 
-                if (savedPage == savedPages.end() || !savedPage->second) {
-                    if (auto page = PageCollections[slot]->TryGetPage(
-                            *ReadOperation_, location, NeedIn(location.Type) || location.Type == EPage::FlatIndex)) {
-                        // Retain the page while decoding, even if its cache entry is withdrawn.
-                        AddSavedPage(slot, location.Offset, std::move(page));
-                        savedPage = savedPages.find(location.Offset);
+                    if (savedPage == savedPages.end() || !savedPage->second) {
+                        if (auto page = PageCollections[slot]->TryGetPage(
+                                cacheOp, location, NeedIn(location.Type) || location.Type == EPage::FlatIndex)) {
+                            // Retain the page while decoding, even if its cache entry is withdrawn.
+                            AddSavedPage(slot, location.Offset, std::move(page));
+                            savedPage = savedPages.find(location.Offset);
+                        }
                     }
-                }
 
-                TCachePageRef result;
-                if (savedPage != savedPages.end() && savedPage->second) {
-                    result = savedPage->second.Acquire();
-                } else {
-                    auto [it, inserted] = NeedPages[slot].emplace(location);
-                    Y_DEBUG_ABORT_UNLESS(inserted || *it == location);
-                }
-                // Bound the active view lifetime
-                if (++OpPageCount_ == NSharedCache::CacheOperationBatchSize) {
-                    RestartOpBatch();
-                }
-                return result;
+                    TCachePageRef result;
+                    if (savedPage != savedPages.end() && savedPage->second) {
+                        result = savedPage->second.Acquire();
+                    } else {
+                        auto [it, inserted] = NeedPages[slot].emplace(location);
+                        Y_DEBUG_ABORT_UNLESS(inserted || *it == location);
+                    }
+                    return result;
+                });
             }
 
             void EnsureNoNeedPages() const
@@ -153,16 +151,15 @@ namespace NTable {
 
         private:
             bool DoBeginOpBatch() noexcept override {
-                if (ReadOperation_) {
+                if (OpBatch_) {
                     return false;
                 }
-                ReadOperation_.emplace(TCache::Get().BeginOperation());
+                OpBatch_.emplace(TCache::Get().BeginOpBatch());
                 return true;
             }
 
             void DoEndOpBatch() noexcept override {
-                ReadOperation_.reset();
-                OpPageCount_ = 0;
+                OpBatch_.reset();
             }
 
             void AddSavedPage(ui32 slot, TPageOffset offset, TCachePageRef&& page)
@@ -179,8 +176,7 @@ namespace NTable {
             const TPart* Part = nullptr;
             const TVector<TCacheCollectionRef> PageCollections;
             const TPartSlots Slots;
-            std::optional<TCache::TOperation> ReadOperation_;
-            ui32 OpPageCount_ = 0;
+            std::optional<TCache::TOpBatch> OpBatch_;
             TVector<THashMap<TPageOffset, TCachePageRef>> SavedPages;
             // Dedup by offset — keep Size/Type for the fetch request
             TVector<THashSet<TPageLocation, NPage::TPageLocationByOffsetHash, TPageLocationByOffsetEq>> NeedPages;

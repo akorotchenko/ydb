@@ -161,7 +161,8 @@ namespace NKikimr::NSharedCache {
             return cacheOp.AdmitWrittenPage(CacheItem, page.Location, std::move(page.Data), sticky);
         }
 
-        void AddWrittenPages(TCache& cache, TArrayRef<NPageCollection::TPageData> pages, bool sticky);
+        // Prepare the collection before starting its page batch
+        void AddWrittenBatch(TCache::TOpBatch& batch, TArrayRef<NPageCollection::TPageData> pages, bool sticky);
 
         void PrepareCollection(TCache& cache) {
             EnsureCollection(cache);

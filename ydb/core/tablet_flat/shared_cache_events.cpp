@@ -19,18 +19,18 @@ TCachePageRef TEvSaveCompactedPages::AddPage(
     return cacheOp.AdmitPage(CacheItem, page.Location, std::move(page.Data), sticky);
 }
 
-void TEvSaveCompactedPages::AddWrittenPages(TCache& cache, TArrayRef<NPageCollection::TPageData> pages, bool sticky) {
+void TEvSaveCompactedPages::AddWrittenBatch(
+    TCache::TOpBatch& batch, TArrayRef<NPageCollection::TPageData> pages, bool sticky) {
     if (pages.empty()) {
         return;
     }
-    EnsureCollection(cache);
-    for (size_t next = 0; next < pages.size();) {
-        const size_t end = next + Min<size_t>(CacheOperationBatchSize, pages.size() - next);
-        for (auto cacheOp = cache.BeginOperation(); next < end; ++next) {
-            auto page = AddWrittenPage(cacheOp, std::move(pages[next]), sticky);
+    Y_DEBUG_ABORT_UNLESS(Collection_);
+    for (auto& pageData : pages) {
+        batch.ProcessPage([&](auto& cacheOp) {
+            auto page = AddWrittenPage(cacheOp, std::move(pageData), sticky);
             // Release this producer's owner under the same guard, including Sticky/Cold cleanup
             TOperationItemRef<TProdTraits> owner(cacheOp.SpaceOperation(), page.TakeNativeRef());
-        }
+        });
     }
 }
 

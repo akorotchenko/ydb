@@ -16,7 +16,9 @@
 #include <util/generic/size_literals.h>
 
 #include <new>
+#include <optional>
 #include <type_traits>
+#include <utility>
 
 namespace NKikimr::NSharedCache {
 
@@ -133,8 +135,10 @@ public:
     TCacheImpl& operator=(const TCacheImpl&) = delete;
 
     using TOperation = TCacheOperation<TTraits>;
+    using TOpBatch = TCacheOpBatch<TTraits>;
 
     Y_FORCE_INLINE TOperation BeginOperation() noexcept;
+    Y_FORCE_INLINE TOpBatch BeginOpBatch() noexcept;
 
     static TCacheImpl& Get() noexcept {
         TCacheImpl* cache = TryGet();
@@ -1296,6 +1300,77 @@ private:
 };
 
 template <class TTraits>
+class TCacheOpBatch final {
+public:
+    using TOperation = TCacheOperation<TTraits>;
+
+    TCacheOpBatch(const TCacheOpBatch&) = delete;
+    TCacheOpBatch& operator=(const TCacheOpBatch&) = delete;
+    TCacheOpBatch& operator=(TCacheOpBatch&&) = delete;
+    Y_FORCE_INLINE TCacheOpBatch(TCacheOpBatch&& other) noexcept;
+
+    // Actions must not restart or reenter this batch, or retain operation-bound references
+    // Return independent owners or values
+    template <class TAction>
+    Y_FORCE_INLINE auto ProcessPage(TAction&& action);
+
+    Y_FORCE_INLINE void Restart() noexcept;
+
+private:
+    friend class TCacheImpl<TTraits>;
+
+    Y_FORCE_INLINE explicit TCacheOpBatch(TCacheImpl<TTraits>& cache) noexcept;
+    Y_FORCE_INLINE void FinishPage() noexcept;
+
+    TCacheImpl<TTraits>& Cache_;
+    std::optional<TOperation> Operation_;
+    ui32 OpPageCount_ = 0;
+};
+
+template <class TTraits>
+Y_FORCE_INLINE TCacheOpBatch<TTraits>::TCacheOpBatch(TCacheOpBatch&& other) noexcept
+    : Cache_(other.Cache_)
+    , Operation_(std::move(other.Operation_))
+    , OpPageCount_(other.OpPageCount_)
+{}
+
+template <class TTraits>
+Y_FORCE_INLINE TCacheOpBatch<TTraits>::TCacheOpBatch(TCacheImpl<TTraits>& cache) noexcept
+    : Cache_(cache)
+    , Operation_(cache.BeginOperation())
+{}
+
+template <class TTraits>
+template <class TAction>
+Y_FORCE_INLINE auto TCacheOpBatch<TTraits>::ProcessPage(TAction&& action) {
+    using TResult = std::invoke_result_t<TAction, TOperation&>;
+    static_assert(!std::is_reference_v<TResult>, "A page action must return an independent owner or value");
+    if constexpr (std::is_void_v<TResult>) {
+        std::forward<TAction>(action)(*Operation_);
+        FinishPage();
+    } else {
+        auto result = std::forward<TAction>(action)(*Operation_);
+        FinishPage();
+        return result;
+    }
+}
+
+template <class TTraits>
+Y_FORCE_INLINE void TCacheOpBatch<TTraits>::Restart() noexcept {
+    Operation_.reset();
+    OpPageCount_ = 0;
+    Operation_.emplace(Cache_.BeginOperation());
+}
+
+template <class TTraits>
+Y_FORCE_INLINE void TCacheOpBatch<TTraits>::FinishPage() noexcept {
+    // Bound the active view lifetime
+    if (++OpPageCount_ == CacheOperationBatchSize) {
+        Restart();
+    }
+}
+
+template <class TTraits>
 Y_FORCE_INLINE typename TCacheImpl<TTraits>::TOperationView TCacheImpl<TTraits>::BindOperation(
     TSpaceOperation& spaceOp) noexcept {
     return TOperationView(*this, spaceOp);
@@ -1304,6 +1379,11 @@ Y_FORCE_INLINE typename TCacheImpl<TTraits>::TOperationView TCacheImpl<TTraits>:
 template <class TTraits>
 Y_FORCE_INLINE typename TCacheImpl<TTraits>::TOperation TCacheImpl<TTraits>::BeginOperation() noexcept {
     return TOperation(*this, Space_->BeginOperation());
+}
+
+template <class TTraits>
+Y_FORCE_INLINE typename TCacheImpl<TTraits>::TOpBatch TCacheImpl<TTraits>::BeginOpBatch() noexcept {
+    return TOpBatch(*this);
 }
 
 using TPageFetch = TPageFetchImpl<>;

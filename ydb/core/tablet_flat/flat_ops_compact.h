@@ -808,8 +808,11 @@ namespace NTabletFlatExecutor {
                         MakeHolder<NSharedCache::TEvSaveCompactedPages>(pageCollection.PageCollection);
                     saveCompactedPages->PrepareCollection(sharedCache);
                     auto resultingPageCollection = saveCompactedPages->Collection().Acquire();
-                    saveCompactedPages->AddWrittenPages(sharedCache, pageCollection.StickyPages, true);
-                    saveCompactedPages->AddWrittenPages(sharedCache, pageCollection.RegularPages, false);
+                    {
+                        auto batch = sharedCache.BeginOpBatch();
+                        saveCompactedPages->AddWrittenBatch(batch, pageCollection.StickyPages, true);
+                        saveCompactedPages->AddWrittenBatch(batch, pageCollection.RegularPages, false);
+                    }
 
                     Send(MakeSharedPageCacheId(), saveCompactedPages.Release());
 
