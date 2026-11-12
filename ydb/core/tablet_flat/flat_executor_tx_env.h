@@ -89,7 +89,7 @@ namespace NTabletFlatExecutor {
     private:
         using THashSetOfLocation = THashSet<TPageLocation, NTable::NPage::TPageLocationByOffsetHash>;
 
-        bool DoBeginRead() noexcept override {
+        bool DoBeginOpBatch() noexcept override {
             if (ReadOperation_) {
                 return false;
             }
@@ -97,8 +97,9 @@ namespace NTabletFlatExecutor {
             return true;
         }
 
-        void DoEndRead() noexcept override {
+        void DoEndOpBatch() noexcept override {
             ReadOperation_.reset();
+            OpPageCount_ = 0;
         }
 
         void ToLoadPage(const TPageLocation& location, TCollection* pageCollection) {
@@ -113,8 +114,13 @@ namespace NTabletFlatExecutor {
 
         TCachePageRef TryGetPage(const TPageLocation& location, TCollection* pageCollection)
         {
-            auto readScope = BeginRead();
+            auto readScope = BeginOpBatch();
             auto sharedBody = pageCollection->TryGetPage(*ReadOperation_, location);
+
+            // Bound the active view lifetime
+            if (++OpPageCount_ == NSharedCache::CacheOperationBatchSize) {
+                RestartOpBatch();
+            }
 
             if (!sharedBody) {
                 ToLoadPage(location, pageCollection);
@@ -148,6 +154,7 @@ namespace NTabletFlatExecutor {
     private:
         TSeat& Seat;
         std::optional<TCache::TOperation> ReadOperation_;
+        ui32 OpPageCount_ = 0;
 
         THashMap<TLogoBlobID, THashSetOfLocation> ToLoad;
 

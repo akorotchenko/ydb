@@ -328,7 +328,7 @@ TLoader::TFetch TLoader::StageCreatePartView(bool preloadIndex)
     };
 
     {
-        auto readScope = LoaderEnv->BeginRead();
+        auto readScope = LoaderEnv->BeginOpBatch();
         if (BTreeGroupIndexes) {
             if (preloadIndex) {
                 // Note: preload root nodes only because we don't want to have multiple restarts here
@@ -546,7 +546,7 @@ TLoader::TFetch TLoader::StagePreloadData()
 
         bool anyMissed = false;
         {
-            auto readScope = LoaderEnv->BeginRead();
+            auto readScope = LoaderEnv->BeginOpBatch();
             for (auto& item : PreloadBTreeWalkers) {
                 if (!item.Walker) {
                     continue;
@@ -574,7 +574,7 @@ TLoader::TFetch TLoader::StagePreloadData()
     // V1 path: all pages of the page collections with data and index pages of the main group
     TSet<ui32> slots{ partStore->DataSlot({}), partStore->IndexSlot({}) };
     {
-        auto readScope = LoaderEnv->BeginRead();
+        auto readScope = LoaderEnv->BeginOpBatch();
         for (ui32 slot : slots) {
             auto pageCollection = partStore->PageCollections[slot]->PageCollection();
             auto total = pageCollection->MetaPages();

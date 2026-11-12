@@ -482,7 +482,7 @@ Y_UNIT_TEST_SUITE(TColdPartCollectionMetadata) {
 }
 
 Y_UNIT_TEST_SUITE_F(TPartLoaderReadScopes, NTest::TTableCacheTest) {
-    Y_UNIT_TEST(SavedPagesNeedNoNativeOperation) {
+    Y_UNIT_TEST(SavedPagesShareReadScopeOperation) {
         const auto written = WritePart();
         const auto pages = DataPages(written);
         auto collection = AdmitReadCollection(written);
@@ -498,13 +498,16 @@ Y_UNIT_TEST_SUITE_F(TPartLoaderReadScopes, NTest::TTableCacheTest) {
         env.Save(std::move(loaded));
         env.EnsureNoNeedPages();
 
-        auto scope = env.BeginRead();
-        UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
-        UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
+        {
+            auto scope = env.BeginOpBatch();
+            UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 1);
+            UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
+            UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 1);
+        }
         UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
     }
 
-    Y_UNIT_TEST(NestedScopesReuseALazilyOpenedOperation) {
+    Y_UNIT_TEST(NestedScopesReuseOneOperation) {
         const auto written = WritePart();
         const auto pages = DataPages(written);
         auto collection = AdmitReadCollection(written);
@@ -513,10 +516,11 @@ Y_UNIT_TEST_SUITE_F(TPartLoaderReadScopes, NTest::TTableCacheTest) {
         UNIT_ASSERT(page);
         auto env = MakeReadEnv(collection.Acquire());
         {
-            auto outer = env.BeginRead();
-            UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
+            auto outer = env.BeginOpBatch();
+            UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 1);
             {
-                auto inner = env.BeginRead();
+                auto inner = env.BeginOpBatch();
+                UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 1);
                 UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
                 UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 1);
             }
@@ -529,7 +533,7 @@ Y_UNIT_TEST_SUITE_F(TPartLoaderReadScopes, NTest::TTableCacheTest) {
         UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
     }
 
-    Y_UNIT_TEST(SavedPageVisitsReleaseTheGuardAndTheNextMissReopensIt) {
+    Y_UNIT_TEST(SavedPageVisitsRenewOperationWithoutEndingReadScope) {
         const auto written = WritePart();
         const auto pages = DataPages(written);
         auto collection = AdmitReadCollection(written);
@@ -538,14 +542,17 @@ Y_UNIT_TEST_SUITE_F(TPartLoaderReadScopes, NTest::TTableCacheTest) {
         UNIT_ASSERT(page);
         auto env = MakeReadEnv(collection.Acquire());
         {
-            auto scope = env.BeginRead();
+            auto scope = env.BeginOpBatch();
             for (ui32 visit = 0; visit < NSharedCache::CacheOperationBatchSize; ++visit) {
                 UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
-                UNIT_ASSERT_VALUES_EQUAL(
-                    ActiveLoaderOperations(), visit + 1 == NSharedCache::CacheOperationBatchSize ? 0 : 1);
+                UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 1);
             }
-            UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
-            UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 0);
+            {
+                auto inner = env.BeginOpBatch();
+                UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 1);
+                UNIT_ASSERT(env.TryGetSlotPage(0, pages[0]->Location));
+            }
+            UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 1);
             UNIT_ASSERT(!env.TryGetSlotPage(0, pages[1]->Location));
             UNIT_ASSERT_VALUES_EQUAL(ActiveLoaderOperations(), 1);
         }

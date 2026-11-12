@@ -48,7 +48,7 @@ namespace NTable {
 
             Data = { };
 
-            auto readScope = Env->BeginRead();
+            auto readScope = Env->BeginOpBatch();
 
             // Make sure we're at the correct index position first
             if (auto ready = Index.Seek(rowId); ready != EReady::Data) {
@@ -138,7 +138,7 @@ namespace NTable {
             Y_DEBUG_ABORT_UNLESS(seek == ESeek::Exact || seek == ESeek::Lower || seek == ESeek::Upper,
                     "Only ESeek{Exact, Upper, Lower} are currently supported here");
 
-            auto readScope = Env->BeginRead();
+            auto readScope = Env->BeginOpBatch();
             if (auto ready = Index.Seek(seek, key, keyDefaults); ready != EReady::Data) {
                 return Terminate(ready);
             }
@@ -224,7 +224,7 @@ namespace NTable {
             Y_DEBUG_ABORT_UNLESS(seek == ESeek::Exact || seek == ESeek::Lower || seek == ESeek::Upper,
                     "Only ESeek{Exact, Upper, Lower} are currently supported here");
 
-            auto readScope = Env->BeginRead();
+            auto readScope = Env->BeginOpBatch();
             if (auto ready = Index.SeekReverse(seek, key, keyDefaults); ready != EReady::Data) {
                 return Terminate(ready);
             }
@@ -302,7 +302,7 @@ namespace NTable {
                 return Exhausted();
             }
 
-            auto readScope = Env->BeginRead();
+            auto readScope = Env->BeginOpBatch();
             if (auto ready = SeekIndex(rowId); ready != EReady::Data) {
                 return Terminate(ready);
             }
@@ -352,7 +352,7 @@ namespace NTable {
                 }
             }
 
-            auto readScope = Env->BeginRead();
+            auto readScope = Env->BeginOpBatch();
             if (Data) {
                 // Go to the next data page
                 // Keep Data in case we have page faulted on Index.Next and need to call it again
@@ -402,7 +402,7 @@ namespace NTable {
                 }
             }
 
-            auto readScope = Env->BeginRead();
+            auto readScope = Env->BeginOpBatch();
             if (Data) {
                 // Go to the prev data page
                 // Keep Data in case we have page faulted on Index.Prev and need to call it again
@@ -557,7 +557,7 @@ namespace NTable {
                     }
 
                     if (!Data) {
-                        auto readScope = Env->BeginRead();
+                        auto readScope = Env->BeginOpBatch();
                         // Row is not on current page, move to the next
                         switch (Index.Next()) {
                             case EReady::Page: {
@@ -635,7 +635,7 @@ namespace NTable {
                 }
             }
 
-            auto readScope = Env->BeginRead();
+            auto readScope = Env->BeginOpBatch();
 
             // Special case when we are following a previous Index estimate
             if (rowId == RowId && RowVersion <= rowVersion && rowVersion <= MaxVersion) {

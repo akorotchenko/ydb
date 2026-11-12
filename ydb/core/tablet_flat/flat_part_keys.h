@@ -18,7 +18,7 @@ namespace NTable {
 
         TIntrusivePtr<TSlices> Do(TIntrusiveConstPtr<TScreen> screen)
         {
-            auto readScope = Env->BeginRead();
+            auto readScope = Env->BeginOpBatch();
             if (!screen) {
                 // Use a full screen to simplify logic below
                 screen = new TScreen({ TScreen::THole(true) });

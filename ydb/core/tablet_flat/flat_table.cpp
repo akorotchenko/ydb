@@ -920,7 +920,7 @@ TPrechargeResult TTable::Precharge(TRawVals minKey_, TRawVals maxKey_, TTagsRef 
         const NBloom::TPrefix prefix(key);
 
         for (const auto& run : GetLevels()) {
-            auto readScope = env->BeginRead();
+            auto readScope = env->BeginOpBatch();
             auto pos = run.Find(key);
             if (pos != run.end()) {
                 const auto* part = pos->Part.Get();
@@ -947,7 +947,7 @@ TPrechargeResult TTable::Precharge(TRawVals minKey_, TRawVals maxKey_, TTagsRef 
         const TCelled maxKey(maxKey_, *Scheme->Keys, false);
 
         for (const auto& run : GetLevels()) {
-            auto readScope = env->BeginRead();
+            auto readScope = env->BeginOpBatch();
             TPrechargeResult chargeResult;
 
             switch (direction) {
@@ -1293,7 +1293,7 @@ TAutoPtr<TTableIter> TTable::Iterate(const TCelled& key, TTagsRef tags, IPages* 
         }
 
         if (Flatten) {
-            auto readScope = env->BeginRead();
+            auto readScope = env->BeginOpBatch();
             for (const auto& run : GetLevels()) {
                 auto iter = MakeHolder<TRunIter>(run, dbIter->Remap.Tags, Scheme->Keys, env);
 
@@ -1348,7 +1348,7 @@ TAutoPtr<TTableReverseIter> TTable::IterateReverse(TRawVals key_, TTagsRef tags,
         }
 
         if (Flatten) {
-            auto readScope = env->BeginRead();
+            auto readScope = env->BeginOpBatch();
             for (const auto& run : GetLevels()) {
                 auto iter = MakeHolder<TRunIter>(run, dbIter->Remap.Tags, Scheme->Keys, env);
 
@@ -1443,7 +1443,7 @@ EReady TTable::Select(TRawVals key_, TTagsRef tags, IPages* env, TRowState& row,
         }
 
         if (!row.IsFinalized() && Flatten) {
-            auto readScope = env->BeginRead();
+            auto readScope = env->BeginOpBatch();
             // Levels are ordered from newest to oldest, apply in order
             for (const auto& run : GetLevels()) {
                 auto pos = run.Find(key);
@@ -1596,7 +1596,7 @@ TSelectRowVersionResult TTable::SelectRowVersion(
                 if ((readFlags & EHint::NoByKey) ||
                     part->MightHaveKeyPrefix(prefix))
                 {
-                    auto readScope = env->BeginRead();
+                    auto readScope = env->BeginOpBatch();
                     TPartIter it(part, { }, Scheme->Keys, env);
                     it.SetBounds(pos->Slice);
                     auto res = it.Seek(key, ESeek::Exact);

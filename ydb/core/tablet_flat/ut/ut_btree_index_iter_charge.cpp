@@ -442,7 +442,9 @@ namespace {
 Y_UNIT_TEST_SUITE_F(TPageReadScope, ::NKikimr::NTable::NTest::TTableCacheTest) {
     Y_UNIT_TEST(DefaultEnvironmentDoesNotStartAnOperation) {
         TTestEnv env;
-        auto scope = env.BeginRead();
+        auto scope = env.BeginOpBatch();
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+        env.RestartOpBatch();
         UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
     }
 
@@ -451,10 +453,12 @@ Y_UNIT_TEST_SUITE_F(TPageReadScope, ::NKikimr::NTable::NTest::TTableCacheTest) {
         NTabletFlatExecutor::TPageCollectionReadEnv env(seat);
         UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
         {
-            auto outer = env.BeginRead();
+            auto outer = env.BeginOpBatch();
             UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
             {
-                auto inner = env.BeginRead();
+                auto inner = env.BeginOpBatch();
+                UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+                env.RestartOpBatch();
                 UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
             }
             UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
@@ -469,7 +473,7 @@ Y_UNIT_TEST_SUITE_F(TPageReadScope, ::NKikimr::NTable::NTest::TTableCacheTest) {
         TReadEnv env(seat);
         TPartGroupRowIter iter(&part, &env, {});
         {
-            auto outer = env.BeginRead();
+            auto outer = env.BeginOpBatch();
             UNIT_ASSERT(iter.Seek(0) == EReady::Data);
             UNIT_ASSERT_VALUES_EQUAL(env.IndexReads, 3);
             UNIT_ASSERT_VALUES_EQUAL(env.DataReads, 1);
@@ -576,11 +580,21 @@ Y_UNIT_TEST_SUITE_F(TPageReadScope, ::NKikimr::NTable::NTest::TTableCacheTest) {
         IPages& env = cacheEnv;
         TCachePageRef retained;
         {
-            auto scope = env.BeginRead();
+            auto scope = env.BeginOpBatch();
             retained = env.TryGetPage(&stored, location, {});
             auto repeated = env.TryGetPage(&stored, location, {});
             UNIT_ASSERT(retained && repeated);
             UNIT_ASSERT(retained.CacheItem() == repeated.CacheItem());
+            for (ui32 visit = 2; visit < 2 * NSharedCache::CacheOperationBatchSize + 1; ++visit) {
+                auto page = env.TryGetPage(&stored, location, {});
+                UNIT_ASSERT(page && page.CacheItem() == retained.CacheItem());
+                UNIT_ASSERT(page.data() == original.data());
+                UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+            }
+            {
+                auto inner = env.BeginOpBatch();
+                UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+            }
             UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
             UNIT_ASSERT_VALUES_EQUAL(seat.Pinned.size(), 1);
             UNIT_ASSERT_VALUES_EQUAL(cacheEnv.GetStats().NewlyPinnedPages, 1);
@@ -596,7 +610,18 @@ Y_UNIT_TEST_SUITE_F(TPageReadScope, ::NKikimr::NTable::NTest::TTableCacheTest) {
         UNIT_ASSERT_VALUES_EQUAL(cacheEnv.GetStats().NewlyPinnedPages, 1);
 
         const auto missing = IndexTools::GetLastPageLocation(part, {});
-        UNIT_ASSERT(!env.TryGetPage(&stored, missing, {}));
+        {
+            auto scope = env.BeginOpBatch();
+            for (ui32 visit = 0; visit < NSharedCache::CacheOperationBatchSize + 1; ++visit) {
+                UNIT_ASSERT(!env.TryGetPage(&stored, missing, {}));
+                UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+            }
+            {
+                auto inner = env.BeginOpBatch();
+                UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+        }
         UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
         UNIT_ASSERT_VALUES_EQUAL(cacheEnv.GetStats().ToLoadPages, 1);
     }

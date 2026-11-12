@@ -65,7 +65,7 @@ namespace NTable {
 
             ~TReadScope() {
                 if (Env_) {
-                    Env_->DoEndRead();
+                    Env_->DoEndOpBatch();
                 }
             }
 
@@ -80,8 +80,14 @@ namespace NTable {
         };
 
         // Lexical scopes reuse the outer read operation and end before waiting for pages
-        [[nodiscard]] TReadScope BeginRead() noexcept {
-            return TReadScope(DoBeginRead() ? this : nullptr);
+        [[nodiscard]] TReadScope BeginOpBatch() noexcept {
+            return TReadScope(DoBeginOpBatch() ? this : nullptr);
+        }
+
+        // Restart an active batch while its RAII scope keeps ownership of cleanup
+        void RestartOpBatch() noexcept {
+            DoEndOpBatch();
+            DoBeginOpBatch();
         }
 
         struct TResult : private TMoveOnly {
@@ -226,11 +232,11 @@ namespace NTable {
         }
 
     protected:
-        virtual bool DoBeginRead() noexcept {
+        virtual bool DoBeginOpBatch() noexcept {
             return false;
         }
 
-        virtual void DoEndRead() noexcept {}
+        virtual void DoEndOpBatch() noexcept {}
     };
 
 }
