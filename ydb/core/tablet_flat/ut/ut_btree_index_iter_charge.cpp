@@ -612,6 +612,21 @@ Y_UNIT_TEST_SUITE_F(TPageReadScope, ::NKikimr::NTable::NTest::TTableCacheTest) {
         UNIT_ASSERT_VALUES_EQUAL(cacheEnv.GetStats().NewlyPinnedPages, 1);
 
         const auto missing = IndexTools::GetLastPageLocation(part, {});
+        // Part construction may have cached this page; remove it before testing misses
+        {
+            auto cacheOp = TCache::Get().BeginOperation();
+            NSharedCache::TCacheItem item;
+            if (cacheOp.FindPage(stored.PageCollections.front().CacheItem(), static_cast<ui64>(missing.Offset), item) ==
+                NSharedCache::ECacheResultStatus::Hit) {
+                NSharedCache::TOperationItemRef<NSharedCache::TProdTraits> owner(
+                    cacheOp.SpaceOperation(), cacheOp.TryAcquireStructural(item));
+                UNIT_ASSERT(owner);
+                auto state = NSharedCache::THandleState::FromRaw(
+                    cacheOp.Handles()[item.Index()].State.load(std::memory_order_acquire));
+                UNIT_ASSERT(cacheOp.TryBeginErase(owner.Get(), state));
+                cacheOp.Eviction().FinishPageErase(item);
+            }
+        }
         {
             auto scope = env.BeginOpBatch();
             for (ui32 visit = 0; visit < NSharedCache::CacheOperationBatchSize + 1; ++visit) {
