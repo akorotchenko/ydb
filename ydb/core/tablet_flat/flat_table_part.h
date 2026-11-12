@@ -1,6 +1,7 @@
 #pragma once
 
 #include "defs.h"
+#include "flat_part_iface.h"
 #include "flat_part_scheme.h"
 #include "flat_part_slots.h"
 #include "flat_page_btree_index.h"
@@ -19,7 +20,6 @@
 
 namespace NKikimr {
 namespace NTable {
-    struct IPages;
 
     /// Resolves the root TPageLocation from btree meta through page collections.
     /// For v2 roots (byte-offset), returns the inline location directly.

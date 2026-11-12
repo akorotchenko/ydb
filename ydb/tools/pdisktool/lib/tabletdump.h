@@ -2,9 +2,10 @@
 
 #include "issues.h"
 
+#include <ydb/core/tablet_flat/flat_part_iface.h>
+
 namespace NKikimr::NTable {
     class TDatabase;
-    struct IPages;
 }
 
 namespace NKikimr::NPDiskTool {

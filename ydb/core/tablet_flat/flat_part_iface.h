@@ -48,7 +48,7 @@ namespace NTable {
         virtual ui32 GetLastWrittenPageId(ui32 group) const noexcept = 0;
     };
 
-    struct IPages {
+    struct IPageEnvironment {
         using ELargeObj = NTable::ELargeObj;
         using TPart = NTable::TPart;
         using TMemTable = NTable::TMemTable;
@@ -56,7 +56,7 @@ namespace NTable {
         using TPageLocation = NPage::TPageLocation;
         using TGroupId = NPage::TGroupId;
 
-        virtual ~IPages() = default;
+        virtual ~IPageEnvironment() = default;
 
         class TReadScope {
         public:
@@ -70,13 +70,13 @@ namespace NTable {
             }
 
         private:
-            friend struct IPages;
+            friend struct IPageEnvironment;
 
-            explicit TReadScope(IPages* env) noexcept
+            explicit TReadScope(IPageEnvironment* env) noexcept
                 : Env_(env)
             {}
 
-            IPages* Env_;
+            IPageEnvironment* Env_;
         };
 
         // Lexical scopes reuse the outer read operation and end before waiting for pages
@@ -211,20 +211,6 @@ namespace NTable {
         virtual TResult Locate(const TPart*, ui64 ref, ELargeObj lob) = 0;
 
         /**
-         * Returns a data page of the column group, or an empty reference if it is not loaded yet
-         */
-        virtual TCachePageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
-
-        /**
-         * Returns an index page (flat or b-tree) of the column group, or an empty reference if it is not loaded yet
-         *
-         * Index pages may be stored in another page collection than data pages of the same group,
-         * so the page collection is chosen by the part (TPart::IndexSlot) rather than the caller
-         */
-        virtual TCachePageRef TryGetIndexPage(
-            const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
-
-        /**
          * Hook for cleaning up env on DB.RollbackChanges()
          */
         virtual void OnRollbackChanges() {
@@ -239,5 +225,26 @@ namespace NTable {
         virtual void DoEndOpBatch() noexcept {}
     };
 
+    template <class TRef>
+    struct TPages : public IPageEnvironment {
+        using TPageRef = TRef;
+
+        /**
+         * Returns a data page of the column group, or an empty reference if it is not loaded yet
+         */
+        virtual TPageRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
+
+        /**
+         * Returns an index page (flat or b-tree) of the column group, or an empty reference if it is not loaded yet
+         *
+         * Index pages may be stored in another page collection than data pages of the same group,
+         * so the page collection is chosen by the part (TPart::IndexSlot) rather than the caller
+         */
+        virtual TPageRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
+    };
+
+    using IOwnedPages = TPages<TCachePageRef>;
+    using IBorrowedPages = TPages<TCachePageConstRef>;
+    using IPages = IOwnedPages;
 }
 }

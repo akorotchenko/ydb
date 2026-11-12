@@ -14,6 +14,19 @@
 
 namespace NKikimr::NTable::NPage {
 
+static_assert(std::is_same_v<IOwnedPages::TPageRef, TCachePageRef>);
+static_assert(std::is_same_v<IBorrowedPages::TPageRef, TCachePageConstRef>);
+static_assert(std::is_base_of_v<IPageEnvironment, IOwnedPages>);
+static_assert(std::is_base_of_v<IPageEnvironment, IBorrowedPages>);
+static_assert(!std::is_convertible_v<IBorrowedPages*, IOwnedPages*>);
+static_assert(std::is_same_v<decltype(std::declval<IOwnedPages&>().TryGetPage(nullptr, {}, {})), TCachePageRef>);
+static_assert(
+    std::is_same_v<decltype(std::declval<IBorrowedPages&>().TryGetPage(nullptr, {}, {})), TCachePageConstRef>);
+static_assert(
+    std::is_same_v<decltype(std::declval<IBorrowedPages&>().TryGetIndexPage(nullptr, {}, {})), TCachePageConstRef>);
+static_assert(std::is_same_v<IOwnedPages::TResult, IBorrowedPages::TResult>);
+static_assert(sizeof(IPageEnvironment::TResult) == 24);
+
 using NTest::TPartStore;
 
 namespace {
