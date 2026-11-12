@@ -1279,6 +1279,8 @@ class TCacheOperation final : public TSpaceOperation, public TCacheOperationView
     using TOperationView = TCacheOperationView<TTraits>;
 
 public:
+    using TOperationView::AvailableHandleCount;
+    using TOperationView::ReclaimSpareHandle;
     using TOperationView::TryAllocateHandle;
 
     TCacheOperation(const TCacheOperation&) = delete;
