@@ -170,9 +170,11 @@ public:
         return status;
     }
 
+    template <class TTraits>
     static TIntrusivePtr<TPageFetchState> AcquireFetch(
-        TTestCache::TOperation& cacheOp, TPageCacheItem page, TOperationItemRef<TTestTraits>& owner) noexcept {
-        if (cacheOp.TryAcquire(page.CacheItem(), true, owner.Get(), true) != TTestCache::EAcquireStatus::Pending) {
+        TCacheOperation<TTraits>& cacheOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept {
+        if (cacheOp.TryAcquire(page.CacheItem(), true, owner.Get(), true) !=
+            TCacheImpl<TTraits>::EAcquireStatus::Pending) {
             return {};
         }
         TIntrusivePtr<TPageFetchState> fetch = cacheOp.Handles()[page.Index()].Body.Fetch;
@@ -180,9 +182,10 @@ public:
         return fetch;
     }
 
-    static bool MakeReadyPage(TTestCache& cache, TPageCacheItem page, NActors::TSharedData&& data) noexcept {
+    template <class TTraits>
+    static bool MakeReadyPage(TCacheImpl<TTraits>& cache, TPageCacheItem page, NActors::TSharedData&& data) noexcept {
         auto cacheOp = cache.BeginOperation();
-        TOperationItemRef<TTestTraits> owner(cacheOp);
+        TOperationItemRef<TTraits> owner(cacheOp);
         auto fetch = AcquireFetch(cacheOp, page, owner);
         return fetch && cacheOp.Fetches().Complete(owner, *fetch, std::move(data), {});
     }
