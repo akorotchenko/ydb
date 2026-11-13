@@ -7,6 +7,7 @@
 #include "flat_part_charge_range.h"
 #include "flat_part_charge_create.h"
 #include "flat_part_keys.h"
+#include "flat_table.h"
 #include "test/libs/table/test_writer.h"
 #include "test/libs/table/wrap_part.h"
 #include <test/libs/table/test_envs.h>
@@ -630,7 +631,7 @@ Y_UNIT_TEST_SUITE_F(TPageReadScope, ::NKikimr::NTable::NTest::TTableCacheTest) {
             NTabletFlatExecutor::TSeat borrowedSeat(
                 2, TAutoPtr<NTabletFlatExecutor::ITransaction>(new TReadTransaction));
             NTabletFlatExecutor::TPageCollectionReadEnv borrowedEnv(borrowedSeat);
-            auto& borrowedPages = borrowedEnv.BorrowedPages();
+            auto& borrowedPages = *borrowedEnv.BorrowedPages();
             const auto references = [&] {
                 auto cacheOp = TCache::Get().BeginOperation();
                 return NSharedCache::THandleState::FromRaw(
@@ -1955,6 +1956,95 @@ Y_UNIT_TEST_SUITE_F(TRowReaderOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
 }
 
 Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTest) {
+    class TPinBackedEnv final : public TTouchEnv {
+    public:
+        TPinBackedEnv()
+            : Pages(Source)
+        {}
+
+        IBorrowedPages* BorrowedPages() & noexcept override {
+            return &Pages;
+        }
+
+        TCachePageRef TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
+            UNIT_FAIL("Precharge must use the borrowed provider");
+            return {};
+        }
+
+        TCachePageRef TryGetIndexPage(const TPart*, const TPageLocation&, TGroupId) override {
+            UNIT_FAIL("Precharge must use the borrowed provider");
+            return {};
+        }
+
+        TTouchEnv Source;
+        TIndexIteratorOwnership::TBorrowedEnv Pages;
+    };
+
+    void CheckTablePrecharge(const NTest::TPartEggs& eggs) {
+        TScheme::TTableInfo schema("precharge", 1);
+        for (const auto& col : eggs.Scheme->Cols) {
+            auto& column = schema.Columns[col.Tag];
+            column.Id = col.Tag;
+            column.PType = col.TypeInfo;
+            column.KeyOrder = col.Key;
+            column.Family = eggs.Scheme->Families[col.Group];
+        }
+        TTable table(TEpoch::Zero());
+        table.SetScheme(schema);
+        table.Merge(eggs.ToPartView());
+        const TVector<TTag> tags{ 2, 3, 4 };
+        const ui32 first[] = { 1, 5 }, last[] = { 4, 5 };
+        const TRawTypeValue firstKey[] = {
+            TRawTypeValue(&first[0], sizeof(ui32), NScheme::NTypeIds::Uint32),
+            TRawTypeValue(&first[1], sizeof(ui32), NScheme::NTypeIds::Uint32),
+        };
+        const TRawTypeValue lastKey[] = {
+            TRawTypeValue(&last[0], sizeof(ui32), NScheme::NTypeIds::Uint32),
+            TRawTypeValue(&last[1], sizeof(ui32), NScheme::NTypeIds::Uint32),
+        };
+        const std::pair<ui64, ui64> limits[] = { { 0, 0 }, { 5, 0 }, { 0, 1024 } };
+        for (auto direction : { EDirection::Forward, EDirection::Reverse }) {
+            for (bool point : { false, true }) {
+                for (const auto& [items, bytes] : limits) {
+                    TTouchEnv owned;
+                    TPinBackedEnv borrowed;
+                    TSelectStats ownedStats, borrowedStats;
+                    bool ready = false;
+                    for (ui32 retry = 0; retry < 32 && !ready; ++retry) {
+                        const auto precharge = [&](IPages* env, TSelectStats& stats) {
+                            return table.Precharge(firstKey, point ? TRawVals(firstKey) : TRawVals(lastKey), tags, env,
+                                EHint::NoByKey, items, bytes, direction, TRowVersion(0, 1), stats);
+                        };
+                        const auto expected = precharge(&owned, ownedStats);
+                        const auto actual = precharge(&borrowed, borrowedStats);
+                        UNIT_ASSERT_VALUES_EQUAL(actual.Ready, expected.Ready);
+                        UNIT_ASSERT_VALUES_EQUAL(actual.ItemsPrecharged, expected.ItemsPrecharged);
+                        UNIT_ASSERT_VALUES_EQUAL(actual.BytesPrecharged, expected.BytesPrecharged);
+                        UNIT_ASSERT_VALUES_EQUAL(borrowedStats.Sieved, ownedStats.Sieved);
+                        UNIT_ASSERT_VALUES_EQUAL(borrowedStats.Weeded, ownedStats.Weeded);
+                        UNIT_ASSERT(borrowed.Source.Touched == owned.Touched);
+                        ready = actual.Ready;
+                        owned.LoadTouched();
+                        borrowed.Source.LoadTouched();
+                    }
+                    UNIT_ASSERT(ready);
+                }
+            }
+        }
+    }
+
+    Y_UNIT_TEST(TablePrechargeSelectsBorrowedV1) {
+        CheckTablePrecharge(MakePart({ .Levels = 3, .Groups = true, .History = true }));
+    }
+
+    Y_UNIT_TEST(TablePrechargeSelectsBorrowedV2) {
+        CheckTablePrecharge(MakeV2Part({ .Levels = 3, .Groups = true, .History = true }));
+    }
+
+    Y_UNIT_TEST(TablePrechargeSelectsBorrowedFlat) {
+        CheckTablePrecharge(MakePart({ .Levels = 3, .Groups = true, .History = true, .FlatOnly = true }));
+    }
+
     void CheckCharge(const NTest::TPartEggs& eggs) {
         const auto& part = *eggs.Lone();
         const TVector<TTag> tags{ 2, 3, 4 };

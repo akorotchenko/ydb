@@ -72,11 +72,11 @@ namespace NTabletFlatExecutor {
         TPageCollectionReadEnv& operator=(TPageCollectionReadEnv&&) = delete;
 
         // Borrowed pages stay valid while the seat retains its native pins
-        NTable::IBorrowedPages& BorrowedPages() & noexcept {
-            return BorrowedPages_;
+        NTable::IBorrowedPages* BorrowedPages() & noexcept override {
+            return &BorrowedPages_;
         }
 
-        NTable::IBorrowedPages& BorrowedPages() && = delete;
+        NTable::IBorrowedPages* BorrowedPages() && = delete;
 
         struct TStats {
             size_t NewlyPinnedPages = 0;

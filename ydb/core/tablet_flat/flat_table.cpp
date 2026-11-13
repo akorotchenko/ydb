@@ -893,13 +893,17 @@ void TTable::AddSafe(TPartView partView)
     }
 }
 
-TPrechargeResult TTable::Precharge(TRawVals minKey_, TRawVals maxKey_, TTagsRef tags,
-                         IPages* env, ui64 flg,
-                         ui64 items, ui64 bytes,
-                         EDirection direction,
-                         TRowVersion snapshot,
-                         TSelectStats& stats) const
-{
+TPrechargeResult TTable::Precharge(TRawVals minKey_, TRawVals maxKey_, TTagsRef tags, IPages* env, ui64 flg, ui64 items,
+    ui64 bytes, EDirection direction, TRowVersion snapshot, TSelectStats& stats) const {
+    if (auto* borrowed = env->BorrowedPages()) {
+        return PrechargeWithPages(minKey_, maxKey_, tags, borrowed, flg, items, bytes, direction, snapshot, stats);
+    }
+    return PrechargeWithPages(minKey_, maxKey_, tags, env, flg, items, bytes, direction, snapshot, stats);
+}
+
+template <class TRef>
+TPrechargeResult TTable::PrechargeWithPages(TRawVals minKey_, TRawVals maxKey_, TTagsRef tags, TPages<TRef>* env,
+    ui64 flg, ui64 items, ui64 bytes, EDirection direction, TRowVersion snapshot, TSelectStats& stats) const {
     TPrechargeResult result = {
         .Ready = true,
         .ItemsPrecharged = 0,

@@ -351,6 +351,10 @@ public:
     void SetTableObserver(TIntrusivePtr<ITableObserver> ptr);
 
 private:
+    template <class TRef>
+    TPrechargeResult PrechargeWithPages(TRawVals minKey, TRawVals maxKey, TTagsRef tags, TPages<TRef>* env, ui64 flg,
+        ui64 itemsLimit, ui64 bytesLimit, EDirection direction, TRowVersion snapshot, TSelectStats& stats) const;
+
     TMemTable& MemTable();
     void AddSafe(TPartView partView);
 
