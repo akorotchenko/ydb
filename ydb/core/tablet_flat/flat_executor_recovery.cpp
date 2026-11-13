@@ -228,16 +228,21 @@ class TDryRunExecutor
     , public NFlatExecutorSetup::IExecutor
     , public IExecuting
 {
-    struct TDryRunPages : public NTable::IPages {
+    template <class TPageRef>
+    struct TDryRunPages : public NTable::TPages<TPageRef> {
+        using TResult = NTable::IPageEnvironment::TResult;
+        using TPageLocation = NTable::TPageLocation;
+        using TGroupId = NTable::NPage::TGroupId;
+
         TResult Locate(const NTable::TMemTable*, ui64, ui32) override { Y_TABLET_ERROR("Not supported"); }
         TResult Locate(const NTable::TPart*, ui64, NTable::ELargeObj) override { Y_TABLET_ERROR("Not supported");
         }
 
-        TCachePageRef TryGetPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
+        TPageRef TryGetPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
             Y_TABLET_ERROR("Not supported");
         }
 
-        TCachePageRef TryGetIndexPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
+        TPageRef TryGetIndexPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
             Y_TABLET_ERROR("Not supported");
         }
     };
@@ -367,11 +372,12 @@ private:
         ++Step0;
         NTable::TTxStamp stamp(Generation0, Step0);
         DB.Begin(stamp, Pages);
+        Reader.Begin(BorrowedPages);
         NWilson::TSpan span;
-        TTransactionContext txc(TabletId, Generation0, Step0, DB, *this, Max<ui64>(), 0, span);
+        TTransactionContext txc(TabletId, Generation0, Step0, Reader, *this, Max<ui64>(), 0, span);
         const auto& ctx = TActivationContext::AsActorContext();
         bool ready = transaction->Execute(txc, ctx);
-        DB.Commit(stamp, ready);
+        DB.Commit(stamp, ready, Reader);
         if (ready) {
             transaction->Complete(ctx);
         } else {
@@ -382,7 +388,9 @@ private:
     ui64 TabletId;
 
     NTable::TDatabase DB;
-    TDryRunPages Pages;
+    TDryRunPages<TCachePageRef> Pages;
+    TDryRunPages<TCachePageConstRef> BorrowedPages;
+    NTable::TTransactionReader Reader{ DB };
     TDryRunStats Stats;
 
     bool ProcessPendingScheduled = false;

@@ -8,6 +8,22 @@
 namespace NKikimr {
 namespace NTabletFlatExecutor {
 
+    TTransactionContext::TTransactionContext(ui64 tablet, ui32 gen, ui32 step, NTable::TTransactionReader& reader,
+        IExecuting& env, ui64 memoryLimit, ui64 taskId, NWilson::TSpan& transactionSpan)
+        : TTxMemoryProviderBase(memoryLimit, taskId)
+        , Tablet(tablet)
+        , Generation(gen)
+        , Step(step)
+        , Env(env)
+        , DB(reader.GetDatabase())
+        , Reader(reader)
+        , TransactionSpan(transactionSpan)
+    {}
+
+    void TTransactionContext::RollbackChanges() {
+        DB.RollbackChanges(Reader);
+    }
+
 namespace NFlatExecutorSetup {
     IActor* CreateExecutor(ITablet *owner, const TActorId& ownerActorId) {
         return new TExecutor(owner, ownerActorId);

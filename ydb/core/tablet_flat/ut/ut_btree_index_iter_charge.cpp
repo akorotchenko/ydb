@@ -2156,10 +2156,11 @@ Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
         auto ownedDatabase = makeDatabase();
         auto borrowedDatabase = makeDatabase();
         const TVector<TTag> tags{ 2, 3, 4 };
+        TTransactionReader reader(*borrowedDatabase);
         for (bool commit : { false, true }) {
             TTouchEnv ownedEnv, source;
             TIndexIteratorOwnership::TBorrowedEnv borrowedEnv(source);
-            TTransactionReader reader(*borrowedDatabase, borrowedEnv);
+            reader.Begin(borrowedEnv);
             ownedDatabase->Begin(1, ownedEnv);
             borrowedDatabase->Begin(1, source);
             TRowState ownedRow, borrowedRow;

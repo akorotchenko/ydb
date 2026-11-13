@@ -49,10 +49,20 @@ public:
     using TIterator = TTableIterImpl<TPageRef>;
     using TReverseIterator = TTableReverseIterImpl<TPageRef>;
 
-    TDatabaseReader(TDatabase& database, TPages<TPageRef>& env)
+    explicit TDatabaseReader(TDatabase& database)
         : Database_(database)
-        , Env(&env)
     {}
+
+    TDatabaseReader(TDatabase& database, TPages<TPageRef>& env)
+        : TDatabaseReader(database)
+    {
+        Begin(env);
+    }
+
+    void Begin(TPages<TPageRef>& env) noexcept {
+        Y_DEBUG_ABORT_UNLESS(!Env && TempIterators.empty());
+        Env = &env;
+    }
 
     TDatabase& GetDatabase() const noexcept {
         return Database_;
@@ -114,10 +124,6 @@ public:
 
 protected:
     friend class TDatabase;
-
-    explicit TDatabaseReader(TDatabase& database)
-        : Database_(database)
-    {}
 
     TDatabase& Database_;
     // Pass external readers to Database::Commit so cleanup precedes unpinning
@@ -323,8 +329,10 @@ public:
     void RollbackChanges(TDatabaseReader<TPageRef>& reader) {
         const auto stamp = Change->Stamp;
         IPages& env = *Env;
+        auto* pages = reader.Env;
         auto prod = Commit(stamp, false, reader);
         FinishRollback(stamp, env, std::move(prod));
+        reader.Env = pages;
     }
 
     // Page environment of the current transaction. Valid between Begin and Commit.
@@ -341,6 +349,7 @@ public:
         Y_DEBUG_ABORT_UNLESS(&reader.Database_ == this);
         auto onPersistent = PrepareCommit(commit);
         reader.TempIterators.clear();
+        reader.Env = nullptr;
         return FinishCommit(stamp, commit, cookieAllocator, std::move(onPersistent));
     }
     TGarbage RollUp(TTxStamp, TArrayRef<const char> delta, TArrayRef<const char> redo, TMemGlobs annex,

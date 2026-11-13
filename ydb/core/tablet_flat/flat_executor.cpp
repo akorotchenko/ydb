@@ -465,7 +465,9 @@ void TExecutor::ActivateFollower(const TActorContext &ctx) {
     Y_ENSURE(!LogicRedo);
     Y_ENSURE(!LogicAlter);
 
+    TransactionReader.Destroy();
     Database = loadedState->Database;
+    TransactionReader = MakeHolder<NTable::TTransactionReader>(*Database);
     BorrowLogic = loadedState->Loans;
 
     Y_ENSURE(!CompactionLogic);
@@ -505,7 +507,9 @@ void TExecutor::Active(const TActorContext &ctx) {
     Y_ENSURE(Counters, "Expected to have Counters initialized during Boot processing");
 
     CommitManager = loadedState->CommitManager;
+    TransactionReader.Destroy();
     Database = loadedState->Database;
+    TransactionReader = MakeHolder<NTable::TTransactionReader>(*Database);
     LogicSnap = loadedState->Snap;
     GcLogic = loadedState->GcLogic;
     LogicRedo = loadedState->Redo;
@@ -1026,6 +1030,7 @@ TExecutorCaches TExecutor::CleanupState() {
     PendingPartSwitches.clear();
     ReadyPartSwitches = 0;
     Y_ENSURE(!LogicRedo);
+    TransactionReader.Destroy();
     Database.Destroy();
     Y_ENSURE(!GcLogic);
     Y_ENSURE(!LogicAlter);
@@ -2417,8 +2422,9 @@ void TExecutor::ExecuteTransaction(TSeat* seat) {
     THPTimer cpuTimer;
 
     TPageCollectionTxEnv env(*Database, *seat);
+    TransactionReader->Begin(env.BorrowedPages());
 
-    TTransactionContext txc(Owner->TabletID(), Generation(), Step(), *Database, env, seat->CurrentTxDataLimit, seat->TaskId, seat->Self->TxSpan);
+    TTransactionContext txc(Owner->TabletID(), Generation(), Step(), *TransactionReader, env, seat->CurrentTxDataLimit, seat->TaskId, seat->Self->TxSpan);
     txc.NotEnoughMemory(seat->NotEnoughMemoryCount);
 
     Database->Begin(Stamp(), env);
@@ -2453,7 +2459,7 @@ void TExecutor::ExecuteTransaction(TSeat* seat) {
     }
 
     auto *annex = CommitManager ? CommitManager->Annex.Get() : nullptr;
-    auto prod = Database->Commit(Stamp(), done && !failed, annex);
+    auto prod = Database->Commit(Stamp(), done && !failed, *TransactionReader, annex);
     auto rollbackAffects = std::move(prod.Change->RollbackAffects);
 
     if (auto logl = Logger->Log(ELnLev::Debug)) {

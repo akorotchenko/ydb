@@ -2,6 +2,7 @@
 #include "defs.h"
 
 #include "flat_scan_iface.h"
+#include "cache_fwd.h"
 #include "util_fmt_abort.h"
 
 #include <ydb/core/base/tablet.h>
@@ -19,6 +20,9 @@ class TTabletCountersBase;
 
 namespace NTable {
     class TDatabase;
+    template <class TPageRef>
+    class TDatabaseReader;
+    using TTransactionReader = TDatabaseReader<TCachePageConstRef>;
     struct IRedoObserver;
     class TScheme;
     class TBackupExclusion;
@@ -214,18 +218,12 @@ class TTransactionContext : public TTxMemoryProviderBase {
     friend class TExecutor;
 
 public:
-    TTransactionContext(ui64 tablet, ui32 gen, ui32 step, NTable::TDatabase &db, IExecuting &env,
-                        ui64 memoryLimit, ui64 taskId, NWilson::TSpan &transactionSpan)
-        : TTxMemoryProviderBase(memoryLimit, taskId)
-        , Tablet(tablet)
-        , Generation(gen)
-        , Step(step)
-        , Env(env)
-        , DB(db)
-        , TransactionSpan(transactionSpan)
-    {}
+    TTransactionContext(ui64 tablet, ui32 gen, ui32 step, NTable::TTransactionReader& reader, IExecuting& env,
+        ui64 memoryLimit, ui64 taskId, NWilson::TSpan& transactionSpan);
 
     ~TTransactionContext() {}
+
+    void RollbackChanges();
 
     /**
      * Request transaction to restart at some later time
@@ -254,6 +252,8 @@ public:
     const ui32 Step = Max<ui32>();
     IExecuting &Env;
     NTable::TDatabase &DB;
+    // Reader, selectors and borrowed rows are valid in this Execute and its commit/rollback callbacks
+    NTable::TTransactionReader& Reader;
     NWilson::TSpan &TransactionSpan;
     NWilson::TSpan TransactionExecutionSpan;
 

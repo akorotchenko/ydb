@@ -425,6 +425,7 @@ class TExecutor
     THolder<NMetrics::TResourceMetrics> ResourceMetrics;
 
     TAutoPtr<NTable::TDatabase> Database;
+    THolder<NTable::TTransactionReader> TransactionReader;
 
     TAutoPtr<TCommitManager> CommitManager;
     TAutoPtr<TScans> Scans;
