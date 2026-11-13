@@ -7,14 +7,14 @@
 namespace NKikimr {
 namespace NTable {
 
-    class TKeysLoader {
+    template <class TInputRef>
+    class TKeysLoaderImpl {
     public:
-        explicit TKeysLoader(const TPart* part, IPages* env)
+        explicit TKeysLoaderImpl(const TPart* part, TPages<TInputRef>* env)
             : Part(part)
             , Env(env)
             , Index(CreateIndexIter(part, env, {}))
-        {
-        }
+        {}
 
         TIntrusivePtr<TSlices> Do(TIntrusiveConstPtr<TScreen> screen)
         {
@@ -155,13 +155,15 @@ namespace NTable {
 
     private:
         const TPart* Part;
-        IPages* Env;
+        TPages<TInputRef>* Env;
         TRowId RowId = Max<TRowId>();
         TPageOffset Offset = TPageOffset::Max();
         THolder<IPartGroupIndexIter> Index;
-        NPage::TDataPage Page;
+        NPage::TDataPageImpl<TInputRef> Page;
         TSmallVec<TCell> Key;
     };
+
+    using TKeysLoader = TKeysLoaderImpl<TCachePageRef>;
 
 }
 }

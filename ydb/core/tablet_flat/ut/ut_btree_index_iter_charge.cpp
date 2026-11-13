@@ -5,6 +5,8 @@
 #include "flat_part_charge_btree_index.h"
 #include "flat_executor_tx_env.h"
 #include "flat_part_charge_range.h"
+#include "flat_part_charge_create.h"
+#include "flat_part_keys.h"
 #include "test/libs/table/test_writer.h"
 #include "test/libs/table/wrap_part.h"
 #include <test/libs/table/test_envs.h>
@@ -52,6 +54,11 @@ static_assert(!THasOwnedKeyPage<TPartIterImpl<TCachePageConstRef>>);
 static_assert(!THasOwnedKeyPage<TRunIterImpl<TCachePageConstRef>>);
 static_assert(!std::is_constructible_v<TPartGroupRowIter, const TPart*, IBorrowedPages*, TGroupId>);
 static_assert(!std::is_constructible_v<TPartHistoryIter, const TPart*, IBorrowedPages*>);
+
+static_assert(!std::is_constructible_v<TKeysLoader, const TPart*, IBorrowedPages*>);
+static_assert(std::is_constructible_v<TKeysLoaderImpl<TCachePageConstRef>, const TPart*, IBorrowedPages*>);
+static_assert(!std::is_constructible_v<TChargeBTreeIndex, IBorrowedPages*, const TPart&, TTagsRef, bool>);
+static_assert(!std::is_constructible_v<TChargeFlatIndex, IBorrowedPages*, const TPart&, TTagsRef, bool>);
 
 using NTest::TPartStore;
 
@@ -1912,6 +1919,161 @@ Y_UNIT_TEST_SUITE_F(TRowReaderOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
 
     Y_UNIT_TEST(BorrowedRunV2RetainsGroupAndHistoryViews) {
         CheckRun(MakeV2Part({ .Levels = 3, .Groups = true, .History = true }));
+    }
+}
+
+Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTest) {
+    void CheckCharge(const NTest::TPartEggs& eggs) {
+        const auto& part = *eggs.Lone();
+        const TVector<TTag> tags{ 2, 3, 4 };
+        const std::pair<ui64, ui64> limits[] = { { 0, 0 }, { 5, 0 }, { 0, 1024 } };
+        for (bool reverse : { false, true }) {
+            for (bool byKey : { false, true }) {
+                for (const auto& [items, bytes] : limits) {
+                    TTouchEnv ownedEnv, source;
+                    TIndexIteratorOwnership::TBorrowedEnv borrowedEnv(source);
+                    auto owned = CreateCharge(&ownedEnv, part, tags, true);
+                    auto borrowed = CreateCharge(&borrowedEnv, part, tags, true);
+                    auto first = byKey ? MakeKey(1, 5) : TVector<TCell>();
+                    auto last = byKey ? MakeKey(4, 5) : TVector<TCell>();
+                    if (reverse) {
+                        std::swap(first, last);
+                    }
+                    bool ready = false;
+                    for (ui32 retry = 0; retry < 32 && !ready; ++retry) {
+                        const auto charge = [&](ICharge& reader) {
+                            return reverse ? reader.DoReverse(
+                                                 first, last, part.Stat.Rows - 1, 0, *eggs.Scheme->Keys, items, bytes)
+                                           : reader.Do(
+                                                 first, last, 0, part.Stat.Rows - 1, *eggs.Scheme->Keys, items, bytes);
+                        };
+                        const auto expected = charge(*owned);
+                        const auto actual = charge(*borrowed);
+                        UNIT_ASSERT_VALUES_EQUAL(actual.Ready, expected.Ready);
+                        UNIT_ASSERT_VALUES_EQUAL(actual.Overshot, expected.Overshot);
+                        UNIT_ASSERT_VALUES_EQUAL(actual.ItemsPrecharged, expected.ItemsPrecharged);
+                        UNIT_ASSERT_VALUES_EQUAL(actual.BytesPrecharged, expected.BytesPrecharged);
+                        UNIT_ASSERT(source.Touched == ownedEnv.Touched);
+                        ready = actual.Ready;
+                        ownedEnv.LoadTouched();
+                        source.LoadTouched();
+                    }
+                    UNIT_ASSERT(ready);
+                }
+            }
+        }
+    }
+
+    void CheckRange(const NTest::TPartEggs& eggs) {
+        const TVector<TTag> tags{ 2, 3, 4 };
+        TRun run(*eggs.Scheme->Keys);
+        for (const auto& slice : *eggs.Lone()->Slices) {
+            UNIT_ASSERT(run.Insert(eggs.Lone(), slice).second);
+        }
+        const std::pair<ui64, ui64> limits[] = { { 0, 0 }, { 5, 0 }, { 0, 1024 } };
+        for (bool reverse : { false, true }) {
+            for (const auto& [items, bytes] : limits) {
+                TTouchEnv ownedEnv, source;
+                TIndexIteratorOwnership::TBorrowedEnv borrowedEnv(source);
+                auto first = MakeKey(0, 5);
+                auto last = MakeKey(4, 5);
+                if (reverse) {
+                    std::swap(first, last);
+                }
+                bool ready = false;
+                for (ui32 retry = 0; retry < 32 && !ready; ++retry) {
+                    const auto charge = [&](auto* env) {
+                        return reverse
+                                   ? ChargeRangeReverse(
+                                         env, first, last, run, *eggs.Scheme->Keys, tags, items, bytes, true)
+                                   : ChargeRange(env, first, last, run, *eggs.Scheme->Keys, tags, items, bytes, true);
+                    };
+                    const auto expected = charge(&ownedEnv);
+                    const auto actual = charge(&borrowedEnv);
+                    UNIT_ASSERT_VALUES_EQUAL(actual.Ready, expected.Ready);
+                    UNIT_ASSERT_VALUES_EQUAL(actual.ItemsPrecharged, expected.ItemsPrecharged);
+                    UNIT_ASSERT_VALUES_EQUAL(actual.BytesPrecharged, expected.BytesPrecharged);
+                    UNIT_ASSERT(source.Touched == ownedEnv.Touched);
+                    ready = actual.Ready;
+                    ownedEnv.LoadTouched();
+                    source.LoadTouched();
+                }
+                UNIT_ASSERT(ready);
+            }
+        }
+    }
+
+    void CheckKeys(const NTest::TPartEggs& eggs) {
+        const TIntrusiveConstPtr<TScreen> screens[] = { nullptr, new TScreen({ TScreen::THole(true) }),
+            new TScreen({ { 3, 8 }, { 21, 27 }, { 37, 100 } }), new TScreen({ { 50, 100 } }) };
+        for (const auto& screen : screens) {
+            TIntrusivePtr<TSlices> expected, actual;
+            {
+                TTouchEnv ownedEnv, source;
+                TIndexIteratorOwnership::TBorrowedEnv borrowedEnv(source);
+                TKeysLoader owned(eggs.Lone().Get(), &ownedEnv);
+                TKeysLoaderImpl<TCachePageConstRef> borrowed(eggs.Lone().Get(), &borrowedEnv);
+                for (ui32 retry = 0; retry < 32 && !actual; ++retry) {
+                    expected = owned.Do(screen);
+                    actual = borrowed.Do(screen);
+                    UNIT_ASSERT_VALUES_EQUAL(bool(actual), bool(expected));
+                    UNIT_ASSERT(source.Touched == ownedEnv.Touched);
+                    ownedEnv.LoadTouched();
+                    source.LoadTouched();
+                }
+            }
+            UNIT_ASSERT(actual);
+            UNIT_ASSERT_VALUES_EQUAL(actual->size(), expected->size());
+            for (ui32 pos : xrange(actual->size())) {
+                const auto& a = actual->at(pos);
+                const auto& e = expected->at(pos);
+                UNIT_ASSERT_VALUES_EQUAL(a.FirstRowId, e.FirstRowId);
+                UNIT_ASSERT_VALUES_EQUAL(a.LastRowId, e.LastRowId);
+                UNIT_ASSERT_VALUES_EQUAL(a.FirstInclusive, e.FirstInclusive);
+                UNIT_ASSERT_VALUES_EQUAL(a.LastInclusive, e.LastInclusive);
+                UNIT_ASSERT_VALUES_EQUAL(TSerializedCellVec::Serialize(a.FirstKey.GetCells()),
+                    TSerializedCellVec::Serialize(e.FirstKey.GetCells()));
+                UNIT_ASSERT_VALUES_EQUAL(TSerializedCellVec::Serialize(a.LastKey.GetCells()),
+                    TSerializedCellVec::Serialize(e.LastKey.GetCells()));
+            }
+        }
+    }
+
+    Y_UNIT_TEST(BorrowedChargeV1MatchesOwned) {
+        CheckCharge(MakePart({ .Levels = 3, .Groups = true, .History = true }));
+    }
+
+    Y_UNIT_TEST(BorrowedChargeV2MatchesOwned) {
+        CheckCharge(MakeV2Part({ .Levels = 3, .Groups = true, .History = true }));
+    }
+
+    Y_UNIT_TEST(BorrowedChargeFlatMatchesOwned) {
+        CheckCharge(MakePart({ .Levels = 3, .Groups = true, .History = true, .FlatOnly = true }));
+    }
+
+    Y_UNIT_TEST(BorrowedRangeV1MatchesOwned) {
+        CheckRange(MakePart({ .Levels = 3, .Groups = true, .History = true, .Slices = TTestParams::Many }));
+    }
+
+    Y_UNIT_TEST(BorrowedRangeV2MatchesOwned) {
+        CheckRange(MakeV2Part({ .Levels = 3, .Groups = true, .History = true, .Slices = TTestParams::Many }));
+    }
+
+    Y_UNIT_TEST(BorrowedRangeFlatMatchesOwned) {
+        CheckRange(
+            MakePart({ .Levels = 3, .Groups = true, .History = true, .Slices = TTestParams::Many, .FlatOnly = true }));
+    }
+
+    Y_UNIT_TEST(BorrowedKeysV1MatchOwnedSlices) {
+        CheckKeys(MakePart({ .Levels = 3 }));
+    }
+
+    Y_UNIT_TEST(BorrowedKeysV2MatchOwnedSlices) {
+        CheckKeys(MakeV2Part({ .Levels = 3 }));
+    }
+
+    Y_UNIT_TEST(BorrowedKeysFlatMatchOwnedSlices) {
+        CheckKeys(MakePart({ .Levels = 3, .FlatOnly = true }));
     }
 }
 

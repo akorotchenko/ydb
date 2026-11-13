@@ -11,13 +11,16 @@
 namespace NKikimr {
 namespace NTable {
 
-    class TChargeFlatIndex : public ICharge {
+    template <class TInputRef>
+    class TChargeFlatIndexImpl : public ICharge {
+        using TPartGroupFlatIndexIter = TPartGroupFlatIndexIterImpl<TInputRef>;
+
     public:
-        using TIter = NPage::TFlatIndex::TIter;
-        using TDataPage = NPage::TDataPage;
+        using TIter = NPage::TFlatIndexLayout::TIter;
+        using TDataPage = NPage::TDataPageImpl<TInputRef>;
         using TGroupId = NPage::TGroupId;
 
-        TChargeFlatIndex(IPages *env, const TPart &part, TTagsRef tags, bool includeHistory)
+        TChargeFlatIndexImpl(TPages<TInputRef>* env, const TPart& part, TTagsRef tags, bool includeHistory)
             : Env(env)
             , Part(&part)
             , Scheme(*Part->Scheme)
@@ -694,7 +697,7 @@ namespace NTable {
         }
 
     private:
-        IPages * const Env = nullptr;
+        TPages<TInputRef>* const Env = nullptr;
         const TPart * const Part = nullptr;
         const TPartScheme &Scheme;
         mutable TPartGroupFlatIndexIter Index;
@@ -702,6 +705,8 @@ namespace NTable {
         mutable TSmallVec<TGroupState> Groups;
         mutable TSmallVec<TGroupState> HistoryGroups;
     };
+
+    using TChargeFlatIndex = TChargeFlatIndexImpl<TCachePageRef>;
 
 }
 }

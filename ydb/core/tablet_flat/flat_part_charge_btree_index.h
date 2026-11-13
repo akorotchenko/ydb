@@ -7,13 +7,14 @@
 
 namespace NKikimr::NTable {
 
-class TChargeBTreeIndex : public ICharge {
-    using TBtreeIndexNode = NPage::TBtreeIndexNode;
+template <class TInputRef>
+class TChargeBTreeIndexImpl : public ICharge {
+    using TBtreeIndexNode = NPage::TBtreeIndexNodeImpl<TInputRef>;
     using TBtreeIndexMeta = NPage::TBtreeIndexMeta;
     using TRecIdx = NPage::TRecIdx;
     using TGroupId = NPage::TGroupId;
-    using TChild = TBtreeIndexNode::TChild;
-    using TShortChild = TBtreeIndexNode::TShortChild;
+    using TChild = NPage::TBtreeIndexNodeLayout::TChild;
+    using TShortChild = NPage::TBtreeIndexNodeLayout::TShortChild;
     struct TChildState {
         TPageRef Ref;
         TRowId BeginRowId, EndRowId;
@@ -43,15 +44,14 @@ class TChargeBTreeIndex : public ICharge {
     };
 
     struct TNodeState : TChildState, TBtreeIndexNode {
-        TNodeState(TCachePageRef&& data, TChildState child, bool v2Format)
+        TNodeState(TInputRef&& data, TChildState child, bool v2Format)
             : TChildState(std::move(child))
             , TBtreeIndexNode(std::move(data), v2Format)
-        {
-        }
+        {}
     };
 
 public:
-    TChargeBTreeIndex(IPages *env, const TPart &part, TTagsRef tags, bool includeHistory)
+    TChargeBTreeIndexImpl(TPages<TInputRef>* env, const TPart& part, TTagsRef tags, bool includeHistory)
         : Part(&part)
         , Scheme(*Part->Scheme)
         , Env(env)
@@ -176,7 +176,7 @@ public:
                 auto location = NTable::ResolvePageLocation(Part, child.Ref, groupId);
                 auto page = TryGetDataPage(location, groupId);
                 if (page) {
-                    auto data = NPage::TDataPage(std::move(page));
+                    auto data = NPage::TDataPageImpl<TInputRef>(std::move(page));
                     if (child.Ref == key1Ref) {
                         TRowId key1RowId = data.BaseRow() + data.LookupKey(key1, Scheme.Groups[0], ESeek::Lower, &keyDefaults).Off();
                         beginRowId = Max(beginRowId, key1RowId);
@@ -348,7 +348,7 @@ public:
                 auto location = NTable::ResolvePageLocation(Part, child.Ref, groupId);
                 auto page = TryGetDataPage(location, groupId);
                 if (page) {
-                    auto data = NPage::TDataPage(std::move(page));
+                    auto data = NPage::TDataPageImpl<TInputRef>(std::move(page));
                     if (child.Ref == key1Ref) {
                         auto iter = data.LookupKeyReverse(key1, Scheme.Groups[0], ESeek::Lower, &keyDefaults);
                         if (iter) {
@@ -699,7 +699,7 @@ private:
                 auto location = NTable::ResolvePageLocation(Part, child.Ref, groupId);
                 auto page = TryGetDataPage(location, groupId);
                 if (page) {
-                    auto data = NPage::TDataPage(std::move(page));
+                    auto data = NPage::TDataPageImpl<TInputRef>(std::move(page));
                     if (child.Ref == key1Ref) {
                         TRowId key1RowId = data.BaseRow() + data.LookupKey(key1, scheme, ESeek::Lower, keyDefaults).Off();
                         beginRowId = Max(beginRowId, key1RowId);
@@ -795,7 +795,7 @@ private:
     }
 
 private:
-    TCachePageRef TryGetDataPage(const NPage::TPageLocation& location, TGroupId groupId) const {
+    TInputRef TryGetDataPage(const NPage::TPageLocation& location, TGroupId groupId) const {
         return Env->TryGetPage(Part, location, groupId);
     }
 
@@ -864,9 +864,11 @@ private:
 private:
     const TPart* const Part;
     const TPartScheme &Scheme;
-    IPages* const Env;
+    TPages<TInputRef>* const Env;
     TSmallVec<ui32> Groups;
     bool IncludeHistory;
 };
+
+using TChargeBTreeIndex = TChargeBTreeIndexImpl<TCachePageRef>;
 
 }

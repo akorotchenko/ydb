@@ -3,9 +3,9 @@
 
 namespace NKikimr::NTable {
 
-TPrechargeResult ChargeRange(IPages *env, const TCells key1, const TCells key2,
-            const TRun &run, const TKeyCellDefaults &keyDefaults, TTagsRef tags,
-            ui64 items, ui64 bytes, bool includeHistory)
+template <class TInputRef>
+static TPrechargeResult ChargeRangeImpl(TPages<TInputRef>* env, const TCells key1, const TCells key2, const TRun& run,
+    const TKeyCellDefaults& keyDefaults, TTagsRef tags, ui64 items, ui64 bytes, bool includeHistory)
 {
     TPrechargeResult result = {
         .Ready = true,
@@ -73,9 +73,9 @@ TPrechargeResult ChargeRange(IPages *env, const TCells key1, const TCells key2,
     return result;
 }
 
-TPrechargeResult ChargeRangeReverse(IPages *env, const TCells key1, const TCells key2,
-            const TRun &run, const TKeyCellDefaults &keyDefaults, TTagsRef tags,
-            ui64 items, ui64 bytes, bool includeHistory)
+template <class TInputRef>
+static TPrechargeResult ChargeRangeReverseImpl(TPages<TInputRef>* env, const TCells key1, const TCells key2,
+    const TRun& run, const TKeyCellDefaults& keyDefaults, TTagsRef tags, ui64 items, ui64 bytes, bool includeHistory)
 {
     TPrechargeResult result = {
         .Ready = true,
@@ -147,6 +147,26 @@ TPrechargeResult ChargeRangeReverse(IPages *env, const TCells key1, const TCells
     }
 
     return result;
+}
+
+TPrechargeResult ChargeRange(IPages* env, const TCells key1, const TCells key2, const TRun& run,
+    const TKeyCellDefaults& keyDefaults, TTagsRef tags, ui64 items, ui64 bytes, bool includeHistory) {
+    return ChargeRangeImpl(env, key1, key2, run, keyDefaults, tags, items, bytes, includeHistory);
+}
+
+TPrechargeResult ChargeRange(IBorrowedPages* env, const TCells key1, const TCells key2, const TRun& run,
+    const TKeyCellDefaults& keyDefaults, TTagsRef tags, ui64 items, ui64 bytes, bool includeHistory) {
+    return ChargeRangeImpl(env, key1, key2, run, keyDefaults, tags, items, bytes, includeHistory);
+}
+
+TPrechargeResult ChargeRangeReverse(IPages* env, const TCells key1, const TCells key2, const TRun& run,
+    const TKeyCellDefaults& keyDefaults, TTagsRef tags, ui64 items, ui64 bytes, bool includeHistory) {
+    return ChargeRangeReverseImpl(env, key1, key2, run, keyDefaults, tags, items, bytes, includeHistory);
+}
+
+TPrechargeResult ChargeRangeReverse(IBorrowedPages* env, const TCells key1, const TCells key2, const TRun& run,
+    const TKeyCellDefaults& keyDefaults, TTagsRef tags, ui64 items, ui64 bytes, bool includeHistory) {
+    return ChargeRangeReverseImpl(env, key1, key2, run, keyDefaults, tags, items, bytes, includeHistory);
 }
 
 }
