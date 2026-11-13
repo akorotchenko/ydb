@@ -6,15 +6,16 @@
 
 namespace NKikimr::NTable {
 
-class TPartGroupBtreeIndexIter : public IPartGroupIndexIter {
+template <class TInputRef>
+class TPartGroupBtreeIndexIterImpl : public IPartGroupIndexIter {
     using TCells = NPage::TCells;
-    using TBtreeIndexNode = NPage::TBtreeIndexNode;
+    using TBtreeIndexNode = NPage::TBtreeIndexNodeImpl<TInputRef>;
     using TGroupId = NPage::TGroupId;
     using TRecIdx = NPage::TRecIdx;
-    using TChild = TBtreeIndexNode::TChild;
-    using TColumns = TBtreeIndexNode::TColumns;
-    using TCellsIterable = TBtreeIndexNode::TCellsIterable;
-    using TCellsIter = TBtreeIndexNode::TCellsIter;
+    using TChild = NPage::TBtreeIndexNodeLayout::TChild;
+    using TColumns = NPage::TBtreeIndexNodeLayout::TColumns;
+    using TCellsIterable = NPage::TBtreeIndexNodeLayout::TCellsIterable;
+    using TCellsIter = NPage::TBtreeIndexNodeLayout::TCellsIter;
     using TBtreeIndexMeta = NPage::TBtreeIndexMeta;
 
     struct TNodeState {
@@ -109,7 +110,7 @@ class TPartGroupBtreeIndexIter : public IPartGroupIndexIter {
     };
 
 public:
-    TPartGroupBtreeIndexIter(const TPart* part, IPages* env, TGroupId groupId)
+    TPartGroupBtreeIndexIterImpl(const TPart* part, TPages<TInputRef>* env, TGroupId groupId)
         : Part(part)
         , Env(env)
         , GroupId(groupId)
@@ -369,11 +370,13 @@ private:
 
 private:
     const TPart* const Part;
-    IPages* const Env;
+    TPages<TInputRef>* const Env;
     const TGroupId GroupId;
     const TPartScheme::TGroupInfo& GroupInfo;
     const TBtreeIndexMeta Meta;
     TVector<TNodeState> State;
 };
+
+using TPartGroupBtreeIndexIter = TPartGroupBtreeIndexIterImpl<TCachePageRef>;
 
 }

@@ -36,6 +36,13 @@ static_assert(std::is_same_v<decltype(std::declval<const TBorrowedBtreeIndexNode
 static_assert(
     std::is_same_v<decltype(std::declval<const TBorrowedBtreeIndexNode&>().GetPageRef()), const TCachePageConstRef&>);
 
+static_assert(!std::is_constructible_v<TPartGroupBtreeIndexIter, const TPart*, IBorrowedPages*, TGroupId>);
+static_assert(!std::is_constructible_v<TPartGroupFlatIndexIter, const TPart*, IBorrowedPages*, TGroupId>);
+static_assert(
+    std::is_constructible_v<TPartGroupBtreeIndexIterImpl<TCachePageConstRef>, const TPart*, IBorrowedPages*, TGroupId>);
+static_assert(
+    std::is_constructible_v<TPartGroupFlatIndexIterImpl<TCachePageConstRef>, const TPart*, IBorrowedPages*, TGroupId>);
+
 using NTest::TPartStore;
 
 namespace {
@@ -205,6 +212,7 @@ namespace {
         const ESlices Slices = None;
         const ui32 Rows = 40;
         const bool StickSomePages = false;
+        const bool FlatOnly = false;
     };
 
     void SetupSlices(const TTestParams& params, const TPartStore& part) {
@@ -308,7 +316,7 @@ namespace {
             .Key({0, 1});
 
         // these tests are based on comparison of flat and b-tree indexes
-        conf.WriteBTreeIndexV1 = true;
+        conf.WriteBTreeIndexV1 = !params.FlatOnly;
         conf.WriteFlatIndex = true;
 
         TPartCook cook(lay, conf);
@@ -327,8 +335,10 @@ namespace {
 
         SetupSlices(params, part);
 
-        UNIT_ASSERT_VALUES_EQUAL(part.IndexPages.BTreeGroups[0].LevelCount(), params.Levels);
-        if (params.Groups) {
+        if (!params.FlatOnly) {
+            UNIT_ASSERT_VALUES_EQUAL(part.IndexPages.BTreeGroups[0].LevelCount(), params.Levels);
+        }
+        if (params.Groups && !params.FlatOnly) {
             UNIT_ASSERT_VALUES_EQUAL(part.IndexPages.BTreeGroups[1].LevelCount(), params.Levels);
             UNIT_ASSERT_VALUES_EQUAL(part.IndexPages.BTreeGroups[2].LevelCount(), 2);
             UNIT_ASSERT_VALUES_EQUAL(part.IndexPages.BTreeGroups[3].LevelCount(), 1);
@@ -1651,6 +1661,135 @@ namespace {
             UNIT_ASSERT_VALUES_EQUAL(part.IndexPages.BTreeGroups[3].LevelCount(), 1);
         }
         return eggs;
+    }
+}
+
+Y_UNIT_TEST_SUITE_F(TIndexIteratorOwnership, ::NKikimr::NTable::NTest::TTableCacheTest) {
+    class TBorrowedEnv final : public IBorrowedPages {
+    public:
+        explicit TBorrowedEnv(TTouchEnv& source)
+            : Source_(source)
+        {}
+
+        TResult Locate(const TMemTable* table, ui64 ref, ui32 tag) override {
+            return Source_.Locate(table, ref, tag);
+        }
+
+        TResult Locate(const TPart* part, ui64 ref, ELargeObj lob) override {
+            return Source_.Locate(part, ref, lob);
+        }
+
+        TCachePageConstRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId group) override {
+            return Retain(Source_.TryGetPage(part, location, group));
+        }
+
+        TCachePageConstRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId group) override {
+            return Retain(Source_.TryGetIndexPage(part, location, group));
+        }
+
+    private:
+        TCachePageConstRef Retain(TCachePageRef page) {
+            if (!page) {
+                return {};
+            }
+            Pages_.push_back(std::move(page));
+            return Pages_.back().Borrow();
+        }
+
+        TTouchEnv& Source_;
+        TVector<TCachePageRef> Pages_;
+    };
+
+    void CheckIndex(const NTest::TPartEggs& eggs) {
+        const auto& part = *eggs.Lone();
+        TTouchEnv ownedEnv, source;
+        TBorrowedEnv borrowedEnv(source);
+        auto owned = CreateIndexIter(&part, &ownedEnv, {});
+        auto borrowed = CreateIndexIter(&part, &borrowedEnv, {});
+        ui32 faults = 0;
+        const auto step = [&](auto&& action) {
+            for (ui32 retry = 0; retry <= 10; ++retry) {
+                const auto expected = action(*owned);
+                const auto actual = action(*borrowed);
+                UNIT_ASSERT(actual == expected);
+                if (actual == EReady::Page) {
+                    ++faults;
+                    ownedEnv.LoadTouched();
+                    source.LoadTouched();
+                    continue;
+                }
+                UNIT_ASSERT_VALUES_EQUAL(borrowed->IsValid(), owned->IsValid());
+                if (actual == EReady::Data) {
+                    UNIT_ASSERT(borrowed->GetLocation() == owned->GetLocation());
+                    UNIT_ASSERT_VALUES_EQUAL(borrowed->GetRowId(), owned->GetRowId());
+                    UNIT_ASSERT_VALUES_EQUAL(borrowed->GetNextRowId(), owned->GetNextRowId());
+                    TSmallVec<TCell> actualKey, expectedKey;
+                    borrowed->GetKeyCells(actualKey);
+                    owned->GetKeyCells(expectedKey);
+                    UNIT_ASSERT_VALUES_EQUAL(actualKey.size(), expectedKey.size());
+                    for (ui32 column : xrange(actualKey.size())) {
+                        UNIT_ASSERT_VALUES_EQUAL(CompareTypedCells(actualKey[column], expectedKey[column],
+                                                     eggs.Scheme->Keys->Types[column]), 0);
+                    }
+                }
+                return actual;
+            }
+            UNIT_FAIL("Index pages did not become ready");
+            return EReady::Page;
+        };
+        for (auto ready = step([](auto& index) {
+                 return index.Seek(0);
+             });
+             ready == EReady::Data; ready = step([](auto& index) {
+                 return index.Next();
+             })) {
+        }
+        for (auto ready = step([](auto& index) {
+                 return index.SeekLast();
+             });
+             ready == EReady::Data; ready = step([](auto& index) {
+                 return index.Prev();
+             })) {
+        }
+        for (TRowId row : xrange(part.Stat.Rows + 1)) {
+            step([&](auto& index) {
+                return index.Seek(row);
+            });
+        }
+        for (ui32 first : { 0u, 1u, 3u, 5u }) {
+            for (ui32 second : { 0u, 5u, 12u, 13u }) {
+                const auto key = MakeKey(first, second);
+                for (ESeek seek : { ESeek::Exact, ESeek::Lower, ESeek::Upper }) {
+                    step([&](auto& index) {
+                        return index.Seek(seek, key, eggs.Scheme->Keys.Get());
+                    });
+                    step([&](auto& index) {
+                        return index.SeekReverse(seek, key, eggs.Scheme->Keys.Get());
+                    });
+                }
+            }
+        }
+        if (part.IndexPages.HasBTree() && !part.IndexPages.GetBTree({}).LevelCount()) {
+            UNIT_ASSERT_VALUES_EQUAL(faults, 0);
+        } else {
+            UNIT_ASSERT(faults > 0);
+        }
+    }
+
+    Y_UNIT_TEST(BorrowedBtreeV1MatchesOwnedIterator) {
+        CheckIndex(MakePart({ .Levels = 3 }));
+    }
+
+    Y_UNIT_TEST(BorrowedBtreeV2MatchesOwnedIterator) {
+        CheckIndex(MakeV2Part({ .Levels = 3 }));
+    }
+
+    Y_UNIT_TEST(BorrowedFlatMatchesOwnedIterator) {
+        CheckIndex(MakePart({ .Levels = 3, .FlatOnly = true }));
+    }
+
+    Y_UNIT_TEST(BorrowedBtreeWithoutNodesMatchesOwnedIterator) {
+        CheckIndex(MakePart({ .Levels = 0 }));
     }
 }
 

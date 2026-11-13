@@ -4,13 +4,26 @@
 
 namespace NKikimr::NTable {
 
-THolder<IPartGroupIndexIter> CreateIndexIter(const TPart* part, IPages* env, NPage::TGroupId groupId)
-{
-    if (part->IndexPages.HasBTree()) {
-        return MakeHolder<TPartGroupBtreeIndexIter>(part, env, groupId);
-    } else {
-        return MakeHolder<TPartGroupFlatIndexIter>(part, env, groupId);
+namespace {
+
+    template <class TInputRef>
+    THolder<IPartGroupIndexIter> CreateTypedIndexIter(
+        const TPart* part, TPages<TInputRef>* env, NPage::TGroupId groupId) {
+        if (part->IndexPages.HasBTree()) {
+            return MakeHolder<TPartGroupBtreeIndexIterImpl<TInputRef>>(part, env, groupId);
+        } else {
+            return MakeHolder<TPartGroupFlatIndexIterImpl<TInputRef>>(part, env, groupId);
+        }
     }
+
+} // namespace
+
+THolder<IPartGroupIndexIter> CreateIndexIter(const TPart* part, IPages* env, NPage::TGroupId groupId) {
+    return CreateTypedIndexIter(part, env, groupId);
+}
+
+THolder<IPartGroupIndexIter> CreateIndexIter(const TPart* part, IBorrowedPages* env, NPage::TGroupId groupId) {
+    return CreateTypedIndexIter(part, env, groupId);
 }
 
 }

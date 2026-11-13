@@ -10,23 +10,24 @@
 
 namespace NKikimr::NTable {
 
-class TPartGroupFlatIndexIter : public IPartGroupIndexIter, public IStatsPartGroupIter {
+template <class TInputRef>
+class TPartGroupFlatIndexIterImpl : public IPartGroupIndexIter, public IStatsPartGroupIter {
 public:
     using TCells = NPage::TCells;
-    using TRecord = NPage::TFlatIndex::TRecord;
-    using TIndex = NPage::TFlatIndex;
-    using TIter = NPage::TFlatIndex::TIter;
+    using TRecord = NPage::TFlatIndexLayout::TRecord;
+    using TIndex = NPage::TFlatIndexImpl<TInputRef>;
+    using TIter = NPage::TFlatIndexLayout::TIter;
     using TGroupId = NPage::TGroupId;
 
-    TPartGroupFlatIndexIter(const TPart* part, IPages* env, TGroupId groupId)
+    TPartGroupFlatIndexIterImpl(const TPart* part, TPages<TInputRef>* env, TGroupId groupId)
         : Part(part)
         , Env(env)
         , GroupId(groupId)
         , GroupInfo(part->Scheme->GetLayout(groupId))
         // Note: EndRowId may be Max<TRowId>() for legacy TParts
         , EndRowId(groupId.IsMain() && part->Stat.Rows ? part->Stat.Rows : Max<TRowId>())
-    { }
-    
+    {}
+
     EReady Start() override {
         return Seek(0);
     }
@@ -196,12 +197,14 @@ private:
 
 private:
     const TPart* const Part;
-    IPages* const Env;
+    TPages<TInputRef>* const Env;
     const TGroupId GroupId;
     const TPartScheme::TGroupInfo& GroupInfo;
     std::optional<TIndex> Index;
     TIter Iter;
     TRowId EndRowId;
 };
+
+using TPartGroupFlatIndexIter = TPartGroupFlatIndexIterImpl<TCachePageRef>;
 
 }

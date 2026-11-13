@@ -30,5 +30,6 @@ namespace NKikimr::NTable {
     };
 
     THolder<IPartGroupIndexIter> CreateIndexIter(const TPart* part, IPages* env, NPage::TGroupId groupId);
+    THolder<IPartGroupIndexIter> CreateIndexIter(const TPart* part, IBorrowedPages* env, NPage::TGroupId groupId);
     
 }
