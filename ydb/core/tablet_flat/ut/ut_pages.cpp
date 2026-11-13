@@ -25,6 +25,14 @@ namespace NTable {
 
     static_assert(THasOwnedPageData<NPage::TDataPage>);
     static_assert(!THasOwnedPageData<NPage::TBorrowedDataPage>);
+    static_assert(sizeof(NPage::TDataPage) == sizeof(TSharedData) + sizeof(NPage::TDataPage::TBlock) + sizeof(TRowId));
+    static_assert(sizeof(NPage::TBorrowedDataPage) == sizeof(NPage::TDataPage));
+    static_assert(sizeof(void*) != 8 ||
+                  sizeof(NPage::TDataPage::TBlock) == sizeof(NPage::TBlockWithRecords<NPage::TDataPage::TRecord>));
+    static_assert(std::is_copy_constructible_v<NPage::TDataPage>);
+    static_assert(std::is_copy_constructible_v<NPage::TBorrowedDataPage>);
+    static_assert(std::is_nothrow_move_assignable_v<NPage::TDataPage>);
+    static_assert(std::is_nothrow_move_assignable_v<NPage::TBorrowedDataPage>);
 
 namespace {
     /* Sample rows set for old pages compatability tests, should be
@@ -109,6 +117,93 @@ Y_UNIT_TEST_SUITE_F(TPageParserOwnership, ::NKikimr::NTable::NTest::TTableCacheT
 
     Y_UNIT_TEST(CompressedDataPageOwnsDecodedBytes) {
         CheckDataPage(NPage::ECodec::LZ4);
+    }
+
+    Y_UNIT_TEST(SharedBorrowedDataSurvivesInputChanges) {
+        const auto plainEggs = MakePages(NPage::ECodec::Plain);
+        const auto compressedEggs = MakePages(NPage::ECodec::LZ4);
+        NTest::TTestEnv env;
+        const auto& plainPart = *plainEggs.Lone();
+        const auto& compressedPart = *compressedEggs.Lone();
+        auto plain = env.TryGetPage(&plainPart, NTest::IndexTools::GetFirstPageLocation(plainPart, {}), {});
+        auto compressed =
+            env.TryGetPage(&compressedPart, NTest::IndexTools::GetFirstPageLocation(compressedPart, {}), {});
+        NPage::TBorrowedDataPage page(plain.Borrow());
+        auto first = page.BuildSharedData();
+        UNIT_ASSERT(first.data() == plain.data());
+        UNIT_ASSERT(page.data() == first.data());
+        {
+            auto copy = page;
+            auto moved = std::move(copy);
+            UNIT_ASSERT(moved.BuildSharedData().data() == first.data());
+            NPage::TBorrowedDataPage decoded(compressed.Borrow());
+            auto target = moved;
+            target = decoded;
+            UNIT_ASSERT(target.BuildSharedData().data() == decoded.data());
+            target = moved;
+            UNIT_ASSERT(target.BuildSharedData().data() == first.data());
+            target = std::move(decoded);
+            UNIT_ASSERT(target.BuildSharedData().data() != first.data());
+            target = std::move(moved);
+            auto& self = target;
+            target = self;
+            target = std::move(self);
+            UNIT_ASSERT(target.BuildSharedData().data() == first.data());
+        }
+        {
+            NPage::TDataPage owned(&first);
+            auto copy = owned;
+            auto moved = std::move(copy);
+            copy = owned;
+            owned = std::move(moved);
+            auto& self = owned;
+            owned = self;
+            owned = std::move(self);
+            UNIT_ASSERT(owned.GetData().data() == first.data());
+        }
+        page.Set(compressed.Borrow());
+        compressed.Drop();
+        auto decoded = page.BuildSharedData();
+        UNIT_ASSERT(decoded);
+        UNIT_ASSERT(decoded.data() == page.data());
+        UNIT_ASSERT(decoded.data() != first.data());
+        const char decodedFirstByte = decoded.data()[0];
+        {
+            auto copy = page;
+            auto moved = std::move(copy);
+            UNIT_ASSERT(moved.BuildSharedData().data() == decoded.data());
+        }
+        page.Set(&first);
+        plain.Drop();
+        UNIT_ASSERT(page.data() == first.data());
+        auto raw = page.BuildSharedData();
+        UNIT_ASSERT(raw.data() == first.data());
+        page.Set();
+        UNIT_ASSERT(!page);
+        UNIT_ASSERT(page.data() == nullptr);
+        UNIT_ASSERT(!page.BuildSharedData());
+        UNIT_ASSERT(NPage::TDataPage(&first));
+        UNIT_ASSERT_VALUES_EQUAL(decoded.data()[0], decodedFirstByte);
+        UNIT_ASSERT(NPage::TDataPage(&raw));
+    }
+
+    Y_UNIT_TEST(DecompressionFailureReleasesConstructingParserStorage) {
+        const auto eggs = MakePages(NPage::ECodec::LZ4);
+        const auto& part = *eggs.Lone();
+        NTest::TTestEnv env;
+        auto input = env.TryGetPage(&part, NTest::IndexTools::GetFirstPageLocation(part, {}), {});
+        auto malformed = TSharedData::Copy(input.data(), input.size());
+        const auto encoded = NPage::TLabelWrapper().Read(malformed, NPage::EPage::DataPage);
+        UNIT_ASSERT(encoded.Page.size() > sizeof(ui64));
+        const auto offset = encoded.Page.data() - malformed.data();
+        // A two-byte literal cannot fit in the declared one-byte output buffer
+        WriteUnaligned<ui64>(malformed.mutable_data() + offset, 1);
+        malformed.mutable_data()[offset + sizeof(ui64)] = 0x20;
+        UNIT_ASSERT(malformed.IsPrivate());
+        UNIT_ASSERT_EXCEPTION(NPage::TDataPage(&malformed), NBlockCodecs::TDataError);
+        UNIT_ASSERT(malformed.IsPrivate());
+        UNIT_ASSERT_EXCEPTION(NPage::TBorrowedDataPage(&malformed), NBlockCodecs::TDataError);
+        UNIT_ASSERT(malformed.IsPrivate());
     }
 
     Y_UNIT_TEST(BorrowedFlatIndexMatchesOwnedIndex) {

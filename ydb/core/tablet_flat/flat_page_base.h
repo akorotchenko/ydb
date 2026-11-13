@@ -242,9 +242,9 @@ static_assert(sizeof(TDataRef) == 8, "Invalid TDataRef size");
 static_assert(sizeof(TRecordsHeader) == 4, "Invalid TRecordsHeader size");
 static_assert(sizeof(TRecordsEntry) == 4, "Invalid TRecordsEntry size");
 
-template <typename TRecord>
+template <typename TRecord, typename TMetadata = TEmpty>
 struct TBlockWithRecords {
-    using TSelf = TBlockWithRecords<TRecord>;
+    using TSelf = TBlockWithRecords<TRecord, TMetadata>;
     using TIterator = TPageIterator<TSelf, TRecord>;
 
     const TRecord* Record(TRecIdx idx) const noexcept
@@ -265,6 +265,7 @@ struct TBlockWithRecords {
     const void *Base  = nullptr;
     const TRecordsEntry *Offsets = nullptr;
     ui32 Count = 0;
+    Y_NO_UNIQUE_ADDRESS TMetadata Metadata{};
 };
 
 using TCells = TArrayRef<const TCell>;

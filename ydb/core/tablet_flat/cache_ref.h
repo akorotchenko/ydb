@@ -216,6 +216,9 @@ public:
 private:
     friend class TCachePageRefImpl<TTraits>;
 
+    template <class T>
+    friend NActors::TSharedData SharePageBuffer(TCachePageConstRefImpl<T> page) noexcept;
+
     Y_FORCE_INLINE explicit TCachePageConstRefImpl(TCacheItem cacheItem) noexcept
         : CacheItem_(cacheItem)
     {}
@@ -225,6 +228,17 @@ private:
 
     TCacheItem CacheItem_;
 };
+
+// Retain exact page bytes; the native owner must be alive during this call
+template <class TTraits>
+Y_FORCE_INLINE NActors::TSharedData SharePageBuffer(TCachePageConstRefImpl<TTraits> page) noexcept {
+    if (!page) {
+        return {};
+    }
+    return page.WithHandle([](const THandle& handle) {
+        return handle.Body.PageBuffer.Share(handle.Key2OrSize.load(std::memory_order_relaxed));
+    });
+}
 
 // Ordinary eviction must keep a natively owned page findable and its payload valid
 template <class TTraits = TProdTraits>

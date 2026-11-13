@@ -12,6 +12,7 @@
 
 #include <library/cpp/blockcodecs/codecs.h>
 #include <util/generic/buffer.h>
+#include <memory>
 
 namespace NKikimr {
 namespace NTable {
@@ -211,14 +212,159 @@ namespace NPage {
         static_assert(sizeof(TRecord) == 1, "Invalid TDataPage TRecord size");
         static_assert(sizeof(TExtra) == 8, "Invalid TDataPage page extra chunk");
 
-        using TBlock = TBlockWithRecords<TRecord>;
+        enum class EStorageKind : ui8 {
+            SharedData,
+            BorrowedPage,
+        };
+
+        using TBlock = TBlockWithRecords<TRecord, EStorageKind>;
 
     public:
         using TIter = TBlock::TIterator;
     };
 
     template <class TInputRef>
-    struct TDataPageImpl : public TDataPageLayout {
+    class TDataPageStorage : public TDataPageLayout {
+    protected:
+        TDataPageStorage() noexcept = default;
+
+        TDataPageStorage(const TDataPageStorage& other) noexcept
+            : Page(other.Page)
+            , BaseRow_(other.BaseRow_)
+        {
+            AssignStorage(other);
+        }
+
+        TDataPageStorage(TDataPageStorage&& other) noexcept
+            : Page(other.Page)
+            , BaseRow_(other.BaseRow_)
+        {
+            AssignStorage(std::move(other));
+        }
+
+        TDataPageStorage& operator=(const TDataPageStorage& other) noexcept {
+            if (this != &other) {
+                ResetDecoded();
+                AssignStorage(other);
+                Page = other.Page;
+                BaseRow_ = other.BaseRow_;
+            }
+            return *this;
+        }
+
+        TDataPageStorage& operator=(TDataPageStorage&& other) noexcept {
+            if (this != &other) {
+                ResetDecoded();
+                AssignStorage(std::move(other));
+                Page = other.Page;
+                BaseRow_ = other.BaseRow_;
+            }
+            return *this;
+        }
+
+        ~TDataPageStorage() {
+            if constexpr (!std::is_same_v<TInputRef, TCachePageRef>) {
+                if (IsBorrowed()) {
+                    std::destroy_at(&Storage_.InputRef);
+                    return;
+                }
+            }
+            std::destroy_at(&Storage_.Decoded);
+        }
+
+        const TSharedData& DecodedData() const noexcept {
+            Y_DEBUG_ABORT_UNLESS(!IsBorrowed());
+            return Storage_.Decoded;
+        }
+
+        TSharedData& ResetDecoded() noexcept {
+            if constexpr (!std::is_same_v<TInputRef, TCachePageRef>) {
+                if (IsBorrowed()) {
+                    std::destroy_at(&Storage_.InputRef);
+                    std::construct_at(&Storage_.Decoded);
+                    Page.Metadata = EStorageKind::SharedData;
+                    return Storage_.Decoded;
+                }
+            }
+            Storage_.Decoded = {};
+            return Storage_.Decoded;
+        }
+
+        void SetBorrowed(TInputRef ref) noexcept
+            requires(!std::is_same_v<TInputRef, TCachePageRef>)
+        {
+            Y_DEBUG_ABORT_UNLESS(!IsBorrowed());
+            std::destroy_at(&Storage_.Decoded);
+            std::construct_at(&Storage_.InputRef, std::move(ref));
+            Page.Metadata = EStorageKind::BorrowedPage;
+        }
+
+        TSharedData ShareData() const noexcept {
+            if constexpr (!std::is_same_v<TInputRef, TCachePageRef>) {
+                if (IsBorrowed()) {
+                    return NSharedCache::SharePageBuffer(Storage_.InputRef);
+                }
+            }
+            return Storage_.Decoded;
+        }
+
+    private:
+        bool IsBorrowed() const noexcept {
+            if constexpr (std::is_same_v<TInputRef, TCachePageRef>) {
+                return false;
+            } else {
+                return Page.Metadata == EStorageKind::BorrowedPage;
+            }
+        }
+
+        // The empty SharedData alternative is active on entry
+        template <class TOther>
+        void AssignStorage(TOther&& other) noexcept {
+            if constexpr (!std::is_same_v<TInputRef, TCachePageRef>) {
+                if (other.IsBorrowed()) {
+                    std::destroy_at(&Storage_.Decoded);
+                    std::construct_at(&Storage_.InputRef, std::forward<TOther>(other).Storage_.InputRef);
+                    return;
+                }
+            }
+            Storage_.Decoded = std::forward<TOther>(other).Storage_.Decoded;
+        }
+
+        union TStorage {
+            TSharedData Decoded;
+            TInputRef InputRef;
+
+            TStorage() noexcept
+                : Decoded()
+            {}
+
+            // TDataPageStorage destroys the member selected by Page.Metadata
+            ~TStorage() {}
+        } Storage_;
+
+    protected:
+        TBlock Page;
+        TRowId BaseRow_ = Max<TRowId>();
+    };
+
+    template <class TInputRef>
+    struct TDataPageImpl : public TDataPageStorage<TInputRef> {
+    private:
+        using ICodec = NBlockCodecs::ICodec;
+        using TBase = TDataPageStorage<TInputRef>;
+        using TBase::BaseRow_;
+        using TBase::DecodedData;
+        using TBase::Page;
+        using TBase::ResetDecoded;
+        using TBase::SetBorrowed;
+        using TBase::ShareData;
+
+    public:
+        using TBlock = TDataPageLayout::TBlock;
+        using TIter = TDataPageLayout::TIter;
+        using TRecord = TDataPageLayout::TRecord;
+        using TExtra = TDataPageLayout::TExtra;
+
         TDataPageImpl(const TSharedData* raw = nullptr)
         {
             Set(raw);
@@ -248,6 +394,14 @@ namespace NPage {
             return BaseRow_;
         }
 
+        const char* data() const noexcept {
+            return static_cast<const char*>(Page.Base);
+        }
+
+        TSharedData BuildSharedData() const noexcept {
+            return ShareData();
+        }
+
         TDataPageImpl& Set(const TSharedData* raw = nullptr)
         {
             return Parse(raw ? *raw : TSharedData());
@@ -259,7 +413,11 @@ namespace NPage {
                 ref.Drop();
                 return Parse(std::move(raw));
             } else {
-                return Parse(ref ? TArrayRef<const char>(ref.data(), ref.size()) : TArrayRef<const char>(), {});
+                Parse(ref ? TArrayRef<const char>(ref.data(), ref.size()) : TArrayRef<const char>(), {});
+                if (ref && !DecodedData()) {
+                    SetBorrowed(ref);
+                }
+                return *this;
             }
         }
 
@@ -270,6 +428,7 @@ namespace NPage {
         }
 
         TDataPageImpl& Parse(TArrayRef<const char> raw, TSharedData owner) {
+            TSharedData& Decoded = ResetDecoded();
             Page = { };
 
             if (raw) {
@@ -283,7 +442,7 @@ namespace NPage {
 
                     Y_ENSURE(data == ECodec::LZ4, "Only LZ4 encoding allowed");
 
-                    Codec = Codec ? Codec : NBlockCodecs::Codec("lz4fast");
+                    static const ICodec* const Codec = NBlockCodecs::Codec("lz4fast");
                     auto size = Codec->DecompressedLength(data.Page);
 
                     // We expect original page had the same label size as a compressed page
@@ -322,7 +481,7 @@ namespace NPage {
         const TSharedData& GetData() const noexcept
             requires std::is_same_v<TInputRef, TCachePageRef>
         {
-            return Decoded;
+            return DecodedData();
         }
 
         TIter LookupKey(TCells key, const TPartScheme::TGroupInfo &group,
@@ -402,14 +561,6 @@ namespace NPage {
 
             return it;
         }
-
-    private:
-        using ICodec = NBlockCodecs::ICodec;
-
-        TSharedData Decoded;
-        TBlock Page;
-        TRowId BaseRow_ = Max<TRowId>();
-        const ICodec *Codec = nullptr;
     };
 
     using TDataPage = TDataPageImpl<TCachePageRef>;

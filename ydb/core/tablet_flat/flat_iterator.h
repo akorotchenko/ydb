@@ -1071,9 +1071,8 @@ inline void TTableIterBase<TIteratorOps>::InitLastKey(ERowOp op)
         }
         case EType::Run: {
             auto& it = *RunIters[ai.Index];
-            const TSharedData& page = it.GetKeyPage();
-            if (LastKeyPage.data() != page.data()) {
-                LastKeyPage = page;
+            if (LastKeyPage.data() != it.GetKeyPageData()) {
+                LastKeyPage = it.ShareKeyPage();
             }
             break;
         }

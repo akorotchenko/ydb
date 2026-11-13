@@ -451,6 +451,14 @@ namespace NTable {
             return Page.GetData();
         }
 
+        const char* GetKeyPageData() const noexcept {
+            return Page.data();
+        }
+
+        TSharedData ShareKeyPage() const noexcept {
+            return Page.BuildSharedData();
+        }
+
     private:
         Y_FORCE_INLINE EReady Exhausted()
         {
@@ -941,6 +949,14 @@ namespace NTable {
             requires std::is_same_v<TInputRef, TCachePageRef>
         {
             return Main.GetPageData();
+        }
+
+        const char* GetKeyPageData() const noexcept {
+            return Main.GetKeyPageData();
+        }
+
+        TSharedData ShareKeyPage() const noexcept {
+            return Main.ShareKeyPage();
         }
 
         TCells GetRawKey() const
@@ -1785,6 +1801,16 @@ namespace NTable {
         {
             Y_DEBUG_ABORT_UNLESS(CurrentIt);
             return CurrentIt->GetKeyPage();
+        }
+
+        const char* GetKeyPageData() const noexcept {
+            Y_DEBUG_ABORT_UNLESS(CurrentIt);
+            return CurrentIt->GetKeyPageData();
+        }
+
+        TSharedData ShareKeyPage() const noexcept {
+            Y_DEBUG_ABORT_UNLESS(CurrentIt);
+            return CurrentIt->ShareKeyPage();
         }
 
         void Apply(TRowState& row,

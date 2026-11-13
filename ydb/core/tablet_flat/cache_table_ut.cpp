@@ -16482,6 +16482,31 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, item.Index()).Refs(), 0);
     }
 
+    Y_UNIT_TEST(SharedBorrowedPageBufferSurvivesRetiredNativeOwner) {
+        TFixture fixture;
+        const TCollectionCacheItem collection = MakeCollectionCacheItem(61, 62);
+        const TPageCacheItem item = InsertReadyPage(*fixture.Cache, TCacheKey::Page(collection, 0));
+        TTestCachePageRef owner;
+        UNIT_ASSERT(fixture.Cache->Find(collection, 0, owner) == ECacheResultStatus::Hit);
+        auto view = owner.Borrow();
+        const char* data = view.data();
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, item));
+        UNIT_ASSERT(TCacheTestAccess::RetirePageResult(*fixture.Cache, item));
+        TTestCachePageRef absent;
+        UNIT_ASSERT(fixture.Cache->Find(collection, 0, absent) == ECacheResultStatus::Miss);
+        const auto refs = TCacheTestAccess::HandleState(*fixture.Cache, item.Index()).Refs();
+        auto retained = SharePageBuffer(view);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, item.Index()).Refs(), refs);
+        UNIT_ASSERT(retained.data() == data);
+        UNIT_ASSERT_VALUES_EQUAL(retained.size(), 4096);
+        view = {};
+        owner.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
+        UNIT_ASSERT(retained.data() == data);
+        UNIT_ASSERT_VALUES_EQUAL(retained.data()[0], static_cast<char>(item.Index()));
+        UNIT_ASSERT(!SharePageBuffer(TTestCachePageConstRef()));
+    }
+
     Y_UNIT_TEST(PageConstRefSurvivesOwnerMovesAndOperationRenewal) {
         TFixture fixture;
         auto& cache = *fixture.Cache;
@@ -16626,6 +16651,9 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             UNIT_ASSERT(copy.GetLocation() == pinned.GetLocation());
             UNIT_ASSERT(copy.GetType() == pinned.GetType());
             UNIT_ASSERT(copy.IsSticky() == pinned.IsSticky());
+            auto buffer = SharePageBuffer(copy);
+            UNIT_ASSERT(buffer.data() == pinned.data());
+            UNIT_ASSERT_VALUES_EQUAL(buffer.size(), pinned.size());
         }
         UNIT_ASSERT_VALUES_EQUAL(pinned.BuildSharedData().size(), 4096);
         UNIT_ASSERT_VALUES_EQUAL(pinned.BuildSharedData().data()[0], static_cast<char>(inserted.Index()));
