@@ -29,7 +29,8 @@ struct TTableIterOps {
         it.Next();
     }
 
-    static inline EReady MoveNext(TRunIter& it) {
+    template <class TInputRef>
+    static inline EReady MoveNext(TRunIterImpl<TInputRef>& it) {
         return it.Next();
     }
 
@@ -37,7 +38,8 @@ struct TTableIterOps {
         it.Seek(key, seek);
     }
 
-    static inline EReady Seek(TRunIter& it, TArrayRef<const TCell> key, ESeek seek) {
+    template <class TInputRef>
+    static inline EReady Seek(TRunIterImpl<TInputRef>& it, TArrayRef<const TCell> key, ESeek seek) {
         return it.Seek(key, seek);
     }
 
@@ -169,7 +171,8 @@ struct TTableItReverseOps {
         it.Prev();
     }
 
-    static EReady MoveNext(TRunIter& it) {
+    template <class TInputRef>
+    static EReady MoveNext(TRunIterImpl<TInputRef>& it) {
         return it.Prev();
     }
 
@@ -177,7 +180,8 @@ struct TTableItReverseOps {
         it.SeekReverse(key, seek);
     }
 
-    static EReady Seek(TRunIter& it, TArrayRef<const TCell> key, ESeek seek) {
+    template <class TInputRef>
+    static EReady Seek(TRunIterImpl<TInputRef>& it, TArrayRef<const TCell> key, ESeek seek) {
         return it.SeekReverse(key, seek);
     }
 

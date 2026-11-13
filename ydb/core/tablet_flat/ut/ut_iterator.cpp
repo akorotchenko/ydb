@@ -242,6 +242,164 @@ Y_UNIT_TEST_SUITE_F(TIterator, ::NKikimr::NTable::NTest::TTableCacheTest) {
         THashMap<TGroupId, THashSet<TPageId>> Loaded;
     };
 
+    class TBorrowedPageEnv final : public IBorrowedPages {
+    public:
+        explicit TBorrowedPageEnv(NTest::TTestEnv& source)
+            : Source_(source)
+        {}
+
+        TResult Locate(const TMemTable* table, ui64 ref, ui32 tag) override {
+            return Source_.Locate(table, ref, tag);
+        }
+
+        TResult Locate(const TPart* part, ui64 ref, ELargeObj lob) override {
+            return Source_.Locate(part, ref, lob);
+        }
+
+        TCachePageConstRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId group) override {
+            return Retain(Source_.TryGetPage(part, location, group));
+        }
+
+        TCachePageConstRef TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId group) override {
+            return Retain(Source_.TryGetIndexPage(part, location, group));
+        }
+
+    private:
+        TCachePageConstRef Retain(TCachePageRef page) {
+            if (!page) {
+                return {};
+            }
+            Pages_.push_back(std::move(page));
+            return Pages_.back().Borrow();
+        }
+
+        NTest::TTestEnv& Source_;
+        TVector<TCachePageRef> Pages_;
+    };
+
+    template <class TIterator, class TInputRef>
+    THolder<TIterator> MakeTypedTable(const TRowScheme* scheme, TArrayRef<const TRun*> runs, TPages<TInputRef>* env) {
+        const TTag tags[] = { 1 };
+        auto result = MakeHolder<TIterator>(scheme, tags);
+        for (const TRun* run : runs) {
+            auto reader = MakeHolder<TRunIterImpl<TInputRef>>(*run, result->Remap.Tags, scheme->Keys, env);
+            EReady ready;
+            if constexpr (TIterator::Direction == EDirection::Reverse) {
+                ready = reader->SeekReverse({}, ESeek::Lower);
+            } else {
+                ready = reader->Seek({}, ESeek::Lower);
+            }
+            if (ready != EReady::Gone) {
+                result->Push(std::move(reader));
+            }
+        }
+        return result;
+    }
+
+    template <class TOwned, class TBorrowed>
+    void CheckBorrowedTable(NPage::EPage indexType) {
+        static_assert(std::is_same_v<typename TOwned::TReverseType::TReverseType, TOwned>);
+        static_assert(std::is_same_v<typename TBorrowed::TReverseType::TReverseType, TBorrowed>);
+        TLayoutCook lay;
+        lay.Col(0, 0, NScheme::NTypeIds::String).Col(0, 1, NScheme::NTypeIds::String).Key({ 0 });
+        NPage::TConf conf;
+        conf.Group(0).PageSize = 256;
+        conf.Group(0).PageRows = 2;
+        conf.Group(0).Codec = NPage::ECodec::LZ4;
+        conf.Group(0).ForceCompression = true;
+        conf.Group(0).BTreeIndexNodeKeysMin = conf.Group(0).BTreeIndexNodeKeysMax = 2;
+        conf.LargeEdge = 24;
+        conf.WriteFlatIndex = indexType == NPage::EPage::FlatIndex;
+        conf.WriteBTreeIndexV1 = indexType == NPage::EPage::BTreeIndex;
+        conf.WriteBTreeIndexV2 = indexType == NPage::EPage::BTreeIndexV2;
+        constexpr ui32 rowCount = 32;
+        const auto makePart = [&](ui64 epoch) {
+            TPartCook cook(lay, conf, TLogoBlobID(700 + epoch, 2, 3, 1, 0, 0), TEpoch(epoch));
+            for (ui32 row = 1; row <= rowCount; ++row) {
+                cook.AddN(Sprintf("not_inline_and_long_key_%04u", row),
+                    Sprintf("epoch_%u_not_inline_and_long_value_%04u", ui32(epoch), row));
+            }
+            return cook.Finish();
+        };
+        const auto older = makePart(1);
+        const auto newer = makePart(2);
+        TRun olderRun(*older.Scheme->Keys), newerRun(*older.Scheme->Keys);
+        for (const auto& slice : *older.Lone()->Slices) {
+            UNIT_ASSERT(olderRun.Insert(older.Lone(), slice).second);
+        }
+        for (const auto& slice : *newer.Lone()->Slices) {
+            UNIT_ASSERT(newerRun.Insert(newer.Lone(), slice).second);
+        }
+        const TRun* runs[] = { &olderRun, &newerRun };
+        TFirstTimeFailEnv ownedEnv, source;
+        TBorrowedPageEnv borrowedEnv(source);
+        THolder<TOwned> owned;
+        THolder<TBorrowed> borrowed;
+        EReady ready = EReady::Page;
+        ui32 initialFaults = 0;
+        for (ui32 retry = 0; retry < 32 && ready == EReady::Page; ++retry) {
+            owned = MakeTypedTable<TOwned, TCachePageRef>(older.Scheme.Get(), runs, &ownedEnv);
+            borrowed = MakeTypedTable<TBorrowed, TCachePageConstRef>(older.Scheme.Get(), runs, &borrowedEnv);
+            ready = owned->Next(ENext::All);
+            UNIT_ASSERT(ready == borrowed->Next(ENext::All));
+            initialFaults += ready == EReady::Page;
+        }
+        UNIT_ASSERT(ready == EReady::Data);
+        UNIT_ASSERT(initialFaults > 0);
+        TString lastSeen;
+        ui32 rows = 0, laterFaults = 0;
+        for (ui32 attempt = 0; attempt < rowCount * 32; ++attempt) {
+            if (ready == EReady::Gone) {
+                UNIT_ASSERT(borrowed->GetKey().Cells().empty());
+                UNIT_ASSERT(owned->GetKey().Cells().empty());
+                break;
+            }
+            const TString actualKey(borrowed->GetKey().Cells().at(0).AsBuf());
+            UNIT_ASSERT_VALUES_EQUAL(actualKey, TString(owned->GetKey().Cells().at(0).AsBuf()));
+            if (ready == EReady::Page) {
+                UNIT_ASSERT_VALUES_EQUAL(actualKey, lastSeen);
+                ++laterFaults;
+            } else {
+                const ui32 row = TOwned::Direction == EDirection::Reverse ? rowCount - rows : rows + 1;
+                UNIT_ASSERT_VALUES_EQUAL(actualKey, Sprintf("not_inline_and_long_key_%04u", row));
+                const TString expectedValue = Sprintf("epoch_2_not_inline_and_long_value_%04u", row);
+                UNIT_ASSERT_VALUES_EQUAL(TString(borrowed->GetValues().Cells().at(0).AsBuf()), expectedValue);
+                UNIT_ASSERT_VALUES_EQUAL(TString(owned->GetValues().Cells().at(0).AsBuf()), expectedValue);
+                lastSeen = actualKey;
+                ++rows;
+            }
+            ready = owned->Next(ENext::All);
+            UNIT_ASSERT(ready == borrowed->Next(ENext::All));
+        }
+        UNIT_ASSERT(ready == EReady::Gone);
+        UNIT_ASSERT_VALUES_EQUAL(rows, rowCount);
+        UNIT_ASSERT(laterFaults > 0);
+    }
+
+    Y_UNIT_TEST(BorrowedTableV1RetainsKeysDuringPageFaults) {
+        CheckBorrowedTable<TTableIter, TBorrowedTableIter>(NPage::EPage::BTreeIndex);
+    }
+
+    Y_UNIT_TEST(BorrowedTableV2RetainsKeysDuringPageFaults) {
+        CheckBorrowedTable<TTableIter, TBorrowedTableIter>(NPage::EPage::BTreeIndexV2);
+    }
+
+    Y_UNIT_TEST(BorrowedFlatTableRetainsKeysDuringPageFaults) {
+        CheckBorrowedTable<TTableIter, TBorrowedTableIter>(NPage::EPage::FlatIndex);
+    }
+
+    Y_UNIT_TEST(BorrowedReverseTableV1RetainsKeysDuringPageFaults) {
+        CheckBorrowedTable<TTableReverseIter, TBorrowedTableReverseIter>(NPage::EPage::BTreeIndex);
+    }
+
+    Y_UNIT_TEST(BorrowedReverseTableV2RetainsKeysDuringPageFaults) {
+        CheckBorrowedTable<TTableReverseIter, TBorrowedTableReverseIter>(NPage::EPage::BTreeIndexV2);
+    }
+
+    Y_UNIT_TEST(BorrowedReverseFlatTableRetainsKeysDuringPageFaults) {
+        CheckBorrowedTable<TTableReverseIter, TBorrowedTableReverseIter>(NPage::EPage::FlatIndex);
+    }
+
     Y_UNIT_TEST(GetKey)
     {
         TLayoutCook lay;

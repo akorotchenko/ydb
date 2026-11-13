@@ -1874,7 +1874,7 @@ namespace NTable {
         }
 
     private:
-        template <class TIteratorOps>
+        template <class TIteratorOps, class TPageRef>
         friend class TTableIterBase;
 
         void ReleaseLocatedValues() {
