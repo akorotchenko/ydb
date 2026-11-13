@@ -48,11 +48,6 @@ namespace NTable {
         virtual ui32 GetLastWrittenPageId(ui32 group) const noexcept = 0;
     };
 
-    template <class TRef>
-    struct TPages;
-
-    using IBorrowedPages = TPages<TCachePageConstRef>;
-
     struct IPageEnvironment {
         using ELargeObj = NTable::ELargeObj;
         using TPart = NTable::TPart;
@@ -62,13 +57,6 @@ namespace NTable {
         using TGroupId = NPage::TGroupId;
 
         virtual ~IPageEnvironment() = default;
-
-        // Optional pin-backed provider for readers confined to the current call
-        virtual IBorrowedPages* BorrowedPages() & noexcept {
-            return nullptr;
-        }
-
-        IBorrowedPages* BorrowedPages() && = delete;
 
         class TReadScope {
         public:
@@ -256,6 +244,7 @@ namespace NTable {
     };
 
     using IOwnedPages = TPages<TCachePageRef>;
+    using IBorrowedPages = TPages<TCachePageConstRef>;
     using IPages = IOwnedPages;
 }
 }

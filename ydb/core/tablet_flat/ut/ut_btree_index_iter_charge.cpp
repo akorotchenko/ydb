@@ -8,6 +8,8 @@
 #include "flat_part_charge_create.h"
 #include "flat_part_keys.h"
 #include "flat_table.h"
+#include "flat_database.h"
+#include "flat_dbase_naked.h"
 #include "test/libs/table/test_writer.h"
 #include "test/libs/table/wrap_part.h"
 #include <test/libs/table/test_envs.h>
@@ -29,6 +31,15 @@ static_assert(
     std::is_same_v<decltype(std::declval<IBorrowedPages&>().TryGetIndexPage(nullptr, {}, {})), TCachePageConstRef>);
 static_assert(std::is_same_v<IOwnedPages::TResult, IBorrowedPages::TResult>);
 static_assert(sizeof(IPageEnvironment::TResult) == 24);
+
+template <class TReader>
+concept TCanSelectTemporary =
+    requires(TReader&& reader, TRowState& row) { std::move(reader).Select(1, TRawVals{}, TTagsRef{}, row); };
+
+static_assert(!TCanSelectTemporary<TOwningDatabaseReader>);
+static_assert(!TCanSelectTemporary<TTransactionReader>);
+static_assert(!std::is_copy_constructible_v<TTransactionReader>);
+static_assert(!std::is_move_constructible_v<TTransactionReader>);
 
 static_assert(std::is_same_v<TBtreeIndexNode::THeader, TBorrowedBtreeIndexNode::THeader>);
 static_assert(std::is_same_v<TBtreeIndexNode::TChild, TBorrowedBtreeIndexNode::TChild>);
@@ -631,7 +642,7 @@ Y_UNIT_TEST_SUITE_F(TPageReadScope, ::NKikimr::NTable::NTest::TTableCacheTest) {
             NTabletFlatExecutor::TSeat borrowedSeat(
                 2, TAutoPtr<NTabletFlatExecutor::ITransaction>(new TReadTransaction));
             NTabletFlatExecutor::TPageCollectionReadEnv borrowedEnv(borrowedSeat);
-            auto& borrowedPages = *borrowedEnv.BorrowedPages();
+            auto& borrowedPages = borrowedEnv.BorrowedPages();
             const auto references = [&] {
                 auto cacheOp = TCache::Get().BeginOperation();
                 return NSharedCache::THandleState::FromRaw(
@@ -1956,31 +1967,7 @@ Y_UNIT_TEST_SUITE_F(TRowReaderOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
 }
 
 Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTest) {
-    class TPinBackedEnv final : public TTouchEnv {
-    public:
-        TPinBackedEnv()
-            : Pages(Source)
-        {}
-
-        IBorrowedPages* BorrowedPages() & noexcept override {
-            return &Pages;
-        }
-
-        TCachePageRef TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
-            UNIT_FAIL("Precharge must use the borrowed provider");
-            return {};
-        }
-
-        TCachePageRef TryGetIndexPage(const TPart*, const TPageLocation&, TGroupId) override {
-            UNIT_FAIL("Precharge must use the borrowed provider");
-            return {};
-        }
-
-        TTouchEnv Source;
-        TIndexIteratorOwnership::TBorrowedEnv Pages;
-    };
-
-    void InitTable(TTable & table, const NTest::TPartEggs& eggs) {
+    TScheme::TTableInfo MakeTableScheme(const NTest::TPartEggs& eggs) {
         TScheme::TTableInfo schema("precharge", 1);
         for (const auto& col : eggs.Scheme->Cols) {
             auto& column = schema.Columns[col.Tag];
@@ -1989,7 +1976,11 @@ Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
             column.KeyOrder = col.Key;
             column.Family = eggs.Scheme->Families[col.Group];
         }
-        table.SetScheme(schema);
+        return schema;
+    }
+
+    void InitTable(TTable & table, const NTest::TPartEggs& eggs) {
+        table.SetScheme(MakeTableScheme(eggs));
         table.Merge(eggs.ToPartView());
     }
 
@@ -2011,11 +2002,12 @@ Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
             for (bool point : { false, true }) {
                 for (const auto& [items, bytes] : limits) {
                     TTouchEnv owned;
-                    TPinBackedEnv borrowed;
+                    TTouchEnv source;
+                    TIndexIteratorOwnership::TBorrowedEnv borrowed(source);
                     TSelectStats ownedStats, borrowedStats;
                     bool ready = false;
                     for (ui32 retry = 0; retry < 32 && !ready; ++retry) {
-                        const auto precharge = [&](IPages* env, TSelectStats& stats) {
+                        const auto precharge = [&](auto* env, TSelectStats& stats) {
                             return table.Precharge(firstKey, point ? TRawVals(firstKey) : TRawVals(lastKey), tags, env,
                                 EHint::NoByKey, items, bytes, direction, TRowVersion(0, 1), stats);
                         };
@@ -2026,10 +2018,10 @@ Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
                         UNIT_ASSERT_VALUES_EQUAL(actual.BytesPrecharged, expected.BytesPrecharged);
                         UNIT_ASSERT_VALUES_EQUAL(borrowedStats.Sieved, ownedStats.Sieved);
                         UNIT_ASSERT_VALUES_EQUAL(borrowedStats.Weeded, ownedStats.Weeded);
-                        UNIT_ASSERT(borrowed.Source.Touched == owned.Touched);
+                        UNIT_ASSERT(source.Touched == owned.Touched);
                         ready = actual.Ready;
                         owned.LoadTouched();
-                        borrowed.Source.LoadTouched();
+                        source.LoadTouched();
                     }
                     UNIT_ASSERT(ready);
                 }
@@ -2061,10 +2053,11 @@ Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
             const auto cells = MakeKey(first, second);
             for (bool raw : { false, true }) {
                 TTouchEnv owned;
-                TPinBackedEnv borrowed;
+                TTouchEnv source;
+                TIndexIteratorOwnership::TBorrowedEnv borrowed(source);
                 bool ready = false;
                 for (ui32 retry = 0; retry < 32 && !ready; ++retry) {
-                    const auto select = [&](IPages* env) {
+                    const auto select = [&](auto* env) {
                         return raw ? table.SelectRowVersion(rawKey, env, EHint::NoByKey)
                                    : table.SelectRowVersion(cells, env, EHint::NoByKey);
                     };
@@ -2076,10 +2069,10 @@ Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
                     UNIT_ASSERT(actual.RowOp == expected.RowOp);
                     UNIT_ASSERT(actual.LockMode == expected.LockMode);
                     UNIT_ASSERT_VALUES_EQUAL(actual.LockTxId, expected.LockTxId);
-                    UNIT_ASSERT(borrowed.Source.Touched == owned.Touched);
+                    UNIT_ASSERT(source.Touched == owned.Touched);
                     ready = actual.Ready != EReady::Page;
                     owned.LoadTouched();
-                    borrowed.Source.LoadTouched();
+                    source.LoadTouched();
                 }
                 UNIT_ASSERT(ready);
             }
@@ -2096,6 +2089,127 @@ Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
 
     Y_UNIT_TEST(TableRowVersionSelectsBorrowedFlat) {
         CheckTableRowVersions(MakePart({ .Levels = 3, .Groups = true, .History = true, .FlatOnly = true }));
+    }
+
+    void CheckDatabaseReader(EPage indexType, ECodec codec) {
+        TLayoutCook lay;
+        lay.Col(0, 0, NScheme::NTypeIds::Uint32)
+            .Col(0, 1, NScheme::NTypeIds::Uint32)
+            .Col(0, 2, NScheme::NTypeIds::Uint32)
+            .Col(1, 3, NScheme::NTypeIds::Uint64)
+            .Col(1, 4, NScheme::NTypeIds::String)
+            .Key({ 0, 1 });
+        NPage::TConf conf;
+        for (ui32 group : { 0, 1 }) {
+            conf.Group(group).PageRows = 2;
+            conf.Group(group).PageSize = 256;
+            conf.Group(group).Codec = codec;
+            conf.Group(group).ForceCompression = codec == ECodec::LZ4;
+            conf.Group(group).BTreeIndexNodeKeysMin = conf.Group(group).BTreeIndexNodeKeysMax = 2;
+        }
+        conf.WriteFlatIndex = indexType == EPage::FlatIndex;
+        conf.WriteBTreeIndexV1 = indexType == EPage::BTreeIndex;
+        conf.WriteBTreeIndexV2 = indexType == EPage::BTreeIndexV2;
+        TPartCook olderCook(lay, conf, TLogoBlobID(801, 2, 3, 1, 0, 0), TEpoch(i64(1)));
+        TPartCook newerCook(lay, conf, TLogoBlobID(802, 2, 3, 1, 0, 0), TEpoch(i64(2)));
+        const TString payload(512, 'x');
+        for (ui32 key = 0; key < 16; ++key) {
+            olderCook.AddN(key, ui32(0), key, ui64(key), payload);
+            newerCook.AddN(key, ui32(0), key + 100);
+        }
+        const auto older = olderCook.Finish();
+        const auto newer = newerCook.Finish();
+        const auto makeDatabase = [&] {
+            TAutoPtr<TScheme> schema = new TScheme;
+            schema->Tables.emplace(1, MakeTableScheme(older));
+            auto database = MakeHolder<TDatabase>(new TDatabaseImpl(0, schema, nullptr));
+            database->Merge(1, older.ToPartView());
+            database->Merge(1, newer.ToPartView());
+            return database;
+        };
+        auto ownedDatabase = makeDatabase();
+        auto borrowedDatabase = makeDatabase();
+        const TVector<TTag> tags{ 2, 3, 4 };
+        for (bool commit : { false, true }) {
+            TTouchEnv ownedEnv, source;
+            TIndexIteratorOwnership::TBorrowedEnv borrowedEnv(source);
+            TTransactionReader reader(*borrowedDatabase, borrowedEnv);
+            ownedDatabase->Begin(1, ownedEnv);
+            borrowedDatabase->Begin(1, source);
+            TRowState ownedRow, borrowedRow;
+            for (ui32 key : { 1, 9, 15 }) {
+                const ui32 second = 0;
+                const TRawTypeValue rawKey[] = {
+                    TRawTypeValue(&key, sizeof(key), NScheme::NTypeIds::Uint32),
+                    TRawTypeValue(&second, sizeof(second), NScheme::NTypeIds::Uint32),
+                };
+                EReady ready = EReady::Page;
+                for (ui32 retry = 0; retry < 32 && ready == EReady::Page; ++retry) {
+                    const auto expected = ownedDatabase->Select(1, rawKey, tags, ownedRow, EHint::NoByKey);
+                    ready = reader.Select(1, rawKey, tags, borrowedRow, EHint::NoByKey);
+                    UNIT_ASSERT(ready == expected);
+                    UNIT_ASSERT(source.Touched == ownedEnv.Touched);
+                    ownedEnv.LoadTouched();
+                    source.LoadTouched();
+                }
+                UNIT_ASSERT(ready == EReady::Data);
+                UNIT_ASSERT_VALUES_EQUAL(
+                    TSerializedCellVec::Serialize(*borrowedRow), TSerializedCellVec::Serialize(*ownedRow));
+                UNIT_ASSERT_VALUES_EQUAL(borrowedRow.Get(0).AsValue<ui32>(), key + 100);
+                UNIT_ASSERT_VALUES_EQUAL(borrowedRow.Get(1).AsValue<ui64>(), key);
+                UNIT_ASSERT_VALUES_EQUAL(borrowedRow.Get(2).AsBuf(), payload);
+
+                reader.Precharge(1, rawKey, rawKey, tags, EHint::NoByKey, 0, 0);
+                reader.SelectRowVersion(1, rawKey, EHint::NoByKey);
+                UNIT_ASSERT_VALUES_EQUAL(borrowedRow.Get(2).AsBuf(), payload);
+                // Keep both environments in the same loaded-page state for the next Select
+                ownedDatabase->Precharge(1, rawKey, rawKey, tags, EHint::NoByKey, 0, 0);
+                ownedDatabase->SelectRowVersion(1, rawKey, EHint::NoByKey);
+                ownedEnv.LoadTouched();
+                source.LoadTouched();
+                if (key == 9 && !commit) {
+                    bool rollbackRan = false;
+                    borrowedDatabase->OnRollback([&] {
+                        UNIT_ASSERT_VALUES_EQUAL(borrowedRow.Get(2).AsBuf(), payload);
+                        rollbackRan = true;
+                    });
+                    borrowedDatabase->RollbackChanges(reader);
+                    ownedDatabase->RollbackChanges();
+                    UNIT_ASSERT(rollbackRan);
+                }
+            }
+            bool callbackRan = false;
+            const auto callback = [&] {
+                UNIT_ASSERT_VALUES_EQUAL(borrowedRow.Get(2).AsBuf(), payload);
+                callbackRan = true;
+            };
+            if (commit) {
+                borrowedDatabase->OnCommit(callback);
+            } else {
+                borrowedDatabase->OnRollback(callback);
+            }
+            borrowedDatabase->Commit(1, commit, reader);
+            ownedDatabase->Commit(1, commit);
+            UNIT_ASSERT(callbackRan);
+        }
+    }
+
+    Y_UNIT_TEST(TypedDatabaseReaderV1) {
+        for (auto codec : { ECodec::Plain, ECodec::LZ4 }) {
+            CheckDatabaseReader(EPage::BTreeIndex, codec);
+        }
+    }
+
+    Y_UNIT_TEST(TypedDatabaseReaderV2) {
+        for (auto codec : { ECodec::Plain, ECodec::LZ4 }) {
+            CheckDatabaseReader(EPage::BTreeIndexV2, codec);
+        }
+    }
+
+    Y_UNIT_TEST(TypedDatabaseReaderFlat) {
+        for (auto codec : { ECodec::Plain, ECodec::LZ4 }) {
+            CheckDatabaseReader(EPage::FlatIndex, codec);
+        }
     }
 
     void CheckCharge(const NTest::TPartEggs& eggs) {

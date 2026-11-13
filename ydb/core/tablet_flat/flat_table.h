@@ -150,23 +150,19 @@ public:
             TRowVersion snapshot,
             const ITransactionMapPtr& visible = nullptr,
             const ITransactionObserverPtr& observer = nullptr) const;
-    EReady Select(TRawVals key, TTagsRef tags, IPages* env, TRowState& row,
-                  ui64 flg, TRowVersion snapshot, TDeque<TPartIter>& tempIterators,
-                  TSelectStats& stats,
-                  const ITransactionMapPtr& visible = nullptr,
-                  const ITransactionObserverPtr& observer = nullptr) const;
-    TSelectRowVersionResult SelectRowVersion(
-            TRawVals key, IPages* env, ui64 readFlags,
-            const ITransactionMapPtr& visible = nullptr,
-            const ITransactionObserverPtr& observer = nullptr) const;
-    TSelectRowVersionResult SelectRowVersion(
-            TArrayRef<const TCell> key, IPages* env, ui64 readFlags,
-            const ITransactionMapPtr& visible = nullptr,
-            const ITransactionObserverPtr& observer = nullptr) const;
-    TSelectRowVersionResult SelectRowVersion(
-            const TCelled& key, IPages* env, ui64 readFlags,
-            const ITransactionMapPtr& visible = nullptr,
-            const ITransactionObserverPtr& observer = nullptr) const;
+    template <class TRef>
+    EReady Select(TRawVals key, TTagsRef tags, TPages<TRef>* env, TRowState& row, ui64 flg, TRowVersion snapshot,
+        TDeque<TPartIterImpl<TRef>>& tempIterators, TSelectStats& stats, const ITransactionMapPtr& visible = nullptr,
+        const ITransactionObserverPtr& observer = nullptr) const;
+    template <class TRef>
+    TSelectRowVersionResult SelectRowVersion(TRawVals key, TPages<TRef>* env, ui64 readFlags,
+        const ITransactionMapPtr& visible = nullptr, const ITransactionObserverPtr& observer = nullptr) const;
+    template <class TRef>
+    TSelectRowVersionResult SelectRowVersion(TArrayRef<const TCell> key, TPages<TRef>* env, ui64 readFlags,
+        const ITransactionMapPtr& visible = nullptr, const ITransactionObserverPtr& observer = nullptr) const;
+    template <class TRef>
+    TSelectRowVersionResult SelectRowVersion(const TCelled& key, TPages<TRef>* env, ui64 readFlags,
+        const ITransactionMapPtr& visible = nullptr, const ITransactionObserverPtr& observer = nullptr) const;
     // Works in the same way as SelectRowVersion, but for a range specified
     // by key prefix. Used to check row conflicts in unique indexes.
     // Returns either the first locked row or any non-deleted committed row
@@ -176,10 +172,9 @@ public:
             TArrayRef<const TCell> keyPrefix, IPages* env,
             const ITransactionObserverPtr& observer) const;
 
-    TPrechargeResult Precharge(TRawVals minKey, TRawVals maxKey, TTagsRef tags,
-                     IPages* env, ui64 flg,
-                     ui64 itemsLimit, ui64 bytesLimit,
-                     EDirection direction, TRowVersion snapshot, TSelectStats& stats) const;
+    template <class TRef>
+    TPrechargeResult Precharge(TRawVals minKey, TRawVals maxKey, TTagsRef tags, TPages<TRef>* env, ui64 flg,
+        ui64 itemsLimit, ui64 bytesLimit, EDirection direction, TRowVersion snapshot, TSelectStats& stats) const;
 
     void Update(ERowOp, TRawVals key, TOpsRef, TArrayRef<const TMemGlob> apart, TRowVersion rowVersion);
 
@@ -351,14 +346,6 @@ public:
     void SetTableObserver(TIntrusivePtr<ITableObserver> ptr);
 
 private:
-    template <class TRef>
-    TSelectRowVersionResult SelectRowVersionWithPages(const TCelled& key, TPages<TRef>* env, ui64 readFlags,
-        const ITransactionMapPtr& visible, const ITransactionObserverPtr& observer) const;
-
-    template <class TRef>
-    TPrechargeResult PrechargeWithPages(TRawVals minKey, TRawVals maxKey, TTagsRef tags, TPages<TRef>* env, ui64 flg,
-        ui64 itemsLimit, ui64 bytesLimit, EDirection direction, TRowVersion snapshot, TSelectStats& stats) const;
-
     TMemTable& MemTable();
     void AddSafe(TPartView partView);
 

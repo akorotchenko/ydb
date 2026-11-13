@@ -40,13 +40,16 @@ bool TDatabase::TChangeCounter::operator<(const TChangeCounter& rhs) const {
     return Epoch < rhs.Epoch;
 }
 
-TDatabase::TDatabase(TDatabaseImpl *databaseImpl)
-    : DatabaseImpl(databaseImpl ? databaseImpl : new TDatabaseImpl(0, new TScheme, nullptr))
+TDatabase::TDatabase(TDatabaseImpl* databaseImpl)
+    : TOwningDatabaseReader(*this)
+    , DatabaseImpl(databaseImpl ? databaseImpl : new TDatabaseImpl(0, new TScheme, nullptr))
 {
 
 }
 
-TDatabase::~TDatabase() { }
+TDatabase::~TDatabase() {
+    TempIterators.clear();
+}
 
 const TScheme& TDatabase::GetScheme() const noexcept
 {
@@ -212,51 +215,44 @@ TAutoPtr<TTableReverseIter> TDatabase::IterateRangeGeneric<TTableReverseIter>(ui
     return IterateRangeReverse(table, range, tags, snapshot, visible, observer);
 }
 
-EReady TDatabase::Select(ui32 table, TRawVals key, TTagsRef tags, TRowState &row, ui64 flg,
-        TRowVersion snapshot,
-        const ITransactionMapPtr& visible,
-        const ITransactionObserverPtr& observer) const
-{
+template <class TPageRef>
+EReady TDatabaseReader<TPageRef>::Select(ui32 table, TRawVals key, TTagsRef tags, TRowState& row, ui64 flg,
+    TRowVersion snapshot, const ITransactionMapPtr& visible, const ITransactionObserverPtr& observer) const& {
     TSelectStats stats;
     return Select(table, key, tags, row, stats, flg, snapshot, visible, observer);
 }
 
-EReady TDatabase::Select(ui32 table, TRawVals key, TTagsRef tags, TRowState &row, TSelectStats& stats, ui64 flg,
-        TRowVersion snapshot,
-        const ITransactionMapPtr& visible,
-        const ITransactionObserverPtr& observer) const
-{
+template <class TPageRef>
+EReady TDatabaseReader<TPageRef>::Select(ui32 table, TRawVals key, TTagsRef tags, TRowState& row, TSelectStats& stats,
+    ui64 flg, TRowVersion snapshot, const ITransactionMapPtr& visible, const ITransactionObserverPtr& observer) const& {
     TempIterators.clear();
-    CheckReadAllowed(table);
+    Database_.CheckReadAllowed(table);
 
     auto prevSieved = stats.Sieved;
     auto prevWeeded = stats.Weeded;
     auto prevNoKey = stats.NoKey;
     auto prevInvisible = stats.InvisibleRowSkips;
 
-    auto ready = Require(table)->Select(key, tags, Env, row, flg, snapshot, TempIterators, stats, visible, observer);
-    Change->Stats.SelectSieved += stats.Sieved - prevSieved;
-    Change->Stats.SelectWeeded += stats.Weeded - prevWeeded;
-    Change->Stats.SelectNoKey += stats.NoKey - prevNoKey;
-    Change->Stats.SelectInvisible += stats.InvisibleRowSkips - prevInvisible;
+    auto ready =
+        Database_.Require(table)->Select(key, tags, Env, row, flg, snapshot, TempIterators, stats, visible, observer);
+    Database_.Change->Stats.SelectSieved += stats.Sieved - prevSieved;
+    Database_.Change->Stats.SelectWeeded += stats.Weeded - prevWeeded;
+    Database_.Change->Stats.SelectNoKey += stats.NoKey - prevNoKey;
+    Database_.Change->Stats.SelectInvisible += stats.InvisibleRowSkips - prevInvisible;
 
     return ready;
 }
 
-TSelectRowVersionResult TDatabase::SelectRowVersion(
-        ui32 table, TRawVals key, ui64 readFlags,
-        const ITransactionMapPtr& visible,
-        const ITransactionObserverPtr& observer) const
-{
-    return Require(table)->SelectRowVersion(key, Env, readFlags, visible, observer);
+template <class TPageRef>
+TSelectRowVersionResult TDatabaseReader<TPageRef>::SelectRowVersion(ui32 table, TRawVals key, ui64 readFlags,
+    const ITransactionMapPtr& visible, const ITransactionObserverPtr& observer) const {
+    return Database_.Require(table)->SelectRowVersion(key, Env, readFlags, visible, observer);
 }
 
-TSelectRowVersionResult TDatabase::SelectRowVersion(
-        ui32 table, TArrayRef<const TCell> key, ui64 readFlags,
-        const ITransactionMapPtr& visible,
-        const ITransactionObserverPtr& observer) const
-{
-    return Require(table)->SelectRowVersion(key, Env, readFlags, visible, observer);
+template <class TPageRef>
+TSelectRowVersionResult TDatabaseReader<TPageRef>::SelectRowVersion(ui32 table, TArrayRef<const TCell> key,
+    ui64 readFlags, const ITransactionMapPtr& visible, const ITransactionObserverPtr& observer) const {
+    return Database_.Require(table)->SelectRowVersion(key, Env, readFlags, visible, observer);
 }
 
 TSelectRowVersionResult TDatabase::SelectRowVersionByKeyPrefix(
@@ -283,16 +279,17 @@ void TDatabase::CalculateReadSize(TSizeEnv& env, ui32 table, TRawVals minKey, TR
     Require(table)->Precharge(minKey, maxKey, tags, &env, flg, items, bytes, direction, snapshot, stats);
 }
 
-TPrechargeResult TDatabase::Precharge(ui32 table, TRawVals minKey, TRawVals maxKey,
-                    TTagsRef tags, ui64 flg, ui64 items, ui64 bytes,
-                    EDirection direction, TRowVersion snapshot)
+template <class TPageRef>
+TPrechargeResult TDatabaseReader<TPageRef>::Precharge(ui32 table, TRawVals minKey, TRawVals maxKey, TTagsRef tags,
+    ui64 flg, ui64 items, ui64 bytes, EDirection direction, TRowVersion snapshot)
 {
-    CheckPrechargeAllowed(table, minKey, maxKey);
+    Database_.CheckPrechargeAllowed(table, minKey, maxKey);
 
     TSelectStats stats;
-    auto result = Require(table)->Precharge(minKey, maxKey, tags, Env, flg, items, bytes, direction, snapshot, stats);
-    Change->Stats.ChargeSieved += stats.Sieved;
-    Change->Stats.ChargeWeeded += stats.Weeded;
+    auto result =
+        Database_.Require(table)->Precharge(minKey, maxKey, tags, Env, flg, items, bytes, direction, snapshot, stats);
+    Database_.Change->Stats.ChargeSieved += stats.Sieved;
+    Database_.Change->Stats.ChargeWeeded += stats.Weeded;
     return result;
 }
 
@@ -500,6 +497,10 @@ void TDatabase::RollbackChanges()
     IPages& env = *Env;
 
     auto prod = Commit(stamp, false, nullptr);
+    FinishRollback(stamp, env, std::move(prod));
+}
+
+void TDatabase::FinishRollback(TTxStamp stamp, IPages& env, TProd&& prod) {
     env.OnRollbackChanges();
     Begin(stamp, env);
     Change->RollbackAffects = std::move(prod.Change->RollbackAffects);
@@ -748,7 +749,13 @@ bool TDatabase::HasChanges() const
     return *Redo || (Alter_ && *Alter_) || Change->Snapshots || Change->RemovedRowVersions;
 }
 
-TDatabase::TProd TDatabase::Commit(TTxStamp stamp, bool commit, TCookieAllocator *cookieAllocator)
+TDatabase::TProd TDatabase::Commit(TTxStamp stamp, bool commit, TCookieAllocator* cookieAllocator)
+{
+    auto onPersistent = PrepareCommit(commit);
+    return FinishCommit(stamp, commit, cookieAllocator, std::move(onPersistent));
+}
+
+TVector<std::function<void()>> TDatabase::PrepareCommit(bool commit)
 {
     TVector<std::function<void()>> onPersistent;
 
@@ -771,7 +778,12 @@ TDatabase::TProd TDatabase::Commit(TTxStamp stamp, bool commit, TCookieAllocator
     OnPersistent_.clear();
 
     TempIterators.clear();
+    return onPersistent;
+}
 
+TDatabase::TProd TDatabase::FinishCommit(
+    TTxStamp stamp, bool commit, TCookieAllocator* cookieAllocator, TVector<std::function<void()>> onPersistent)
+{
     if (commit && HasChanges()) {
         Y_ENSURE(stamp >= Change->Stamp);
         Y_ENSURE(DatabaseImpl->Serial() == Change->Serial);
@@ -951,6 +963,8 @@ void DebugDumpDb(const TDatabase &db) {
     db.DebugDump(Cout, typeRegistry);
 }
 
+template class TDatabaseReader<TCachePageRef>;
+template class TDatabaseReader<TCachePageConstRef>;
 }}
 
 Y_DECLARE_OUT_SPEC(, NKikimr::NTable::TDatabase::TChangeCounter, stream, value) {

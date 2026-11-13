@@ -39,7 +39,61 @@ struct TKeyRange {
     bool MaxInclusive = true;
 };
 
-class TDatabase {
+class TDatabase;
+
+// Non-owning read view; the database and page provider must outlive it
+// Pass external views to the reader-aware Commit and RollbackChanges overloads
+template <class TPageRef>
+class TDatabaseReader {
+public:
+    TDatabaseReader(TDatabase& database, TPages<TPageRef>& env)
+        : Database_(database)
+        , Env(&env)
+    {}
+
+    TDatabaseReader(const TDatabaseReader&) = delete;
+    TDatabaseReader& operator=(const TDatabaseReader&) = delete;
+    TDatabaseReader(TDatabaseReader&&) = delete;
+    TDatabaseReader& operator=(TDatabaseReader&&) = delete;
+
+    // Row views expire at the next Select on this reader, reader destruction or transaction Commit
+    EReady Select(ui32 table, TRawVals key, TTagsRef tags, TRowState& row, ui64 readFlags = 0,
+        TRowVersion snapshot = TRowVersion::Max(), const ITransactionMapPtr& visible = nullptr,
+        const ITransactionObserverPtr& observer = nullptr) const&;
+
+    EReady Select(ui32 table, TRawVals key, TTagsRef tags, TRowState& row, TSelectStats& stats, ui64 readFlags = 0,
+        TRowVersion snapshot = TRowVersion::Max(), const ITransactionMapPtr& visible = nullptr,
+        const ITransactionObserverPtr& observer = nullptr) const&;
+
+    template <class... TArgs>
+    EReady Select(TArgs&&...) const&& = delete;
+
+    TSelectRowVersionResult SelectRowVersion(ui32 table, TRawVals key, ui64 readFlags = 0,
+        const ITransactionMapPtr& visible = nullptr, const ITransactionObserverPtr& observer = nullptr) const;
+    TSelectRowVersionResult SelectRowVersion(ui32 table, TArrayRef<const TCell> key, ui64 readFlags = 0,
+        const ITransactionMapPtr& visible = nullptr, const ITransactionObserverPtr& observer = nullptr) const;
+
+    TPrechargeResult Precharge(ui32 table, TRawVals minKey, TRawVals maxKey, TTagsRef tags, ui64 readFlags,
+        ui64 itemsLimit, ui64 bytesLimit, EDirection direction = EDirection::Forward,
+        TRowVersion snapshot = TRowVersion::Max());
+
+protected:
+    friend class TDatabase;
+
+    explicit TDatabaseReader(TDatabase& database)
+        : Database_(database)
+    {}
+
+    TDatabase& Database_;
+    // Pass external readers to Database::Commit so cleanup precedes unpinning
+    TPages<TPageRef>* Env = nullptr;
+    mutable TDeque<TPartIterImpl<TPageRef>> TempIterators;
+};
+
+using TOwningDatabaseReader = TDatabaseReader<TCachePageRef>;
+using TTransactionReader = TDatabaseReader<TCachePageConstRef>;
+
+class TDatabase : public TOwningDatabaseReader {
 public:
     using TMemGlobs = TVector<NPageCollection::TMemGlob>;
     using TCookieAllocator = NPageCollection::TCookieAllocator;
@@ -116,34 +170,9 @@ public:
             const ITransactionMapPtr& visible = nullptr,
             const ITransactionObserverPtr& observer = nullptr) const;
 
-    // NOTE: the row refeneces data in some internal buffers that get invalidated on the next Select() or Commit() call
-    EReady Select(ui32 table, TRawVals key, TTagsRef tags, TRowState& row,
-                  ui64 readFlags = 0, TRowVersion snapshot = TRowVersion::Max(),
-                  const ITransactionMapPtr& visible = nullptr,
-                  const ITransactionObserverPtr& observer = nullptr) const;
-
-    EReady Select(ui32 table, TRawVals key, TTagsRef tags, TRowState& row, TSelectStats& stats,
-                  ui64 readFlags = 0, TRowVersion snapshot = TRowVersion::Max(),
-                  const ITransactionMapPtr& visible = nullptr,
-                  const ITransactionObserverPtr& observer = nullptr) const;
-
-    TSelectRowVersionResult SelectRowVersion(
-            ui32 table, TRawVals key, ui64 readFlags = 0,
-            const ITransactionMapPtr& visible = nullptr,
-            const ITransactionObserverPtr& observer = nullptr) const;
-    TSelectRowVersionResult SelectRowVersion(
-            ui32 table, TArrayRef<const TCell> key, ui64 readFlags = 0,
-            const ITransactionMapPtr& visible = nullptr,
-            const ITransactionObserverPtr& observer = nullptr) const;
-
     TSelectRowVersionResult SelectRowVersionByKeyPrefix(
             ui32 table, TArrayRef<const TCell> key,
             const ITransactionObserverPtr& observer = nullptr) const;
-
-    TPrechargeResult Precharge(ui32 table, TRawVals minKey, TRawVals maxKey,
-                        TTagsRef tags, ui64 readFlags, ui64 itemsLimit, ui64 bytesLimit,
-                        EDirection direction = EDirection::Forward,
-                        TRowVersion snapshot = TRowVersion::Max());
 
     TSizeEnv CreateSizeEnv();
     void CalculateReadSize(TSizeEnv& env, ui32 table, TRawVals minKey, TRawVals maxKey,
@@ -281,12 +310,30 @@ public:
      */
     void RollbackChanges();
 
+    template <class TPageRef>
+    void RollbackChanges(TDatabaseReader<TPageRef>& reader) {
+        const auto stamp = Change->Stamp;
+        IPages& env = *Env;
+        auto prod = Commit(stamp, false, reader);
+        FinishRollback(stamp, env, std::move(prod));
+    }
+
     // Page environment of the current transaction. Valid between Begin and Commit.
     IPages* GetPagesEnv() const noexcept { return Env; }
 
     // executor interface
     void Begin(TTxStamp, IPages& env);
     TProd Commit(TTxStamp, bool commit, TCookieAllocator* = nullptr);
+
+    // Invalidate this reader after callbacks, before finalizing the transaction
+    template <class TPageRef>
+    TProd Commit(
+        TTxStamp stamp, bool commit, TDatabaseReader<TPageRef>& reader, TCookieAllocator* cookieAllocator = nullptr) {
+        Y_DEBUG_ABORT_UNLESS(&reader.Database_ == this);
+        auto onPersistent = PrepareCommit(commit);
+        reader.TempIterators.clear();
+        return FinishCommit(stamp, commit, cookieAllocator, std::move(onPersistent));
+    }
     TGarbage RollUp(TTxStamp, TArrayRef<const char> delta, TArrayRef<const char> redo, TMemGlobs annex,
         TArrayRef<const ui32> truncatedTables, IRedoObserver* observer = nullptr);
 
@@ -323,6 +370,14 @@ public:
     }
 
 private:
+    template <class TPageRef>
+    friend class TDatabaseReader;
+
+    TVector<std::function<void()>> PrepareCommit(bool commit);
+    TProd FinishCommit(
+        TTxStamp stamp, bool commit, TCookieAllocator* cookieAllocator, TVector<std::function<void()>> onPersistent);
+    void FinishRollback(TTxStamp stamp, IPages& env, TProd&& prod);
+
     TTable* Require(ui32 tableId) const;
     TTable* RequireForUpdate(ui32 tableId) const;
 
@@ -334,7 +389,6 @@ private:
 
     bool NoMoreReadsFlag = false;
     bool NoMoreUnprechargedReadsFlag = false;
-    IPages* Env = nullptr;
     THolder<TChange> Change;
     TAutoPtr<TAlter> Alter_;
     TAutoPtr<TAnnex> Annex;
@@ -343,7 +397,6 @@ private:
     TVector<ui32> ModifiedRefs;
     TVector<TUpdateOp> ModifiedOps;
 
-    mutable TDeque<TPartIter> TempIterators; // Keeps the last result of Select() valid
     mutable TVector<ui32> PrechargedTables;
 
     TVector<std::function<void()>> OnCommit_;

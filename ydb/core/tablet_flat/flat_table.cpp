@@ -893,17 +893,9 @@ void TTable::AddSafe(TPartView partView)
     }
 }
 
-TPrechargeResult TTable::Precharge(TRawVals minKey_, TRawVals maxKey_, TTagsRef tags, IPages* env, ui64 flg, ui64 items,
-    ui64 bytes, EDirection direction, TRowVersion snapshot, TSelectStats& stats) const {
-    if (auto* borrowed = env->BorrowedPages()) {
-        return PrechargeWithPages(minKey_, maxKey_, tags, borrowed, flg, items, bytes, direction, snapshot, stats);
-    }
-    return PrechargeWithPages(minKey_, maxKey_, tags, env, flg, items, bytes, direction, snapshot, stats);
-}
-
 template <class TRef>
-TPrechargeResult TTable::PrechargeWithPages(TRawVals minKey_, TRawVals maxKey_, TTagsRef tags, TPages<TRef>* env,
-    ui64 flg, ui64 items, ui64 bytes, EDirection direction, TRowVersion snapshot, TSelectStats& stats) const {
+TPrechargeResult TTable::Precharge(TRawVals minKey_, TRawVals maxKey_, TTagsRef tags, TPages<TRef>* env, ui64 flg,
+    ui64 items, ui64 bytes, EDirection direction, TRowVersion snapshot, TSelectStats& stats) const {
     TPrechargeResult result = {
         .Ready = true,
         .ItemsPrecharged = 0,
@@ -1377,13 +1369,10 @@ TAutoPtr<TTableReverseIter> TTable::IterateReverse(TRawVals key_, TTagsRef tags,
     return dbIter;
 }
 
-EReady TTable::Select(TRawVals key_, TTagsRef tags, IPages* env, TRowState& row,
-                      ui64 flg, TRowVersion snapshot,
-                      TDeque<TPartIter>& tempIterators,
-                      TSelectStats& stats,
-                      const ITransactionMapPtr& visible,
-                      const ITransactionObserverPtr& observer) const
-{
+template <class TRef>
+EReady TTable::Select(TRawVals key_, TTagsRef tags, TPages<TRef>* env, TRowState& row, ui64 flg, TRowVersion snapshot,
+    TDeque<TPartIterImpl<TRef>>& tempIterators, TSelectStats& stats, const ITransactionMapPtr& visible,
+    const ITransactionObserverPtr& observer) const {
     Y_ENSURE(ColdParts.empty(), "Cannot select with cold parts");
     Y_ENSURE(key_.size() == Scheme->Keys->Types.size());
 
@@ -1457,7 +1446,7 @@ EReady TTable::Select(TRawVals key_, TTagsRef tags, IPages* env, TRowState& row,
                         part->MightHaveKeyPrefix(prefix))
                     {
                         ++stats.Sieved;
-                        TPartIter& it = tempIterators.emplace_back(part, tags, Scheme->Keys, env);
+                        auto& it = tempIterators.emplace_back(part, tags, Scheme->Keys, env);
                         it.SetBounds(pos->Slice);
                         auto res = it.Seek(key, ESeek::Exact);
                         if (res == EReady::Data) {
@@ -1500,36 +1489,24 @@ EReady TTable::Select(TRawVals key_, TTagsRef tags, IPages* env, TRowState& row,
     }
 }
 
-TSelectRowVersionResult TTable::SelectRowVersion(
-        TRawVals key_, IPages* env, ui64 readFlags,
-        const ITransactionMapPtr& visible,
-        const ITransactionObserverPtr& observer) const
-{
-    const TCelled key(key_, *Scheme->Keys, true);
-
-    return SelectRowVersion(key, env, readFlags, visible, observer);
-}
-
-TSelectRowVersionResult TTable::SelectRowVersion(
-        TArrayRef<const TCell> key_, IPages* env, ui64 readFlags,
-        const ITransactionMapPtr& visible,
-        const ITransactionObserverPtr& observer) const
-{
-    const TCelled key(key_, *Scheme->Keys, true);
-
-    return SelectRowVersion(key, env, readFlags, visible, observer);
-}
-
-TSelectRowVersionResult TTable::SelectRowVersion(const TCelled& key, IPages* env, ui64 readFlags,
+template <class TRef>
+TSelectRowVersionResult TTable::SelectRowVersion(TRawVals key_, TPages<TRef>* env, ui64 readFlags,
     const ITransactionMapPtr& visible, const ITransactionObserverPtr& observer) const {
-    if (auto* borrowed = env->BorrowedPages()) {
-        return SelectRowVersionWithPages(key, borrowed, readFlags, visible, observer);
-    }
-    return SelectRowVersionWithPages(key, env, readFlags, visible, observer);
+    const TCelled key(key_, *Scheme->Keys, true);
+
+    return SelectRowVersion(key, env, readFlags, visible, observer);
 }
 
 template <class TRef>
-TSelectRowVersionResult TTable::SelectRowVersionWithPages(const TCelled& key, TPages<TRef>* env, ui64 readFlags,
+TSelectRowVersionResult TTable::SelectRowVersion(TArrayRef<const TCell> key_, TPages<TRef>* env, ui64 readFlags,
+    const ITransactionMapPtr& visible, const ITransactionObserverPtr& observer) const {
+    const TCelled key(key_, *Scheme->Keys, true);
+
+    return SelectRowVersion(key, env, readFlags, visible, observer);
+}
+
+template <class TRef>
+TSelectRowVersionResult TTable::SelectRowVersion(const TCelled& key, TPages<TRef>* env, ui64 readFlags,
     const ITransactionMapPtr& visible, const ITransactionObserverPtr& observer) const {
     Y_ENSURE(ColdParts.empty(), "Cannot select with cold parts");
 
@@ -1850,4 +1827,26 @@ TPartStats& TPartStats::operator-=(const TPartStats& rhs)
     return *this;
 }
 
+template EReady TTable::Select<TCachePageRef>(TRawVals, TTagsRef, TPages<TCachePageRef>*, TRowState&, ui64, TRowVersion,
+    TDeque<TPartIterImpl<TCachePageRef>>&, TSelectStats&, const ITransactionMapPtr&,
+    const ITransactionObserverPtr&) const;
+template TPrechargeResult TTable::Precharge<TCachePageRef>(TRawVals, TRawVals, TTagsRef, TPages<TCachePageRef>*, ui64,
+    ui64, ui64, EDirection, TRowVersion, TSelectStats&) const;
+template TSelectRowVersionResult TTable::SelectRowVersion<TCachePageRef>(
+    TRawVals, TPages<TCachePageRef>*, ui64, const ITransactionMapPtr&, const ITransactionObserverPtr&) const;
+template TSelectRowVersionResult TTable::SelectRowVersion<TCachePageRef>(TArrayRef<const TCell>, TPages<TCachePageRef>*,
+    ui64, const ITransactionMapPtr&, const ITransactionObserverPtr&) const;
+template TSelectRowVersionResult TTable::SelectRowVersion<TCachePageRef>(
+    const TCelled&, TPages<TCachePageRef>*, ui64, const ITransactionMapPtr&, const ITransactionObserverPtr&) const;
+template EReady TTable::Select<TCachePageConstRef>(TRawVals, TTagsRef, TPages<TCachePageConstRef>*, TRowState&, ui64,
+    TRowVersion, TDeque<TPartIterImpl<TCachePageConstRef>>&, TSelectStats&, const ITransactionMapPtr&,
+    const ITransactionObserverPtr&) const;
+template TPrechargeResult TTable::Precharge<TCachePageConstRef>(TRawVals, TRawVals, TTagsRef,
+    TPages<TCachePageConstRef>*, ui64, ui64, ui64, EDirection, TRowVersion, TSelectStats&) const;
+template TSelectRowVersionResult TTable::SelectRowVersion<TCachePageConstRef>(
+    TRawVals, TPages<TCachePageConstRef>*, ui64, const ITransactionMapPtr&, const ITransactionObserverPtr&) const;
+template TSelectRowVersionResult TTable::SelectRowVersion<TCachePageConstRef>(TArrayRef<const TCell>,
+    TPages<TCachePageConstRef>*, ui64, const ITransactionMapPtr&, const ITransactionObserverPtr&) const;
+template TSelectRowVersionResult TTable::SelectRowVersion<TCachePageConstRef>(
+    const TCelled&, TPages<TCachePageConstRef>*, ui64, const ITransactionMapPtr&, const ITransactionObserverPtr&) const;
 }}
