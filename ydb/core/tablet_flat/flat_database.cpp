@@ -20,7 +20,7 @@
 namespace NKikimr {
 namespace NTable {
 
-bool TDatabase::TChangeCounter::operator<(const TChangeCounter& rhs) const {
+bool TDatabaseCore::TChangeCounter::operator<(const TChangeCounter& rhs) const {
     if (Serial && rhs.Serial) {
         // When both counters have serial they can be compared directly
         return Serial < rhs.Serial;
@@ -40,23 +40,28 @@ bool TDatabase::TChangeCounter::operator<(const TChangeCounter& rhs) const {
     return Epoch < rhs.Epoch;
 }
 
-TDatabase::TDatabase(TDatabaseImpl* databaseImpl)
-    : TOwningDatabaseReader(*this)
-    , DatabaseImpl(databaseImpl ? databaseImpl : new TDatabaseImpl(0, new TScheme, nullptr))
-{
+TDatabaseState::TDatabaseState(TDatabaseImpl* databaseImpl)
+    : DatabaseImpl(databaseImpl ? databaseImpl : new TDatabaseImpl(0, new TScheme, nullptr))
+{}
 
-}
+TDatabaseState::~TDatabaseState() = default;
+
+TDatabase::TDatabase(TDatabaseImpl* databaseImpl)
+    : TDatabaseState(databaseImpl)
+    , TDatabaseCore(static_cast<TDatabaseState&>(*this))
+    , TOwningDatabaseReader(*this)
+{}
 
 TDatabase::~TDatabase() {
     TempIterators.clear();
 }
 
-const TScheme& TDatabase::GetScheme() const noexcept
+const TScheme& TDatabaseCore::GetScheme() const noexcept
 {
-    return *DatabaseImpl->Scheme;
+    return *State_.DatabaseImpl->Scheme;
 }
 
-TIntrusiveConstPtr<TRowScheme> TDatabase::GetRowScheme(ui32 table) const
+TIntrusiveConstPtr<TRowScheme> TDatabaseCore::GetRowScheme(ui32 table) const
 {
     return Require(table)->GetScheme();
 }
@@ -214,10 +219,10 @@ EReady TDatabaseReader<TPageRef>::Select(ui32 table, TRawVals key, TTagsRef tags
 
     auto ready =
         Database_.Require(table)->Select(key, tags, Env, row, flg, snapshot, TempIterators, stats, visible, observer);
-    Database_.Change->Stats.SelectSieved += stats.Sieved - prevSieved;
-    Database_.Change->Stats.SelectWeeded += stats.Weeded - prevWeeded;
-    Database_.Change->Stats.SelectNoKey += stats.NoKey - prevNoKey;
-    Database_.Change->Stats.SelectInvisible += stats.InvisibleRowSkips - prevInvisible;
+    Database_.State_.Change->Stats.SelectSieved += stats.Sieved - prevSieved;
+    Database_.State_.Change->Stats.SelectWeeded += stats.Weeded - prevWeeded;
+    Database_.State_.Change->Stats.SelectNoKey += stats.NoKey - prevNoKey;
+    Database_.State_.Change->Stats.SelectInvisible += stats.InvisibleRowSkips - prevInvisible;
 
     return ready;
 }
@@ -266,12 +271,12 @@ TPrechargeResult TDatabaseReader<TPageRef>::Precharge(ui32 table, TRawVals minKe
     TSelectStats stats;
     auto result =
         Database_.Require(table)->Precharge(minKey, maxKey, tags, Env, flg, items, bytes, direction, snapshot, stats);
-    Database_.Change->Stats.ChargeSieved += stats.Sieved;
-    Database_.Change->Stats.ChargeWeeded += stats.Weeded;
+    Database_.State_.Change->Stats.ChargeSieved += stats.Sieved;
+    Database_.State_.Change->Stats.ChargeWeeded += stats.Weeded;
     return result;
 }
 
-void TDatabase::Update(ui32 table, ERowOp rop, TRawVals key, TArrayRef<const TUpdateOp> ops, TRowVersion rowVersion)
+void TDatabaseCore::Update(ui32 table, ERowOp rop, TRawVals key, TArrayRef<const TUpdateOp> ops, TRowVersion rowVersion)
 {
     Y_DEBUG_ABORT_UNLESS(rowVersion != TRowVersion::Max(), "Updates cannot have v{max} as row version");
 
@@ -281,16 +286,16 @@ void TDatabase::Update(ui32 table, ERowOp rop, TRawVals key, TArrayRef<const TUp
         }
     }
 
-    NRedo::IAnnex* annex = Annex.Get();
+    NRedo::IAnnex* annex = State_.Annex.Get();
     NRedo::IAnnex::TLimit limit = annex->Limit(table);
-    limit.MinExternSize = Max(limit.MinExternSize, DatabaseImpl->AnnexByteLimit());
+    limit.MinExternSize = Max(limit.MinExternSize, State_.DatabaseImpl->AnnexByteLimit());
 
-    if (ModifiedRefs.size() < ops.size()) {
-        ModifiedRefs.resize(FastClp2(ops.size()));
+    if (State_.ModifiedRefs.size() < ops.size()) {
+        State_.ModifiedRefs.resize(FastClp2(ops.size()));
     }
-    ModifiedOps.assign(ops.begin(), ops.end());
-    for (size_t index = 0; index < ModifiedOps.size(); ++index) {
-        TUpdateOp& op = ModifiedOps[index];
+    State_.ModifiedOps.assign(ops.begin(), ops.end());
+    for (size_t index = 0; index < State_.ModifiedOps.size(); ++index) {
+        TUpdateOp& op = State_.ModifiedOps[index];
         if (auto error = NScheme::HasUnexpectedValueSize(op.Value)) {
             Y_TABLET_ERROR("Op index " << index << " tag " << op.Tag << " validation failure: " << error);
         }
@@ -307,19 +312,19 @@ void TDatabase::Update(ui32 table, ERowOp rop, TRawVals key, TArrayRef<const TUp
         TArrayRef<const char> raw = op.AsRef();
         if (limit.IsExtern(raw.size())) {
             if (auto got = annex->Place(table, op.Tag, raw)) {
-                ModifiedRefs[index] = got.Ref;
-                const auto payload = NUtil::NBin::ToRef(ModifiedRefs[index]);
+                State_.ModifiedRefs[index] = got.Ref;
+                const auto payload = NUtil::NBin::ToRef(State_.ModifiedRefs[index]);
                 op.Value = TRawTypeValue(payload, op.Value.Type());
                 op.Op = ELargeObj::Extern;
             }
         }
     }
 
-    Redo->EvUpdate(table, rop, key, ModifiedOps, rowVersion);
-    RequireForUpdate(table)->Update(rop, key, ModifiedOps, Annex->Current(), rowVersion);
+    State_.Redo->EvUpdate(table, rop, key, State_.ModifiedOps, rowVersion);
+    RequireForUpdate(table)->Update(rop, key, State_.ModifiedOps, State_.Annex->Current(), rowVersion);
 }
 
-void TDatabase::UpdateTx(ui32 table, ERowOp rop, TRawVals key, TArrayRef<const TUpdateOp> ops, ui64 txId, ui32 savepointSeqNum)
+void TDatabaseCore::UpdateTx(ui32 table, ERowOp rop, TRawVals key, TArrayRef<const TUpdateOp> ops, ui64 txId, ui32 savepointSeqNum)
 {
     for (size_t index = 0; index < key.size(); ++index) {
         if (auto error = NScheme::HasUnexpectedValueSize(key[index])) {
@@ -327,9 +332,9 @@ void TDatabase::UpdateTx(ui32 table, ERowOp rop, TRawVals key, TArrayRef<const T
         }
     }
 
-    ModifiedOps.assign(ops.begin(), ops.end());
-    for (size_t index = 0; index < ModifiedOps.size(); ++index) {
-        TUpdateOp& op = ModifiedOps[index];
+    State_.ModifiedOps.assign(ops.begin(), ops.end());
+    for (size_t index = 0; index < State_.ModifiedOps.size(); ++index) {
+        TUpdateOp& op = State_.ModifiedOps[index];
         if (auto error = NScheme::HasUnexpectedValueSize(op.Value)) {
             Y_TABLET_ERROR("Op index " << index << " tag " << op.Tag << " validation failure: " << error);
         }
@@ -347,11 +352,11 @@ void TDatabase::UpdateTx(ui32 table, ERowOp rop, TRawVals key, TArrayRef<const T
         //        avoid creating large objects when they are in deltas
     }
 
-    Redo->EvUpdateTx(table, rop, key, ModifiedOps, txId, savepointSeqNum);
-    RequireForUpdate(table)->UpdateTx(rop, key, ModifiedOps, Annex->Current(), txId, savepointSeqNum);
+    State_.Redo->EvUpdateTx(table, rop, key, State_.ModifiedOps, txId, savepointSeqNum);
+    RequireForUpdate(table)->UpdateTx(rop, key, State_.ModifiedOps, State_.Annex->Current(), txId, savepointSeqNum);
 }
 
-void TDatabase::LockRowTx(ui32 table, ELockMode mode, TRawVals key, ui64 txId)
+void TDatabaseCore::LockRowTx(ui32 table, ELockMode mode, TRawVals key, ui64 txId)
 {
     Y_ENSURE(mode != ELockMode::None);
 
@@ -361,82 +366,82 @@ void TDatabase::LockRowTx(ui32 table, ELockMode mode, TRawVals key, ui64 txId)
         }
     }
 
-    Redo->EvLockRowTx(table, mode, key, txId);
+    State_.Redo->EvLockRowTx(table, mode, key, txId);
     RequireForUpdate(table)->LockRowTx(mode, key, txId);
 }
 
-void TDatabase::RemoveTx(ui32 table, ui64 txId)
+void TDatabaseCore::RemoveTx(ui32 table, ui64 txId)
 {
-    Redo->EvRemoveTx(table, txId);
+    State_.Redo->EvRemoveTx(table, txId);
     RequireForUpdate(table)->RemoveTx(txId);
 }
 
-void TDatabase::CommitTx(ui32 table, ui64 txId, TRowVersion rowVersion)
+void TDatabaseCore::CommitTx(ui32 table, ui64 txId, TRowVersion rowVersion)
 {
-    Redo->EvCommitTx(table, txId, rowVersion);
+    State_.Redo->EvCommitTx(table, txId, rowVersion);
     RequireForUpdate(table)->CommitTx(txId, rowVersion);
 }
 
-bool TDatabase::HasOpenTx(ui32 table, ui64 txId) const
+bool TDatabaseCore::HasOpenTx(ui32 table, ui64 txId) const
 {
     return Require(table)->HasOpenTx(txId);
 }
 
-bool TDatabase::HasTxData(ui32 table, ui64 txId) const
+bool TDatabaseCore::HasTxData(ui32 table, ui64 txId) const
 {
     return Require(table)->HasTxData(txId);
 }
 
-bool TDatabase::HasCommittedTx(ui32 table, ui64 txId) const
+bool TDatabaseCore::HasCommittedTx(ui32 table, ui64 txId) const
 {
     return Require(table)->HasCommittedTx(txId);
 }
 
-bool TDatabase::HasRemovedTx(ui32 table, ui64 txId) const
+bool TDatabaseCore::HasRemovedTx(ui32 table, ui64 txId) const
 {
     return Require(table)->HasRemovedTx(txId);
 }
 
-const absl::flat_hash_set<ui64>& TDatabase::GetOpenTxs(ui32 table) const
+const absl::flat_hash_set<ui64>& TDatabaseCore::GetOpenTxs(ui32 table) const
 {
     return Require(table)->GetOpenTxs();
 }
 
-size_t TDatabase::GetOpenTxCount(ui32 table) const
+size_t TDatabaseCore::GetOpenTxCount(ui32 table) const
 {
     return Require(table)->GetOpenTxCount();
 }
 
-size_t TDatabase::GetTxsWithDataCount(ui32 table) const
+size_t TDatabaseCore::GetTxsWithDataCount(ui32 table) const
 {
     return Require(table)->GetTxsWithDataCount();
 }
 
-size_t TDatabase::GetTxsWithStatusCount(ui32 table) const
+size_t TDatabaseCore::GetTxsWithStatusCount(ui32 table) const
 {
     return Require(table)->GetTxsWithStatusCount();
 }
 
-size_t TDatabase::GetCommittedTxCount(ui32 table) const
+size_t TDatabaseCore::GetCommittedTxCount(ui32 table) const
 {
     return Require(table)->GetCommittedTxCount();
 }
 
-size_t TDatabase::GetRemovedTxCount(ui32 table) const
+size_t TDatabaseCore::GetRemovedTxCount(ui32 table) const
 {
     return Require(table)->GetRemovedTxCount();
 }
 
-void TDatabase::RemoveRowVersions(ui32 table, const TRowVersion& lower, const TRowVersion& upper)
+void TDatabaseCore::RemoveRowVersions(ui32 table, const TRowVersion& lower, const TRowVersion& upper)
 {
     if (Y_LIKELY(lower < upper)) {
-        Change->RemovedRowVersions[table].push_back({ lower, upper });
+        State_.Change->RemovedRowVersions[table].push_back({ lower, upper });
     }
 }
 
-const TRowVersionRanges& TDatabase::GetRemovedRowVersions(ui32 table) const
+const TRowVersionRanges& TDatabaseCore::GetRemovedRowVersions(ui32 table) const
 {
-    if (auto& wrap = DatabaseImpl->Get(table, false)) {
+    if (auto& wrap = State_.DatabaseImpl->Get(table, false)) {
         return wrap->GetRemovedRowVersions();
     }
 
@@ -444,34 +449,34 @@ const TRowVersionRanges& TDatabase::GetRemovedRowVersions(ui32 table) const
     return empty;
 }
 
-void TDatabase::NoMoreReadsForTx() {
-    NoMoreReadsFlag = true;
+void TDatabaseCore::NoMoreReadsForTx() {
+    State_.NoMoreReadsFlag = true;
 }
 
-void TDatabase::NoMoreUnprechargedReadsForTx() {
-    NoMoreUnprechargedReadsFlag = true;
+void TDatabaseCore::NoMoreUnprechargedReadsForTx() {
+    State_.NoMoreUnprechargedReadsFlag = true;
 }
 
 void TDatabase::Begin(TTxStamp stamp, IPages& env)
 {
-    Y_ENSURE(!Redo, "Transaction already in progress");
+    Y_ENSURE(!State_.Redo, "Transaction already in progress");
     Y_ENSURE(!Env);
-    Annex = new TAnnex(*DatabaseImpl->Scheme, DatabaseImpl->Stats.NormalizedFreeSpaceShareByChannel);
-    Redo = new NRedo::TWriter;
-    DatabaseImpl->BeginTransaction();
-    Change = MakeHolder<TChange>(stamp, DatabaseImpl->Serial());
+    State_.Annex = new TAnnex(*State_.DatabaseImpl->Scheme, State_.DatabaseImpl->Stats.NormalizedFreeSpaceShareByChannel);
+    State_.Redo = new NRedo::TWriter;
+    State_.DatabaseImpl->BeginTransaction();
+    State_.Change = MakeHolder<TChange>(stamp, State_.DatabaseImpl->Serial());
     Env = &env;
-    NoMoreReadsFlag = false;
-    NoMoreUnprechargedReadsFlag = false;
-    PrechargedTables.clear();
+    State_.NoMoreReadsFlag = false;
+    State_.NoMoreUnprechargedReadsFlag = false;
+    State_.PrechargedTables.clear();
 }
 
 void TDatabase::RollbackChanges()
 {
-    Y_ENSURE(Redo, "Transaction is not in progress");
+    Y_ENSURE(State_.Redo, "Transaction is not in progress");
     Y_ENSURE(Env);
 
-    TTxStamp stamp = Change->Stamp;
+    TTxStamp stamp = State_.Change->Stamp;
     IPages& env = *Env;
 
     auto prod = Commit(stamp, false, nullptr);
@@ -481,107 +486,107 @@ void TDatabase::RollbackChanges()
 void TDatabase::FinishRollback(TTxStamp stamp, IPages& env, TProd&& prod) {
     env.OnRollbackChanges();
     Begin(stamp, env);
-    Change->RollbackAffects = std::move(prod.Change->RollbackAffects);
+    State_.Change->RollbackAffects = std::move(prod.Change->RollbackAffects);
 }
 
-TPartView TDatabase::GetPartView(ui32 tableId, const TLogoBlobID &bundle) const {
+TPartView TDatabaseCore::GetPartView(ui32 tableId, const TLogoBlobID &bundle) const {
     return Require(tableId)->GetPartView(bundle);
 }
 
-TVector<TPartView> TDatabase::GetTableParts(ui32 tableId) const {
+TVector<TPartView> TDatabaseCore::GetTableParts(ui32 tableId) const {
     return Require(tableId)->GetAllParts();
 }
 
-TVector<TIntrusiveConstPtr<TColdPart>> TDatabase::GetTableColdParts(ui32 tableId) const {
+TVector<TIntrusiveConstPtr<TColdPart>> TDatabaseCore::GetTableColdParts(ui32 tableId) const {
     return Require(tableId)->GetColdParts();
 }
 
-void TDatabase::EnumerateTableParts(ui32 tableId, const std::function<void(const TPartView&)>& callback) const {
+void TDatabaseCore::EnumerateTableParts(ui32 tableId, const std::function<void(const TPartView&)>& callback) const {
     Require(tableId)->EnumerateParts(std::move(callback));
 }
 
-void TDatabase::EnumerateTableColdParts(ui32 tableId, const std::function<void(const TIntrusiveConstPtr<TColdPart>&)>& callback) const {
+void TDatabaseCore::EnumerateTableColdParts(ui32 tableId, const std::function<void(const TIntrusiveConstPtr<TColdPart>&)>& callback) const {
     Require(tableId)->EnumerateColdParts(callback);
 }
 
-void TDatabase::EnumerateTableTxStatusParts(ui32 tableId, const std::function<void(const TIntrusiveConstPtr<TTxStatusPart>&)>& callback) const {
+void TDatabaseCore::EnumerateTableTxStatusParts(ui32 tableId, const std::function<void(const TIntrusiveConstPtr<TTxStatusPart>&)>& callback) const {
     Require(tableId)->EnumerateTxStatusParts(callback);
 }
 
-void TDatabase::EnumerateTxStatusParts(const std::function<void(const TIntrusiveConstPtr<TTxStatusPart>&)>& callback) const {
-    DatabaseImpl->EnumerateTxStatusParts(callback);
+void TDatabaseCore::EnumerateTxStatusParts(const std::function<void(const TIntrusiveConstPtr<TTxStatusPart>&)>& callback) const {
+    State_.DatabaseImpl->EnumerateTxStatusParts(callback);
 }
 
-ui64 TDatabase::GetTableMemSize(ui32 tableId, TEpoch epoch) const {
+ui64 TDatabaseCore::GetTableMemSize(ui32 tableId, TEpoch epoch) const {
     return Require(tableId)->GetMemSize(epoch);
 }
 
-ui64 TDatabase::GetTableMemAllocatedSize(ui32 tableId) const {
+ui64 TDatabaseCore::GetTableMemAllocatedSize(ui32 tableId) const {
     return Require(tableId)->GetMemAllocatedSize();
 }
 
-ui64 TDatabase::GetTableMemRowCount(ui32 tableId) const {
+ui64 TDatabaseCore::GetTableMemRowCount(ui32 tableId) const {
     return Require(tableId)->GetMemRowCount();
 }
 
-ui64 TDatabase::GetTableMemOpsCount(ui32 tableId) const {
+ui64 TDatabaseCore::GetTableMemOpsCount(ui32 tableId) const {
     return Require(tableId)->GetOpsCount();
 }
 
-ui64 TDatabase::GetTableIndexSize(ui32 tableId) const {
+ui64 TDatabaseCore::GetTableIndexSize(ui32 tableId) const {
     const auto& partStats = Require(tableId)->Stat().Parts;
     return partStats.FlatIndexBytes + partStats.BTreeIndexBytes;
 }
 
-ui64 TDatabase::GetTableSearchHeight(ui32 tableId) const {
+ui64 TDatabaseCore::GetTableSearchHeight(ui32 tableId) const {
     return Require(tableId)->GetSearchHeight();
 }
 
-ui64 TDatabase::EstimateRowSize(ui32 tableId) const {
+ui64 TDatabaseCore::EstimateRowSize(ui32 tableId) const {
     return Require(tableId)->EstimateRowSize();
 }
 
-const TDbStats& TDatabase::Counters() const noexcept
+const TDbStats& TDatabaseCore::Counters() const noexcept
 {
-    return DatabaseImpl->Stats;
+    return State_.DatabaseImpl->Stats;
 }
 
-TDbRuntimeStats TDatabase::RuntimeCounters() const noexcept
+TDbRuntimeStats TDatabaseCore::RuntimeCounters() const noexcept
 {
-    return DatabaseImpl->GetRuntimeStats();
+    return State_.DatabaseImpl->GetRuntimeStats();
 }
 
-void TDatabase::UpdateApproximateFreeSharesByChannel(const THashMap<ui32, float>& approximateFreeSpaceShareByChannel)
+void TDatabaseCore::UpdateApproximateFreeSharesByChannel(const THashMap<ui32, float>& approximateFreeSpaceShareByChannel)
 {
     for (auto& [channel, value] : approximateFreeSpaceShareByChannel) {
-        DatabaseImpl->Stats.NormalizedFreeSpaceShareByChannel[channel] = NUtil::NormalizeFreeSpaceShare(value);
+        State_.DatabaseImpl->Stats.NormalizedFreeSpaceShareByChannel[channel] = NUtil::NormalizeFreeSpaceShare(value);
     }
 }
 
-void TDatabase::SetTableObserver(ui32 table, TIntrusivePtr<ITableObserver> ptr)
+void TDatabaseCore::SetTableObserver(ui32 table, TIntrusivePtr<ITableObserver> ptr)
 {
     Require(table)->SetTableObserver(std::move(ptr));
 }
 
-TDatabase::TChangeCounter TDatabase::Head(ui32 table) const
+TDatabaseCore::TChangeCounter TDatabaseCore::Head(ui32 table) const
 {
     if (table == Max<ui32>()) {
-        return { DatabaseImpl->StableSerial(), TEpoch::Max() };
+        return { State_.DatabaseImpl->StableSerial(), TEpoch::Max() };
     } else {
-        auto &wrap = DatabaseImpl->Get(table, true);
+        auto &wrap = State_.DatabaseImpl->Get(table, true);
 
         return { wrap.StableSerial(), wrap.StableHead() };
     }
 }
 
-TString TDatabase::SnapshotToLog(ui32 table, TTxStamp stamp)
+TString TDatabaseCore::SnapshotToLog(ui32 table, TTxStamp stamp)
 {
-    Y_ENSURE(!Redo, "Cannot SnapshotToLog inside a transaction");
+    Y_ENSURE(!State_.Redo, "Cannot SnapshotToLog inside a transaction");
 
-    auto scn = DatabaseImpl->Serial() + 1;
-    auto epoch = DatabaseImpl->Get(table, true)->Snapshot();
+    auto scn = State_.DatabaseImpl->Serial() + 1;
+    auto epoch = State_.DatabaseImpl->Get(table, true)->Snapshot();
 
-    DatabaseImpl->Rewind(scn);
+    State_.DatabaseImpl->Rewind(scn);
 
     NRedo::TWriter writer;
     writer.EvBegin(ui32(ECompatibility::Head), ui32(ECompatibility::Edge), scn, stamp);
@@ -589,26 +594,26 @@ TString TDatabase::SnapshotToLog(ui32 table, TTxStamp stamp)
     return std::move(writer).Finish();
 }
 
-TEpoch TDatabase::TxSnapTable(ui32 table)
+TEpoch TDatabaseCore::TxSnapTable(ui32 table)
 {
-    Y_ENSURE(Redo, "Cannot TxSnapTable outside a transaction");
-    ++Change->Snapshots;
-    return DatabaseImpl->FlushTable(table);
+    Y_ENSURE(State_.Redo, "Cannot TxSnapTable outside a transaction");
+    ++State_.Change->Snapshots;
+    return State_.DatabaseImpl->FlushTable(table);
 }
 
-void TDatabase::Truncate(ui32 table)
+void TDatabaseCore::Truncate(ui32 table)
 {
-    Y_ENSURE(Redo, "Cannot Truncate outside a transaction");
-    ++Change->Snapshots;
-    DatabaseImpl->TruncateTable(table);
+    Y_ENSURE(State_.Redo, "Cannot Truncate outside a transaction");
+    ++State_.Change->Snapshots;
+    State_.DatabaseImpl->TruncateTable(table);
 }
 
-TAutoPtr<TSubset> TDatabase::CompactionSubset(ui32 table, TEpoch before, TArrayRef<const TLogoBlobID> bundle) const
+TAutoPtr<TSubset> TDatabaseCore::CompactionSubset(ui32 table, TEpoch before, TArrayRef<const TLogoBlobID> bundle) const
 {
     return Require(table)->CompactionSubset(before, bundle);
 }
 
-TAutoPtr<TSubset> TDatabase::PartSwitchSubset(ui32 table, TEpoch before, TArrayRef<const TLogoBlobID> bundle, TArrayRef<const TLogoBlobID> txStatus) const
+TAutoPtr<TSubset> TDatabaseCore::PartSwitchSubset(ui32 table, TEpoch before, TArrayRef<const TLogoBlobID> bundle, TArrayRef<const TLogoBlobID> txStatus) const
 {
     return Require(table)->PartSwitchSubset(before, bundle, txStatus);
 }
@@ -633,98 +638,98 @@ TAutoPtr<TSubset> TDatabase::Subset(ui32 table, TEpoch before, TRawVals from, TR
     return subset;
 }
 
-TAutoPtr<TSubset> TDatabase::ScanSnapshot(ui32 table, TRowVersion snapshot)
+TAutoPtr<TSubset> TDatabaseCore::ScanSnapshot(ui32 table, TRowVersion snapshot)
 {
     return Require(table)->ScanSnapshot(snapshot);
 }
 
-bool TDatabase::HasBorrowed(ui32 table, ui64 selfTabletId) const
+bool TDatabaseCore::HasBorrowed(ui32 table, ui64 selfTabletId) const
 {
     return Require(table)->HasBorrowed(selfTabletId);
 }
 
-TBundleSlicesMap TDatabase::LookupSlices(ui32 table, TArrayRef<const TLogoBlobID> bundles) const
+TBundleSlicesMap TDatabaseCore::LookupSlices(ui32 table, TArrayRef<const TLogoBlobID> bundles) const
 {
     return Require(table)->LookupSlices(bundles);
 }
 
-void TDatabase::ReplaceSlices(ui32 table, TBundleSlicesMap slices)
+void TDatabaseCore::ReplaceSlices(ui32 table, TBundleSlicesMap slices)
 {
-    return DatabaseImpl->ReplaceSlices(table, std::move(slices));
+    return State_.DatabaseImpl->ReplaceSlices(table, std::move(slices));
 }
 
-void TDatabase::Replace(
+void TDatabaseCore::Replace(
     ui32 table,
     const TSubset& subset,
     TArrayRef<const TPartView> newParts,
     TArrayRef<const TIntrusiveConstPtr<TTxStatusPart>> newTxStatus)
 {
-    return DatabaseImpl->Replace(table, subset, newParts, newTxStatus);
+    return State_.DatabaseImpl->Replace(table, subset, newParts, newTxStatus);
 }
 
-void TDatabase::Merge(ui32 table, TPartView partView)
+void TDatabaseCore::Merge(ui32 table, TPartView partView)
 {
-    return DatabaseImpl->Merge(table, std::move(partView));
+    return State_.DatabaseImpl->Merge(table, std::move(partView));
 }
 
-void TDatabase::Merge(ui32 table, TIntrusiveConstPtr<TColdPart> part)
+void TDatabaseCore::Merge(ui32 table, TIntrusiveConstPtr<TColdPart> part)
 {
-    return DatabaseImpl->Merge(table, std::move(part));
+    return State_.DatabaseImpl->Merge(table, std::move(part));
 }
 
-void TDatabase::Merge(ui32 table, TIntrusiveConstPtr<TTxStatusPart> txStatus)
+void TDatabaseCore::Merge(ui32 table, TIntrusiveConstPtr<TTxStatusPart> txStatus)
 {
-    return DatabaseImpl->Merge(table, std::move(txStatus));
+    return State_.DatabaseImpl->Merge(table, std::move(txStatus));
 }
 
-void TDatabase::MergeDone(ui32 table)
+void TDatabaseCore::MergeDone(ui32 table)
 {
-    return DatabaseImpl->MergeDone(table);
+    return State_.DatabaseImpl->MergeDone(table);
 }
 
-TAlter& TDatabase::Alter()
+TAlter& TDatabaseCore::Alter()
 {
-    Y_ENSURE(Redo, "Scheme change must be done within a transaction");
+    Y_ENSURE(State_.Redo, "Scheme change must be done within a transaction");
 
-    return *(Alter_ ? Alter_ : (Alter_ = new TAlter(DatabaseImpl.Get())));
+    return *(State_.Alter_ ? State_.Alter_ : (State_.Alter_ = new TAlter(State_.DatabaseImpl.Get())));
 }
 
 void TDatabase::DebugDumpTable(ui32 table, IOutputStream& str, const NScheme::TTypeRegistry& typeRegistry) const {
     str << "Table " << table << Endl;
-    if (auto &wrap = DatabaseImpl->Get(table, false))
+    if (auto &wrap = State_.DatabaseImpl->Get(table, false))
         wrap->DebugDump(str, Env, typeRegistry);
     else
         str << "unknown" << Endl;
 }
 
 void TDatabase::DebugDump(IOutputStream& str, const NScheme::TTypeRegistry& typeRegistry) const {
-    for (const auto& it: DatabaseImpl->Scheme->Tables) {
-        if (DatabaseImpl->Get(it.first, false)) {
+    for (const auto& it: State_.DatabaseImpl->Scheme->Tables) {
+        if (State_.DatabaseImpl->Get(it.first, false)) {
             str << "======= " << it.second.Name << " ======\n";
             DebugDumpTable(it.first, str, typeRegistry);
         }
     }
 }
 
-TKeyRangeCache* TDatabase::DebugGetTableErasedKeysCache(ui32 table) const {
-    if (auto &wrap = DatabaseImpl->Get(table, false)) {
+TKeyRangeCache* TDatabaseCore::DebugGetTableErasedKeysCache(ui32 table) const {
+    if (auto &wrap = State_.DatabaseImpl->Get(table, false)) {
         return wrap->GetErasedKeysCache();
     } else {
         return nullptr;
     }
 }
 
-size_t TDatabase::GetCommitRedoBytes() const
+size_t TDatabaseCore::GetCommitRedoBytes() const
 {
-    Y_ENSURE(Redo, "Transaction is not in progress");
-    return Redo->Bytes();
+    Y_ENSURE(State_.Redo, "Transaction is not in progress");
+    return State_.Redo->Bytes();
 }
 
-bool TDatabase::HasChanges() const
+bool TDatabaseCore::HasChanges() const
 {
-    Y_ENSURE(Redo, "Transaction is not in progress");
+    Y_ENSURE(State_.Redo, "Transaction is not in progress");
 
-    return *Redo || (Alter_ && *Alter_) || Change->Snapshots || Change->RemovedRowVersions;
+    return *State_.Redo || (State_.Alter_ && *State_.Alter_) || State_.Change->Snapshots || State_.Change->RemovedRowVersions;
 }
 
 TDatabase::TProd TDatabase::Commit(TTxStamp stamp, bool commit, TCookieAllocator* cookieAllocator)
@@ -735,56 +740,70 @@ TDatabase::TProd TDatabase::Commit(TTxStamp stamp, bool commit, TCookieAllocator
 
 TVector<std::function<void()>> TDatabase::PrepareCommit(bool commit)
 {
+    auto onPersistent = TDatabaseCore::PrepareCommit(commit);
+    TempIterators.clear();
+    return onPersistent;
+}
+
+TVector<std::function<void()>> TDatabaseCore::PrepareCommit(bool commit)
+{
     TVector<std::function<void()>> onPersistent;
 
     if (commit) {
-        for (auto& callback : OnCommit_) {
+        for (auto& callback : State_.OnCommit_) {
             callback();
         }
-        onPersistent = std::move(OnPersistent_);
+        onPersistent = std::move(State_.OnPersistent_);
     } else {
-        auto it = OnRollback_.rbegin();
-        auto end = OnRollback_.rend();
+        auto it = State_.OnRollback_.rbegin();
+        auto end = State_.OnRollback_.rend();
         while (it != end) {
             (*it)();
             ++it;
         }
     }
 
-    OnCommit_.clear();
-    OnRollback_.clear();
-    OnPersistent_.clear();
+    State_.OnCommit_.clear();
+    State_.OnRollback_.clear();
+    State_.OnPersistent_.clear();
 
-    TempIterators.clear();
     return onPersistent;
 }
 
 TDatabase::TProd TDatabase::FinishCommit(
     TTxStamp stamp, bool commit, TCookieAllocator* cookieAllocator, TVector<std::function<void()>> onPersistent)
 {
+    auto prod = TDatabaseCore::FinishCommit(stamp, commit, cookieAllocator, std::move(onPersistent));
+    Env = nullptr;
+    return prod;
+}
+
+TDatabaseCore::TProd TDatabaseCore::FinishCommit(
+    TTxStamp stamp, bool commit, TCookieAllocator* cookieAllocator, TVector<std::function<void()>> onPersistent)
+{
     if (commit && HasChanges()) {
-        Y_ENSURE(stamp >= Change->Stamp);
-        Y_ENSURE(DatabaseImpl->Serial() == Change->Serial);
+        Y_ENSURE(stamp >= State_.Change->Stamp);
+        Y_ENSURE(State_.DatabaseImpl->Serial() == State_.Change->Serial);
 
         // FIXME: Temporary hack for using up to date change stamp when scan
         //        is queued inside a transaction. In practice we just need to
         //        stop using empty commits for scans. See KIKIMR-5366 for
         //        details.
-        const_cast<TTxStamp&>(Change->Stamp) = stamp;
+        const_cast<TTxStamp&>(State_.Change->Stamp) = stamp;
 
         NRedo::TWriter prefix{ };
 
         {
             // Chunks with events unknown to older versions require a newer evolution to read
-            const ui32 head = Max(ui32(ECompatibility::Head), Redo->RequiredEvolution());
+            const ui32 head = Max(ui32(ECompatibility::Head), State_.Redo->RequiredEvolution());
             const ui32 edge = ui32(ECompatibility::Edge);
 
-            prefix.EvBegin(head, edge, Change->Serial, Change->Stamp);
+            prefix.EvBegin(head, edge, State_.Change->Serial, State_.Change->Stamp);
         }
 
         const auto offset = prefix.Bytes(); /* useful payload starts here */
 
-        auto annex = Annex->Unwrap();
+        auto annex = State_.Annex->Unwrap();
         if (annex) {
             Y_ENSURE(cookieAllocator, "Have to provide TCookieAllocator with enabled annex");
 
@@ -803,109 +822,108 @@ TDatabase::TProd TDatabase::FinishCommit(
             prefix.EvAnnex(blobs);
         }
 
-        DatabaseImpl->CommitTransaction(Change->Stamp, annex, prefix);
+        State_.DatabaseImpl->CommitTransaction(State_.Change->Stamp, annex, prefix);
 
-        if (Alter_ && *Alter_) {
-            auto delta = Alter_->Flush();
-            Y_PROTOBUF_SUPPRESS_NODISCARD delta->SerializeToString(&Change->Scheme);
+        if (State_.Alter_ && *State_.Alter_) {
+            auto delta = State_.Alter_->Flush();
+            Y_PROTOBUF_SUPPRESS_NODISCARD delta->SerializeToString(&State_.Change->Scheme);
         }
 
-        prefix.Join(std::move(*Redo));
+        prefix.Join(std::move(*State_.Redo));
 
-        Change->Redo = std::move(prefix).Finish();
+        State_.Change->Redo = std::move(prefix).Finish();
 
-        for (const auto& xpair : Change->RemovedRowVersions) {
-            if (auto& wrap = DatabaseImpl->Get(xpair.first, false)) {
+        for (const auto& xpair : State_.Change->RemovedRowVersions) {
+            if (auto& wrap = State_.DatabaseImpl->Get(xpair.first, false)) {
                 for (const auto& range : xpair.second) {
                     wrap->RemoveRowVersions(range.Lower, range.Upper);
                 }
             }
         }
 
-        Change->Garbage = std::move(DatabaseImpl->Garbage);
-        Change->Deleted = std::move(DatabaseImpl->Deleted);
-        Change->Truncated = std::move(DatabaseImpl->Truncated);
-        Change->Affects = DatabaseImpl->GrabAffects();
-        Change->Annex = std::move(annex);
+        State_.Change->Garbage = std::move(State_.DatabaseImpl->Garbage);
+        State_.Change->Deleted = std::move(State_.DatabaseImpl->Deleted);
+        State_.Change->Truncated = std::move(State_.DatabaseImpl->Truncated);
+        State_.Change->Affects = State_.DatabaseImpl->GrabAffects();
+        State_.Change->Annex = std::move(annex);
 
-        if (Change->Redo.size() == offset && !Change->Affects) {
-            std::exchange(Change->Redo, { }); /* omit complete NOOP redo */
+        if (State_.Change->Redo.size() == offset && !State_.Change->Affects) {
+            std::exchange(State_.Change->Redo, { }); /* omit complete NOOP redo */
         }
 
-        if (Change->Redo.size() > offset && !Change->Affects) {
+        if (State_.Change->Redo.size() > offset && !State_.Change->Affects) {
             Y_TABLET_ERROR(
-                NFmt::Do(*Change) << " produced " << (Change->Redo.size() - offset)
+                NFmt::Do(*State_.Change) << " produced " << (State_.Change->Redo.size() - offset)
                 << "b of non technical redo without leaving effects on data");
-        } else if (Change->Redo && Change->Serial != DatabaseImpl->Serial()) {
+        } else if (State_.Change->Redo && State_.Change->Serial != State_.DatabaseImpl->Serial()) {
             Y_TABLET_ERROR(
-                NFmt::Do(*Change) << " serial diverged from current db "
-                << DatabaseImpl->Serial() << " after rolling up redo log");
-        } else if (Change->Deleted.size() != Change->Garbage.size()) {
-            Y_TABLET_ERROR(NFmt::Do(*Change) << " has inconsistent garbage data");
+                NFmt::Do(*State_.Change) << " serial diverged from current db "
+                << State_.DatabaseImpl->Serial() << " after rolling up redo log");
+        } else if (State_.Change->Deleted.size() != State_.Change->Garbage.size()) {
+            Y_TABLET_ERROR(NFmt::Do(*State_.Change) << " has inconsistent garbage data");
         }
     } else {
-        auto affects = DatabaseImpl->RollbackTransaction();
-        Change->RollbackAffects.insert(Change->RollbackAffects.end(), affects.begin(), affects.end());
-        SortUnique(Change->RollbackAffects);
+        auto affects = State_.DatabaseImpl->RollbackTransaction();
+        State_.Change->RollbackAffects.insert(State_.Change->RollbackAffects.end(), affects.begin(), affects.end());
+        SortUnique(State_.Change->RollbackAffects);
     }
 
-    DatabaseImpl->RunGC();
+    State_.DatabaseImpl->RunGC();
 
-    Redo = nullptr;
-    Annex = nullptr;
-    Alter_ = nullptr;
-    Env = nullptr;
+    State_.Redo = nullptr;
+    State_.Annex = nullptr;
+    State_.Alter_ = nullptr;
 
-    return { std::move(Change), std::move(onPersistent) };
+    return { std::move(State_.Change), std::move(onPersistent) };
 }
 
-TTable* TDatabase::Require(ui32 table) const
+TTable* TDatabaseCore::Require(ui32 table) const
 {
-    return DatabaseImpl->Get(table, true).Self.Get();
+    return State_.DatabaseImpl->Get(table, true).Self.Get();
 }
 
-TTable* TDatabase::RequireForUpdate(ui32 table) const
+TTable* TDatabaseCore::RequireForUpdate(ui32 table) const
 {
-    return DatabaseImpl->GetForUpdate(table).Self.Get();
+    return State_.DatabaseImpl->GetForUpdate(table).Self.Get();
 }
 
-void TDatabase::CheckReadAllowed(ui32 table) const
+void TDatabaseCore::CheckReadAllowed(ui32 table) const
 {
-    Y_ENSURE(!NoMoreReadsFlag, "Trying to read after reads prohibited, table " << table);
-    if (NoMoreUnprechargedReadsFlag) [[unlikely]] {
+    Y_ENSURE(!State_.NoMoreReadsFlag, "Trying to read after reads prohibited, table " << table);
+    if (State_.NoMoreUnprechargedReadsFlag) [[unlikely]] {
         Y_DEBUG_ABORT_UNLESS(
-            std::find(PrechargedTables.begin(), PrechargedTables.end(), table) != PrechargedTables.end(),
+            std::find(State_.PrechargedTables.begin(), State_.PrechargedTables.end(), table) != State_.PrechargedTables.end(),
             "Trying to read a previously unprecharged table %u", table);
     }
 }
 
-void TDatabase::CheckPrechargeAllowed(ui32 table, TRawVals minKey, TRawVals maxKey) const
+void TDatabaseCore::CheckPrechargeAllowed(ui32 table, TRawVals minKey, TRawVals maxKey) const
 {
-    Y_ENSURE(!NoMoreReadsFlag, "Trying to precharge after reads prohibited, table " << table);
-    if (NoMoreUnprechargedReadsFlag) [[unlikely]] {
+    Y_ENSURE(!State_.NoMoreReadsFlag, "Trying to precharge after reads prohibited, table " << table);
+    if (State_.NoMoreUnprechargedReadsFlag) [[unlikely]] {
         Y_DEBUG_ABORT_UNLESS(
-            std::find(PrechargedTables.begin(), PrechargedTables.end(), table) != PrechargedTables.end(),
+            std::find(State_.PrechargedTables.begin(), State_.PrechargedTables.end(), table) != State_.PrechargedTables.end(),
             "Trying to precharge a previously unprecharged table %u", table);
     } else if (!minKey && !maxKey) {
         // Note: tables are usually fully precharged only in init transcations
         // This vector is small or empty most of the time and not worth using a hash table
-        PrechargedTables.push_back(table);
+        State_.PrechargedTables.push_back(table);
     }
 }
 
-TGarbage TDatabase::RollUp(TTxStamp stamp, TArrayRef<const char> delta, TArrayRef<const char> redo,
+TGarbage TDatabaseCore::RollUp(TTxStamp stamp, TArrayRef<const char> delta, TArrayRef<const char> redo,
                                 TMemGlobs annex, TArrayRef<const ui32> truncatedTables, IRedoObserver* observer)
 {
     Y_ENSURE(!annex || redo, "Annex have to be rolled up with redo log");
 
-    DatabaseImpl->Switch(stamp);
+    State_.DatabaseImpl->Switch(stamp);
 
     if (delta) {
         TSchemeChanges changes;
         bool parseOk = ParseFromStringNoSizeLimit(changes, delta);
         Y_ENSURE(parseOk);
 
-        DatabaseImpl->ApplySchema(changes);
+        State_.DatabaseImpl->ApplySchema(changes);
     }
 
     if (observer) {
@@ -915,22 +933,22 @@ TGarbage TDatabase::RollUp(TTxStamp stamp, TArrayRef<const char> delta, TArrayRe
     }
 
     if (redo) {
-        DatabaseImpl->Assign(std::move(annex));
-        DatabaseImpl->ApplyRedo(redo, observer);
-        DatabaseImpl->GrabAnnex();
+        State_.DatabaseImpl->Assign(std::move(annex));
+        State_.DatabaseImpl->ApplyRedo(redo, observer);
+        State_.DatabaseImpl->GrabAnnex();
     }
 
-    return std::move(DatabaseImpl->Garbage);
+    return std::move(State_.DatabaseImpl->Garbage);
 }
 
-void TDatabase::RollUpRemoveRowVersions(ui32 table, const TRowVersion& lower, const TRowVersion& upper)
+void TDatabaseCore::RollUpRemoveRowVersions(ui32 table, const TRowVersion& lower, const TRowVersion& upper)
 {
-    if (auto& wrap = DatabaseImpl->Get(table, false)) {
+    if (auto& wrap = State_.DatabaseImpl->Get(table, false)) {
         wrap->RemoveRowVersions(lower, upper);
     }
 }
 
-TCompactionStats TDatabase::GetCompactionStats(ui32 table) const
+TCompactionStats TDatabaseCore::GetCompactionStats(ui32 table) const
 {
     return Require(table)->GetCompactionStats();
 }

@@ -134,7 +134,37 @@ protected:
 using TOwningDatabaseReader = TDatabaseReader<TCachePageRef>;
 using TTransactionReader = TDatabaseReader<TCachePageConstRef>;
 
-class TDatabase : public TOwningDatabaseReader {
+class TDatabaseCore;
+
+class TDatabaseState {
+    friend class TDatabase;
+    friend class TDatabaseCore;
+    template <class TPageRef>
+    friend class TDatabaseReader;
+
+    explicit TDatabaseState(TDatabaseImpl* databaseImpl);
+    ~TDatabaseState();
+
+    const THolder<TDatabaseImpl> DatabaseImpl;
+
+    bool NoMoreReadsFlag = false;
+    bool NoMoreUnprechargedReadsFlag = false;
+    THolder<TChange> Change;
+    TAutoPtr<TAlter> Alter_;
+    TAutoPtr<TAnnex> Annex;
+    TAutoPtr<NRedo::TWriter> Redo;
+
+    TVector<ui32> ModifiedRefs;
+    TVector<TUpdateOp> ModifiedOps;
+
+    mutable TVector<ui32> PrechargedTables;
+
+    TVector<std::function<void()>> OnCommit_;
+    TVector<std::function<void()>> OnRollback_;
+    TVector<std::function<void()>> OnPersistent_;
+};
+
+class TDatabaseCore {
 public:
     using TMemGlobs = TVector<NPageCollection::TMemGlob>;
     using TCookieAllocator = NPageCollection::TCookieAllocator;
@@ -177,10 +207,6 @@ public:
         bool operator<(const TChangeCounter& rhs) const;
     };
 
-    TDatabase(const TDatabase&) = delete;
-    TDatabase(TDatabaseImpl *databaseImpl = nullptr);
-    ~TDatabase();
-
     void SetTableObserver(ui32 table, TIntrusivePtr<ITableObserver> ptr);
 
     /**
@@ -188,12 +214,6 @@ public:
      * table = Max<ui32>() by default).
      */
     TChangeCounter Head(ui32 table = Max<ui32>()) const;
-
-    TSizeEnv CreateSizeEnv();
-    void CalculateReadSize(TSizeEnv& env, ui32 table, TRawVals minKey, TRawVals maxKey,
-                        TTagsRef tags, ui64 readFlags, ui64 itemsLimit, ui64 bytesLimit,
-                        EDirection direction = EDirection::Forward,
-                        TRowVersion snapshot = TRowVersion::Max());
 
     void Update(ui32 table, ERowOp, TRawVals key, TArrayRef<const TUpdateOp>, TRowVersion rowVersion = TRowVersion::Min());
 
@@ -290,7 +310,6 @@ public:
 
     TAutoPtr<TSubset> CompactionSubset(ui32 table, TEpoch before, TArrayRef<const TLogoBlobID> bundle) const;
     TAutoPtr<TSubset> PartSwitchSubset(ui32 table, TEpoch before, TArrayRef<const TLogoBlobID> bundle, TArrayRef<const TLogoBlobID> txStatus) const;
-    TAutoPtr<TSubset> Subset(ui32 table, TEpoch before, TRawVals from, TRawVals to) const;
     TAutoPtr<TSubset> ScanSnapshot(ui32 table, TRowVersion snapshot = TRowVersion::Max());
 
     bool HasBorrowed(ui32 table, ui64 selfTabletId) const;
@@ -308,15 +327,83 @@ public:
     void Merge(ui32 table, TIntrusiveConstPtr<TTxStatusPart>);
     void MergeDone(ui32 table);
 
-    void DebugDumpTable(ui32 table, IOutputStream& str, const NScheme::TTypeRegistry& typeRegistry) const;
-    void DebugDump(IOutputStream& str, const NScheme::TTypeRegistry& typeRegistry) const;
-
     TKeyRangeCache* DebugGetTableErasedKeysCache(ui32 table) const;
 
     /**
      * Returns true when current transaction has changes to commit
      */
     bool HasChanges() const;
+    TGarbage RollUp(TTxStamp, TArrayRef<const char> delta, TArrayRef<const char> redo, TMemGlobs annex,
+        TArrayRef<const ui32> truncatedTables, IRedoObserver* observer = nullptr);
+
+    void RollUpRemoveRowVersions(ui32 table, const TRowVersion& lower, const TRowVersion& upper);
+
+    size_t GetCommitRedoBytes() const;
+
+    TCompactionStats GetCompactionStats(ui32 table) const;
+
+    /**
+     * Adds a callback, which is called when database changes are committed
+     */
+    template<class TCallback>
+    void OnCommit(TCallback&& callback) {
+        State_.OnCommit_.emplace_back(std::forward<TCallback>(callback));
+    }
+
+    /**
+     * Adds a callback, which is called when database changes are rolled back
+     *
+     * @param callback
+     */
+    template<class TCallback>
+    void OnRollback(TCallback&& callback) {
+        State_.OnRollback_.emplace_back(std::forward<TCallback>(callback));
+    }
+
+    /**
+     * Adds a callback, which is called when database changes are persistent
+     */
+    template<class TCallback>
+    void OnPersistent(TCallback&& callback) {
+        State_.OnPersistent_.emplace_back(std::forward<TCallback>(callback));
+    }
+
+protected:
+    friend class TDatabase;
+    template <class TPageRef>
+    friend class TDatabaseReader;
+
+    explicit TDatabaseCore(TDatabaseState& state) noexcept
+        : State_(state)
+    {}
+
+    TVector<std::function<void()>> PrepareCommit(bool commit);
+    TProd FinishCommit(
+        TTxStamp stamp, bool commit, TCookieAllocator* cookieAllocator, TVector<std::function<void()>> onPersistent);
+
+    TTable* Require(ui32 tableId) const;
+    TTable* RequireForUpdate(ui32 tableId) const;
+    void CheckReadAllowed(ui32 table) const;
+    void CheckPrechargeAllowed(ui32 table, TRawVals minKey, TRawVals maxKey) const;
+
+    TDatabaseState& State_;
+};
+
+class TDatabase : private TDatabaseState, public TDatabaseCore, public TOwningDatabaseReader {
+public:
+    TDatabase(const TDatabase&) = delete;
+    TDatabase(TDatabaseImpl *databaseImpl = nullptr);
+    ~TDatabase();
+
+    TSizeEnv CreateSizeEnv();
+    void CalculateReadSize(TSizeEnv& env, ui32 table, TRawVals minKey, TRawVals maxKey,
+                        TTagsRef tags, ui64 readFlags, ui64 itemsLimit, ui64 bytesLimit,
+                        EDirection direction = EDirection::Forward,
+                        TRowVersion snapshot = TRowVersion::Max());
+    TAutoPtr<TSubset> Subset(ui32 table, TEpoch before, TRawVals from, TRawVals to) const;
+
+    void DebugDumpTable(ui32 table, IOutputStream& str, const NScheme::TTypeRegistry& typeRegistry) const;
+    void DebugDump(IOutputStream& str, const NScheme::TTypeRegistry& typeRegistry) const;
 
     /**
      * Rollback all current transaction changes
@@ -327,7 +414,7 @@ public:
 
     template <class TPageRef>
     void RollbackChanges(TDatabaseReader<TPageRef>& reader) {
-        const auto stamp = Change->Stamp;
+        const auto stamp = State_.Change->Stamp;
         IPages& env = *Env;
         auto* pages = reader.Env;
         auto prod = Commit(stamp, false, reader);
@@ -352,74 +439,12 @@ public:
         reader.Env = nullptr;
         return FinishCommit(stamp, commit, cookieAllocator, std::move(onPersistent));
     }
-    TGarbage RollUp(TTxStamp, TArrayRef<const char> delta, TArrayRef<const char> redo, TMemGlobs annex,
-        TArrayRef<const ui32> truncatedTables, IRedoObserver* observer = nullptr);
-
-    void RollUpRemoveRowVersions(ui32 table, const TRowVersion& lower, const TRowVersion& upper);
-
-    size_t GetCommitRedoBytes() const;
-
-    TCompactionStats GetCompactionStats(ui32 table) const;
-
-    /**
-     * Adds a callback, which is called when database changes are committed
-     */
-    template<class TCallback>
-    void OnCommit(TCallback&& callback) {
-        OnCommit_.emplace_back(std::forward<TCallback>(callback));
-    }
-
-    /**
-     * Adds a callback, which is called when database changes are rolled back
-     *
-     * @param callback
-     */
-    template<class TCallback>
-    void OnRollback(TCallback&& callback) {
-        OnRollback_.emplace_back(std::forward<TCallback>(callback));
-    }
-
-    /**
-     * Adds a callback, which is called when database changes are persistent
-     */
-    template<class TCallback>
-    void OnPersistent(TCallback&& callback) {
-        OnPersistent_.emplace_back(std::forward<TCallback>(callback));
-    }
 
 private:
-    template <class TPageRef>
-    friend class TDatabaseReader;
-
     TVector<std::function<void()>> PrepareCommit(bool commit);
     TProd FinishCommit(
         TTxStamp stamp, bool commit, TCookieAllocator* cookieAllocator, TVector<std::function<void()>> onPersistent);
     void FinishRollback(TTxStamp stamp, IPages& env, TProd&& prod);
-
-    TTable* Require(ui32 tableId) const;
-    TTable* RequireForUpdate(ui32 tableId) const;
-
-    void CheckReadAllowed(ui32 table) const;
-    void CheckPrechargeAllowed(ui32 table, TRawVals minKey, TRawVals maxKey) const;
-
-private:
-    const THolder<TDatabaseImpl> DatabaseImpl;
-
-    bool NoMoreReadsFlag = false;
-    bool NoMoreUnprechargedReadsFlag = false;
-    THolder<TChange> Change;
-    TAutoPtr<TAlter> Alter_;
-    TAutoPtr<TAnnex> Annex;
-    TAutoPtr<NRedo::TWriter> Redo;
-
-    TVector<ui32> ModifiedRefs;
-    TVector<TUpdateOp> ModifiedOps;
-
-    mutable TVector<ui32> PrechargedTables;
-
-    TVector<std::function<void()>> OnCommit_;
-    TVector<std::function<void()>> OnRollback_;
-    TVector<std::function<void()>> OnPersistent_;
 };
 
 
