@@ -14,19 +14,22 @@
 namespace NKikimr {
 namespace NTable {
 
+    template <class TInputRef>
+    class TRunIterImpl;
+
     /**
      * Part group iterator that may be positioned on a specific row id
      */
-    class TPartGroupRowIter {
+    template <class TInputRef>
+    class TPartGroupRowIterImpl {
     public:
-        TPartGroupRowIter(const TPart* part, IPages* env, NPage::TGroupId groupId)
+        TPartGroupRowIterImpl(const TPart* part, TPages<TInputRef>* env, NPage::TGroupId groupId)
             : Part(part)
-            , Env(env) 
+            , Env(env)
             , GroupId(groupId)
             , Index_(CreateIndexIter(part, env, groupId))
             , Index(*Index_.Get())
-        {
-        }
+        {}
 
         EReady Seek(TRowId rowId) {
             // Fast path, check if we already have the needed data page
@@ -74,7 +77,7 @@ namespace NTable {
             return IsValid() ? (Page.BaseRow() + Data.Off()) : Max<TRowId>();
         }
 
-        const NPage::TDataPage::TRecord* GetRecord() const noexcept {
+        const NPage::TDataPageLayout::TRecord* GetRecord() const noexcept {
             Y_DEBUG_ABORT_UNLESS(IsValid(), "Use of unpositioned iterator");
             return Data.GetRecord();
         }
@@ -96,32 +99,41 @@ namespace NTable {
 
     protected:
         const TPart* const Part;
-        IPages* const Env;
+        TPages<TInputRef>* const Env;
         const NPage::TGroupId GroupId;
 
         TPageOffset Offset = TPageOffset::Max();
 
         THolder<IPartGroupIndexIter> Index_;
         IPartGroupIndexIter& Index;
-        NPage::TDataPage Page;
-        NPage::TDataPage::TIter Data;
+        NPage::TDataPageImpl<TInputRef> Page;
+        // Data refers to the embedded page block; positioned iterators must not move
+        NPage::TDataPageLayout::TIter Data;
     };
+
+    using TPartGroupRowIter = TPartGroupRowIterImpl<TCachePageRef>;
 
     /**
      * Part group iterator that may be positioned on a specific key
      */
-    class TPartGroupKeyIter : private TPartGroupRowIter
-    {
+    template <class TInputRef>
+    class TPartGroupKeyIterImpl : private TPartGroupRowIterImpl<TInputRef> {
+        using TBase = TPartGroupRowIterImpl<TInputRef>;
+        using TBase::Data;
+        using TBase::Env;
+        using TBase::Index;
+        using TBase::LoadPage;
+        using TBase::Page;
+
     public:
         using TCells = NPage::TCells;
 
-        TPartGroupKeyIter(const TPart* part, IPages* env, NPage::TGroupId groupId)
-            : TPartGroupRowIter(part, env, groupId)
+        TPartGroupKeyIterImpl(const TPart* part, TPages<TInputRef>* env, NPage::TGroupId groupId)
+            : TBase(part, env, groupId)
             , BeginRowId(0)
             , EndRowId(Index.GetEndRowId())
             , RowId(Max<TRowId>())
-        {
-        }
+        {}
 
         void SetBounds(TRowId beginRowId, TRowId endRowId)
         {
@@ -424,8 +436,8 @@ namespace NTable {
             Y_TABLET_ERROR("Unexpected failure to seek in a non-final data page");
         }
 
-        using TPartGroupRowIter::IsValid;
-        using TPartGroupRowIter::GetRecord;
+        using TBase::GetRecord;
+        using TBase::IsValid;
 
         Y_FORCE_INLINE TRowId GetRowId() const noexcept {
             // N.B. we don't check IsValid because screen-related code may
@@ -433,7 +445,9 @@ namespace NTable {
             return RowId;
         }
 
-        const TSharedData& GetPageData() const noexcept {
+        const TSharedData& GetPageData() const noexcept
+            requires std::is_same_v<TInputRef, TCachePageRef>
+        {
             return Page.GetData();
         }
 
@@ -481,17 +495,27 @@ namespace NTable {
         TRowId RowId;
     };
 
+    using TPartGroupKeyIter = TPartGroupKeyIterImpl<TCachePageRef>;
+
     /**
      * Part iterator over history data
      */
-    class TPartHistoryIter : private TPartGroupRowIter
-    {
+    template <class TInputRef>
+    class TPartHistoryIterImpl : private TPartGroupRowIterImpl<TInputRef> {
+        using TBase = TPartGroupRowIterImpl<TInputRef>;
+        using TBase::Data;
+        using TBase::Env;
+        using TBase::Index;
+        using TBase::LoadPage;
+        using TBase::Page;
+        using TBase::Part;
+
     public:
         using TCells = NPage::TCells;
 
-        explicit TPartHistoryIter(const TPart* part, IPages* env)
-            : TPartGroupRowIter(part, env, NPage::TGroupId(0, /* historic */ true))
-        { }
+        explicit TPartHistoryIterImpl(const TPart* part, TPages<TInputRef>* env)
+            : TBase(part, env, NPage::TGroupId(0, /* historic */ true))
+        {}
 
         EReady Seek(TRowId rowId, const TRowVersion& rowVersion)
         {
@@ -510,7 +534,7 @@ namespace NTable {
             TCells key{ keyCells, 3 };
 
             // Directly use the history group scheme
-            const auto& scheme = Part->Scheme->HistoryGroup;
+            const TPartScheme::TGroupInfo& scheme = Part->Scheme->HistoryGroup;
             Y_DEBUG_ABORT_UNLESS(scheme.ColsKeyIdx.size() == 3);
             Y_DEBUG_ABORT_UNLESS(scheme.ColsKeyData.size() == 3);
 
@@ -519,17 +543,19 @@ namespace NTable {
 
             // Helper for loading row id and row version from the index
             auto checkIndex = [&]() -> bool {
-                RowId = Index.GetKeyCell(0).AsValue<TRowId>();
-                RowVersion.Step = Index.GetKeyCell(1).AsValue<ui64>();
-                RowVersion.TxId = Index.GetKeyCell(2).AsValue<ui64>();
+                IPartGroupIndexIter& index = Index;
+                RowId = index.GetKeyCell(0).AsValue<TRowId>();
+                RowVersion.Step = index.GetKeyCell(1).AsValue<ui64>();
+                RowVersion.TxId = index.GetKeyCell(2).AsValue<ui64>();
                 return rowId == RowId;
             };
 
             // Helper for loading row id and row version from the data page
             auto checkData = [&]() -> bool {
-                RowId = Data->Cell(scheme.ColsKeyData[0]).AsValue<TRowId>();
-                RowVersion.Step = Data->Cell(scheme.ColsKeyData[1]).AsValue<ui64>();
-                RowVersion.TxId = Data->Cell(scheme.ColsKeyData[2]).AsValue<ui64>();
+                const NPage::TDataPageLayout::TRecord* data = Data.GetRecord();
+                RowId = data->Cell(scheme.ColsKeyData[0]).AsValue<TRowId>();
+                RowVersion.Step = data->Cell(scheme.ColsKeyData[1]).AsValue<ui64>();
+                RowVersion.TxId = data->Cell(scheme.ColsKeyData[2]).AsValue<ui64>();
                 return rowId == RowId;
             };
 
@@ -661,7 +687,8 @@ namespace NTable {
             // We need exact match on rowId, bail on larger values
             Y_DEBUG_ABORT_UNLESS(Index.GetRowId() == 0 || Index.GetKeyCellsCount(), "Non-first page is expected to have key cells");
             if (Index.GetKeyCellsCount()) {
-                TRowId indexRowId = Index.GetKeyCell(0).AsValue<TRowId>();
+                const TCell indexKey = Index.GetKeyCell(0);
+                TRowId indexRowId = indexKey.AsValue<TRowId>();
                 if (rowId < indexRowId) {
                     // We cannot compute MaxVersion anyway as indexRowId row may be presented on the previous page
                     // and last existing version for rowId is unknown
@@ -756,12 +783,12 @@ namespace NTable {
             }
         }
 
-        using TPartGroupRowIter::IsValid;
-        using TPartGroupRowIter::GetRecord;
+        using TBase::GetRecord;
+        using TBase::IsValid;
 
         TRowId GetHistoryRowId() const noexcept {
             Y_DEBUG_ABORT_UNLESS(IsValid());
-            return TPartGroupRowIter::GetRowId();
+            return TBase::GetRowId();
         }
 
         TRowId GetRowId() const noexcept {
@@ -793,12 +820,20 @@ namespace NTable {
         TRowVersion MaxVersion;
     };
 
-    class TPartIter final {
+    using TPartHistoryIter = TPartHistoryIterImpl<TCachePageRef>;
+
+    template <class TInputRef>
+    class TPartIterImpl final {
+        using TPartGroupRowIter = TPartGroupRowIterImpl<TInputRef>;
+        using TPartGroupKeyIter = TPartGroupKeyIterImpl<TInputRef>;
+        using TPartHistoryIter = TPartHistoryIterImpl<TInputRef>;
+
     public:
         using TCells = NPage::TCells;
         using TGroupId = NPage::TGroupId;
 
-        TPartIter(const TPart* part, TTagsRef tags, TIntrusiveConstPtr<TKeyCellDefaults> keyDefaults, IPages* env)
+        TPartIterImpl(
+            const TPart* part, TTagsRef tags, TIntrusiveConstPtr<TKeyCellDefaults> keyDefaults, TPages<TInputRef>* env)
             : Part(part)
             , Env(env)
             , Pinout(Part->Scheme->MakePinout(tags))
@@ -903,6 +938,7 @@ namespace NTable {
         }
 
         const TSharedData& GetKeyPage() const noexcept
+            requires std::is_same_v<TInputRef, TCachePageRef>
         {
             return Main.GetPageData();
         }
@@ -1345,11 +1381,11 @@ namespace NTable {
             }
         }
 
-        void Apply(TRowState& row, TPinout::TPin pin, const NPage::TDataPage::TRecord* mainRecord, ui32 altIndex) const
-        {
+        void Apply(
+            TRowState& row, TPinout::TPin pin, const NPage::TDataPageLayout::TRecord* mainRecord, ui32 altIndex) const {
             auto& col = SkipMainVersion ? Part->Scheme->HistoryColumns[pin.From] : Part->Scheme->AllColumns[pin.From];
 
-            const NPage::TDataPage::TRecord* data;
+            const NPage::TDataPageLayout::TRecord* data;
             if (col.Group == 0) {
                 data = mainRecord;
             } else {
@@ -1377,9 +1413,8 @@ namespace NTable {
             Apply(row, pin, data, col);
         }
 
-        void Apply(TRowState& row, TPinout::TPin pin, const NPage::TDataPage::TRecord* data,
-                const TPartScheme::TColumn& info) const
-        {
+        void Apply(TRowState& row, TPinout::TPin pin, const NPage::TDataPageLayout::TRecord* data,
+            const TPartScheme::TColumn& info) const {
             auto op = data->GetCellOp(info);
 
             if (op == ECellOp::Empty) {
@@ -1424,13 +1459,13 @@ namespace NTable {
 
     public:
         const TPart* const Part;
-        IPages* const Env;
+        TPages<TInputRef>* const Env;
 
     private:
-        friend class TRunIter;
+        friend class TRunIterImpl<TInputRef>;
 
         // Cells from every version of the current key may remain in compaction's saved rows.
-        mutable TVector<IPages::TResult> LocatedValues;
+        mutable TVector<IPageEnvironment::TResult> LocatedValues;
         const TPinout Pinout;
         const TIntrusiveConstPtr<TKeyCellDefaults> KeyCellDefaults;
 
@@ -1449,7 +1484,7 @@ namespace NTable {
             TPartHistoryIter History;
             mutable TSmallVec<TPartGroupRowIter> Groups;
 
-            THistoryState(const TPart* part, IPages* env, const TPinout& pinout)
+            THistoryState(const TPart* part, TPages<TInputRef>* env, const TPinout& pinout)
                 : History(part, env)
             {
                 Groups.reserve(pinout.AltGroups().size());
@@ -1468,11 +1503,17 @@ namespace NTable {
         ui8 SkipEraseVersion : 1;
     };
 
-    class TRunIter final {
+    using TPartIter = TPartIterImpl<TCachePageRef>;
+
+    template <class TInputRef>
+    class TRunIterImpl final {
+        using TPartIter = TPartIterImpl<TInputRef>;
+
     public:
         using TCells = NPage::TCells;
 
-        TRunIter(const TRun& run, TTagsRef tags, TIntrusiveConstPtr<TKeyCellDefaults> keyDefaults, IPages* env)
+        TRunIterImpl(
+            const TRun& run, TTagsRef tags, TIntrusiveConstPtr<TKeyCellDefaults> keyDefaults, TPages<TInputRef>* env)
             : Run(run)
             , Tags(tags)
             , KeyCellDefaults(std::move(keyDefaults))
@@ -1740,6 +1781,7 @@ namespace NTable {
         }
 
         const TSharedData& GetKeyPage() const noexcept
+            requires std::is_same_v<TInputRef, TCachePageRef>
         {
             Y_DEBUG_ABORT_UNLESS(CurrentIt);
             return CurrentIt->GetKeyPage();
@@ -1871,13 +1913,16 @@ namespace NTable {
         const TRun& Run;
         TTagsRef const Tags;
         TIntrusiveConstPtr<TKeyCellDefaults> const KeyCellDefaults;
-        IPages* const Env;
+        TPages<TInputRef>* const Env;
 
     private:
         TRun::const_iterator Current;
         THolder<TPartIter> CurrentIt;
+        // Borrowed providers retain pages for inactive cached iterators too
         THashMap<const TPart*, THolder<TPartIter>> Cache;
     };
+
+    using TRunIter = TRunIterImpl<TCachePageRef>;
 
 }
 }

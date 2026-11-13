@@ -43,6 +43,16 @@ static_assert(
 static_assert(
     std::is_constructible_v<TPartGroupFlatIndexIterImpl<TCachePageConstRef>, const TPart*, IBorrowedPages*, TGroupId>);
 
+template <class TReader>
+concept THasOwnedKeyPage = requires(const TReader& reader) { reader.GetKeyPage(); };
+
+static_assert(THasOwnedKeyPage<TPartIter>);
+static_assert(THasOwnedKeyPage<TRunIter>);
+static_assert(!THasOwnedKeyPage<TPartIterImpl<TCachePageConstRef>>);
+static_assert(!THasOwnedKeyPage<TRunIterImpl<TCachePageConstRef>>);
+static_assert(!std::is_constructible_v<TPartGroupRowIter, const TPart*, IBorrowedPages*, TGroupId>);
+static_assert(!std::is_constructible_v<TPartHistoryIter, const TPart*, IBorrowedPages*>);
+
 using NTest::TPartStore;
 
 namespace {
@@ -1790,6 +1800,118 @@ Y_UNIT_TEST_SUITE_F(TIndexIteratorOwnership, ::NKikimr::NTable::NTest::TTableCac
 
     Y_UNIT_TEST(BorrowedBtreeWithoutNodesMatchesOwnedIterator) {
         CheckIndex(MakePart({ .Levels = 0 }));
+    }
+}
+
+Y_UNIT_TEST_SUITE_F(TRowReaderOwnership, ::NKikimr::NTable::NTest::TTableCacheTest) {
+    template <class TOwned, class TBorrowed>
+    void CheckReaders(TOwned & owned, TBorrowed & borrowed, TTouchEnv & ownedEnv, TTouchEnv & source,
+        const NTest::TPartEggs& eggs, TTagsRef tags) {
+        const auto step = [&](auto&& action) {
+            for (ui32 retry = 0; retry <= 10; ++retry) {
+                const auto expected = action(owned);
+                const auto actual = action(borrowed);
+                UNIT_ASSERT(actual == expected);
+                if (actual != EReady::Page) {
+                    return actual;
+                }
+                ownedEnv.LoadTouched();
+                source.LoadTouched();
+            }
+            UNIT_FAIL("Reader pages did not become ready");
+            return EReady::Page;
+        };
+        const auto checkRow = [&] {
+            UNIT_ASSERT_VALUES_EQUAL(borrowed.GetRowId(), owned.GetRowId());
+            UNIT_ASSERT(borrowed.GetRowVersion() == owned.GetRowVersion());
+            const auto expectedKey = owned.GetKey().Cells();
+            const auto actualKey = borrowed.GetKey().Cells();
+            UNIT_ASSERT_VALUES_EQUAL(actualKey.size(), expectedKey.size());
+            for (ui32 column : xrange(actualKey.size())) {
+                UNIT_ASSERT_VALUES_EQUAL(
+                    CompareTypedCells(actualKey[column], expectedKey[column], eggs.Scheme->Keys->Types[column]), 0);
+            }
+            for (ui32 retry = 0; retry <= 10; ++retry) {
+                TRowState expected(tags.size()), actual(tags.size());
+                owned.Apply(expected, nullptr, nullptr);
+                borrowed.Apply(actual, nullptr, nullptr);
+                UNIT_ASSERT_VALUES_EQUAL(actual.Need(), expected.Need());
+                if (actual.Need()) {
+                    ownedEnv.LoadTouched();
+                    source.LoadTouched();
+                    continue;
+                }
+                UNIT_ASSERT(actual.GetRowState() == expected.GetRowState());
+                for (ui32 column : xrange(tags.size())) {
+                    UNIT_ASSERT(actual.GetCellOp(column) == expected.GetCellOp(column));
+                    const auto& type = eggs.Lone()->Scheme->FindColumnByTag(tags[column])->TypeInfo;
+                    UNIT_ASSERT_VALUES_EQUAL(CompareTypedCells(actual.Get(column), expected.Get(column), type), 0);
+                }
+                return;
+            }
+            UNIT_FAIL("Reader column groups did not become ready");
+        };
+        for (bool reverse : { false, true }) {
+            auto ready = step([&](auto& reader) {
+                return reverse ? reader.SeekReverse({}, ESeek::Lower) : reader.Seek({}, ESeek::Lower);
+            });
+            ui32 rows = 0;
+            while (ready == EReady::Data) {
+                checkRow();
+                UNIT_ASSERT(step([&](auto& reader) {
+                    TIteratorStats stats;
+                    return reader.SkipToRowVersion({ 0, 0 }, stats, nullptr, nullptr, ITransactionSet::None);
+                }) == EReady::Data);
+                checkRow();
+                ++rows;
+                ready = step([&](auto& reader) {
+                    return reverse ? reader.Prev() : reader.Next();
+                });
+            }
+            UNIT_ASSERT_VALUES_EQUAL(rows, eggs.Lone()->Stat.Rows);
+        }
+    }
+
+    void CheckPart(const NTest::TPartEggs& eggs) {
+        const TVector<TTag> tags{ 2, 3, 4 };
+        TTouchEnv ownedEnv, source;
+        TIndexIteratorOwnership::TBorrowedEnv borrowedEnv(source);
+        TPartIter owned(eggs.Lone().Get(), tags, eggs.Scheme->Keys, &ownedEnv);
+        TPartIterImpl<TCachePageConstRef> borrowed(eggs.Lone().Get(), tags, eggs.Scheme->Keys, &borrowedEnv);
+        CheckReaders(owned, borrowed, ownedEnv, source, eggs, tags);
+    }
+
+    void CheckRun(const NTest::TPartEggs& eggs) {
+        const TVector<TTag> tags{ 2, 3, 4 };
+        TRun run(*eggs.Scheme->Keys);
+        for (const auto& slice : *eggs.Lone()->Slices) {
+            UNIT_ASSERT(run.Insert(eggs.Lone(), slice).second);
+        }
+        TTouchEnv ownedEnv, source;
+        TIndexIteratorOwnership::TBorrowedEnv borrowedEnv(source);
+        TRunIter owned(run, tags, eggs.Scheme->Keys, &ownedEnv);
+        TRunIterImpl<TCachePageConstRef> borrowed(run, tags, eggs.Scheme->Keys, &borrowedEnv);
+        CheckReaders(owned, borrowed, ownedEnv, source, eggs, tags);
+    }
+
+    Y_UNIT_TEST(BorrowedPartV1RetainsGroupAndHistoryViews) {
+        CheckPart(MakePart({ .Levels = 3, .Groups = true, .History = true }));
+    }
+
+    Y_UNIT_TEST(BorrowedPartV2RetainsGroupAndHistoryViews) {
+        CheckPart(MakeV2Part({ .Levels = 3, .Groups = true, .History = true }));
+    }
+
+    Y_UNIT_TEST(BorrowedFlatPartRetainsGroupAndHistoryViews) {
+        CheckPart(MakePart({ .Levels = 3, .Groups = true, .History = true, .FlatOnly = true }));
+    }
+
+    Y_UNIT_TEST(BorrowedRunV1RetainsGroupAndHistoryViews) {
+        CheckRun(MakePart({ .Levels = 3, .Groups = true, .History = true }));
+    }
+
+    Y_UNIT_TEST(BorrowedRunV2RetainsGroupAndHistoryViews) {
+        CheckRun(MakeV2Part({ .Levels = 3, .Groups = true, .History = true }));
     }
 }
 
