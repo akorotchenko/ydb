@@ -138,15 +138,15 @@ public:
 
     TVector<TIntrusiveConstPtr<TMemTable>> GetMemTables() const;
 
-    TAutoPtr<TTableIter> Iterate(TRawVals key, TTagsRef tags, IPages* env, ESeek,
-            TRowVersion snapshot,
-            const ITransactionMapPtr& visible = nullptr,
-            const ITransactionObserverPtr& observer = nullptr) const;
-    TAutoPtr<TTableIter> Iterate(const TCelled& key, TTagsRef tags, IPages* env, ESeek seek,
-            TRowVersion snapshot,
-            const ITransactionMapPtr& visible = nullptr,
-            const ITransactionObserverPtr& observer = nullptr) const;
-    TAutoPtr<TTableReverseIter> IterateReverse(TRawVals key, TTagsRef tags, IPages* env, ESeek,
+    template <class TRef>
+    TAutoPtr<TTableIterImpl<TRef>> Iterate(TRawVals key, TTagsRef tags, TPages<TRef>* env, ESeek, TRowVersion snapshot,
+        const ITransactionMapPtr& visible = nullptr, const ITransactionObserverPtr& observer = nullptr) const;
+    template <class TRef>
+    TAutoPtr<TTableIterImpl<TRef>> Iterate(const TCelled& key, TTagsRef tags, TPages<TRef>* env, ESeek seek,
+        TRowVersion snapshot, const ITransactionMapPtr& visible = nullptr,
+        const ITransactionObserverPtr& observer = nullptr) const;
+    template <class TRef>
+    TAutoPtr<TTableReverseIterImpl<TRef>> IterateReverse(TRawVals key, TTagsRef tags, TPages<TRef>* env, ESeek,
             TRowVersion snapshot,
             const ITransactionMapPtr& visible = nullptr,
             const ITransactionObserverPtr& observer = nullptr) const;
@@ -168,9 +168,9 @@ public:
     // Returns either the first locked row or any non-deleted committed row
     // from the range if no rows are locked in range. Feeds uncommitted
     // non-lock-only deltas to the specified observer.
+    template <class TRef>
     TSelectRowVersionResult SelectRowVersionByKeyPrefix(
-            TArrayRef<const TCell> keyPrefix, IPages* env,
-            const ITransactionObserverPtr& observer) const;
+        TArrayRef<const TCell> keyPrefix, TPages<TRef>* env, const ITransactionObserverPtr& observer) const;
 
     template <class TRef>
     TPrechargeResult Precharge(TRawVals minKey, TRawVals maxKey, TTagsRef tags, TPages<TRef>* env, ui64 flg,

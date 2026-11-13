@@ -478,43 +478,33 @@ private:
     bool SeekInternal(TArrayRef<const TCell> key, ESeek seek);
 };
 
-class TTableIter;
-class TTableReverseIter;
+template <class TPageRef>
+class TTableIterImpl;
+template <class TPageRef>
+class TTableReverseIterImpl;
 
-class TTableIter : public TTableIterBase<TTableIterOps> {
+template <class TPageRef>
+class TTableIterImpl : public TTableIterBase<TTableIterOps, TPageRef> {
 public:
-    using TTableIterBase::TTableIterBase;
-
-    typedef TTableReverseIter TReverseType;
-
+    using TBase = TTableIterBase<TTableIterOps, TPageRef>;
+    using TBase::TBase;
+    using TReverseType = TTableReverseIterImpl<TPageRef>;
     static constexpr EDirection Direction = EDirection::Forward;
 };
 
-class TTableReverseIter : public TTableIterBase<TTableItReverseOps> {
+template <class TPageRef>
+class TTableReverseIterImpl : public TTableIterBase<TTableItReverseOps, TPageRef> {
 public:
-    using TTableIterBase::TTableIterBase;
-
-    typedef TTableIter TReverseType;
-
+    using TBase = TTableIterBase<TTableItReverseOps, TPageRef>;
+    using TBase::TBase;
+    using TReverseType = TTableIterImpl<TPageRef>;
     static constexpr EDirection Direction = EDirection::Reverse;
 };
 
-class TBorrowedTableIter;
-class TBorrowedTableReverseIter;
-
-class TBorrowedTableIter : public TTableIterBase<TTableIterOps, TCachePageConstRef> {
-public:
-    using TTableIterBase::TTableIterBase;
-    using TReverseType = TBorrowedTableReverseIter;
-    static constexpr EDirection Direction = EDirection::Forward;
-};
-
-class TBorrowedTableReverseIter : public TTableIterBase<TTableItReverseOps, TCachePageConstRef> {
-public:
-    using TTableIterBase::TTableIterBase;
-    using TReverseType = TBorrowedTableIter;
-    static constexpr EDirection Direction = EDirection::Reverse;
-};
+using TTableIter = TTableIterImpl<TCachePageRef>;
+using TTableReverseIter = TTableReverseIterImpl<TCachePageRef>;
+using TBorrowedTableIter = TTableIterImpl<TCachePageConstRef>;
+using TBorrowedTableReverseIter = TTableReverseIterImpl<TCachePageConstRef>;
 
 template <class TIteratorOps, class TInputRef>
 inline TTableIterBase<TIteratorOps, TInputRef>::TTableIterBase(const TRowScheme* scheme, TTagsRef tags, ui64 limit,

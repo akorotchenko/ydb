@@ -40,6 +40,8 @@ static_assert(!TCanSelectTemporary<TOwningDatabaseReader>);
 static_assert(!TCanSelectTemporary<TTransactionReader>);
 static_assert(!std::is_copy_constructible_v<TTransactionReader>);
 static_assert(!std::is_move_constructible_v<TTransactionReader>);
+static_assert(std::is_same_v<TTransactionReader::TIterator, TBorrowedTableIter>);
+static_assert(std::is_same_v<TTransactionReader::TReverseIterator, TBorrowedTableReverseIter>);
 
 static_assert(std::is_same_v<TBtreeIndexNode::THeader, TBorrowedBtreeIndexNode::THeader>);
 static_assert(std::is_same_v<TBtreeIndexNode::TChild, TBorrowedBtreeIndexNode::TChild>);
@@ -2137,6 +2139,86 @@ Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
             ownedDatabase->Begin(1, ownedEnv);
             borrowedDatabase->Begin(1, source);
             TRowState ownedRow, borrowedRow;
+            const auto checkIterators = [&](auto makeOwned, auto makeBorrowed, const TVector<ui32>& keys) {
+                auto owned = makeOwned();
+                auto borrowed = makeBorrowed();
+                ui32 rows = 0;
+                bool finished = false;
+                for (ui32 attempt = 0; attempt < 128 && !finished; ++attempt) {
+                    const auto expected = owned->Next(ENext::All);
+                    const auto actual = borrowed->Next(ENext::All);
+                    UNIT_ASSERT(actual == expected);
+                    if (actual == EReady::Page) {
+                        ownedEnv.LoadTouched();
+                        source.LoadTouched();
+                        if (rows == 0) {
+                            owned = makeOwned();
+                            borrowed = makeBorrowed();
+                        }
+                        continue;
+                    }
+                    if (actual == EReady::Gone) {
+                        finished = true;
+                        break;
+                    }
+                    UNIT_ASSERT(rows < keys.size());
+                    UNIT_ASSERT_VALUES_EQUAL(borrowed->GetKey().Cells()[0].template AsValue<ui32>(), keys[rows]);
+                    UNIT_ASSERT_VALUES_EQUAL(TSerializedCellVec::Serialize(borrowed->GetValues().Cells()),
+                        TSerializedCellVec::Serialize(owned->GetValues().Cells()));
+                    UNIT_ASSERT_VALUES_EQUAL(
+                        borrowed->GetValues().Cells()[0].template AsValue<ui32>(), keys[rows] + 100);
+                    UNIT_ASSERT_VALUES_EQUAL(borrowed->GetValues().Cells()[1].template AsValue<ui64>(), keys[rows]);
+                    UNIT_ASSERT_VALUES_EQUAL(borrowed->GetValues().Cells()[2].AsBuf(), payload);
+                    ++rows;
+                }
+                UNIT_ASSERT(finished);
+                UNIT_ASSERT_VALUES_EQUAL(rows, keys.size());
+                ownedEnv.LoadTouched();
+                source.LoadTouched();
+            };
+            const ui32 lower = 3, upper = 12, second = 0;
+            const TRawTypeValue lowerKey[] = {
+                TRawTypeValue(&lower, sizeof(lower), NScheme::NTypeIds::Uint32),
+                TRawTypeValue(&second, sizeof(second), NScheme::NTypeIds::Uint32),
+            };
+            const TRawTypeValue upperKey[] = {
+                TRawTypeValue(&upper, sizeof(upper), NScheme::NTypeIds::Uint32),
+                TRawTypeValue(&second, sizeof(second), NScheme::NTypeIds::Uint32),
+            };
+            const TKeyRange range{ lowerKey, upperKey, false, true };
+            checkIterators(
+                [&] {
+                    return ownedDatabase->IterateRangeGeneric<TTableIter>(1, range, tags);
+                },
+                [&] {
+                    return reader.IterateRangeGeneric<TBorrowedTableIter>(1, range, tags);
+                },
+                { 4, 5, 6, 7, 8, 9, 10, 11, 12 });
+            checkIterators(
+                [&] {
+                    return ownedDatabase->IterateRangeGeneric<TTableReverseIter>(1, range, tags);
+                },
+                [&] {
+                    return reader.IterateRangeGeneric<TBorrowedTableReverseIter>(1, range, tags);
+                },
+                { 12, 11, 10, 9, 8, 7, 6, 5, 4 });
+            checkIterators(
+                [&] {
+                    return ownedDatabase->IterateExact(1, lowerKey, tags);
+                },
+                [&] {
+                    return reader.IterateExact(1, lowerKey, tags);
+                },
+                { 3 });
+            const auto prefix = MakeKey(lower, 0);
+            const auto expectedPrefix =
+                ownedDatabase->SelectRowVersionByKeyPrefix(1, TArrayRef<const TCell>(prefix).Slice(0, 1));
+            const auto actualPrefix = reader.SelectRowVersionByKeyPrefix(1, TArrayRef<const TCell>(prefix).Slice(0, 1));
+            UNIT_ASSERT(actualPrefix.Ready == expectedPrefix.Ready);
+            UNIT_ASSERT(actualPrefix.RowVersion == expectedPrefix.RowVersion);
+            UNIT_ASSERT_VALUES_EQUAL(actualPrefix.RowTxId, expectedPrefix.RowTxId);
+            ownedEnv.LoadTouched();
+            source.LoadTouched();
             for (ui32 key : { 1, 9, 15 }) {
                 const ui32 second = 0;
                 const TRawTypeValue rawKey[] = {

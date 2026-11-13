@@ -1252,7 +1252,8 @@ TMemTable& TTable::MemTable()
     return *Mutable;
 }
 
-TAutoPtr<TTableIter> TTable::Iterate(TRawVals key_, TTagsRef tags, IPages* env, ESeek seek,
+template <class TRef>
+TAutoPtr<TTableIterImpl<TRef>> TTable::Iterate(TRawVals key_, TTagsRef tags, TPages<TRef>* env, ESeek seek,
         TRowVersion snapshot,
         const ITransactionMapPtr& visible,
         const ITransactionObserverPtr& observer) const
@@ -1261,7 +1262,8 @@ TAutoPtr<TTableIter> TTable::Iterate(TRawVals key_, TTagsRef tags, IPages* env, 
     return Iterate(key, tags, env, seek, snapshot, visible, observer);
 }
 
-TAutoPtr<TTableIter> TTable::Iterate(const TCelled& key, TTagsRef tags, IPages* env, ESeek seek,
+template <class TRef>
+TAutoPtr<TTableIterImpl<TRef>> TTable::Iterate(const TCelled& key, TTagsRef tags, TPages<TRef>* env, ESeek seek,
         TRowVersion snapshot,
         const ITransactionMapPtr& visible,
         const ITransactionObserverPtr& observer) const
@@ -1269,9 +1271,8 @@ TAutoPtr<TTableIter> TTable::Iterate(const TCelled& key, TTagsRef tags, IPages* 
     Y_ENSURE(ColdParts.empty(), "Cannot iterate with cold parts");
     const ui64 limit = seek == ESeek::Exact ? 1 : Max<ui64>();
 
-    TAutoPtr<TTableIter> dbIter(new TTableIter(Scheme.Get(), tags, limit, snapshot,
-            TMergedTransactionMap::Create(visible, CommittedTransactions),
-            observer));
+    TAutoPtr<TTableIterImpl<TRef>> dbIter(new TTableIterImpl<TRef>(
+        Scheme.Get(), tags, limit, snapshot, TMergedTransactionMap::Create(visible, CommittedTransactions), observer));
 
     if (Mutable) {
         dbIter->Push(TMemIter::Make(*Mutable, Mutable->Snapshot(), key, seek, Scheme->Keys, &dbIter->Remap, env, EDirection::Forward));
@@ -1291,7 +1292,7 @@ TAutoPtr<TTableIter> TTable::Iterate(const TCelled& key, TTagsRef tags, IPages* 
         if (Flatten) {
             auto readScope = env->BeginOpBatch();
             for (const auto& run : GetLevels()) {
-                auto iter = MakeHolder<TRunIter>(run, dbIter->Remap.Tags, Scheme->Keys, env);
+                auto iter = MakeHolder<TRunIterImpl<TRef>>(run, dbIter->Remap.Tags, Scheme->Keys, env);
 
                 if (iter->Seek(key, seek) != EReady::Gone)
                     dbIter->Push(std::move(iter));
@@ -1314,19 +1315,17 @@ TAutoPtr<TTableIter> TTable::Iterate(const TCelled& key, TTagsRef tags, IPages* 
     return dbIter;
 }
 
-TAutoPtr<TTableReverseIter> TTable::IterateReverse(TRawVals key_, TTagsRef tags, IPages* env, ESeek seek,
-        TRowVersion snapshot,
-        const ITransactionMapPtr& visible,
-        const ITransactionObserverPtr& observer) const
-{
+template <class TRef>
+TAutoPtr<TTableReverseIterImpl<TRef>> TTable::IterateReverse(TRawVals key_, TTagsRef tags, TPages<TRef>* env,
+    ESeek seek, TRowVersion snapshot, const ITransactionMapPtr& visible,
+    const ITransactionObserverPtr& observer) const {
     Y_ENSURE(ColdParts.empty(), "Cannot iterate with cold parts");
 
     const TCelled key(key_, *Scheme->Keys, false);
     const ui64 limit = seek == ESeek::Exact ? 1 : Max<ui64>();
 
-    TAutoPtr<TTableReverseIter> dbIter(new TTableReverseIter(Scheme.Get(), tags, limit, snapshot,
-            TMergedTransactionMap::Create(visible, CommittedTransactions),
-            observer));
+    TAutoPtr<TTableReverseIterImpl<TRef>> dbIter(new TTableReverseIterImpl<TRef>(
+        Scheme.Get(), tags, limit, snapshot, TMergedTransactionMap::Create(visible, CommittedTransactions), observer));
 
     if (Mutable) {
         dbIter->Push(TMemIter::Make(*Mutable, Mutable->Snapshot(), key, seek, Scheme->Keys, &dbIter->Remap, env, EDirection::Reverse));
@@ -1346,7 +1345,7 @@ TAutoPtr<TTableReverseIter> TTable::IterateReverse(TRawVals key_, TTagsRef tags,
         if (Flatten) {
             auto readScope = env->BeginOpBatch();
             for (const auto& run : GetLevels()) {
-                auto iter = MakeHolder<TRunIter>(run, dbIter->Remap.Tags, Scheme->Keys, env);
+                auto iter = MakeHolder<TRunIterImpl<TRef>>(run, dbIter->Remap.Tags, Scheme->Keys, env);
 
                 if (iter->SeekReverse(key, seek) != EReady::Gone)
                     dbIter->Push(std::move(iter));
@@ -1603,10 +1602,9 @@ TSelectRowVersionResult TTable::SelectRowVersion(const TCelled& key, TPages<TRef
     return augment(ready ? EReady::Gone : EReady::Page);
 }
 
+template <class TRef>
 TSelectRowVersionResult TTable::SelectRowVersionByKeyPrefix(
-        TArrayRef<const TCell> keyPrefix, IPages* env,
-        const ITransactionObserverPtr& observer) const
-{
+    TArrayRef<const TCell> keyPrefix, TPages<TRef>* env, const ITransactionObserverPtr& observer) const {
     if (keyPrefix.size() == Scheme->Keys->Size()) {
         // A full key, not a prefix
         return SelectRowVersion(keyPrefix, env, 0, nullptr, observer);
@@ -1849,4 +1847,21 @@ template TSelectRowVersionResult TTable::SelectRowVersion<TCachePageConstRef>(TA
     TPages<TCachePageConstRef>*, ui64, const ITransactionMapPtr&, const ITransactionObserverPtr&) const;
 template TSelectRowVersionResult TTable::SelectRowVersion<TCachePageConstRef>(
     const TCelled&, TPages<TCachePageConstRef>*, ui64, const ITransactionMapPtr&, const ITransactionObserverPtr&) const;
+template TAutoPtr<TTableIterImpl<TCachePageRef>> TTable::Iterate<TCachePageRef>(TRawVals, TTagsRef,
+    TPages<TCachePageRef>*, ESeek, TRowVersion, const ITransactionMapPtr&, const ITransactionObserverPtr&) const;
+template TAutoPtr<TTableIterImpl<TCachePageRef>> TTable::Iterate<TCachePageRef>(const TCelled&, TTagsRef,
+    TPages<TCachePageRef>*, ESeek, TRowVersion, const ITransactionMapPtr&, const ITransactionObserverPtr&) const;
+template TAutoPtr<TTableReverseIterImpl<TCachePageRef>> TTable::IterateReverse<TCachePageRef>(TRawVals, TTagsRef,
+    TPages<TCachePageRef>*, ESeek, TRowVersion, const ITransactionMapPtr&, const ITransactionObserverPtr&) const;
+template TSelectRowVersionResult TTable::SelectRowVersionByKeyPrefix<TCachePageRef>(
+    TArrayRef<const TCell>, TPages<TCachePageRef>*, const ITransactionObserverPtr&) const;
+template TAutoPtr<TTableIterImpl<TCachePageConstRef>> TTable::Iterate<TCachePageConstRef>(TRawVals, TTagsRef,
+    TPages<TCachePageConstRef>*, ESeek, TRowVersion, const ITransactionMapPtr&, const ITransactionObserverPtr&) const;
+template TAutoPtr<TTableIterImpl<TCachePageConstRef>> TTable::Iterate<TCachePageConstRef>(const TCelled&, TTagsRef,
+    TPages<TCachePageConstRef>*, ESeek, TRowVersion, const ITransactionMapPtr&, const ITransactionObserverPtr&) const;
+template TAutoPtr<TTableReverseIterImpl<TCachePageConstRef>> TTable::IterateReverse<TCachePageConstRef>(TRawVals,
+    TTagsRef, TPages<TCachePageConstRef>*, ESeek, TRowVersion, const ITransactionMapPtr&,
+    const ITransactionObserverPtr&) const;
+template TSelectRowVersionResult TTable::SelectRowVersionByKeyPrefix<TCachePageConstRef>(
+    TArrayRef<const TCell>, TPages<TCachePageConstRef>*, const ITransactionObserverPtr&) const;
 }}

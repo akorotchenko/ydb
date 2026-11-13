@@ -61,9 +61,10 @@ TIntrusiveConstPtr<TRowScheme> TDatabase::GetRowScheme(ui32 table) const
     return Require(table)->GetScheme();
 }
 
-TAutoPtr<TTableIter> TDatabase::Iterate(ui32 table, TRawVals key, TTagsRef tags, ELookup mode) const
-{
-    CheckReadAllowed(table);
+template <class TPageRef>
+TAutoPtr<TTableIterImpl<TPageRef>> TDatabaseReader<TPageRef>::Iterate(
+    ui32 table, TRawVals key, TTagsRef tags, ELookup mode) const {
+    Database_.CheckReadAllowed(table);
 
     const auto seekBy = [](TRawVals key, ELookup mode) {
         if (!key && mode != ELookup::ExactMatch) {
@@ -88,17 +89,15 @@ TAutoPtr<TTableIter> TDatabase::Iterate(ui32 table, TRawVals key, TTagsRef tags,
         Y_TABLET_ERROR("Don't know how to convert ELookup to ESeek mode");
     };
 
-    return Require(table)->Iterate(key, tags, Env, seekBy(key, mode), TRowVersion::Max());
+    return Database_.Require(table)->Iterate(key, tags, Env, seekBy(key, mode), TRowVersion::Max());
 }
 
-TAutoPtr<TTableIter> TDatabase::IterateExact(ui32 table, TRawVals key, TTagsRef tags,
-        TRowVersion snapshot,
-        const ITransactionMapPtr& visible,
-        const ITransactionObserverPtr& observer) const
-{
-    CheckReadAllowed(table);
+template <class TPageRef>
+TAutoPtr<TTableIterImpl<TPageRef>> TDatabaseReader<TPageRef>::IterateExact(ui32 table, TRawVals key, TTagsRef tags,
+    TRowVersion snapshot, const ITransactionMapPtr& visible, const ITransactionObserverPtr& observer) const {
+    Database_.CheckReadAllowed(table);
 
-    auto iter = Require(table)->Iterate(key, tags, Env, ESeek::Exact, snapshot, visible, observer);
+    auto iter = Database_.Require(table)->Iterate(key, tags, Env, ESeek::Exact, snapshot, visible, observer);
 
     // N.B. ESeek::Exact produces iterators with limit=1
 
@@ -143,19 +142,18 @@ namespace {
     }
 }
 
-TAutoPtr<TTableIter> TDatabase::IterateRange(ui32 table, const TKeyRange& range, TTagsRef tags,
-        TRowVersion snapshot,
-        const ITransactionMapPtr& visible,
-        const ITransactionObserverPtr& observer) const
-{
-    CheckReadAllowed(table);
+template <class TPageRef>
+TAutoPtr<TTableIterImpl<TPageRef>> TDatabaseReader<TPageRef>::IterateRange(ui32 table, const TKeyRange& range,
+    TTagsRef tags, TRowVersion snapshot, const ITransactionMapPtr& visible,
+    const ITransactionObserverPtr& observer) const {
+    Database_.CheckReadAllowed(table);
 
-    Y_DEBUG_ABORT_UNLESS(!IsAmbiguousRange(range, Require(table)->GetScheme()->Keys->Size()),
-        "%s", IsAmbiguousRangeReason(range, Require(table)->GetScheme()->Keys->Size()));
+    Y_DEBUG_ABORT_UNLESS(!IsAmbiguousRange(range, Database_.Require(table)->GetScheme()->Keys->Size()), "%s",
+        IsAmbiguousRangeReason(range, Database_.Require(table)->GetScheme()->Keys->Size()));
 
     ESeek seek = !range.MinKey || range.MinInclusive ? ESeek::Lower : ESeek::Upper;
 
-    auto iter = Require(table)->Iterate(range.MinKey, tags, Env, seek, snapshot, visible, observer);
+    auto iter = Database_.Require(table)->Iterate(range.MinKey, tags, Env, seek, snapshot, visible, observer);
 
     if (range.MaxKey) {
         TCelled maxKey(range.MaxKey, *iter->Scheme->Keys, false);
@@ -170,19 +168,18 @@ TAutoPtr<TTableIter> TDatabase::IterateRange(ui32 table, const TKeyRange& range,
     return iter;
 }
 
-TAutoPtr<TTableReverseIter> TDatabase::IterateRangeReverse(ui32 table, const TKeyRange& range, TTagsRef tags,
-        TRowVersion snapshot,
-        const ITransactionMapPtr& visible,
-        const ITransactionObserverPtr& observer) const
-{
-    CheckReadAllowed(table);
+template <class TPageRef>
+TAutoPtr<TTableReverseIterImpl<TPageRef>> TDatabaseReader<TPageRef>::IterateRangeReverse(ui32 table,
+    const TKeyRange& range, TTagsRef tags, TRowVersion snapshot, const ITransactionMapPtr& visible,
+    const ITransactionObserverPtr& observer) const {
+    Database_.CheckReadAllowed(table);
 
-    Y_DEBUG_ABORT_UNLESS(!IsAmbiguousRange(range, Require(table)->GetScheme()->Keys->Size()),
-        "%s", IsAmbiguousRangeReason(range, Require(table)->GetScheme()->Keys->Size()));
+    Y_DEBUG_ABORT_UNLESS(!IsAmbiguousRange(range, Database_.Require(table)->GetScheme()->Keys->Size()), "%s",
+        IsAmbiguousRangeReason(range, Database_.Require(table)->GetScheme()->Keys->Size()));
 
     ESeek seek = !range.MaxKey || range.MaxInclusive ? ESeek::Lower : ESeek::Upper;
 
-    auto iter = Require(table)->IterateReverse(range.MaxKey, tags, Env, seek, snapshot, visible, observer);
+    auto iter = Database_.Require(table)->IterateReverse(range.MaxKey, tags, Env, seek, snapshot, visible, observer);
 
     if (range.MinKey) {
         TCelled minKey(range.MinKey, *iter->Scheme->Keys, false);
@@ -195,24 +192,6 @@ TAutoPtr<TTableReverseIter> TDatabase::IterateRangeReverse(ui32 table, const TKe
     }
 
     return iter;
-}
-
-template<>
-TAutoPtr<TTableIter> TDatabase::IterateRangeGeneric<TTableIter>(ui32 table, const TKeyRange& range, TTagsRef tags,
-        TRowVersion snapshot,
-        const ITransactionMapPtr& visible,
-        const ITransactionObserverPtr& observer) const
-{
-    return IterateRange(table, range, tags, snapshot, visible, observer);
-}
-
-template<>
-TAutoPtr<TTableReverseIter> TDatabase::IterateRangeGeneric<TTableReverseIter>(ui32 table, const TKeyRange& range, TTagsRef tags,
-        TRowVersion snapshot,
-        const ITransactionMapPtr& visible,
-        const ITransactionObserverPtr& observer) const
-{
-    return IterateRangeReverse(table, range, tags, snapshot, visible, observer);
 }
 
 template <class TPageRef>
@@ -255,11 +234,10 @@ TSelectRowVersionResult TDatabaseReader<TPageRef>::SelectRowVersion(ui32 table, 
     return Database_.Require(table)->SelectRowVersion(key, Env, readFlags, visible, observer);
 }
 
-TSelectRowVersionResult TDatabase::SelectRowVersionByKeyPrefix(
-        ui32 table, TArrayRef<const TCell> key,
-        const ITransactionObserverPtr& observer) const
-{
-    return Require(table)->SelectRowVersionByKeyPrefix(key, Env, observer);
+template <class TPageRef>
+TSelectRowVersionResult TDatabaseReader<TPageRef>::SelectRowVersionByKeyPrefix(
+    ui32 table, TArrayRef<const TCell> key, const ITransactionObserverPtr& observer) const {
+    return Database_.Require(table)->SelectRowVersionByKeyPrefix(key, Env, observer);
 }
 
 TSizeEnv TDatabase::CreateSizeEnv()

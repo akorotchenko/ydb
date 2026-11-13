@@ -46,6 +46,9 @@ class TDatabase;
 template <class TPageRef>
 class TDatabaseReader {
 public:
+    using TIterator = TTableIterImpl<TPageRef>;
+    using TReverseIterator = TTableReverseIterImpl<TPageRef>;
+
     TDatabaseReader(TDatabase& database, TPages<TPageRef>& env)
         : Database_(database)
         , Env(&env)
@@ -55,6 +58,34 @@ public:
     TDatabaseReader& operator=(const TDatabaseReader&) = delete;
     TDatabaseReader(TDatabaseReader&&) = delete;
     TDatabaseReader& operator=(TDatabaseReader&&) = delete;
+
+    // Borrowed iterators must finish before the provider releases its page owners
+    /*_ Call Next() before accessing each row including the 1st row. */
+
+    TAutoPtr<TIterator> Iterate(ui32 table, TRawVals key, TTagsRef tags, ELookup) const;
+    TAutoPtr<TIterator> IterateExact(ui32 table, TRawVals key, TTagsRef tags, TRowVersion snapshot = TRowVersion::Max(),
+        const ITransactionMapPtr& visible = nullptr, const ITransactionObserverPtr& observer = nullptr) const;
+    TAutoPtr<TIterator> IterateRange(ui32 table, const TKeyRange& range, TTagsRef tags,
+        TRowVersion snapshot = TRowVersion::Max(), const ITransactionMapPtr& visible = nullptr,
+        const ITransactionObserverPtr& observer = nullptr) const;
+    TAutoPtr<TReverseIterator> IterateRangeReverse(ui32 table, const TKeyRange& range, TTagsRef tags,
+        TRowVersion snapshot = TRowVersion::Max(), const ITransactionMapPtr& visible = nullptr,
+        const ITransactionObserverPtr& observer = nullptr) const;
+
+    template <class TIteratorType>
+    TAutoPtr<TIteratorType> IterateRangeGeneric(ui32 table, const TKeyRange& range, TTagsRef tags,
+        TRowVersion snapshot = TRowVersion::Max(), const ITransactionMapPtr& visible = nullptr,
+        const ITransactionObserverPtr& observer = nullptr) const {
+        static_assert(std::is_same_v<TIteratorType, TIterator> || std::is_same_v<TIteratorType, TReverseIterator>);
+        if constexpr (std::is_same_v<TIteratorType, TIterator>) {
+            return IterateRange(table, range, tags, snapshot, visible, observer);
+        } else {
+            return IterateRangeReverse(table, range, tags, snapshot, visible, observer);
+        }
+    }
+
+    TSelectRowVersionResult SelectRowVersionByKeyPrefix(
+        ui32 table, TArrayRef<const TCell> key, const ITransactionObserverPtr& observer = nullptr) const;
 
     // Row views expire at the next Select on this reader, reader destruction or transaction Commit
     EReady Select(ui32 table, TRawVals key, TTagsRef tags, TRowState& row, ui64 readFlags = 0,
@@ -147,32 +178,6 @@ public:
      * table = Max<ui32>() by default).
      */
     TChangeCounter Head(ui32 table = Max<ui32>()) const;
-
-    /*_ Call Next() before accessing each row including the 1st row. */
-
-    TAutoPtr<TTableIter> Iterate(ui32 table, TRawVals key, TTagsRef tags, ELookup) const;
-    TAutoPtr<TTableIter> IterateExact(ui32 table, TRawVals key, TTagsRef tags,
-            TRowVersion snapshot = TRowVersion::Max(),
-            const ITransactionMapPtr& visible = nullptr,
-            const ITransactionObserverPtr& observer = nullptr) const;
-    TAutoPtr<TTableIter> IterateRange(ui32 table, const TKeyRange& range, TTagsRef tags,
-            TRowVersion snapshot = TRowVersion::Max(),
-            const ITransactionMapPtr& visible = nullptr,
-            const ITransactionObserverPtr& observer = nullptr) const;
-    TAutoPtr<TTableReverseIter> IterateRangeReverse(ui32 table, const TKeyRange& range, TTagsRef tags,
-            TRowVersion snapshot = TRowVersion::Max(),
-            const ITransactionMapPtr& visible = nullptr,
-            const ITransactionObserverPtr& observer = nullptr) const;
-
-    template<class TIteratorType>
-    TAutoPtr<TIteratorType> IterateRangeGeneric(ui32 table, const TKeyRange& range, TTagsRef tags,
-            TRowVersion snapshot = TRowVersion::Max(),
-            const ITransactionMapPtr& visible = nullptr,
-            const ITransactionObserverPtr& observer = nullptr) const;
-
-    TSelectRowVersionResult SelectRowVersionByKeyPrefix(
-            ui32 table, TArrayRef<const TCell> key,
-            const ITransactionObserverPtr& observer = nullptr) const;
 
     TSizeEnv CreateSizeEnv();
     void CalculateReadSize(TSizeEnv& env, ui32 table, TRawVals minKey, TRawVals maxKey,
