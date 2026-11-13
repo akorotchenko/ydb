@@ -9,6 +9,7 @@
 #include "flat_part_keys.h"
 #include "flat_table.h"
 #include "flat_database.h"
+#include "flat_cxx_database.h"
 #include "flat_dbase_naked.h"
 #include "test/libs/table/test_writer.h"
 #include "test/libs/table/wrap_part.h"
@@ -1969,6 +1970,29 @@ Y_UNIT_TEST_SUITE_F(TRowReaderOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
 }
 
 Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTest) {
+    struct TReaderSchema : NIceDb::Schema {
+        struct Rows : Table<1> {
+            struct First : Column<0, NScheme::NTypeIds::Uint32> {};
+
+            struct Second : Column<1, NScheme::NTypeIds::Uint32> {};
+
+            struct Value : Column<2, NScheme::NTypeIds::Uint32> {};
+
+            struct WideValue : Column<3, NScheme::NTypeIds::Uint64> {};
+
+            struct Text : Column<4, NScheme::NTypeIds::String> {};
+
+            using TKey = TableKey<First, Second>;
+            using TColumns = TableColumns<First, Second, Value, WideValue, Text>;
+        };
+
+        struct NoAutoRows : Rows {
+            using Precharge = NoAutoPrecharge;
+        };
+
+        using TTables = SchemaTables<Rows>;
+    };
+
     TScheme::TTableInfo MakeTableScheme(const NTest::TPartEggs& eggs) {
         TScheme::TTableInfo schema("precharge", 1);
         for (const auto& col : eggs.Scheme->Cols) {
@@ -2139,6 +2163,96 @@ Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
             ownedDatabase->Begin(1, ownedEnv);
             borrowedDatabase->Begin(1, source);
             TRowState ownedRow, borrowedRow;
+            NIceDb::TNiceDb ownedNice(*ownedDatabase);
+            NIceDb::TTransactionNiceDb borrowedNice(reader);
+            UNIT_ASSERT(&borrowedNice.GetDatabase() == borrowedDatabase.Get());
+            UNIT_ASSERT(borrowedNice.HaveTable<TReaderSchema::Rows>());
+            const auto checkRowsets = [&](auto makeOwned, auto makeBorrowed, const TVector<ui32>& keys) {
+                bool finished = false;
+                for (ui32 retry = 0; retry < 128 && !finished; ++retry) {
+                    auto owned = makeOwned();
+                    auto borrowed = makeBorrowed();
+                    ui32 rows = 0;
+                    while (owned.IsReady() && borrowed.IsReady()) {
+                        UNIT_ASSERT_VALUES_EQUAL(borrowed.IsValid(), owned.IsValid());
+                        if (!owned.IsValid()) {
+                            UNIT_ASSERT_VALUES_EQUAL(rows, keys.size());
+                            finished = true;
+                            break;
+                        }
+                        UNIT_ASSERT(rows < keys.size());
+                        UNIT_ASSERT_VALUES_EQUAL(borrowed.template GetValue<TReaderSchema::Rows::First>(), keys[rows]);
+                        UNIT_ASSERT_VALUES_EQUAL(
+                            borrowed.template GetValue<TReaderSchema::Rows::Value>(), keys[rows] + 100);
+                        UNIT_ASSERT_VALUES_EQUAL(
+                            borrowed.template GetValue<TReaderSchema::Rows::WideValue>(), keys[rows]);
+                        UNIT_ASSERT_VALUES_EQUAL(borrowed.template GetValue<TReaderSchema::Rows::Text>(), payload);
+                        UNIT_ASSERT_VALUES_EQUAL(borrowed.template GetValue<TReaderSchema::Rows::Text>(),
+                            owned.template GetValue<TReaderSchema::Rows::Text>());
+                        ++rows;
+                        owned.Next();
+                        borrowed.Next();
+                    }
+                    UNIT_ASSERT_VALUES_EQUAL(borrowed.IsReady(), owned.IsReady());
+                    ownedEnv.LoadTouched();
+                    source.LoadTouched();
+                }
+                UNIT_ASSERT(finished);
+            };
+            checkRowsets(
+                [&] {
+                    return ownedNice.Table<TReaderSchema::Rows>().Key(ui32(3), ui32(0)).Select();
+                },
+                [&] {
+                    return borrowedNice.Table<TReaderSchema::Rows>().Key(ui32(3), ui32(0)).Select();
+                },
+                { 3 });
+            // The selector keeps the reader binding after the temporary facade is destroyed
+            auto ownedSelector = NIceDb::TNiceDb(*ownedDatabase).Table<TReaderSchema::Rows>();
+            auto borrowedSelector = NIceDb::TTransactionNiceDb(reader).Table<TReaderSchema::Rows>();
+            checkRowsets(
+                [&] {
+                    return ownedSelector.GreaterOrEqual(ui32(3)).LessOrEqual(ui32(12)).Select();
+                },
+                [&] {
+                    return borrowedSelector.GreaterOrEqual(ui32(3)).LessOrEqual(ui32(12)).Select();
+                },
+                { 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 });
+            checkRowsets(
+                [&] {
+                    return ownedSelector.GreaterOrEqual(ui32(3)).LessOrEqual(ui32(12)).Reverse().Select();
+                },
+                [&] {
+                    return borrowedSelector.GreaterOrEqual(ui32(3)).LessOrEqual(ui32(12)).Reverse().Select();
+                },
+                { 12, 11, 10, 9, 8, 7, 6, 5, 4, 3 });
+            checkRowsets(
+                [&] {
+                    return ownedSelector.Prefix(ui32(3)).Select();
+                },
+                [&] {
+                    return borrowedSelector.Prefix(ui32(3)).Select();
+                },
+                { 3 });
+            checkRowsets(
+                [&] {
+                    return ownedNice.Table<TReaderSchema::NoAutoRows>().Prefix(ui32(3)).Select();
+                },
+                [&] {
+                    return borrowedNice.Table<TReaderSchema::NoAutoRows>().Prefix(ui32(3)).Select();
+                },
+                { 3 });
+            for (ui32 retry = 0; retry < 32; ++retry) {
+                const bool expected = ownedNice.Precharge<TReaderSchema>();
+                const bool actual = borrowedNice.Precharge<TReaderSchema>();
+                UNIT_ASSERT_VALUES_EQUAL(actual, expected);
+                ownedEnv.LoadTouched();
+                source.LoadTouched();
+                if (actual) {
+                    break;
+                }
+                UNIT_ASSERT(retry + 1 < 32);
+            }
             const auto checkIterators = [&](auto makeOwned, auto makeBorrowed, const TVector<ui32>& keys) {
                 auto owned = makeOwned();
                 auto borrowed = makeBorrowed();
@@ -2261,6 +2375,12 @@ Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
                 }
             }
             bool callbackRan = false;
+            ownedNice.Table<TReaderSchema::Rows>()
+                .Key(ui32(100), ui32(0))
+                .Update<TReaderSchema::Rows::Value>(ui32(999));
+            borrowedNice.Table<TReaderSchema::Rows>()
+                .Key(ui32(100), ui32(0))
+                .Update<TReaderSchema::Rows::Value>(ui32(999));
             const auto callback = [&] {
                 UNIT_ASSERT_VALUES_EQUAL(borrowedRow.Get(2).AsBuf(), payload);
                 callbackRan = true;

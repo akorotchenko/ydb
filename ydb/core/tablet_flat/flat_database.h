@@ -54,6 +54,10 @@ public:
         , Env(&env)
     {}
 
+    TDatabase& GetDatabase() const noexcept {
+        return Database_;
+    }
+
     TDatabaseReader(const TDatabaseReader&) = delete;
     TDatabaseReader& operator=(const TDatabaseReader&) = delete;
     TDatabaseReader(TDatabaseReader&&) = delete;
