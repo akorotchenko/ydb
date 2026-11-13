@@ -65,7 +65,7 @@ namespace NKikimr::NTable::NPage {
         bool operator!=(const TPageRef& other) const { return !(*this == other); }
     };
 
-    class TBtreeIndexNode {
+    class TBtreeIndexNodeLayout {
     public:
         using TColumns = TArrayRef<const TPartScheme::TColumn>;
         using TCells = TArrayRef<const TCell>;
@@ -446,22 +446,26 @@ namespace NKikimr::NTable::NPage {
     public:
         // Version = 0 didn't have GroupDataSize field
         static const ui16 FormatVersion = 1;
+    };
 
-        TBtreeIndexNode(TSharedData raw, bool v2Format)
+    template <class TInputRef>
+    class TBtreeIndexNodeImpl : public TBtreeIndexNodeLayout {
+    public:
+        TBtreeIndexNodeImpl(TSharedData raw, bool v2Format)
             : Raw(std::move(raw))
             , IsV2Format(v2Format)
         {
             Parse();
         }
 
-        TBtreeIndexNode(TCachePageRef&& ref, bool v2Format)
+        TBtreeIndexNodeImpl(TInputRef&& ref, bool v2Format)
             : Ref(std::move(ref))
             , IsV2Format(v2Format)
         {
             Parse();
         }
 
-        const TCachePageRef& GetPageRef() const noexcept {
+        const TInputRef& GetPageRef() const noexcept {
             return Ref;
         }
 
@@ -495,7 +499,7 @@ namespace NKikimr::NTable::NPage {
         }
 
     public:
-        TCachePageRef&& TakePageRef() noexcept {
+        TInputRef&& TakePageRef() noexcept {
             return std::move(Ref);
         }
 
@@ -827,7 +831,7 @@ namespace NKikimr::NTable::NPage {
         }
 
     private:
-        TCachePageRef Ref;
+        TInputRef Ref;
         TSharedData Raw;
         const THeader* Header = nullptr;
         const void* Keys = nullptr;
@@ -835,6 +839,9 @@ namespace NKikimr::NTable::NPage {
         const void* Children = nullptr;
         bool IsV2Format = false;
     };
+
+    using TBtreeIndexNode = TBtreeIndexNodeImpl<TCachePageRef>;
+    using TBorrowedBtreeIndexNode = TBtreeIndexNodeImpl<TCachePageConstRef>;
 
     struct TBtreeIndexMeta {
         TPageId RootV1 = Max<TPageId>();

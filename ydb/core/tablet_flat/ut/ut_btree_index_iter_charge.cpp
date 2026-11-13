@@ -27,6 +27,15 @@ static_assert(
 static_assert(std::is_same_v<IOwnedPages::TResult, IBorrowedPages::TResult>);
 static_assert(sizeof(IPageEnvironment::TResult) == 24);
 
+static_assert(std::is_same_v<TBtreeIndexNode::THeader, TBorrowedBtreeIndexNode::THeader>);
+static_assert(std::is_same_v<TBtreeIndexNode::TChild, TBorrowedBtreeIndexNode::TChild>);
+static_assert(std::is_same_v<TBtreeIndexNode::TChildV2, TBorrowedBtreeIndexNode::TChildV2>);
+static_assert(std::is_same_v<TBtreeIndexNode::TCellsIterable, TBorrowedBtreeIndexNode::TCellsIterable>);
+static_assert(std::is_same_v<decltype(std::declval<const TBtreeIndexNode&>().GetChild(0, false)), TPageRef>);
+static_assert(std::is_same_v<decltype(std::declval<const TBorrowedBtreeIndexNode&>().GetChild(0, false)), TPageRef>);
+static_assert(
+    std::is_same_v<decltype(std::declval<const TBorrowedBtreeIndexNode&>().GetPageRef()), const TCachePageConstRef&>);
+
 using NTest::TPartStore;
 
 namespace {
@@ -1642,6 +1651,70 @@ namespace {
             UNIT_ASSERT_VALUES_EQUAL(part.IndexPages.BTreeGroups[3].LevelCount(), 1);
         }
         return eggs;
+    }
+}
+
+Y_UNIT_TEST_SUITE_F(TBtreeIndexNodeOwnership, ::NKikimr::NTable::NTest::TTableCacheTest) {
+    void CheckNode(const NTest::TPartEggs& eggs, bool v2Format) {
+        const auto& part = *eggs.Lone();
+        NTest::TTestEnv env;
+        auto owner = env.TryGetIndexPage(&part, part.IndexPages.GetRootLocation(&part, {}), {});
+        UNIT_ASSERT(owner);
+
+        TBtreeIndexNode original(std::move(owner), v2Format);
+        UNIT_ASSERT(!owner);
+        TBorrowedBtreeIndexNode borrowed(original.GetPageRef().Borrow(), v2Format);
+        TBtreeIndexNode raw(original.GetPageRef().BuildSharedData(), v2Format);
+        auto owned = std::move(original);
+        UNIT_ASSERT(!original.GetPageRef());
+        UNIT_ASSERT(borrowed.GetPageRef().data() == owned.GetPageRef().data());
+
+        const auto& layout = part.Scheme->GetLayout({});
+        const auto* keyDefaults = eggs.Scheme->Keys.Get();
+        const auto check = [&](const auto& node) {
+            UNIT_ASSERT_VALUES_EQUAL(node.GetKeysCount(), owned.GetKeysCount());
+            UNIT_ASSERT_VALUES_EQUAL(node.GetChildrenCount(), owned.GetChildrenCount());
+            UNIT_ASSERT_VALUES_EQUAL(node.IsFixedFormat(), owned.IsFixedFormat());
+            UNIT_ASSERT_VALUES_EQUAL(node.IsShortChildFormat(), owned.IsShortChildFormat());
+            for (TRecIdx pos : xrange(owned.GetChildrenCount())) {
+                UNIT_ASSERT(node.GetChild(pos, false) == owned.GetChild(pos, false));
+                UNIT_ASSERT_VALUES_EQUAL(node.GetChildRowCount(pos), owned.GetChildRowCount(pos));
+            }
+            for (TRecIdx pos : xrange(owned.GetKeysCount())) {
+                auto actual = node.GetKeyCellsIter(pos, layout.ColsKeyIdx);
+                auto expected = owned.GetKeyCellsIter(pos, layout.ColsKeyIdx);
+                for (TPos column : xrange(actual.Count())) {
+                    UNIT_ASSERT_VALUES_EQUAL(
+                        CompareTypedCells(actual.Next(), expected.Next(), layout.KeyTypes[column]), 0);
+                }
+            }
+            for (TRowId row : xrange(part.Stat.Rows)) {
+                UNIT_ASSERT_VALUES_EQUAL(node.Seek(row), owned.Seek(row));
+            }
+            for (ui32 first : { 0u, 1u, 3u, 5u }) {
+                for (ui32 second : { 0u, 5u, 12u }) {
+                    const auto key = MakeKey(first, second);
+                    for (ESeek seek : { ESeek::Exact, ESeek::Lower, ESeek::Upper }) {
+                        UNIT_ASSERT_VALUES_EQUAL(node.Seek(seek, key, layout.ColsKeyIdx, keyDefaults),
+                            owned.Seek(seek, key, layout.ColsKeyIdx, keyDefaults));
+                        UNIT_ASSERT_VALUES_EQUAL(node.SeekReverse(seek, key, layout.ColsKeyIdx, keyDefaults),
+                            owned.SeekReverse(seek, key, layout.ColsKeyIdx, keyDefaults));
+                    }
+                }
+            }
+        };
+        check(borrowed);
+        check(raw);
+        owner = owned.TakePageRef();
+        UNIT_ASSERT(owner);
+    }
+
+    Y_UNIT_TEST(BorrowedV1MatchesOwnedNode) {
+        CheckNode(MakePart({ .Levels = 3 }), false);
+    }
+
+    Y_UNIT_TEST(BorrowedV2MatchesOwnedNode) {
+        CheckNode(MakeV2Part({ .Levels = 3 }), true);
     }
 }
 
