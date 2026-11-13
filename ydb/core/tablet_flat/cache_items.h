@@ -364,8 +364,8 @@ Y_FORCE_INLINE void TCacheItems<TTraits>::Release(TCacheItem cacheItem) noexcept
     for (;;) {
         const THandleState expected = THandleState::FromRaw(expectedRaw);
         Y_DEBUG_ABORT_UNLESS(!KnownPage || expected.IsPageKind());
-        if (!cacheItem.Matches(expected) || (!KnownPage && !expected.IsPageKind()) || !expected.IsHot() ||
-            !expected.IsStickyNoneField()) {
+        if (Y_UNLIKELY(!cacheItem.Matches(expected) || (!KnownPage && !expected.IsPageKind()) || !expected.IsHot() ||
+                       !expected.IsStickyNoneField())) {
             auto cacheOp = Cache_.BeginOperation();
             cacheOp.ReleaseCleanup(cacheItem);
             return;
@@ -373,7 +373,7 @@ Y_FORCE_INLINE void TCacheItems<TTraits>::Release(TCacheItem cacheItem) noexcept
         Y_DEBUG_ABORT_UNLESS(expected.Refs() != 0);
         THandleState desired = expected.DecrementRefs();
         const bool notifyShrink = desired.Refs() == 0 && expected.HasShrinkWaiter();
-        if (notifyShrink) {
+        if (Y_UNLIKELY(notifyShrink)) {
             desired = desired.WithShrinkWaiter(false);
         }
         Cache_.InvokeHook(ECacheHookPoint::BeforeHotPageRefRelease, cacheItem);
@@ -382,7 +382,7 @@ Y_FORCE_INLINE void TCacheItems<TTraits>::Release(TCacheItem cacheItem) noexcept
             continue;
         }
         // The last owner may enable immediate unmapping; only use captured state after the CAS
-        if (notifyShrink) {
+        if (Y_UNLIKELY(notifyShrink)) {
             Cache_.NotifyResourcesAvailable();
         }
         return;
