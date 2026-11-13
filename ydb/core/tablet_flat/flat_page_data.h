@@ -18,7 +18,7 @@ namespace NTable {
 namespace NPage {
 
 
-    struct TDataPage {
+    struct TDataPageLayout {
 
         /*
                 TRecord binary layout v1
@@ -215,24 +215,27 @@ namespace NPage {
 
     public:
         using TIter = TBlock::TIterator;
+    };
 
-        TDataPage(const TSharedData *raw = nullptr)
+    template <class TInputRef>
+    struct TDataPageImpl : public TDataPageLayout {
+        TDataPageImpl(const TSharedData* raw = nullptr)
         {
             Set(raw);
         }
 
-        explicit TDataPage(TCachePageRef&& ref) {
+        explicit TDataPageImpl(TInputRef&& ref) {
             Set(std::move(ref));
         }
 
         NPage::TLabel Label() const noexcept
         {
-            return ReadUnaligned<NPage::TLabel>(Decoded.data());
+            return ReadUnaligned<NPage::TLabel>(Page.Base);
         }
 
         explicit operator bool() const noexcept
         {
-            return bool(Decoded);
+            return Page.Base != nullptr;
         }
 
         const TBlock* operator->() const noexcept
@@ -245,19 +248,28 @@ namespace NPage {
             return BaseRow_;
         }
 
-        TDataPage& Set(const TSharedData *raw = nullptr)
+        TDataPageImpl& Set(const TSharedData* raw = nullptr)
         {
             return Parse(raw ? *raw : TSharedData());
         }
 
-        TDataPage& Set(TCachePageRef&& ref) {
-            TSharedData raw = ref ? ref.BuildSharedData() : TSharedData();
-            ref.Drop();
-            return Parse(std::move(raw));
+        TDataPageImpl& Set(TInputRef&& ref) {
+            if constexpr (std::is_same_v<TInputRef, TCachePageRef>) {
+                TSharedData raw = ref ? ref.BuildSharedData() : TSharedData();
+                ref.Drop();
+                return Parse(std::move(raw));
+            } else {
+                return Parse(ref ? TArrayRef<const char>(ref.data(), ref.size()) : TArrayRef<const char>(), {});
+            }
         }
 
     private:
-        TDataPage& Parse(TSharedData raw) {
+        TDataPageImpl& Parse(TSharedData raw) {
+            const TArrayRef<const char> bytes(raw);
+            return Parse(bytes, std::move(raw));
+        }
+
+        TDataPageImpl& Parse(TArrayRef<const char> raw, TSharedData owner) {
             Page = { };
 
             if (raw) {
@@ -287,7 +299,7 @@ namespace NPage {
                     base = Decoded.begin();
                     data.Page = { Decoded.begin() + labelSize, Decoded.end() };
                 } else {
-                    Decoded = std::move(raw);
+                    Decoded = std::move(owner);
                 }
 
                 auto *recordsHeader = TDeref<TRecordsHeader>::At(data.Page.data(), 0);
@@ -307,7 +319,9 @@ namespace NPage {
         }
 
     public:
-        const TSharedData& GetData() const noexcept {
+        const TSharedData& GetData() const noexcept
+            requires std::is_same_v<TInputRef, TCachePageRef>
+        {
             return Decoded;
         }
 
@@ -397,6 +411,9 @@ namespace NPage {
         TRowId BaseRow_ = Max<TRowId>();
         const ICodec *Codec = nullptr;
     };
+
+    using TDataPage = TDataPageImpl<TCachePageRef>;
+    using TBorrowedDataPage = TDataPageImpl<TCachePageConstRef>;
 }
 }
 }

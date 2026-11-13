@@ -11,7 +11,7 @@ namespace NKikimr {
 namespace NTable {
 namespace NPage {
 
-    struct TFlatIndex {
+    struct TFlatIndexLayout {
         /*
                 TRecord binary layout v2
             .---------.---------------.
@@ -62,20 +62,23 @@ namespace NPage {
         using TIter = typename TBlock::TIterator;
 
         static constexpr ui16 Version = 3;
+    };
 
-        TFlatIndex(TSharedData raw)
+    template <class TInputRef>
+    struct TFlatIndexImpl : public TFlatIndexLayout {
+        TFlatIndexImpl(TSharedData raw)
             : Raw(std::move(raw))
         {
             Parse();
         }
 
-        explicit TFlatIndex(TCachePageRef&& ref)
+        explicit TFlatIndexImpl(TInputRef&& ref)
             : Ref(std::move(ref))
         {
             Parse();
         }
 
-        const TCachePageRef& GetPageRef() const noexcept {
+        const TInputRef& GetPageRef() const noexcept {
             return Ref;
         }
 
@@ -288,12 +291,15 @@ namespace NPage {
         }
 
     private:
-        TCachePageRef Ref;
+        TInputRef Ref;
         TSharedData Raw;
         TBlock Page;
         const TRecord* LastKey;
         TRowId EndRowId;
     };
+
+    using TFlatIndex = TFlatIndexImpl<TCachePageRef>;
+    using TBorrowedFlatIndex = TFlatIndexImpl<TCachePageConstRef>;
 
 }
 }

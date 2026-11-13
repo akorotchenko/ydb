@@ -15,12 +15,139 @@
 namespace NKikimr {
 namespace NTable {
 
+    static_assert(std::is_same_v<NPage::TDataPage::TRecord, NPage::TBorrowedDataPage::TRecord>);
+    static_assert(std::is_same_v<NPage::TDataPage::TIter, NPage::TBorrowedDataPage::TIter>);
+    static_assert(std::is_same_v<NPage::TFlatIndex::TRecord, NPage::TBorrowedFlatIndex::TRecord>);
+    static_assert(std::is_same_v<NPage::TFlatIndex::TIter, NPage::TBorrowedFlatIndex::TIter>);
+
+    template <class TPage>
+    concept THasOwnedPageData = requires(const TPage& page) { page.GetData(); };
+
+    static_assert(THasOwnedPageData<NPage::TDataPage>);
+    static_assert(!THasOwnedPageData<NPage::TBorrowedDataPage>);
+
 namespace {
     /* Sample rows set for old pages compatability tests, should be
         updated with assosiated raw page collections (see data/ directory).
      */
 
     const NTest::TMass MassZ(new NTest::TModelStd(false), 128);
+}
+
+Y_UNIT_TEST_SUITE_F(TPageParserOwnership, ::NKikimr::NTable::NTest::TTableCacheTest) {
+    NTest::TPartEggs MakePages(NPage::ECodec codec) {
+        NTest::TLayoutCook lay;
+        lay.Col(0, 0, NScheme::NTypeIds::Uint32).Col(0, 1, NScheme::NTypeIds::String).Key({ 0 });
+        NPage::TConf conf;
+        conf.Group(0).PageRows = 2;
+        conf.Group(0).Codec = codec;
+        conf.Group(0).ForceCompression = codec != NPage::ECodec::Plain;
+        NTest::TPartCook cook(lay, conf);
+        for (ui32 row : xrange(6u)) {
+            cook.Add(*NTest::TSchemedCookRow(*lay).Col(row * 2, TString(128, 'x') + ToString(row)));
+        }
+        return cook.Finish();
+    }
+
+    void CheckDataPage(NPage::ECodec codec) {
+        const auto eggs = MakePages(codec);
+        const auto& part = *eggs.Lone();
+        NTest::TTestEnv env;
+        auto input = env.TryGetPage(&part, NTest::IndexTools::GetFirstPageLocation(part, {}), {});
+        UNIT_ASSERT(input);
+        UNIT_ASSERT(NPage::TLabelWrapper().Read({ input.data(), input.size() }).Codec == codec);
+        auto ownedInput = input.Acquire();
+        NPage::TDataPage owned(std::move(ownedInput));
+        UNIT_ASSERT(!ownedInput);
+        NPage::TBorrowedDataPage borrowed(input.Borrow());
+        UNIT_ASSERT(owned);
+        UNIT_ASSERT(borrowed);
+        if (codec == NPage::ECodec::Plain) {
+            UNIT_ASSERT(borrowed->Base == input.data());
+            UNIT_ASSERT(owned.GetData().data() == input.data());
+            owned.Set(&owned.GetData());
+            UNIT_ASSERT(owned->Base == input.data());
+        } else {
+            UNIT_ASSERT(borrowed->Base != input.data());
+            input.Drop();
+        }
+        UNIT_ASSERT_VALUES_EQUAL(borrowed.BaseRow(), owned.BaseRow());
+        UNIT_ASSERT_VALUES_EQUAL(borrowed->Count, owned->Count);
+        UNIT_ASSERT_VALUES_EQUAL(borrowed.Label().Format, owned.Label().Format);
+        const auto& layout = part.Scheme->GetLayout({});
+        for (ui32 row : xrange(owned->Count)) {
+            const auto* actual = borrowed->Record(row);
+            const auto* expected = owned->Record(row);
+            UNIT_ASSERT(actual->GetRop() == expected->GetRop());
+            for (const auto& column : layout.Columns) {
+                UNIT_ASSERT_VALUES_EQUAL(
+                    CompareTypedCells(actual->Cell(column), expected->Cell(column), column.TypeInfo), 0);
+            }
+        }
+        for (ui32 keyValue : xrange(5u)) {
+            const TCell key[] = { TCell::Make(keyValue) };
+            for (ESeek seek : { ESeek::Exact, ESeek::Lower, ESeek::Upper }) {
+                UNIT_ASSERT_VALUES_EQUAL(borrowed.LookupKey(key, layout, seek, eggs.Scheme->Keys.Get()).Off(),
+                    owned.LookupKey(key, layout, seek, eggs.Scheme->Keys.Get()).Off());
+                UNIT_ASSERT_VALUES_EQUAL(borrowed.LookupKeyReverse(key, layout, seek, eggs.Scheme->Keys.Get()).Off(),
+                    owned.LookupKeyReverse(key, layout, seek, eggs.Scheme->Keys.Get()).Off());
+            }
+        }
+        borrowed.Set();
+        UNIT_ASSERT(!borrowed);
+        UNIT_ASSERT_VALUES_EQUAL(borrowed->Count, 0);
+        UNIT_ASSERT_VALUES_EQUAL(borrowed.BaseRow(), Max<TRowId>());
+        if (input) {
+            borrowed.Set(input.Borrow());
+            UNIT_ASSERT(borrowed->Base == input.data());
+        }
+    }
+
+    Y_UNIT_TEST(PlainDataPageBorrowsPinnedBytes) {
+        CheckDataPage(NPage::ECodec::Plain);
+    }
+
+    Y_UNIT_TEST(CompressedDataPageOwnsDecodedBytes) {
+        CheckDataPage(NPage::ECodec::LZ4);
+    }
+
+    Y_UNIT_TEST(BorrowedFlatIndexMatchesOwnedIndex) {
+        const auto eggs = MakePages(NPage::ECodec::Plain);
+        const auto& part = *eggs.Lone();
+        NTest::TTestEnv env;
+        auto owner = env.TryGetIndexPage(&part, part.GetIndexPageLocation(part.IndexPages.GetFlat({}), {}), {});
+        UNIT_ASSERT(owner);
+        NPage::TFlatIndex original(owner.Acquire());
+        NPage::TBorrowedFlatIndex borrowed(owner.Borrow());
+        NPage::TFlatIndex raw(owner.BuildSharedData());
+        auto owned = std::move(original);
+        UNIT_ASSERT(borrowed.GetPageRef().data() == owned.GetPageRef().data());
+        const auto& layout = part.Scheme->GetLayout({});
+        const auto check = [&](const auto& index) {
+            UNIT_ASSERT_VALUES_EQUAL(index.Rows(), owned.Rows());
+            UNIT_ASSERT_VALUES_EQUAL(index.GetEndRowId(), owned.GetEndRowId());
+            for (TRowId row : xrange(part.Stat.Rows + 1)) {
+                auto actual = index.LookupRow(row);
+                auto expected = owned.LookupRow(row);
+                UNIT_ASSERT_VALUES_EQUAL(actual.Off(), expected.Off());
+                if (actual) {
+                    UNIT_ASSERT_VALUES_EQUAL(actual->GetPageId(), expected->GetPageId());
+                    UNIT_ASSERT_VALUES_EQUAL(index.GetLastRowId(actual), owned.GetLastRowId(expected));
+                }
+            }
+            for (ui32 keyValue : xrange(14u)) {
+                const TCell key[] = { TCell::Make(keyValue) };
+                for (ESeek seek : { ESeek::Exact, ESeek::Lower, ESeek::Upper }) {
+                    UNIT_ASSERT_VALUES_EQUAL(index.LookupKey(key, layout, seek, eggs.Scheme->Keys.Get()).Off(),
+                        owned.LookupKey(key, layout, seek, eggs.Scheme->Keys.Get()).Off());
+                    UNIT_ASSERT_VALUES_EQUAL(index.LookupKeyReverse(key, layout, seek, eggs.Scheme->Keys.Get()).Off(),
+                        owned.LookupKeyReverse(key, layout, seek, eggs.Scheme->Keys.Get()).Off());
+                }
+            }
+        };
+        check(borrowed);
+        check(raw);
+    }
 }
 
 Y_UNIT_TEST_SUITE_F(NPage, ::NKikimr::NTable::NTest::TTableCacheTest) {
