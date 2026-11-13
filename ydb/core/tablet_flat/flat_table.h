@@ -352,6 +352,10 @@ public:
 
 private:
     template <class TRef>
+    TSelectRowVersionResult SelectRowVersionWithPages(const TCelled& key, TPages<TRef>* env, ui64 readFlags,
+        const ITransactionMapPtr& visible, const ITransactionObserverPtr& observer) const;
+
+    template <class TRef>
     TPrechargeResult PrechargeWithPages(TRawVals minKey, TRawVals maxKey, TTagsRef tags, TPages<TRef>* env, ui64 flg,
         ui64 itemsLimit, ui64 bytesLimit, EDirection direction, TRowVersion snapshot, TSelectStats& stats) const;
 

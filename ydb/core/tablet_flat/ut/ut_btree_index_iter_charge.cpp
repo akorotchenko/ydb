@@ -1980,7 +1980,7 @@ Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
         TIndexIteratorOwnership::TBorrowedEnv Pages;
     };
 
-    void CheckTablePrecharge(const NTest::TPartEggs& eggs) {
+    void InitTable(TTable & table, const NTest::TPartEggs& eggs) {
         TScheme::TTableInfo schema("precharge", 1);
         for (const auto& col : eggs.Scheme->Cols) {
             auto& column = schema.Columns[col.Tag];
@@ -1989,9 +1989,13 @@ Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
             column.KeyOrder = col.Key;
             column.Family = eggs.Scheme->Families[col.Group];
         }
-        TTable table(TEpoch::Zero());
         table.SetScheme(schema);
         table.Merge(eggs.ToPartView());
+    }
+
+    void CheckTablePrecharge(const NTest::TPartEggs& eggs) {
+        TTable table(TEpoch::Zero());
+        InitTable(table, eggs);
         const TVector<TTag> tags{ 2, 3, 4 };
         const ui32 first[] = { 1, 5 }, last[] = { 4, 5 };
         const TRawTypeValue firstKey[] = {
@@ -2043,6 +2047,55 @@ Y_UNIT_TEST_SUITE_F(TPrechargeOwnership, ::NKikimr::NTable::NTest::TTableCacheTe
 
     Y_UNIT_TEST(TablePrechargeSelectsBorrowedFlat) {
         CheckTablePrecharge(MakePart({ .Levels = 3, .Groups = true, .History = true, .FlatOnly = true }));
+    }
+
+    void CheckTableRowVersions(const NTest::TPartEggs& eggs) {
+        TTable table(TEpoch::Zero());
+        InitTable(table, eggs);
+        const std::pair<ui32, ui32> keys[] = { { 1, 3 }, { 1, 5 }, { 100, 3 } };
+        for (const auto& [first, second] : keys) {
+            const TRawTypeValue rawKey[] = {
+                TRawTypeValue(&first, sizeof(ui32), NScheme::NTypeIds::Uint32),
+                TRawTypeValue(&second, sizeof(ui32), NScheme::NTypeIds::Uint32),
+            };
+            const auto cells = MakeKey(first, second);
+            for (bool raw : { false, true }) {
+                TTouchEnv owned;
+                TPinBackedEnv borrowed;
+                bool ready = false;
+                for (ui32 retry = 0; retry < 32 && !ready; ++retry) {
+                    const auto select = [&](IPages* env) {
+                        return raw ? table.SelectRowVersion(rawKey, env, EHint::NoByKey)
+                                   : table.SelectRowVersion(cells, env, EHint::NoByKey);
+                    };
+                    const auto expected = select(&owned);
+                    const auto actual = select(&borrowed);
+                    UNIT_ASSERT(actual.Ready == expected.Ready);
+                    UNIT_ASSERT(actual.RowVersion == expected.RowVersion);
+                    UNIT_ASSERT_VALUES_EQUAL(actual.RowTxId, expected.RowTxId);
+                    UNIT_ASSERT(actual.RowOp == expected.RowOp);
+                    UNIT_ASSERT(actual.LockMode == expected.LockMode);
+                    UNIT_ASSERT_VALUES_EQUAL(actual.LockTxId, expected.LockTxId);
+                    UNIT_ASSERT(borrowed.Source.Touched == owned.Touched);
+                    ready = actual.Ready != EReady::Page;
+                    owned.LoadTouched();
+                    borrowed.Source.LoadTouched();
+                }
+                UNIT_ASSERT(ready);
+            }
+        }
+    }
+
+    Y_UNIT_TEST(TableRowVersionSelectsBorrowedV1) {
+        CheckTableRowVersions(MakePart({ .Levels = 3, .Groups = true, .History = true }));
+    }
+
+    Y_UNIT_TEST(TableRowVersionSelectsBorrowedV2) {
+        CheckTableRowVersions(MakeV2Part({ .Levels = 3, .Groups = true, .History = true }));
+    }
+
+    Y_UNIT_TEST(TableRowVersionSelectsBorrowedFlat) {
+        CheckTableRowVersions(MakePart({ .Levels = 3, .Groups = true, .History = true, .FlatOnly = true }));
     }
 
     void CheckCharge(const NTest::TPartEggs& eggs) {

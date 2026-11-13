@@ -1520,11 +1520,17 @@ TSelectRowVersionResult TTable::SelectRowVersion(
     return SelectRowVersion(key, env, readFlags, visible, observer);
 }
 
-TSelectRowVersionResult TTable::SelectRowVersion(
-        const TCelled& key, IPages* env, ui64 readFlags,
-        const ITransactionMapPtr& visible,
-        const ITransactionObserverPtr& observer) const
-{
+TSelectRowVersionResult TTable::SelectRowVersion(const TCelled& key, IPages* env, ui64 readFlags,
+    const ITransactionMapPtr& visible, const ITransactionObserverPtr& observer) const {
+    if (auto* borrowed = env->BorrowedPages()) {
+        return SelectRowVersionWithPages(key, borrowed, readFlags, visible, observer);
+    }
+    return SelectRowVersionWithPages(key, env, readFlags, visible, observer);
+}
+
+template <class TRef>
+TSelectRowVersionResult TTable::SelectRowVersionWithPages(const TCelled& key, TPages<TRef>* env, ui64 readFlags,
+    const ITransactionMapPtr& visible, const ITransactionObserverPtr& observer) const {
     Y_ENSURE(ColdParts.empty(), "Cannot select with cold parts");
 
     const TRemap remap(*Scheme, { });
@@ -1601,7 +1607,7 @@ TSelectRowVersionResult TTable::SelectRowVersion(
                     part->MightHaveKeyPrefix(prefix))
                 {
                     auto readScope = env->BeginOpBatch();
-                    TPartIter it(part, { }, Scheme->Keys, env);
+                    TPartIterImpl<TRef> it(part, {}, Scheme->Keys, env);
                     it.SetBounds(pos->Slice);
                     auto res = it.Seek(key, ESeek::Exact);
                     if (res == EReady::Data && ready) {

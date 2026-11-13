@@ -20,11 +20,8 @@ namespace NTable {
     public:
         using TCells = TArrayRef<const TCell>;
 
-        TMemIter(const TMemTable* memTable,
-                TIntrusiveConstPtr<TKeyCellDefaults> keyDefaults,
-                const TRemap* remap,
-                IPages *env,
-                NMem::TTreeIterator&& iterator)
+        TMemIter(const TMemTable* memTable, TIntrusiveConstPtr<TKeyCellDefaults> keyDefaults, const TRemap* remap,
+            IPageEnvironment* env, NMem::TTreeIterator&& iterator)
             : MemTable(memTable)
             , KeyCellDefaults(std::move(keyDefaults))
             , Remap(remap)
@@ -37,15 +34,9 @@ namespace NTable {
             Y_ENSURE(Remap, "Remap cannot be NULL");
         }
 
-        static TAutoPtr<TMemIter> Make(
-                const TMemTable& memTable,
-                const NMem::TTreeSnapshot& snapshot,
-                TCells key,
-                ESeek seek,
-                TIntrusiveConstPtr<TKeyCellDefaults> keyDefaults,
-                const TRemap *remap,
-                IPages *env,
-                EDirection direction = EDirection::Forward)
+        static TAutoPtr<TMemIter> Make(const TMemTable& memTable, const NMem::TTreeSnapshot& snapshot, TCells key,
+            ESeek seek, TIntrusiveConstPtr<TKeyCellDefaults> keyDefaults, const TRemap* remap, IPageEnvironment* env,
+            EDirection direction = EDirection::Forward)
         {
             auto *iter = new TMemIter(&memTable, std::move(keyDefaults), remap, env, snapshot.Iterator());
 
@@ -485,7 +476,7 @@ namespace NTable {
         const TMemTable *MemTable = nullptr;
         const TIntrusiveConstPtr<TKeyCellDefaults> KeyCellDefaults;
         const TRemap* Remap = nullptr;
-        IPages * const Env = nullptr;
+        IPageEnvironment* const Env = nullptr;
 
     private:
         NMem::TTreeIterator RowIt;
