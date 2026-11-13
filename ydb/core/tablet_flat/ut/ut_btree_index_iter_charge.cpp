@@ -626,6 +626,38 @@ Y_UNIT_TEST_SUITE_F(TPageReadScope, ::NKikimr::NTable::NTest::TTableCacheTest) {
         UNIT_ASSERT(TCache::Get().Find(part.GetPageCollection(0)->Label(), collection) ==
                     NSharedCache::ECacheResultStatus::Hit);
         stored.PageCollections.push_back(std::move(collection));
+        {
+            NTabletFlatExecutor::TSeat borrowedSeat(
+                2, TAutoPtr<NTabletFlatExecutor::ITransaction>(new TReadTransaction));
+            NTabletFlatExecutor::TPageCollectionReadEnv borrowedEnv(borrowedSeat);
+            auto& borrowedPages = borrowedEnv.BorrowedPages();
+            const auto references = [&] {
+                auto cacheOp = TCache::Get().BeginOperation();
+                return NSharedCache::THandleState::FromRaw(
+                    cacheOp.Handles()[original.CacheItem().Index()].State.load(std::memory_order_relaxed))
+                    .Refs();
+            };
+            const auto before = references();
+            auto first = borrowedPages.TryGetPage(&stored, location, {});
+            UNIT_ASSERT(first);
+            UNIT_ASSERT(first.CacheItem() == original.CacheItem());
+            UNIT_ASSERT_VALUES_EQUAL(references(), before + 1);
+            UNIT_ASSERT_VALUES_EQUAL(borrowedSeat.Pinned.size(), 1);
+            {
+                auto outer = borrowedPages.BeginOpBatch();
+                auto inner = borrowedEnv.BeginOpBatch();
+                for (ui32 visit = 0; visit < 2 * NSharedCache::CacheOperationBatchSize + 1; ++visit) {
+                    auto page = borrowedPages.TryGetPage(&stored, location, {});
+                    UNIT_ASSERT(page.CacheItem() == first.CacheItem());
+                    UNIT_ASSERT(page.data() == original.data());
+                    UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+                }
+            }
+            UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(references(), before + 1);
+            UNIT_ASSERT_VALUES_EQUAL(borrowedEnv.GetStats().NewlyPinnedPages, 1);
+            UNIT_ASSERT_VALUES_EQUAL(borrowedEnv.GetStats().NewlyPinnedBytes, original.size());
+        }
         NTabletFlatExecutor::TSeat seat(1, TAutoPtr<NTabletFlatExecutor::ITransaction>(new TReadTransaction));
         NTabletFlatExecutor::TPageCollectionReadEnv cacheEnv(seat);
         IPages& env = cacheEnv;

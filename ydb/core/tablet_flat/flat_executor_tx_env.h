@@ -18,9 +18,65 @@ namespace NKikimr {
 namespace NTabletFlatExecutor {
 
     struct TPageCollectionReadEnv : public NTable::IPages {
+        class TBorrowedPages final : public NTable::IBorrowedPages {
+        public:
+            explicit TBorrowedPages(TPageCollectionReadEnv& env) noexcept
+                : Env_(env)
+            {}
+
+            TResult Locate(const TMemTable* table, ui64 ref, ui32 tag) override {
+                return Env_.Locate(table, ref, tag);
+            }
+
+            TResult Locate(const TPart* part, ui64 ref, ELargeObj lob) override {
+                return Env_.Locate(part, ref, lob);
+            }
+
+            TCachePageConstRef TryGetPage(const TPart* part, const TPageLocation& location, TGroupId group) override {
+                Y_ENSURE(!NTable::NPage::IsIndexPage(location.Type));
+                const auto* store = CheckedCast<const NTable::TPartStore*>(part);
+                return Env_.TryGetBorrowedPage(location, store->PageCollections.at(part->DataSlot(group)).Get());
+            }
+
+            TCachePageConstRef TryGetIndexPage(
+                const TPart* part, const TPageLocation& location, TGroupId group) override {
+                Y_ENSURE(location.Type == NTable::NPage::EPage::Undef || NTable::NPage::IsIndexPage(location.Type));
+                const auto* store = CheckedCast<const NTable::TPartStore*>(part);
+                return Env_.TryGetBorrowedPage(location, store->PageCollections.at(part->IndexSlot(group)).Get());
+            }
+
+            void OnRollbackChanges() override {
+                Env_.OnRollbackChanges();
+            }
+
+        private:
+            bool DoBeginOpBatch() noexcept override {
+                return Env_.DoBeginOpBatch();
+            }
+
+            void DoEndOpBatch() noexcept override {
+                Env_.DoEndOpBatch();
+            }
+
+            TPageCollectionReadEnv& Env_;
+        };
+
         TPageCollectionReadEnv(TSeat& seat)
             : Seat(seat)
-        { }
+            , BorrowedPages_(*this)
+        {}
+
+        TPageCollectionReadEnv(const TPageCollectionReadEnv&) = delete;
+        TPageCollectionReadEnv& operator=(const TPageCollectionReadEnv&) = delete;
+        TPageCollectionReadEnv(TPageCollectionReadEnv&&) = delete;
+        TPageCollectionReadEnv& operator=(TPageCollectionReadEnv&&) = delete;
+
+        // Borrowed pages stay valid while the seat retains its native pins
+        NTable::IBorrowedPages& BorrowedPages() & noexcept {
+            return BorrowedPages_;
+        }
+
+        NTable::IBorrowedPages& BorrowedPages() && = delete;
 
         struct TStats {
             size_t NewlyPinnedPages = 0;
@@ -88,6 +144,38 @@ namespace NTabletFlatExecutor {
 
     private:
         using THashSetOfLocation = THashSet<TPageLocation, NTable::NPage::TPageLocationByOffsetHash>;
+
+        TCachePageConstRef TryGetBorrowedPage(const TPageLocation& location, TCollection* pageCollection) {
+            auto readScope = BeginOpBatch();
+            return OpBatch_->ProcessPage([&](auto& cacheOp) -> TCachePageConstRef {
+                NSharedCache::NDetail::TFoundItem collection, page;
+                if (cacheOp.FindCollection(pageCollection->Id(), collection) == NSharedCache::ECacheResultStatus::Hit &&
+                    collection.Item == pageCollection->CacheItem.CacheItem() && collection.State.IsReady() &&
+                    collection.State.IsSticky() &&
+                    cacheOp.FindPage(pageCollection->CacheItem, static_cast<ui64>(location.Offset), page) ==
+                        NSharedCache::ECacheResultStatus::Hit &&
+                    page.State.IsHot() && page.State.Frequency() == 2) {
+                    if (const auto pinned = Seat.Pinned.find(NSharedCache::TPageCacheItem::FromValidated(page.Item));
+                        pinned != Seat.Pinned.end()) {
+                        return pinned->Borrow();
+                    }
+                }
+
+                auto owned = pageCollection->TryGetPage(cacheOp, location);
+                if (!owned) {
+                    ToLoadPage(location, pageCollection);
+                    return {};
+                }
+                const auto [pinned, inserted] = Seat.Pinned.emplace(std::move(owned));
+                if (inserted) {
+                    ++Stats.NewlyPinnedPages;
+                    if (!pinned->IsSticky()) {
+                        Stats.NewlyPinnedBytes += pinned->size();
+                    }
+                }
+                return pinned->Borrow();
+            });
+        }
 
         bool DoBeginOpBatch() noexcept override {
             if (OpBatch_) {
@@ -157,6 +245,7 @@ namespace NTabletFlatExecutor {
         ui64 MissingReferencesSize_ = 0;
 
         TStats Stats;
+        TBorrowedPages BorrowedPages_;
     };
 
     struct TPageCollectionTxEnv : public TPageCollectionReadEnv, public IExecuting {

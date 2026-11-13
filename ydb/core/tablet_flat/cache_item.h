@@ -850,3 +850,10 @@ inline void TPageFetchState::DrainWaiters(TPageFetchWaiter* head, TConsumer&& co
 }
 
 } // namespace NKikimr::NSharedCache
+
+template <>
+struct THash<NKikimr::NSharedCache::TPageCacheItem> {
+    size_t operator()(NKikimr::NSharedCache::TPageCacheItem item) const noexcept {
+        return THash<ui64>()(item.CacheItem().Raw());
+    }
+};
