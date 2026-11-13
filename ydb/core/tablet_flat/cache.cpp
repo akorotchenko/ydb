@@ -268,15 +268,13 @@ bool TCache::CanAllocateHandles(TArrayRef<const TCacheHandleRequirement> require
     ui64 missing = 0;
     THashMap<TLogoBlobID, THashSet<ui64>> seen;
     for (const auto& requirement : requirements) {
-        TCacheItem item;
+        NDetail::TFoundItem found;
         TCollectionCacheItem collection;
-        if (cacheOp.FindCollection(requirement.CollectionId, item) != ECacheResultStatus::Miss) {
-            const THandleState state =
-                THandleState::FromRaw(cacheOp.Handles()[item.Index()].State.load(std::memory_order_acquire));
-            if (!item.Matches(state) || !state.IsCollectionKind() || !state.IsReady()) {
+        if (cacheOp.FindCollection(requirement.CollectionId, found) != ECacheResultStatus::Miss) {
+            if (!found.State.IsReady()) {
                 return false;
             }
-            collection = TCollectionCacheItem::FromValidated(item);
+            collection = TCollectionCacheItem::FromValidated(found.Item);
         }
         auto [it, first] = seen.try_emplace(requirement.CollectionId);
         missing += first && !collection;
@@ -285,7 +283,7 @@ bool TCache::CanAllocateHandles(TArrayRef<const TCacheHandleRequirement> require
             if (!it->second.insert(offset).second) {
                 continue;
             }
-            TCacheItem present;
+            NDetail::TFoundItem present;
             missing += !collection || cacheOp.FindPage(collection, offset, present) == ECacheResultStatus::Miss;
         }
     }
@@ -316,9 +314,9 @@ bool TCache::WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheItem> ret
     for (const auto& requirement : requirements) {
         auto [it, first] = pages.try_emplace(requirement.CollectionId);
         if (first) {
-            TCacheItem current;
+            NDetail::TFoundItem current;
             if (cacheOp.FindCollection(requirement.CollectionId, current) == ECacheResultStatus::Miss ||
-                !collections.contains(current.Raw())) {
+                !collections.contains(current.Item.Raw())) {
                 exceeds |= ++handles > handleLimit;
             }
         }
@@ -586,13 +584,13 @@ ECacheCollectionLookupStatus TCache::FindCollection(
     collection.Drop();
     auto cacheOp = BeginOperation();
     for (;;) {
-        TCacheItem item;
-        if (cacheOp.FindCollection(id, item) == ECacheResultStatus::Miss) {
+        NDetail::TFoundItem found;
+        if (cacheOp.FindCollection(id, found) == ECacheResultStatus::Miss) {
             return ECacheCollectionLookupStatus::Miss;
         }
-        InvokeHook(ECacheHookPoint::BeforeCollectionRefAcquired, item);
+        InvokeHook(ECacheHookPoint::BeforeCollectionRefAcquired, found.Item);
         TOperationItemRef ref(cacheOp);
-        switch (cacheOp.TryAcquire(item, false, ref.Get())) {
+        switch (cacheOp.TryAcquire(found, false, ref.Get())) {
             case EAcquireStatus::Stale:
                 continue;
             case EAcquireStatus::Pending:
@@ -600,8 +598,8 @@ ECacheCollectionLookupStatus TCache::FindCollection(
             case EAcquireStatus::Ready:
                 if (!cacheOp.AttachCollection(registry, ref.Get())) {
                     const auto state = THandleState::FromRaw(
-                        cacheOp.SpaceOperation().Handles()[item.Index()].State.load(std::memory_order_acquire));
-                    if (item.Matches(state) && state.IsCollectionKind() && state.IsReady() &&
+                        cacheOp.SpaceOperation().Handles()[found.Item.Index()].State.load(std::memory_order_acquire));
+                    if (found.Item.Matches(state) && state.IsCollectionKind() && state.IsReady() &&
                         state.IsTransitionField()) {
                         return ECacheCollectionLookupStatus::Pending;
                     }
@@ -814,7 +812,7 @@ bool TCache::PreparePageBatch(TSpaceOperation& spaceOp, TCollection& collection,
         candidate.CollectionOwnerHeld = true;
         // Only pages that are absent from the table need admission budget: a page that is already resident is
         // a hit or a pending subscription and must be admitted even when the cache is at its limit.
-        TCacheItem resident;
+        NDetail::TFoundItem resident;
         candidate.Prepare =
             cacheOp.FindPage(collection.CacheItem, candidate.Key.Word(1), resident) == ECacheResultStatus::Miss &&
             preparedOffsets.insert(static_cast<ui64>(request.Location.Offset)).second;
@@ -1082,23 +1080,21 @@ ECacheResultStatus TCache::FindOrInsert(TSpaceOperation& spaceOp, TKeyedCandidat
     TCacheItemRef& ref) noexcept(noexcept(PrepareCandidate(spaceOp, candidate))) {
     auto cacheOp = BindOperation(spaceOp);
     for (;;) {
-        typename TOperation::TInsertPosition insertPosition;
-        TCacheItem cacheItem;
-        const ECacheResultStatus status = cacheOp.FindForInsert(candidate, cacheItem, insertPosition);
+        typename TOperation::TInsertPosition found;
+        const ECacheResultStatus status = cacheOp.FindForInsert(candidate, found);
         bool inserted = false;
         if (status == ECacheResultStatus::Miss) {
             if (candidate.CacheItem.IsNull()) {
                 // Preparation may throw; the insertion position is recomputed afterwards
-                cacheOp.DropInsertOwner(insertPosition);
+                cacheOp.DropInsertOwner(found);
                 if (!cacheOp.PrepareCandidate(candidate)) {
                     return ECacheResultStatus::Miss;
                 }
                 continue;
             }
-            if (!cacheOp.InsertAt(insertPosition, candidate.CacheItem)) {
+            if (!cacheOp.InsertAt(found, candidate.CacheItem)) {
                 continue;
             }
-            cacheItem = candidate.CacheItem;
             inserted = true;
         } else {
             Y_DEBUG_ABORT_UNLESS(status == ECacheResultStatus::Hit);
@@ -1109,7 +1105,7 @@ ECacheResultStatus TCache::FindOrInsert(TSpaceOperation& spaceOp, TKeyedCandidat
         if constexpr (std::is_same_v<TKeyedCandidate, TPageInsertCandidate>) {
             preload = candidate.Admission == EPageAdmission::Preload;
         }
-        const EAcquireStatus acquireStatus = cacheOp.TryAcquire(cacheItem, true, acquired.Get(), preload);
+        const EAcquireStatus acquireStatus = cacheOp.TryAcquire(found, true, acquired.Get(), preload);
         if (acquireStatus == EAcquireStatus::Stale) {
             Y_DEBUG_ABORT_UNLESS(!inserted);
             continue;
@@ -1122,7 +1118,7 @@ ECacheResultStatus TCache::FindOrInsert(TSpaceOperation& spaceOp, TKeyedCandidat
             return ECacheResultStatus::Inserted;
         }
 
-        Y_DEBUG_ABORT_UNLESS(cacheOp.MatchesCandidateMetadata(candidate, cacheItem));
+        Y_DEBUG_ABORT_UNLESS(cacheOp.MatchesCandidateMetadata(candidate, found.Item));
         if (!candidate.CacheItem.IsNull()) {
             cacheOp.RecycleCandidate(candidate.CacheItem);
             candidate.CacheItem = {};

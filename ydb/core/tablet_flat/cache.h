@@ -916,8 +916,8 @@ public: // Cache table operations
     }
 
     Y_FORCE_INLINE ECacheResultStatus FindPage(
-        TCollectionCacheItem collection, ui64 offset, TCacheItem& item) noexcept {
-        return Cache_.Table_.FindPage(SpaceOp_, collection, offset, item);
+        TCollectionCacheItem collection, ui64 offset, NDetail::TFoundItem& found) noexcept {
+        return Cache_.Table_.FindPage(SpaceOp_, collection, offset, found);
     }
 
     Y_FORCE_INLINE ECacheResultStatus FindPage(
@@ -927,8 +927,8 @@ public: // Cache table operations
             TCollectionCacheItem Collection;
             ui64 Offset;
 
-            Y_FORCE_INLINE ECacheResultStatus operator()(TCacheItem& item) const noexcept {
-                return CacheOp.FindPage(Collection, Offset, item);
+            Y_FORCE_INLINE ECacheResultStatus operator()(NDetail::TFoundItem& found) const noexcept {
+                return CacheOp.FindPage(Collection, Offset, found);
             }
         };
 
@@ -941,8 +941,8 @@ public: // Cache table operations
         return FindPage(collection, offset, ref, true);
     }
 
-    Y_FORCE_INLINE ECacheResultStatus FindCollection(const TLogoBlobID& id, TCacheItem& item) noexcept {
-        return Cache_.Table_.FindCollection(SpaceOp_, id, item);
+    Y_FORCE_INLINE ECacheResultStatus FindCollection(const TLogoBlobID& id, NDetail::TFoundItem& found) noexcept {
+        return Cache_.Table_.FindCollection(SpaceOp_, id, found);
     }
 
     Y_FORCE_INLINE ECacheResultStatus FindCollection(const TLogoBlobID& id, TCacheItemRefImpl<TTraits>& ref) noexcept {
@@ -950,8 +950,8 @@ public: // Cache table operations
             TCacheOperationView& CacheOp;
             const TLogoBlobID& Id;
 
-            Y_FORCE_INLINE ECacheResultStatus operator()(TCacheItem& item) const noexcept {
-                return CacheOp.FindCollection(Id, item);
+            Y_FORCE_INLINE ECacheResultStatus operator()(NDetail::TFoundItem& found) const noexcept {
+                return CacheOp.FindCollection(Id, found);
             }
         };
 
@@ -959,12 +959,11 @@ public: // Cache table operations
     }
 
     template <class TKeyedCandidate>
-    Y_FORCE_INLINE ECacheResultStatus FindForInsert(
-        const TKeyedCandidate& candidate, TCacheItem& item, TInsertPosition& position) noexcept {
+    Y_FORCE_INLINE ECacheResultStatus FindForInsert(const TKeyedCandidate& candidate, TInsertPosition& found) noexcept {
         if constexpr (TKeyedCandidate::IsPageKind()) {
-            return Cache_.Table_.FindPageForInsert(SpaceOp_, candidate.Key, item, position);
+            return Cache_.Table_.FindPageForInsert(SpaceOp_, candidate.Key, found);
         } else {
-            return Cache_.Table_.FindCollectionForInsert(SpaceOp_, candidate.Key, item, position);
+            return Cache_.Table_.FindCollectionForInsert(SpaceOp_, candidate.Key, found);
         }
     }
 
@@ -1021,9 +1020,9 @@ public: // Cache helpers
         return Cache_.KeepLoadRoom(SpaceOp_);
     }
 
-    Y_FORCE_INLINE EAcquireStatus TryAcquire(
-        TCacheItem item, bool allowPending, TCacheItemRefImpl<TTraits>& ref, bool preload = false) noexcept {
-        return Items().TryAcquire(item, allowPending, ref, preload);
+    Y_FORCE_INLINE EAcquireStatus TryAcquire(const NDetail::TFoundItem& found, bool allowPending,
+        TCacheItemRefImpl<TTraits>& ref, bool preload = false) noexcept {
+        return Items().TryAcquire(found, allowPending, ref, preload);
     }
 
     Y_FORCE_INLINE TCacheItemRefImpl<TTraits> TryAcquireStructural(TCacheItem item) noexcept {
@@ -1448,14 +1447,15 @@ template <class TLookup>
 Y_FORCE_INLINE ECacheResultStatus TCacheImpl<TTraits>::Find(
     TOperationView& cacheOp, TLookup&& lookup, TCacheItemRefImpl<TTraits>& ref, bool preload) noexcept {
     for (;;) {
-        TCacheItem cacheItem;
-        const ECacheResultStatus status = lookup(cacheItem);
+        NDetail::TFoundItem found;
+        const ECacheResultStatus status = lookup(found);
         if (status == ECacheResultStatus::Miss) {
             return ECacheResultStatus::Miss;
         }
         Y_DEBUG_ABORT_UNLESS(status == ECacheResultStatus::Hit);
+        InvokeHook(ECacheHookPoint::BeforeLookupItemAcquire, found.Item);
         TOperationItemRef<TTraits> acquired(cacheOp.SpaceOperation());
-        switch (cacheOp.TryAcquire(cacheItem, false, acquired.Get(), preload)) {
+        switch (cacheOp.TryAcquire(found, false, acquired.Get(), preload)) {
             case EAcquireStatus::Stale:
                 continue;
             case EAcquireStatus::Pending:

@@ -72,6 +72,19 @@ using TItemResult = TTestResult<TTestCacheItemRef>;
 
 class TCacheTestAccess {
 public:
+    template <class TTraits>
+    static typename TCacheItems<TTraits>::EAcquireStatus TryAcquire(TCacheOperationView<TTraits>& operation,
+        TCacheItem item, bool allowPending, TCacheItemRefImpl<TTraits>& ref, bool preload = false) noexcept {
+        using EAcquireStatus = typename TCacheItems<TTraits>::EAcquireStatus;
+        auto& spaceOp = operation.SpaceOperation();
+        if (!spaceOp.Contains(item)) {
+            return EAcquireStatus::Stale;
+        }
+        NDetail::TFoundItem found{ item,
+            THandleState::FromRaw(spaceOp.Handles()[item.Index()].State.load(std::memory_order_relaxed)) };
+        return found.IsValid() ? operation.TryAcquire(found, allowPending, ref, preload) : EAcquireStatus::Stale;
+    }
+
     static bool RegisterShrinkWait(TTestCache& cache, TCacheItem item) noexcept {
         auto cacheOp = cache.BeginOperation();
         const auto expected = THandleState::FromRaw(
@@ -190,7 +203,7 @@ public:
     template <class TTraits>
     static TIntrusivePtr<TPageFetchState> AcquireFetch(
         TCacheOperation<TTraits>& cacheOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept {
-        if (cacheOp.TryAcquire(page.CacheItem(), true, owner.Get(), true) !=
+        if (TryAcquire(cacheOp, page.CacheItem(), true, owner.Get(), true) !=
             TCacheImpl<TTraits>::EAcquireStatus::Pending) {
             return {};
         }
@@ -760,9 +773,9 @@ public:
 
     static EResizeStep FindSplitBoundary(TTestCache& cache, ui32 bucket, ui32 splitBit, TCacheItem& firstSuffix) {
         auto operation = cache.BeginOperation();
-        TCacheTableImpl<TTestTraits>::TOrderedLink result;
+        TCacheTableImpl<TTestTraits>::TFoundItem result;
         const auto step = cache.Table_.FindSplitBoundary(operation.SpaceOperation(), bucket, splitBit, true, result);
-        firstSuffix = result.Expected;
+        firstSuffix = result.Item;
         return step;
     }
 
@@ -778,8 +791,8 @@ public:
 
     static bool ValidateTerminalOwner(TTestCache& cache, TCacheItem owner, TCacheItem terminal) noexcept {
         auto spaceOp = cache.BeginOperation();
-        TCacheTableImpl<TTestTraits>::TOrderedLink orderedLink{
-            .Expected = terminal,
+        TCacheTableImpl<TTestTraits>::TFoundItem orderedLink{
+            .Item = terminal,
             .Owner = owner,
         };
         return cache.Table_.ValidateTerminalOwner(spaceOp, orderedLink);
@@ -789,12 +802,11 @@ public:
         TTestCacheItemRef ref;
         {
             auto operation = cache.BeginOperation();
-            TCacheItem cacheItem;
+            NDetail::TFoundItem found;
             const auto collection = TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(key.Word(0)));
-            Y_ABORT_UNLESS(
-                cache.Table_.FindPage(operation, collection, key.Word(1), cacheItem) == ECacheResultStatus::Hit);
+            Y_ABORT_UNLESS(cache.Table_.FindPage(operation, collection, key.Word(1), found) == ECacheResultStatus::Hit);
             UNIT_ASSERT(cache.Space_->AdvanceSpaceGeneration());
-            const auto status = operation.TryAcquire(cacheItem, false, ref);
+            const auto status = operation.TryAcquire(found, false, ref);
             Y_ABORT_UNLESS(
                 status == (expectPending ? TTestCache::EAcquireStatus::Pending : TTestCache::EAcquireStatus::Ready));
         }
@@ -804,11 +816,11 @@ public:
 
     static TTestCacheItemRef AcquirePending(TTestCache& cache, const TCacheKey& key) noexcept {
         auto operation = cache.BeginOperation();
-        TCacheItem cacheItem;
+        NDetail::TFoundItem found;
         const auto collection = TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(key.Word(0)));
-        Y_ABORT_UNLESS(cache.Table_.FindPage(operation, collection, key.Word(1), cacheItem) == ECacheResultStatus::Hit);
+        Y_ABORT_UNLESS(cache.Table_.FindPage(operation, collection, key.Word(1), found) == ECacheResultStatus::Hit);
         TTestCacheItemRef ref;
-        Y_ABORT_UNLESS(operation.TryAcquire(cacheItem, true, ref) == TTestCache::EAcquireStatus::Pending);
+        Y_ABORT_UNLESS(operation.TryAcquire(found, true, ref) == TTestCache::EAcquireStatus::Pending);
         return ref;
     }
 
@@ -3969,9 +3981,9 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             auto cacheOp = fixture.Cache->BeginOperation();
             hazard = &cacheOp.Hazard();
             UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
-            TCacheItem item;
-            UNIT_ASSERT(cacheOp.FindPage(PageCollection(key), key.Word(1), item) == ECacheResultStatus::Hit);
-            UNIT_ASSERT(item == page.CacheItem());
+            NDetail::TFoundItem found;
+            UNIT_ASSERT(cacheOp.FindPage(PageCollection(key), key.Word(1), found) == ECacheResultStatus::Hit);
+            UNIT_ASSERT(found.Item == page.CacheItem());
             UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 0);
             {
                 auto movedOp = std::move(cacheOp);
@@ -3979,8 +3991,8 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                 UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
                 TOperationItemRef<TTestTraits> acquired(movedOp);
                 UNIT_ASSERT(
-                    movedOp.TryAcquire(item, false, acquired.Get()) == TTestCache::TOperation::EAcquireStatus::Ready);
-                UNIT_ASSERT(acquired.CacheItem() == item);
+                    movedOp.TryAcquire(found, false, acquired.Get()) == TTestCache::TOperation::EAcquireStatus::Ready);
+                UNIT_ASSERT(acquired.CacheItem() == found.Item);
                 UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
                 UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).Refs(), 1);
             }
@@ -4002,14 +4014,14 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                 auto cacheOp = TCacheTestAccess::BindOperation(*fixture.Cache, spaceOp);
                 UNIT_ASSERT(&cacheOp.SpaceOperation() == &spaceOp);
                 UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
-                TCacheItem item;
-                UNIT_ASSERT(cacheOp.FindPage(PageCollection(key), key.Word(1), item) == ECacheResultStatus::Hit);
-                UNIT_ASSERT(item == page.CacheItem());
+                NDetail::TFoundItem found;
+                UNIT_ASSERT(cacheOp.FindPage(PageCollection(key), key.Word(1), found) == ECacheResultStatus::Hit);
+                UNIT_ASSERT(found.Item == page.CacheItem());
                 {
                     TOperationItemRef<TTestTraits> acquired(cacheOp.SpaceOperation());
-                    UNIT_ASSERT(cacheOp.TryAcquire(item, false, acquired.Get()) ==
+                    UNIT_ASSERT(cacheOp.TryAcquire(found, false, acquired.Get()) ==
                                 TTestCache::TOperation::EAcquireStatus::Ready);
-                    UNIT_ASSERT(acquired.CacheItem() == item);
+                    UNIT_ASSERT(acquired.CacheItem() == found.Item);
                     UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
                 }
                 UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(hazard->State.load(std::memory_order_acquire)), 1);
@@ -4046,7 +4058,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
                 const THandleState deleted = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
                 UNIT_ASSERT(deleted.IsTombstone());
                 UNIT_ASSERT_VALUES_EQUAL(deleted.Refs(), 2);
-                TCacheItem found;
+                NDetail::TFoundItem found;
                 UNIT_ASSERT(cacheOp.FindPage(PageCollection(key), key.Word(1), found) == ECacheResultStatus::Miss);
 
                 cacheOp.FinishErase(owner.CacheItem(), key);
@@ -4364,7 +4376,7 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         auto collection = MakeReviewRetainedCollection(fixture, id);
         {
             auto operation = cache.BeginOperation();
-            TCacheItem found;
+            NDetail::TFoundItem found;
             UNIT_ASSERT(operation.FindPage(parent, offset, found) == ECacheResultStatus::Miss);
         }
         const auto item = collection.CacheItem();
@@ -4373,10 +4385,125 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
         collection.Drop();
         const auto page = InsertReadyPage(cache, TCacheKey::Page(parent, offset));
         auto operation = cache.BeginOperation();
-        TCacheItem found;
+        NDetail::TFoundItem found;
         UNIT_ASSERT(operation.FindCollection(id, found) == ECacheResultStatus::Miss);
         UNIT_ASSERT(operation.FindPage(parent, offset, found) == ECacheResultStatus::Hit);
-        UNIT_ASSERT(found == page.CacheItem());
+        UNIT_ASSERT(found.Item == page.CacheItem());
+    }
+
+    Y_UNIT_TEST(LookupSnapshotRetriesPageReferenceChange) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection = MakeCollectionCacheItem(61, 62);
+        const auto item = InsertReadyPage(cache, TCacheKey::Page(collection, 0));
+        TTestCachePageRef source;
+        UNIT_ASSERT(cache.Find(collection, 0, source) == ECacheResultStatus::Hit);
+        const auto before = TCacheTestAccess::HandleState(cache, item.Index()).Refs();
+
+        struct TContext {
+            TTestCachePageRef& Source;
+            TTestCachePageRef Extra;
+            bool Changed = false;
+        } context{ source, {} };
+
+        TTestTraits hooks{ &context, [](void* opaque, ECacheHookPoint point, TCacheItem) noexcept {
+                              auto& ctx = *static_cast<TContext*>(opaque);
+                              if (point == ECacheHookPoint::BeforeLookupItemAcquire && !ctx.Changed) {
+                                  ctx.Changed = true;
+                                  ctx.Extra = ctx.Source.Acquire();
+                              }
+                          } };
+        TCacheHookGuard guard(cache, hooks);
+        TTestCachePageRef result;
+        UNIT_ASSERT(cache.Find(collection, 0, result) == ECacheResultStatus::Hit);
+        UNIT_ASSERT(context.Changed);
+        UNIT_ASSERT(result.CacheItem() == item);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, item.Index()).Refs(), before + 2);
+    }
+
+    Y_UNIT_TEST(LookupSnapshotRetriesCollectionReferenceChange) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const TLogoBlobID id(310, 312, 10);
+        auto source = MakeReviewRetainedCollection(fixture, id);
+        const auto item = source.CacheItem();
+        const auto before = TCacheTestAccess::HandleState(cache, item.Index()).Refs();
+
+        struct TContext {
+            TTestCacheCollectionRef& Source;
+            TTestCacheCollectionRef Extra;
+            bool Changed = false;
+        } context{ source, {} };
+
+        TTestTraits hooks{ &context, [](void* opaque, ECacheHookPoint point, TCacheItem) noexcept {
+                              auto& ctx = *static_cast<TContext*>(opaque);
+                              if (point == ECacheHookPoint::BeforeLookupItemAcquire && !ctx.Changed) {
+                                  ctx.Changed = true;
+                                  ctx.Extra = ctx.Source.Acquire();
+                              }
+                          } };
+        TCacheHookGuard guard(cache, hooks);
+        TTestCacheCollectionRef result;
+        UNIT_ASSERT(cache.Find(id, result) == ECacheResultStatus::Hit);
+        UNIT_ASSERT(context.Changed);
+        UNIT_ASSERT(result.CacheItem() == item);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, item.Index()).Refs(), before + 2);
+    }
+
+    Y_UNIT_TEST(LookupSnapshotRetriesAfterPageErase) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection = MakeCollectionCacheItem(61, 62);
+        const auto item = InsertReadyPage(cache, TCacheKey::Page(collection, 0));
+
+        struct TContext {
+            TTestCache& Cache;
+            TPageCacheItem Item;
+            bool Erased = false;
+        } context{ cache, item };
+
+        TTestTraits hooks{ &context, [](void* opaque, ECacheHookPoint point, TCacheItem) noexcept {
+                              auto& ctx = *static_cast<TContext*>(opaque);
+                              if (point == ECacheHookPoint::BeforeLookupItemAcquire && !ctx.Erased) {
+                                  ctx.Erased = true;
+                                  Y_ABORT_UNLESS(TCacheTestAccess::EvictFromHot(ctx.Cache, ctx.Item));
+                                  Y_ABORT_UNLESS(TCacheTestAccess::RetirePageResult(ctx.Cache, ctx.Item));
+                              }
+                          } };
+        TCacheHookGuard guard(cache, hooks);
+        TTestCachePageRef result;
+        UNIT_ASSERT(cache.Find(collection, 0, result) == ECacheResultStatus::Miss);
+        UNIT_ASSERT(context.Erased);
+        UNIT_ASSERT(!result);
+    }
+
+    Y_UNIT_TEST(LookupSnapshotRetriesAfterPageReplacement) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection = MakeCollectionCacheItem(61, 62);
+        const auto item = InsertReadyPage(cache, TCacheKey::Page(collection, 0));
+        TTestCachePageRef source;
+        UNIT_ASSERT(cache.Find(collection, 0, source) == ECacheResultStatus::Hit);
+
+        struct TContext {
+            TTestCache& Cache;
+            TPageCacheItem Item;
+            bool Replaced = false;
+        } context{ cache, item };
+
+        TTestTraits hooks{ &context, [](void* opaque, ECacheHookPoint point, TCacheItem) noexcept {
+                              auto& ctx = *static_cast<TContext*>(opaque);
+                              if (point == ECacheHookPoint::BeforeLookupItemAcquire && !ctx.Replaced) {
+                                  ctx.Replaced = true;
+                                  Y_ABORT_UNLESS(TCacheTestAccess::RelocatePage(ctx.Cache, ctx.Item));
+                              }
+                          } };
+        TCacheHookGuard guard(cache, hooks);
+        TTestCachePageRef result;
+        UNIT_ASSERT(cache.Find(collection, 0, result) == ECacheResultStatus::Hit);
+        UNIT_ASSERT(context.Replaced);
+        UNIT_ASSERT(result.CacheItem() != item);
+        UNIT_ASSERT_VALUES_EQUAL(result.data()[0], source.data()[0]);
     }
 
     void AddReviewRetainedPage(TFixture & fixture, TCollectionCacheItem collection, ui64 offset) {
@@ -9607,16 +9734,16 @@ Y_UNIT_TEST_SUITE(TCacheTableTest) {
             UNIT_ASSERT_VALUES_EQUAL(
                 operation.SpaceOperation().EntrySpaceState().Resizing(), entryActive && !assignedEntry);
             const auto check = [&] {
-                TCacheItem found;
+                NDetail::TFoundItem found;
                 UNIT_ASSERT(operation.FindPage(parent.CacheItem(), pageKey.Word(1), found) == ECacheResultStatus::Hit);
-                UNIT_ASSERT(found == page.CacheItem());
+                UNIT_ASSERT(found.Item == page.CacheItem());
                 UNIT_ASSERT(
                     operation.FindPage(parent.CacheItem(), missingPageKey.Word(1), found) == ECacheResultStatus::Miss);
-                UNIT_ASSERT(found.IsNull());
+                UNIT_ASSERT(found.Item.IsNull());
                 UNIT_ASSERT(operation.FindCollection(collectionId, found) == ECacheResultStatus::Hit);
-                UNIT_ASSERT(found == collection.CacheItem().CacheItem());
+                UNIT_ASSERT(found.Item == collection.CacheItem().CacheItem());
                 UNIT_ASSERT(operation.FindCollection(missingCollectionId, found) == ECacheResultStatus::Miss);
-                UNIT_ASSERT(found.IsNull());
+                UNIT_ASSERT(found.Item.IsNull());
             };
             if (entryActive) {
                 CompleteBucketResize(cache, *fixture.Space);

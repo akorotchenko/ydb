@@ -476,6 +476,27 @@ constexpr bool TCacheItem::Matches(THandleState state) const noexcept {
     return Version() == state.Version();
 }
 
+namespace NDetail {
+    // State is validated on a successful key lookup and used within the same operation
+    struct TFoundItem {
+        TCacheItem Item;
+        THandleState State;
+        std::atomic<ui64>* Link = nullptr;
+        TCacheItem Owner;
+        bool Equal = false;
+        bool SawSplit = false;
+
+        Y_FORCE_INLINE bool IsValid() const noexcept {
+            return IsValid(State);
+        }
+
+        Y_FORCE_INLINE bool IsValid(THandleState state) const noexcept {
+            return Item.Matches(state) && !state.IsFree() && !state.IsReplacing() && !state.IsReplaced() &&
+                   !state.IsTombstone();
+        }
+    };
+} // namespace NDetail
+
 class TPageCacheItem {
 public:
     constexpr TPageCacheItem() noexcept = default;

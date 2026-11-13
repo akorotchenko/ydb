@@ -1468,10 +1468,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             UNIT_ASSERT(saved.Pages[page] == _P(page));
             UNIT_ASSERT(!pages[page].Data);
             auto cacheOp = cache.BeginOperation();
-            TCacheItem item;
-            UNIT_ASSERT(cacheOp.FindPage(collection.CacheItem(), static_cast<ui64>(_P(page).Offset), item) ==
+            NSharedCache::NDetail::TFoundItem found;
+            UNIT_ASSERT(cacheOp.FindPage(collection.CacheItem(), static_cast<ui64>(_P(page).Offset), found) ==
                         ECacheResultStatus::Hit);
-            const auto state = THandleState::FromRaw(cacheOp.SpaceOperation().Handles()[item.Index()].State.load());
+            const auto state =
+                THandleState::FromRaw(cacheOp.SpaceOperation().Handles()[found.Item.Index()].State.load());
             UNIT_ASSERT(state.IsSticky());
             UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 0);
         }

@@ -664,16 +664,16 @@ Y_UNIT_TEST_SUITE_F(TPageReadScope, ::NKikimr::NTable::NTest::TTableCacheTest) {
         // Part construction may have cached this page; remove it before testing misses
         {
             auto cacheOp = TCache::Get().BeginOperation();
-            NSharedCache::TCacheItem item;
-            if (cacheOp.FindPage(stored.PageCollections.front().CacheItem(), static_cast<ui64>(missing.Offset), item) ==
-                NSharedCache::ECacheResultStatus::Hit) {
+            NSharedCache::NDetail::TFoundItem found;
+            if (cacheOp.FindPage(stored.PageCollections.front().CacheItem(), static_cast<ui64>(missing.Offset),
+                    found) == NSharedCache::ECacheResultStatus::Hit) {
                 NSharedCache::TOperationItemRef<NSharedCache::TProdTraits> owner(
-                    cacheOp.SpaceOperation(), cacheOp.TryAcquireStructural(item));
+                    cacheOp.SpaceOperation(), cacheOp.TryAcquireStructural(found.Item));
                 UNIT_ASSERT(owner);
                 auto state = NSharedCache::THandleState::FromRaw(
-                    cacheOp.Handles()[item.Index()].State.load(std::memory_order_acquire));
+                    cacheOp.Handles()[found.Item.Index()].State.load(std::memory_order_acquire));
                 UNIT_ASSERT(cacheOp.TryBeginErase(owner.Get(), state));
-                cacheOp.Eviction().FinishPageErase(item);
+                cacheOp.Eviction().FinishPageErase(found.Item);
             }
         }
         {

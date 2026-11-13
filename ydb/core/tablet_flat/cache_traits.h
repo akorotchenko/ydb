@@ -34,6 +34,7 @@ enum class ECacheHookPoint {
     BeforeTableLinkCas, // Payload is the link owner, may be null.
     AfterTableLinkCas, // Payload is the link owner, may be null.
     BeforeTableItemValidation, // Linked identity, after sampling Next/keys and before checking State
+    BeforeLookupItemAcquire, // Matched identity, after table validation and before acquiring a native reference
     AfterTombstoneOwnerClaim, // Payload is the claimed item.
     AfterTombstoneHelperClaim, // Payload is the claimed item.
     BeforeTombstoneFinalCas, // Payload is the item at its final CAS.

@@ -54,8 +54,8 @@ private:
 
     // Reference acquisition
     TCacheItemRefImpl<TTraits> TryAcquireRetiredItemRef(TSpaceOperation& spaceOp, TCacheItem item) noexcept;
-    Y_FORCE_INLINE EAcquireStatus TryAcquire(TSpaceOperation& spaceOp, TCacheItem cacheItem, bool allowPending,
-        TCacheItemRefImpl<TTraits>& ref, bool preload = false) noexcept;
+    Y_FORCE_INLINE EAcquireStatus TryAcquire(TSpaceOperation& spaceOp, const NDetail::TFoundItem& found,
+        bool allowPending, TCacheItemRefImpl<TTraits>& ref, bool preload = false) noexcept;
     TCacheItemRefImpl<TTraits> TryAcquireHotItemRef(
         TSpaceOperation& spaceOp, TCacheItem item, ECacheTier expectedTier) noexcept;
     Y_FORCE_INLINE TCacheItemRefImpl<TTraits> AcquireMorePageRef(TCacheItem item) noexcept;
@@ -134,9 +134,9 @@ public:
         return Cache_.Items_.TryAcquireRetiredItemRef(SpaceOp_, item);
     }
 
-    Y_FORCE_INLINE EAcquireStatus TryAcquire(
-        TCacheItem cacheItem, bool allowPending, TCacheItemRefImpl<TTraits>& ref, bool preload = false) noexcept {
-        return Cache_.Items_.TryAcquire(SpaceOp_, cacheItem, allowPending, ref, preload);
+    Y_FORCE_INLINE EAcquireStatus TryAcquire(const NDetail::TFoundItem& found, bool allowPending,
+        TCacheItemRefImpl<TTraits>& ref, bool preload = false) noexcept {
+        return Cache_.Items_.TryAcquire(SpaceOp_, found, allowPending, ref, preload);
     }
 
     Y_FORCE_INLINE TCacheItemRefImpl<TTraits> TryAcquireHotItemRef(TCacheItem item, ECacheTier expectedTier) noexcept {
@@ -292,21 +292,14 @@ Y_FORCE_INLINE TCacheItemRefImpl<TTraits> TCacheItems<TTraits>::AcquireMoreColle
 
 template <class TTraits>
 Y_FORCE_INLINE typename TCacheItems<TTraits>::EAcquireStatus TCacheItems<TTraits>::TryAcquire(TSpaceOperation& spaceOp,
-    TCacheItem cacheItem, bool allowPending, TCacheItemRefImpl<TTraits>& ref, bool preload) noexcept {
+    const NDetail::TFoundItem& found, bool allowPending, TCacheItemRefImpl<TTraits>& ref, bool preload) noexcept {
     auto cacheOp = Cache_.BindOperation(spaceOp);
-    if (!spaceOp.Contains(cacheItem)) {
-        return EAcquireStatus::Stale;
-    }
-
+    const TCacheItem cacheItem = found.Item;
+    Y_DEBUG_ABORT_UNLESS(spaceOp.Contains(cacheItem) && found.IsValid());
     THandle& handle = spaceOp.Handles()[cacheItem.Index()];
-    ui64 expectedRaw = handle.State.load(std::memory_order_relaxed);
+    ui64 expectedRaw = found.State.Raw();
     for (;;) {
         const THandleState expected = THandleState::FromRaw(expectedRaw);
-        if (!cacheItem.Matches(expected) || expected.IsFree() || expected.IsReplacing() || expected.IsReplaced() ||
-            expected.IsTombstone())
-        {
-            return EAcquireStatus::Stale;
-        }
 
         if (expected.IsPending() && !allowPending) {
             return EAcquireStatus::Pending;
@@ -324,6 +317,9 @@ Y_FORCE_INLINE typename TCacheItems<TTraits>::EAcquireStatus TCacheItems<TTraits
         if (!handle.State.compare_exchange_weak(
                 expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed))
         {
+            if (!found.IsValid(THandleState::FromRaw(expectedRaw))) {
+                return EAcquireStatus::Stale;
+            }
             continue;
         }
         if (expected.IsCold()) {

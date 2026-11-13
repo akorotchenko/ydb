@@ -124,7 +124,7 @@ TCacheKey LoadCacheKey(const THandle& handle, EItemKind kind) noexcept;
 template <class TTraits = TProdTraits>
 class TCacheTableImpl {
 public: // Cache table operations
-    struct TInsertPosition {
+    struct TInsertPosition : NDetail::TFoundItem {
         void DropOwner(TSpaceOperation& spaceOp) noexcept {
             OwnerRef.Drop(spaceOp);
         }
@@ -132,9 +132,6 @@ public: // Cache table operations
     private:
         friend class TCacheTableImpl<TTraits>;
 
-        std::atomic<ui64>* Link = nullptr;
-        TCacheItem Expected;
-        TCacheItem Owner;
         TCacheItemRefImpl<TTraits> OwnerRef;
         TSpaceState SpaceState;
         TBucketResizeState ResizeState;
@@ -145,16 +142,16 @@ public: // Cache table operations
     {}
 
     Y_FORCE_INLINE ECacheResultStatus FindPage(
-        TSpaceOperation& spaceOp, TCollectionCacheItem collection, ui64 offset, TCacheItem& cacheItem) noexcept;
+        TSpaceOperation& spaceOp, TCollectionCacheItem collection, ui64 offset, NDetail::TFoundItem& found) noexcept;
 
     Y_FORCE_INLINE ECacheResultStatus FindCollection(
-        TSpaceOperation& spaceOp, const TLogoBlobID& id, TCacheItem& cacheItem) noexcept;
+        TSpaceOperation& spaceOp, const TLogoBlobID& id, NDetail::TFoundItem& found) noexcept;
 
-    ECacheResultStatus FindPageForInsert(TSpaceOperation& spaceOp, const TCacheKey& key, TCacheItem& cacheItem,
-        TInsertPosition& insertPosition) noexcept;
+    ECacheResultStatus FindPageForInsert(
+        TSpaceOperation& spaceOp, const TCacheKey& key, TInsertPosition& found) noexcept;
 
-    ECacheResultStatus FindCollectionForInsert(TSpaceOperation& spaceOp, const TCacheKey& key, TCacheItem& cacheItem,
-        TInsertPosition& insertPosition) noexcept;
+    ECacheResultStatus FindCollectionForInsert(
+        TSpaceOperation& spaceOp, const TCacheKey& key, TInsertPosition& found) noexcept;
 
     bool InsertAt(TSpaceOperation& spaceOp, TInsertPosition& insertPosition, TCacheItem candidate) noexcept;
 
@@ -185,13 +182,7 @@ public: // Resizing
 private: // Table helpers
     friend class TCacheTestAccess;
 
-    struct TOrderedLink {
-        std::atomic<ui64>* Link = nullptr;
-        TCacheItem Expected;
-        TCacheItem Owner;
-        bool Equal = false;
-        bool SawSplit = false;
-    };
+    using TFoundItem = NDetail::TFoundItem;
 
     struct TBucketRoute {
         TBucketResizeState Resize;
@@ -213,12 +204,12 @@ private: // Table helpers
 
     template <bool Insert, bool IsPage>
     Y_FORCE_INLINE ECacheResultStatus FindOrInsert(TSpaceOperation& spaceOp, const TCacheKey& key, ui32 hash,
-        TSpaceState spaceState, TCacheItem& cacheItem, TInsertPosition* insertPosition = nullptr) noexcept;
+        TSpaceState spaceState, std::conditional_t<Insert, TInsertPosition, TFoundItem>& found) noexcept;
 
     Y_FORCE_INLINE bool ValidateTerminalOwner(
-        const TSpaceOperation& spaceOp, const TOrderedLink& orderedLink) const noexcept;
+        const TSpaceOperation& spaceOp, const TFoundItem& orderedLink) const noexcept;
 
-    bool FindLink(TSpaceOperation& spaceOp, const TCacheKey& key, TCacheItem target, TOrderedLink& result) noexcept;
+    bool FindLink(TSpaceOperation& spaceOp, const TCacheKey& key, TCacheItem target, TFoundItem& result) noexcept;
 
     TCacheItemRefImpl<TTraits> TryAcquire(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
 
@@ -232,33 +223,32 @@ private: // Table helpers
 
     template <ETombstoneMode Mode, bool IsPage>
     Y_FORCE_INLINE bool FindInBucket(TSpaceOperation& spaceOp, const TCacheKey& key, ui32 hash, ui32 bucket,
-        bool followsSplitSuffix, TOrderedLink& result) noexcept;
+        bool followsSplitSuffix, TFoundItem& result) noexcept;
 
     template <ETombstoneMode Mode, bool IsPage, bool ResizeActive>
     Y_FORCE_INLINE EBucketRouteResult FindRoute(TSpaceOperation& spaceOp, const TCacheKey& key, ui32 hash,
-        TSpaceState& spaceState, TBucketRoute& route, TOrderedLink& result) noexcept;
+        TSpaceState& spaceState, TBucketRoute& route, TFoundItem& result) noexcept;
 
     template <ETombstoneMode Mode, bool IsPage>
     EBucketRouteResult FindWithResize(TSpaceOperation& spaceOp, const TCacheKey& key, ui32 hash,
-        TSpaceState& spaceState, TBucketRoute& route, TOrderedLink& result) noexcept;
+        TSpaceState& spaceState, TBucketRoute& route, TFoundItem& result) noexcept;
 
-    bool FindLinkOnBucket(
-        const TSpaceOperation& spaceOp, TCacheItem target, ui32 bucket, TOrderedLink& result) noexcept;
+    bool FindLinkOnBucket(const TSpaceOperation& spaceOp, TCacheItem target, ui32 bucket, TFoundItem& result) noexcept;
 
     Y_FORCE_INLINE TBucketRoute SelectBucket(ui32 hash, TSpaceState spaceState) const noexcept;
 
     Y_FORCE_INLINE TBucketRoute SelectResizeBucket(ui32 hash) const noexcept;
 
     template <ETombstoneMode Mode>
-    static Y_FORCE_INLINE bool SelectGrowthBucket(TBucketRoute& route, const TOrderedLink& link) noexcept;
+    static Y_FORCE_INLINE bool SelectGrowthBucket(TBucketRoute& route, const TFoundItem& link) noexcept;
 
     template <ETombstoneMode Mode, bool ResizeActive>
     Y_FORCE_INLINE EBucketRouteResult ResolveBucketMiss(
-        TSpaceState& spaceState, TBucketRoute& route, const TOrderedLink& link) const noexcept;
+        TSpaceState& spaceState, TBucketRoute& route, const TFoundItem& link) const noexcept;
 
 private: // Resize helpers
     EResizeStep FindSplitBoundary(
-        const TSpaceOperation& spaceOp, ui32 bucket, ui32 splitBit, bool suffix, TOrderedLink& result) noexcept;
+        const TSpaceOperation& spaceOp, ui32 bucket, ui32 splitBit, bool suffix, TFoundItem& result) noexcept;
 
     EResizeStep ResizeOwnerResult(const TSpaceOperation& spaceOp, TCacheItem owner) const noexcept;
     EResizeStep ActivateBucketSplit(
@@ -311,62 +301,63 @@ Y_FORCE_INLINE ui32 HashCollectionKey(const TLogoBlobID& id) noexcept {
 template <class TTraits>
 template <typename TCacheTableImpl<TTraits>::ETombstoneMode Mode, bool IsPage>
 Y_FORCE_INLINE bool TCacheTableImpl<TTraits>::FindInBucket(TSpaceOperation& spaceOp, const TCacheKey& key, ui32 hash,
-    ui32 bucket, bool followsSplitSuffix, TOrderedLink& result) noexcept {
+    ui32 bucket, bool followsSplitSuffix, TFoundItem& result) noexcept {
     Y_DEBUG_ABORT_UNLESS(key.IsPageKind() == IsPage);
 
 restart:
     result.Link = &spaceOp.Buckets()[bucket];
-    result.Expected = TCacheItem::FromRaw(result.Link->load(std::memory_order_acquire));
+    result.Item = TCacheItem::FromRaw(result.Link->load(std::memory_order_acquire));
     result.Owner = {};
     result.Equal = false;
     result.SawSplit = false;
-    if (Y_UNLIKELY(result.Expected.IsClosedBucketHead())) {
+    result.State = {};
+    if (Y_UNLIKELY(result.Item.IsClosedBucketHead())) {
         return false;
     }
     for (;;) {
-        if (result.Expected.IsNull()) {
+        if (result.Item.IsNull()) {
             if (!ValidateTerminalOwner(spaceOp, result)) {
                 goto restart;
             }
             return true;
         }
-        if (Y_UNLIKELY(result.Expected.IsFrozen() || !spaceOp.Contains(result.Expected))) {
+        if (Y_UNLIKELY(result.Item.IsFrozen() || !spaceOp.Contains(result.Item))) {
             goto restart;
         }
 
-        THandle& handle = spaceOp.Handles()[result.Expected.Index()];
+        THandle& handle = spaceOp.Handles()[result.Item.Index()];
         const TCacheItem next = TCacheItem::FromRaw(handle.Next.load(std::memory_order_acquire));
         // Acquire rewritten words before validating their handle generation
         const ui64 key0 = handle.Key0.load(std::memory_order_acquire);
         const ui64 key1 = handle.Key1.load(std::memory_order_acquire);
         const ui64 key2 = handle.Key2OrSize.load(std::memory_order_acquire);
-        Cache_.InvokeHook(ECacheHookPoint::BeforeTableItemValidation, result.Expected);
+        Cache_.InvokeHook(ECacheHookPoint::BeforeTableItemValidation, result.Item);
         const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-        if (Y_UNLIKELY(!result.Expected.Matches(state) || state.IsFree())) {
+        if (Y_UNLIKELY(!result.Item.Matches(state) || state.IsFree())) {
             goto restart;
         }
         if (Y_UNLIKELY(state.IsReplacing() || state.IsReplaced())) {
-            if (!next.IsFrozen() || next.WithoutFrozen().IsNull() || next.WithoutFrozen() == result.Expected) {
+            if (!next.IsFrozen() || next.WithoutFrozen().IsNull() || next.WithoutFrozen() == result.Item) {
                 goto restart;
             }
-            result.Expected = next.WithoutFrozen();
+            result.Item = next.WithoutFrozen();
             continue;
         }
-        if (Y_UNLIKELY(state.IsBucketSplit() || (state.IsTombstone() && result.Expected.IsResizeMarker())))
+        if (Y_UNLIKELY(state.IsBucketSplit() || (state.IsTombstone() && result.Item.IsResizeMarker())))
         {
             result.SawSplit = true;
             if (!followsSplitSuffix) {
                 return true;
             }
             result.Link = &handle.Next;
-            result.Owner = TCacheItem::Make(state.Version(), result.Expected.Index());
-            result.Expected = next.WithoutFrozen();
+            result.Owner = TCacheItem::Make(state.Version(), result.Item.Index());
+            result.Item = next.WithoutFrozen();
             continue;
         }
         const bool tombstone = state.IsTombstone();
         if (Y_UNLIKELY(tombstone)) {
             if constexpr (Mode == ETombstoneMode::Help) {
-                TryFinishErase(result.Expected, key, spaceOp);
+                TryFinishErase(result.Item, key, spaceOp);
                 goto restart;
             }
         } else if (Y_UNLIKELY(next.IsFrozen())) {
@@ -375,24 +366,25 @@ restart:
         const TCacheKey itemKey = TCacheKey::FromWords(state.Kind(), key0, key1, key2);
         if (Y_LIKELY(IsPage == state.IsPageKind() && NDetail::CacheKeyWordsEqual<IsPage>(itemKey, key))) {
             result.Equal = !tombstone;
+            result.State = state;
             return true;
         }
         if (NDetail::CompareKnownCacheKeys<IsPage>(itemKey, itemKey.Hash(), key, hash) > 0) {
             return true;
         }
         result.Link = &handle.Next;
-        result.Owner = TCacheItem::Make(state.Version(), result.Expected.Index());
-        result.Expected = next.WithoutFrozen();
+        result.Owner = TCacheItem::Make(state.Version(), result.Item.Index());
+        result.Item = next.WithoutFrozen();
     }
 }
 
 template <class TTraits>
 Y_FORCE_INLINE bool TCacheTableImpl<TTraits>::ValidateTerminalOwner(
-    const TSpaceOperation& spaceOp, const TOrderedLink& orderedLink) const noexcept {
+    const TSpaceOperation& spaceOp, const TFoundItem& orderedLink) const noexcept {
     if (orderedLink.Owner.IsNull()) {
         return true;
     }
-    if (orderedLink.Expected.Version() != orderedLink.Owner.Version() || !spaceOp.Contains(orderedLink.Owner))
+    if (orderedLink.Item.Version() != orderedLink.Owner.Version() || !spaceOp.Contains(orderedLink.Owner))
     {
         return false;
     }
@@ -405,7 +397,7 @@ Y_FORCE_INLINE bool TCacheTableImpl<TTraits>::ValidateTerminalOwner(
 template <class TTraits>
 template <typename TCacheTableImpl<TTraits>::ETombstoneMode Mode, bool ResizeActive>
 Y_FORCE_INLINE typename TCacheTableImpl<TTraits>::EBucketRouteResult TCacheTableImpl<TTraits>::ResolveBucketMiss(
-    TSpaceState& spaceState, TBucketRoute& route, const TOrderedLink& link) const noexcept {
+    TSpaceState& spaceState, TBucketRoute& route, const TFoundItem& link) const noexcept {
     if (!Cache_.Space_->RefreshBucketRoute(spaceState, route.Resize)) {
         return EBucketRouteResult::Retry;
     }
@@ -421,7 +413,7 @@ template <class TTraits>
 template <typename TCacheTableImpl<TTraits>::ETombstoneMode Mode, bool IsPage, bool ResizeActive>
 Y_FORCE_INLINE typename TCacheTableImpl<TTraits>::EBucketRouteResult TCacheTableImpl<TTraits>::FindRoute(
     TSpaceOperation& spaceOp, const TCacheKey& key, ui32 hash, TSpaceState& spaceState, TBucketRoute& route,
-    TOrderedLink& result) noexcept {
+    TFoundItem& result) noexcept {
     if (!FindInBucket<Mode, IsPage>(spaceOp, key, hash, route.Bucket, route.FollowsSplitSuffix, result)) {
         Cache_.Space_->RefreshBucketRoute(spaceState, route.Resize);
         return EBucketRouteResult::Retry;
@@ -435,72 +427,65 @@ Y_FORCE_INLINE typename TCacheTableImpl<TTraits>::EBucketRouteResult TCacheTable
 template <class TTraits>
 template <bool Insert, bool IsPage>
 Y_FORCE_INLINE ECacheResultStatus TCacheTableImpl<TTraits>::FindOrInsert(TSpaceOperation& spaceOp, const TCacheKey& key,
-    ui32 hash, TSpaceState spaceState, TCacheItem& cacheItem, TInsertPosition* insertPosition) noexcept {
+    ui32 hash, TSpaceState spaceState, std::conditional_t<Insert, TInsertPosition, TFoundItem>& found) noexcept {
     static constexpr ETombstoneMode Mode = Insert ? ETombstoneMode::Help : ETombstoneMode::Traverse;
     for (;;) {
         TBucketRoute route;
-        TOrderedLink orderedLink;
+        found = {};
         EBucketRouteResult status;
         if (Y_UNLIKELY(spaceState.Resizing())) {
-            status = FindWithResize<Mode, IsPage>(spaceOp, key, hash, spaceState, route, orderedLink);
+            status = FindWithResize<Mode, IsPage>(spaceOp, key, hash, spaceState, route, found);
         } else {
             const ui32 bucket = hash & spaceState.BucketMask();
             route = { .Bucket = bucket, .BaseBucket = bucket };
-            status = FindRoute<Mode, IsPage, false>(spaceOp, key, hash, spaceState, route, orderedLink);
+            status = FindRoute<Mode, IsPage, false>(spaceOp, key, hash, spaceState, route, found);
         }
-        if (Y_LIKELY(orderedLink.Equal)) {
-            cacheItem = orderedLink.Expected;
+        if (Y_LIKELY(found.Equal)) {
             return ECacheResultStatus::Hit;
         }
         if (Y_UNLIKELY(status == EBucketRouteResult::Retry)) {
             continue;
         }
         if constexpr (!Insert) {
-            cacheItem = {};
+            found = {};
+            return ECacheResultStatus::Miss;
+        } else {
+            TOperationItemRef<TTraits> ownerRef(spaceOp);
+            if (!found.Owner.IsNull()) {
+                Cache_.InvokeHook(ECacheHookPoint::BeforeInsertOwnerAcquire, found.Owner);
+                ownerRef.Get() = TryAcquire(spaceOp, found.Owner);
+                if (!ownerRef) {
+                    continue;
+                }
+                const THandleState ownerState =
+                    THandleState::FromRaw(spaceOp.Handles()[found.Owner.Index()].State.load(std::memory_order_relaxed));
+                if (!found.Owner.Matches(ownerState) || ownerState.IsTombstone() || ownerState.IsFree() ||
+                    found.Link->load(std::memory_order_acquire) != found.Item.Raw())
+                {
+                    continue;
+                }
+            }
+            found.OwnerRef = ownerRef.Take();
+            found.SpaceState = spaceState;
+            found.ResizeState = route.Resize;
+            Cache_.InvokeHook(ECacheHookPoint::AfterInsertPositionFound, found.Owner);
             return ECacheResultStatus::Miss;
         }
-        Y_DEBUG_ABORT_UNLESS(insertPosition);
-
-        TOperationItemRef<TTraits> ownerRef(spaceOp);
-        if (!orderedLink.Owner.IsNull()) {
-            Cache_.InvokeHook(ECacheHookPoint::BeforeInsertOwnerAcquire, orderedLink.Owner);
-            ownerRef.Get() = TryAcquire(spaceOp, orderedLink.Owner);
-            if (!ownerRef) {
-                continue;
-            }
-            const THandleState ownerState = THandleState::FromRaw(
-                spaceOp.Handles()[orderedLink.Owner.Index()].State.load(std::memory_order_relaxed));
-            if (!orderedLink.Owner.Matches(ownerState) || ownerState.IsTombstone() || ownerState.IsFree() ||
-                orderedLink.Link->load(std::memory_order_acquire) != orderedLink.Expected.Raw())
-            {
-                continue;
-            }
-        }
-        insertPosition->Link = orderedLink.Link;
-        insertPosition->Expected = orderedLink.Expected;
-        insertPosition->Owner = orderedLink.Owner;
-        insertPosition->OwnerRef = ownerRef.Take();
-        insertPosition->SpaceState = spaceState;
-        insertPosition->ResizeState = route.Resize;
-        Cache_.InvokeHook(ECacheHookPoint::AfterInsertPositionFound, insertPosition->Owner);
-        cacheItem = {};
-        return ECacheResultStatus::Miss;
     }
 }
 
 template <class TTraits>
 Y_FORCE_INLINE ECacheResultStatus TCacheTableImpl<TTraits>::FindPage(
-    TSpaceOperation& spaceOp, TCollectionCacheItem collection, ui64 offset, TCacheItem& cacheItem) noexcept {
-    const ui32 hash = HashPageKey(collection, offset);
-    const TSpaceState spaceState = spaceOp.EntrySpaceState();
-    return FindOrInsert<false, true>(spaceOp, TCacheKey::Page(collection, offset), hash, spaceState, cacheItem);
+    TSpaceOperation& spaceOp, TCollectionCacheItem collection, ui64 offset, NDetail::TFoundItem& found) noexcept {
+    return FindOrInsert<false, true>(spaceOp, TCacheKey::Page(collection, offset), HashPageKey(collection, offset),
+        spaceOp.EntrySpaceState(), found);
 }
 
 template <class TTraits>
 Y_FORCE_INLINE ECacheResultStatus TCacheTableImpl<TTraits>::FindCollection(
-    TSpaceOperation& spaceOp, const TLogoBlobID& id, TCacheItem& cacheItem) noexcept {
+    TSpaceOperation& spaceOp, const TLogoBlobID& id, NDetail::TFoundItem& found) noexcept {
     return FindOrInsert<false, false>(
-        spaceOp, TCacheKey::Collection(id), HashCollectionKey(id), spaceOp.EntrySpaceState(), cacheItem);
+        spaceOp, TCacheKey::Collection(id), HashCollectionKey(id), spaceOp.EntrySpaceState(), found);
 }
 
 } // namespace NKikimr::NSharedCache

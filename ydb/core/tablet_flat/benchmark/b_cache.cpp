@@ -281,10 +281,10 @@ namespace {
         }
 
         ECacheResultStatus LookupTable(TCache::TOperation& operation, ui64 offset) {
-            TCacheItem item;
-            const auto status = operation.FindPage(Collection_.CacheItem(), offset, item);
+            NDetail::TFoundItem found;
+            const auto status = operation.FindPage(Collection_.CacheItem(), offset, found);
             if (status == ECacheResultStatus::Hit) {
-                ui64 value = item.Raw();
+                ui64 value = found.Item.Raw();
                 benchmark::DoNotOptimize(value);
             }
             return status;

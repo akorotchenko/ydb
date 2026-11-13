@@ -8,55 +8,56 @@ namespace NKikimr::NSharedCache {
 
 CACHE_TEMPLATE
 typename TCacheTable::EResizeStep TCacheTable::FindSplitBoundary(
-    const TSpaceOperation& spaceOp, ui32 bucket, ui32 splitBit, bool suffix, TOrderedLink& result) noexcept {
+    const TSpaceOperation& spaceOp, ui32 bucket, ui32 splitBit, bool suffix, TFoundItem& result) noexcept {
     result.Link = &spaceOp.Buckets()[bucket];
-    result.Expected = TCacheItem::FromRaw(result.Link->load(std::memory_order_acquire));
+    result.Item = TCacheItem::FromRaw(result.Link->load(std::memory_order_acquire));
     result.Owner = {};
     result.Equal = false;
     result.SawSplit = false;
+    result.State = {};
     bool atBucketHead = true;
     for (;;) {
-        if (atBucketHead && result.Expected.IsClosedBucketHead()) {
+        if (atBucketHead && result.Item.IsClosedBucketHead()) {
             return EResizeStep::Blocked;
         }
-        if (result.Expected.IsNull()) {
+        if (result.Item.IsNull()) {
             if (!ValidateTerminalOwner(spaceOp, result)) {
                 return EResizeStep::Retry;
             }
             return EResizeStep::Complete;
         }
-        if (!spaceOp.Contains(result.Expected)) {
+        if (!spaceOp.Contains(result.Item)) {
             return EResizeStep::Retry;
         }
 
-        THandle& handle = spaceOp.Handles()[result.Expected.Index()];
+        THandle& handle = spaceOp.Handles()[result.Item.Index()];
         const TCacheItem next = TCacheItem::FromRaw(handle.Next.load(std::memory_order_acquire));
         const ui64 key0 = handle.Key0.load(std::memory_order_acquire);
         const ui64 key1 = handle.Key1.load(std::memory_order_acquire);
         const ui64 key2 = handle.Key2OrSize.load(std::memory_order_acquire);
-        Cache_.InvokeHook(ECacheHookPoint::BeforeTableItemValidation, result.Expected);
+        Cache_.InvokeHook(ECacheHookPoint::BeforeTableItemValidation, result.Item);
         const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
-        if (!result.Expected.Matches(state) || state.IsFree()) {
+        if (!result.Item.Matches(state) || state.IsFree()) {
             return EResizeStep::Retry;
         }
-        if (state.IsTombstone() && !result.Expected.IsResizeMarker()) {
+        if (state.IsTombstone() && !result.Item.IsResizeMarker()) {
             return EResizeStep::Blocked;
         }
         if (state.IsReplacing() || state.IsReplaced()) {
-            if (!next.IsFrozen() || next.WithoutFrozen().IsNull() || next.WithoutFrozen() == result.Expected) {
+            if (!next.IsFrozen() || next.WithoutFrozen().IsNull() || next.WithoutFrozen() == result.Item) {
                 return EResizeStep::Retry;
             }
-            result.Expected = next.WithoutFrozen();
+            result.Item = next.WithoutFrozen();
             continue;
         }
-        if (state.IsBucketSplit() || (state.IsTombstone() && result.Expected.IsResizeMarker()))
+        if (state.IsBucketSplit() || (state.IsTombstone() && result.Item.IsResizeMarker()))
         {
-            if (result.Expected.IsResizeMarker()) {
+            if (result.Item.IsResizeMarker()) {
                 return EResizeStep::Complete;
             }
             result.Link = &handle.Next;
-            result.Owner = result.Expected;
-            result.Expected = next.WithoutFrozen();
+            result.Owner = result.Item;
+            result.Item = next.WithoutFrozen();
             atBucketHead = false;
             continue;
         }
@@ -65,8 +66,8 @@ typename TCacheTable::EResizeStep TCacheTable::FindSplitBoundary(
         const bool isSuffix = splitBit != 0 && (key.Hash() & splitBit) != 0;
         if (splitBit == 0 || suffix != isSuffix) {
             result.Link = &handle.Next;
-            result.Owner = result.Expected;
-            result.Expected = next.WithoutFrozen();
+            result.Owner = result.Item;
+            result.Item = next.WithoutFrozen();
             atBucketHead = false;
             continue;
         }
@@ -151,14 +152,14 @@ typename TCacheTable::EResizeStep TCacheTable::PrepareBucketSplit(TSpaceOperatio
         return EResizeStep::Complete;
     }
     const ui32 bucket = resize.Cursor();
-    TOrderedLink boundary;
+    TFoundItem boundary;
     TCacheItem suffix;
     if (resize.Direction() == EBucketResize::Growing) {
         const auto step = FindSplitBoundary(spaceOp, bucket, resize.SplitBit(), true, boundary);
         if (step != EResizeStep::Complete) {
             return step;
         }
-        suffix = boundary.Expected;
+        suffix = boundary.Item;
     } else {
         const auto step = FindSplitBoundary(spaceOp, bucket, 0, false, boundary);
         if (step != EResizeStep::Complete) {
@@ -192,13 +193,13 @@ typename TCacheTable::EResizeStep TCacheTable::ActivateBucketSplitOrMerge(TSpace
 CACHE_TEMPLATE
 typename TCacheTable::EResizeStep TCacheTable::ActivateBucketSplit(
     TSpaceOperation& spaceOp, const TBucketResizeState& resize, TCacheItem marker) noexcept {
-    TOrderedLink boundary;
+    TFoundItem boundary;
     const ui32 bucket = resize.Cursor();
     const auto step = FindSplitBoundary(spaceOp, bucket, resize.SplitBit(), true, boundary);
     if (step != EResizeStep::Complete) {
         return step;
     }
-    if (boundary.Expected == marker) {
+    if (boundary.Item == marker) {
         return Cache_.Space_->AdvanceBucketResizePhase(EBucketResizePhase::Activated) ? EResizeStep::Complete
                                                                                       : EResizeStep::Blocked;
     }
@@ -211,7 +212,7 @@ typename TCacheTable::EResizeStep TCacheTable::ActivateBucketSplit(
         const THandleState ownerState =
             THandleState::FromRaw(spaceOp.Handles()[boundary.Owner.Index()].State.load(std::memory_order_relaxed));
         if (!boundary.Owner.Matches(ownerState) || ownerState.IsFree() ||
-            boundary.Link->load(std::memory_order_acquire) != boundary.Expected.Raw())
+            boundary.Link->load(std::memory_order_acquire) != boundary.Item.Raw())
         {
             return EResizeStep::Retry;
         }
@@ -219,7 +220,7 @@ typename TCacheTable::EResizeStep TCacheTable::ActivateBucketSplit(
             return EResizeStep::Blocked;
         }
     }
-    const TCacheItem next = boundary.Expected.IsNull() ? TCacheItem::Make(marker.Version(), 0) : boundary.Expected;
+    const TCacheItem next = boundary.Item.IsNull() ? TCacheItem::Make(marker.Version(), 0) : boundary.Item;
     spaceOp.Handles()[ResizeMarkerIndex].Next.store(next.Raw(), std::memory_order_release);
     ui64 expectedPeer = 0;
     if (!spaceOp.Buckets()[bucket | resize.SplitBit()].compare_exchange_strong(
@@ -229,7 +230,7 @@ typename TCacheTable::EResizeStep TCacheTable::ActivateBucketSplit(
         return EResizeStep::Retry;
     }
     Cache_.InvokeHook(ECacheHookPoint::AfterGrowthBucketPublished, marker);
-    ui64 expected = boundary.Expected.Raw();
+    ui64 expected = boundary.Item.Raw();
     if (!boundary.Link->compare_exchange_strong(
             expected, marker.Raw(), std::memory_order_release, std::memory_order_acquire))
     {
@@ -248,13 +249,13 @@ typename TCacheTable::EResizeStep TCacheTable::ActivateBucketMerge(
         TCacheItem::FromRaw(spaceOp.Buckets()[bucket | resize.SplitBit()].load(std::memory_order_acquire));
     const TCacheItem next = highHead.IsNull() ? TCacheItem::Make(marker.Version(), 0) : highHead;
     spaceOp.Handles()[ResizeMarkerIndex].Next.store(next.Raw(), std::memory_order_release);
-    TOrderedLink boundary;
+    TFoundItem boundary;
     const auto step = FindSplitBoundary(spaceOp, bucket, 0, false, boundary);
     if (step != EResizeStep::Complete) {
         return step;
     }
-    if (boundary.Expected != marker) {
-        ui64 expected = boundary.Expected.Raw();
+    if (boundary.Item != marker) {
+        ui64 expected = boundary.Item.Raw();
         if (!boundary.Link->compare_exchange_strong(
                 expected, marker.Raw(), std::memory_order_release, std::memory_order_acquire))
         {
@@ -334,7 +335,7 @@ typename TCacheTable::EResizeStep TCacheTable::RemoveBucketSplit(TSpaceOperation
     }
     const TCacheItem markerIdentity = TCacheItem::Make(markerState.Version(), ResizeMarkerIndex);
 
-    const auto unlinkMarker = [&](const TOrderedLink& markerLink, TCacheItem successor,
+    const auto unlinkMarker = [&](const TFoundItem& markerLink, TCacheItem successor,
                                   TOperationItemRef& ownerRef) noexcept {
         Cache_.InvokeHook(ECacheHookPoint::BeforeBucketSplitLinkClaim, markerLink.Owner);
         if (!markerLink.Owner.IsNull()) {
@@ -359,7 +360,7 @@ typename TCacheTable::EResizeStep TCacheTable::RemoveBucketSplit(TSpaceOperation
     TOperationItemRef oldOwnerRef(spaceOp);
     TOperationItemRef markerOwnerRef(spaceOp);
     if (resize.Direction() == EBucketResize::Growing && markerState.IsBucketSplit()) {
-        TOrderedLink oldLink;
+        TFoundItem oldLink;
         if (!FindLinkOnBucket(spaceOp, markerIdentity, bucket, oldLink)) {
             return EResizeStep::Retry;
         }
@@ -375,7 +376,7 @@ typename TCacheTable::EResizeStep TCacheTable::RemoveBucketSplit(TSpaceOperation
     }
     Cache_.InvokeHook(ECacheHookPoint::AfterBucketSplitOwnerCheck, markerIdentity);
     const ui32 markerBucket = resize.Direction() == EBucketResize::Growing ? bucket | resize.SplitBit() : bucket;
-    TOrderedLink markerLink;
+    TFoundItem markerLink;
     if (FindLinkOnBucket(spaceOp, markerIdentity, markerBucket, markerLink)) {
         const TCacheItem successor =
             TCacheItem::FromRaw(spaceOp.Handles()[ResizeMarkerIndex].Next.load(std::memory_order_acquire))
@@ -400,7 +401,7 @@ typename TCacheTable::EResizeStep TCacheTable::RemoveBucketSplit(TSpaceOperation
 
 // Resize members are instantiated here; other table members are instantiated in cache_table.cpp.
 template TCacheTableImpl<TProdTraits>::EResizeStep TCacheTableImpl<TProdTraits>::FindSplitBoundary(
-    const TSpaceOperation&, ui32, ui32, bool, TCacheTableImpl<TProdTraits>::TOrderedLink&) noexcept;
+    const TSpaceOperation&, ui32, ui32, bool, TCacheTableImpl<TProdTraits>::TFoundItem&) noexcept;
 template bool TCacheTableImpl<TProdTraits>::PrepareSplitMarker(const TSpaceOperation&, TCacheItem) noexcept;
 template bool TCacheTableImpl<TProdTraits>::TransitionSplitMarkerToTombstone(
     const TSpaceOperation&, TCacheItem) noexcept;
@@ -423,7 +424,7 @@ template TCacheTableImpl<TProdTraits>::EResizeStep TCacheTableImpl<TProdTraits>:
     TSpaceOperation&) noexcept;
 
 template TCacheTableImpl<TTestTraits>::EResizeStep TCacheTableImpl<TTestTraits>::FindSplitBoundary(
-    const TSpaceOperation&, ui32, ui32, bool, TCacheTableImpl<TTestTraits>::TOrderedLink&) noexcept;
+    const TSpaceOperation&, ui32, ui32, bool, TCacheTableImpl<TTestTraits>::TFoundItem&) noexcept;
 template bool TCacheTableImpl<TTestTraits>::PrepareSplitMarker(const TSpaceOperation&, TCacheItem) noexcept;
 template bool TCacheTableImpl<TTestTraits>::TransitionSplitMarkerToTombstone(
     const TSpaceOperation&, TCacheItem) noexcept;
