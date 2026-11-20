@@ -1468,8 +1468,7 @@ bool TExecutor::PrepareExternalPart(TPendingPartSwitch &partSwitch, TPendingPart
         if (auto fetch = stage->Loader.Run({.PreloadIndex = true, .PreloadData = PreloadTablesData.contains(partSwitch.TableId)})) {
             stage->Fetching = fetch.PageCollection.Get();
 
-            Send(MakeSharedPageCacheId(), PageCache.MakePageRequest(
-                NBlockIO::EPriority::Fast, std::move(fetch.PageCollection), std::move(fetch.Pages)),
+            Send(MakeSharedPageCacheId(), stage->Loader.MakeRequest(NBlockIO::EPriority::Fast, std::move(fetch)),
                 0, ui64(ERequestTypeCookie::PendingInit));
 
             ++partSwitch.PendingLoads;
