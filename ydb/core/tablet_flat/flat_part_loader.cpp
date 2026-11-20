@@ -32,12 +32,12 @@ TLoader::~TLoader()
     LoaderEnv->CancelMetadata();
 }
 
-void TLoader::BeginMetadata(const TMetadataLoadContext& context)
+bool TLoader::BeginMetadata(const TMetadataLoadContext& context)
 {
     const auto prepareRoot = [this] {
         return PrepareMetadataRoot();
     };
-    LoaderEnv->BeginMetadata(Components.PageCollectionComponents, context, prepareRoot);
+    return LoaderEnv->BeginMetadata(Components.PageCollectionComponents, context, prepareRoot);
 }
 
 EMetadataLoadResult TLoader::SaveMetadata(ui32 slot, TSharedData data)
@@ -57,6 +57,12 @@ EMetadataLoadResult TLoader::AcceptMetadata(ui32 slot, const NTabletFlatExecutor
 bool TLoader::PrepareMetadataRoot()
 {
     PrepareRoot();
+    ApplyIndexSelection();
+    return HasOuterCollection();
+}
+
+void TLoader::ApplyIndexSelection()
+{
     const auto slots = GetSlots();
     for (ui32 slot = 0; slot < LoaderEnv->GetCollectionCount() && slot < slots.SlotsCount(); ++slot) {
         if (!LoaderEnv->HasCollection(slot)) {
@@ -66,9 +72,8 @@ bool TLoader::PrepareMetadataRoot()
         for (auto groupId : StrippedV1Shadows) {
             skip |= slots.IndexSlot(groupId) == slot;
         }
-        LoaderEnv->GetCollection(slot)->SetSkipBTreeIndexV1Shadow(skip);
+        LoaderEnv->SetSkipBTreeIndexV1Shadow(slot, skip);
     }
-    return HasOuterCollection();
 }
 
 void TLoader::PrepareRoot()
@@ -285,12 +290,7 @@ void TLoader::StageParseMeta()
     }
 
     // Shared cache skips dead V1 b-tree pages of the page collections with stripped V1 shadows
-    for (ui32 slot : xrange(slots.SlotsCount())) {
-        LoaderEnv->GetCollection(slot)->SetSkipBTreeIndexV1Shadow(false);
-    }
-    for (auto groupId : StrippedV1Shadows) {
-        LoaderEnv->GetCollection(slots.IndexSlot(groupId))->SetSkipBTreeIndexV1Shadow(true);
-    }
+    ApplyIndexSelection();
 
     LoaderEnv->Initialize(slots);
 }
@@ -574,11 +574,11 @@ void TLoader::Save(NActors::IEventBase& event)
     }
 }
 
-void TLoader::TLoaderEnv::BeginMetadata(
+bool TLoader::TLoaderEnv::BeginMetadata(
     TArrayRef<TPageCollectionComponents> components, const TMetadataLoadContext& context, TFunctionRef<bool()>)
 {
     if (MetadataState != EMetadataState::Idle) {
-        return;
+        return false;
     }
     MetadataState = EMetadataState::Loading;
     if (GetCollectionCount() < components.size()) {
@@ -592,6 +592,7 @@ void TLoader::TLoaderEnv::BeginMetadata(
             context.LoadRaw(slot, components[slot].LargeGlobId);
         }
     }
+    return true;
 }
 
 EMetadataLoadResult TLoader::TLoaderEnv::SaveMetadata(
