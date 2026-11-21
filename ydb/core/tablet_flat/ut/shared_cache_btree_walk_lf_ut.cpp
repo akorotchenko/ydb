@@ -1,0 +1,546 @@
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
+#include <ydb/core/tablet_flat/test/libs/rows/layout.h>
+
+#include <library/cpp/testing/unittest/registar.h>
+
+#include <flat_page_btree_index_writer.h>
+#include <shared_cache_btree_walk_lf.h>
+#include <cache.h>
+#include <shared_sausagecache_state_lf.h>
+
+namespace NKikimr::NSharedCache {
+namespace {
+
+    class TPageCollectionStub final : public NPageCollection::IPageCollection {
+    public:
+        explicit TPageCollectionStub(TLogoBlobID id)
+            : Id(std::move(id))
+        {
+        }
+
+        const TLogoBlobID& Label() const noexcept override {
+            return Id;
+        }
+
+        ui32 Total() const noexcept override {
+            return 1;
+        }
+
+        NPageCollection::TInfo Page(ui32) const override {
+            return {};
+        }
+
+        NPageCollection::TBorder Bounds(ui32) const override {
+            return {};
+        }
+
+        NPageCollection::TBorder Bounds(const TPageLocation&) const override {
+            return {};
+        }
+
+        NPageCollection::TGlobId Glob(ui32) const override {
+            return {};
+        }
+
+        bool Verify(ui32, TArrayRef<const char>) const override {
+            return false;
+        }
+
+        bool Verify(const TPageLocation&, TArrayRef<const char>) const override {
+            return false;
+        }
+
+        size_t BackingSize() const noexcept override {
+            return 0;
+        }
+
+        i64 GetMetadataMemoryUsage() const noexcept override {
+            return sizeof(TPageCollectionStub);
+        }
+
+        const TSharedData* GetMetadataBuffer() const noexcept override {
+            return nullptr;
+        }
+
+        TPageLocation GetLocation(ui32) const override {
+            return {};
+        }
+
+    private:
+        TLogoBlobID Id;
+    };
+
+    class TWalkHostMock final : public ICacheBTreeWalkHost {
+    public:
+        TCacheCollectionRef Collection;
+        TPendingInMemoryPages PendingInMemoryPages;
+        THashMap<TPageOffset, TSharedData> CorePages;
+        TVector<TVector<TPageLocation>> StickyBatches;
+        ui32 CancelledRequests = 0;
+        ui32 ScheduledContinuations = 0;
+        ui32 ExpiredChecks = 0;
+        ui32 CollectionLookups = 0;
+        TLogoBlobID FetchWalkCollectionId;
+        bool AllowFetch = false;
+        TVector<ui32> LookupBatches;
+
+        TWalkHostMock() {
+            Collection = NTable::NTest::AdmitCollection(
+                TCache::Get(), MakeIntrusiveConst<TPageCollectionStub>(TLogoBlobID(1, 1, 1)));
+            Collection->EnsureActorState();
+            auto& cache = TCache::Get();
+            UNIT_ASSERT(cache.SetCollectionPagesCacheMode(Collection.CacheItem(), ECacheMode::Regular));
+        }
+
+        void KeepCollection(const TActorId& owner) {
+            Collection->GetActorState()->InMemoryOwners.insert(owner);
+            auto& cache = TCache::Get();
+            UNIT_ASSERT(cache.SetCollectionPagesCacheMode(Collection.CacheItem(), ECacheMode::TryKeepInMemory));
+        }
+
+        TCollection* FindCollection(const TLogoBlobID& id) override {
+            ++CollectionLookups;
+            return id == Collection->Id() ? Collection.Get() : nullptr;
+        }
+
+        TPendingInMemoryPages& PendingPages() override {
+            return PendingInMemoryPages;
+        }
+
+        TCache::TOperation BeginOperation() override {
+            LookupBatches.push_back(0);
+            return TCache::Get().BeginOperation();
+        }
+
+        NActors::TSharedData FindPage(TCacheOperationView<TProdTraits>&, TCollection&, TPageOffset offset) override {
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazards[0].State.load()), 1);
+            ++LookupBatches.back();
+            if (const auto* page = CorePages.FindPtr(offset)) {
+                return *page;
+            }
+            return {};
+        }
+
+        void FetchIndexLevel(TCollection&, TVector<TPageLocation>&&, const TLogoBlobID& walkCollectionId) override {
+            UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazards[0].State.load()));
+            UNIT_ASSERT_C(AllowFetch, "Unexpected index fetch");
+            FetchWalkCollectionId = walkCollectionId;
+        }
+
+        void RequestStickyPages(TCollection&, const TActorId&, const TVector<TPageLocation>& locations) override {
+            StickyBatches.push_back(locations);
+        }
+
+        void CancelQueuedRequestsAndPump(const TLogoBlobID&) override {
+            ++CancelledRequests;
+        }
+
+        void TryDropExpiredCollection(TCollection&) override {
+            ++ExpiredChecks;
+        }
+
+        void ScheduleContinuation() override {
+            ++ScheduledContinuations;
+        }
+
+        void AddLoadedNode(const TPageLocation& location, TSharedData body) {
+            UNIT_ASSERT_VALUES_EQUAL(location.Size, body.size());
+            UNIT_ASSERT(CorePages.emplace(location.Offset, std::move(body)).second);
+        }
+    };
+
+    NTable::NPage::TBtreeIndexNode::TChildV2 MakeChild(const TPageLocation& location) {
+        return { location.Offset, location.Size, location.Crc32, 1, location.Size, 0, 0 };
+    }
+
+    TSharedData MakeNode(const TPageLocation& first, const TPageLocation& second) {
+        NTable::NTest::TLayoutCook layout;
+        layout.Col(0, 0, NScheme::NTypeIds::Uint32).Key({ 0 });
+        NTable::NPage::TBtreeIndexNodeWriter<NTable::NPage::TBtreeIndexNode::TChildV2> writer(
+            new NTable::TPartScheme(layout.RowScheme()->Cols), {});
+        const TCell key = TCell::Make(ui32(100));
+        writer.AddChild(MakeChild(first));
+        writer.AddKey(TArrayRef<const TCell>(&key, 1));
+        writer.AddChild(MakeChild(second));
+        return writer.Finish();
+    }
+
+    TEvAttach::TBtreeSeed MakeSeed(const TWalkHostMock& host, ui32 pageId) {
+        TEvAttach::TBtreeSeed seed;
+        seed.IndexCollectionId = TLogoBlobID(1, 1, 2);
+        seed.DataCollectionId = host.Collection->Id();
+        seed.Root = TPageLocation::FromPageIndex(pageId, 10, NTable::NPage::EPage::BTreeIndexV2, pageId + 1);
+        seed.LevelCount = 1;
+        return seed;
+    }
+
+} // namespace
+
+Y_UNIT_TEST_SUITE_F(TCacheBTreeWalkController, ::NKikimr::NTable::NTest::TTableCacheTest) {
+    Y_UNIT_TEST(MissingIndexBatchSharesOneOperationAndReleasesBeforeFetch) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        host.AllowFetch = true;
+
+        const auto data1 = TPageLocation::FromByteOffset(4000, 10, EPage::DataPage, 1);
+        const auto data2 = TPageLocation::FromByteOffset(5000, 10, EPage::DataPage, 2);
+        const auto leafBody = MakeNode(data1, data2);
+        const auto leaf1 = TPageLocation::FromByteOffset(2000, leafBody.size(), EPage::BTreeIndexV2, 3);
+        const auto leaf2 = TPageLocation::FromByteOffset(3000, leafBody.size(), EPage::BTreeIndexV2, 4);
+        auto rootBody = MakeNode(leaf1, leaf2);
+        auto seed = MakeSeed(host, 0);
+        seed.IndexCollectionId = host.Collection->Id();
+        seed.Root = TPageLocation::FromByteOffset(1000, rootBody.size(), EPage::BTreeIndexV2, 5);
+        seed.LevelCount = 2;
+        seed.QueueDataPages = false;
+        host.AddLoadedNode(seed.Root, std::move(rootBody));
+
+        walks.UpdateSeeds(*host.Collection, owner, { seed });
+        walks.Advance();
+        UNIT_ASSERT_VALUES_EQUAL(host.LookupBatches.size(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(host.LookupBatches[0], 1);
+        UNIT_ASSERT_VALUES_EQUAL(host.LookupBatches[1], 3);
+        UNIT_ASSERT(host.FetchWalkCollectionId == host.Collection->Id());
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazards[0].State.load()));
+    }
+
+    Y_UNIT_TEST(CoreKeepIndexUsesPendingQueueAndParsesReadyPage) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        host.KeepCollection(owner);
+
+        const auto dataPage1 = TPageLocation::FromByteOffset(2000, 10, EPage::DataPage, 1);
+        const auto dataPage2 = TPageLocation::FromByteOffset(3000, 10, EPage::DataPage, 2);
+        auto body = MakeNode(dataPage1, dataPage2);
+        auto seed = MakeSeed(host, 0);
+        seed.IndexCollectionId = host.Collection->Id();
+        seed.Root = TPageLocation::FromByteOffset(1000, body.size(), EPage::BTreeIndexV2, 3);
+
+        walks.UpdateSeeds(*host.Collection, owner, { seed });
+        walks.Advance();
+        UNIT_ASSERT(host.PendingInMemoryPages.at(host.Collection->Id()).contains(seed.Root));
+
+        host.CorePages.emplace(seed.Root.Offset, std::move(body));
+        host.PendingInMemoryPages.at(host.Collection->Id()).erase(seed.Root);
+        walks.IndexPagesChanged(host.Collection->Id());
+        walks.Advance();
+        const auto& pending = host.PendingInMemoryPages.at(host.Collection->Id());
+        UNIT_ASSERT(pending.contains(dataPage1));
+        UNIT_ASSERT(pending.contains(dataPage2));
+    }
+
+    Y_UNIT_TEST(CoreRegularIndexUsesCoreFetchAndParsesReadyPage) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        host.AllowFetch = true;
+
+        const auto dataPage1 = TPageLocation::FromByteOffset(2000, 10, EPage::DataPage, 1);
+        const auto dataPage2 = TPageLocation::FromByteOffset(3000, 10, EPage::DataPage, 2);
+        auto body = MakeNode(dataPage1, dataPage2);
+        auto seed = MakeSeed(host, 0);
+        seed.IndexCollectionId = host.Collection->Id();
+        seed.Root = TPageLocation::FromByteOffset(1000, body.size(), EPage::BTreeIndexV2, 3);
+
+        walks.UpdateSeeds(*host.Collection, owner, { seed });
+        walks.Advance();
+        UNIT_ASSERT_VALUES_EQUAL(host.FetchWalkCollectionId, host.Collection->Id());
+        UNIT_ASSERT(host.PendingInMemoryPages.empty());
+
+        host.CorePages.emplace(seed.Root.Offset, std::move(body));
+        walks.IndexPagesChanged(host.Collection->Id());
+        walks.Advance();
+        walks.FinishReady();
+        UNIT_ASSERT(host.PendingInMemoryPages.empty());
+        UNIT_ASSERT_VALUES_EQUAL(host.ExpiredChecks, 1);
+    }
+
+    Y_UNIT_TEST(MissingInMemoryIndexUsesPendingQueue) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        auto seed = MakeSeed(host, 0);
+        seed.IndexCollectionId = host.Collection->Id();
+        host.KeepCollection(owner);
+
+        walks.UpdateSeeds(*host.Collection, owner, { seed });
+        walks.Advance();
+        walks.Advance();
+        const auto& pending = host.PendingInMemoryPages.at(host.Collection->Id());
+        UNIT_ASSERT_VALUES_EQUAL(pending.size(), 1);
+        UNIT_ASSERT(pending.contains(seed.Root));
+        // Capacity-blocked index reads wait for loader progress without spinning self-wakeups.
+        UNIT_ASSERT_VALUES_EQUAL(host.ScheduledContinuations, 0);
+
+        walks.UpdateSeeds(*host.Collection, owner, {});
+        UNIT_ASSERT(pending.contains(seed.Root));
+        UNIT_ASSERT(walks.IsIdle(host.Collection->Id()));
+    }
+
+    Y_UNIT_TEST(BlockedIndexAssociationPreventsExpiry) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        const auto seed = MakeSeed(host, 0);
+
+        walks.UpdateSeeds(*host.Collection, owner, { seed });
+        walks.DropForIndexCollection(seed.IndexCollectionId);
+        UNIT_ASSERT(!walks.IsIdle(host.Collection->Id()));
+
+        walks.UpdateSeeds(*host.Collection, owner, {});
+        UNIT_ASSERT(walks.IsIdle(host.Collection->Id()));
+        walks.EraseCollection(host.Collection->Id());
+    }
+
+    Y_UNIT_TEST(IdenticalSeedsDoNotRestartWalk) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        const auto current = MakeSeed(host, 0);
+        const auto historic = MakeSeed(host, 1);
+
+        walks.UpdateSeeds(*host.Collection, owner, { current, historic });
+        walks.UpdateSeeds(*host.Collection, owner, { current, historic });
+        UNIT_ASSERT_VALUES_EQUAL(host.CancelledRequests, 0);
+    }
+
+    Y_UNIT_TEST(ReorderedSeedsRestartWalk) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        const auto current = MakeSeed(host, 0);
+        const auto historic = MakeSeed(host, 1);
+
+        walks.UpdateSeeds(*host.Collection, owner, { current, historic });
+        walks.UpdateSeeds(*host.Collection, owner, { historic, current });
+        UNIT_ASSERT_VALUES_EQUAL(host.CancelledRequests, 1);
+    }
+
+    Y_UNIT_TEST(IndexOnlyDropTracksReplacementAndIdenticalUpdates) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        auto current = MakeSeed(host, 0);
+        current.QueueDataPages = false;
+        auto historic = MakeSeed(host, 1);
+        historic.QueueDataPages = false;
+
+        walks.UpdateSeeds(*host.Collection, owner, { current, historic });
+        walks.UpdateSeeds(*host.Collection, owner, { current, historic });
+        walks.DropIndexOnlyWalks(current.IndexCollectionId);
+        UNIT_ASSERT(!walks.HasActiveWalks());
+        UNIT_ASSERT_VALUES_EQUAL(host.CancelledRequests, 1);
+
+        current.QueueDataPages = true;
+        walks.UpdateSeeds(*host.Collection, owner, { current });
+        walks.DropIndexOnlyWalks(current.IndexCollectionId);
+        UNIT_ASSERT(walks.HasActiveWalks());
+        UNIT_ASSERT_VALUES_EQUAL(host.CancelledRequests, 1);
+
+        walks.UpdateSeeds(*host.Collection, owner, {});
+        UNIT_ASSERT(walks.IsIdle(host.Collection->Id()));
+    }
+
+    Y_UNIT_TEST(IndexOnlyDropTracksEachOwnerAndRemoval) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId firstOwner(1, TStringBuf("first"));
+        const TActorId secondOwner(1, TStringBuf("second"));
+        auto indexOnly = MakeSeed(host, 0);
+        indexOnly.QueueDataPages = false;
+        auto data = indexOnly;
+        data.QueueDataPages = true;
+
+        walks.UpdateSeeds(*host.Collection, firstOwner, { indexOnly });
+        walks.UpdateSeeds(*host.Collection, secondOwner, { indexOnly });
+        walks.UpdateSeeds(*host.Collection, firstOwner, { data });
+        const ui32 cancelled = host.CancelledRequests;
+        walks.DropIndexOnlyWalks(indexOnly.IndexCollectionId);
+        UNIT_ASSERT(!walks.HasActiveWalks());
+        UNIT_ASSERT_VALUES_EQUAL(host.CancelledRequests, cancelled + 1);
+
+        // Re-enable the run, then remove the remaining index-only owner's contribution.
+        walks.UpdateSeeds(*host.Collection, firstOwner, { data });
+        walks.UpdateSeeds(*host.Collection, secondOwner, {});
+        const ui32 afterRemoval = host.CancelledRequests;
+        walks.DropIndexOnlyWalks(indexOnly.IndexCollectionId);
+        UNIT_ASSERT(walks.HasActiveWalks());
+        UNIT_ASSERT_VALUES_EQUAL(host.CancelledRequests, afterRemoval);
+    }
+
+    Y_UNIT_TEST(IndexOnlyDropTracksChangedIndexAssociation) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        auto seed = MakeSeed(host, 0);
+        seed.QueueDataPages = false;
+        const TLogoBlobID oldIndex = seed.IndexCollectionId;
+        walks.UpdateSeeds(*host.Collection, owner, { seed });
+
+        seed.IndexCollectionId = host.Collection->Id();
+        walks.UpdateSeeds(*host.Collection, owner, { seed });
+        const ui32 cancelled = host.CancelledRequests;
+        walks.DropIndexOnlyWalks(oldIndex);
+        UNIT_ASSERT(walks.HasActiveWalks());
+        UNIT_ASSERT_VALUES_EQUAL(host.CancelledRequests, cancelled);
+        walks.DropIndexOnlyWalks(seed.IndexCollectionId);
+        UNIT_ASSERT(!walks.HasActiveWalks());
+        UNIT_ASSERT_VALUES_EQUAL(host.CancelledRequests, cancelled + 1);
+    }
+
+    Y_UNIT_TEST(MultiLevelWalkSplitsDataPageBatches) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        constexpr ui64 dataPageSize = 3 * 1024 * 1024;
+        const auto dataPage1 = TPageLocation::FromByteOffset(4000, dataPageSize, EPage::DataPage, 1);
+        const auto dataPage2 = TPageLocation::FromByteOffset(5000, dataPageSize, EPage::DataPage, 2);
+        const auto dataPage3 = TPageLocation::FromByteOffset(6000, dataPageSize, EPage::DataPage, 3);
+        const auto dataPage4 = TPageLocation::FromByteOffset(7000, dataPageSize, EPage::DataPage, 4);
+
+        auto firstBody = MakeNode(dataPage1, dataPage2);
+        auto secondBody = MakeNode(dataPage3, dataPage4);
+        const auto first = TPageLocation::FromByteOffset(2000, firstBody.size(), EPage::BTreeIndexV2, 5);
+        const auto second = TPageLocation::FromByteOffset(3000, secondBody.size(), EPage::BTreeIndexV2, 6);
+        auto rootBody = MakeNode(first, second);
+        const auto root = TPageLocation::FromByteOffset(1000, rootBody.size(), EPage::BTreeIndexV2, 7);
+        host.AddLoadedNode(root, std::move(rootBody));
+        host.AddLoadedNode(first, std::move(firstBody));
+        host.AddLoadedNode(second, std::move(secondBody));
+
+        auto seed = MakeSeed(host, 0);
+        seed.IndexCollectionId = host.Collection->Id();
+        seed.Root = root;
+        seed.LevelCount = 2;
+        seed.QueueDataPages = true;
+        seed.Sticky = true;
+        host.KeepCollection(owner);
+        const auto blocker = TPageLocation::FromByteOffset(8000, 10, EPage::DataPage, 8);
+        auto& pending = host.PendingInMemoryPages[host.Collection->Id()];
+        pending.emplace(blocker);
+        walks.UpdateSeeds(*host.Collection, owner, { seed });
+        walks.Advance();
+        walks.Advance();
+        walks.Advance();
+        walks.FinishReady();
+
+        UNIT_ASSERT_VALUES_EQUAL(host.StickyBatches.size(), 3);
+        UNIT_ASSERT(host.StickyBatches[0] == TVector<TPageLocation>({ root, first, second }));
+        UNIT_ASSERT(host.StickyBatches[1] == TVector<TPageLocation>({ dataPage1, dataPage2 }));
+        UNIT_ASSERT(host.StickyBatches[2] == TVector<TPageLocation>({ dataPage3, dataPage4 }));
+        UNIT_ASSERT_VALUES_EQUAL(pending.size(), 5);
+        UNIT_ASSERT(pending.contains(dataPage1) && pending.contains(dataPage2));
+        UNIT_ASSERT(pending.contains(dataPage3) && pending.contains(dataPage4));
+        UNIT_ASSERT_VALUES_EQUAL(host.ScheduledContinuations, 2);
+        UNIT_ASSERT_VALUES_EQUAL(host.ExpiredChecks, 1);
+
+        // Queued pages remain collection preload work after the walk is withdrawn.
+        walks.UpdateSeeds(*host.Collection, owner, {});
+        UNIT_ASSERT_VALUES_EQUAL(pending.size(), 5);
+        UNIT_ASSERT(pending.contains(blocker));
+        UNIT_ASSERT_VALUES_EQUAL(host.ExpiredChecks, 1);
+    }
+
+    Y_UNIT_TEST(QueuedDataPagesIgnoreExistingInMemoryPages) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        const auto blocker = TPageLocation::FromByteOffset(2000, 10, EPage::DataPage, 1);
+        auto seed = MakeSeed(host, 0);
+        seed.IndexCollectionId = host.Collection->Id();
+        seed.Root = TPageLocation::FromByteOffset(3000, 10, EPage::DataPage, 2);
+        seed.LevelCount = 0;
+        host.KeepCollection(owner);
+        auto& pending = host.PendingInMemoryPages[host.Collection->Id()];
+        pending.emplace(blocker);
+
+        walks.UpdateSeeds(*host.Collection, owner, { seed });
+        walks.Advance();
+        UNIT_ASSERT_VALUES_EQUAL(pending.size(), 2);
+        UNIT_ASSERT(pending.contains(seed.Root));
+        UNIT_ASSERT_VALUES_EQUAL(host.ScheduledContinuations, 1);
+
+        walks.Advance();
+        walks.FinishReady();
+        UNIT_ASSERT_VALUES_EQUAL(host.ExpiredChecks, 1);
+        pending.erase(seed.Root);
+        walks.FinishReady();
+        UNIT_ASSERT_VALUES_EQUAL(host.ExpiredChecks, 1);
+    }
+
+    Y_UNIT_TEST(CompletionOnlyChecksChangedRuns) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        auto seed = MakeSeed(host, 0);
+        seed.IndexCollectionId = host.Collection->Id();
+        seed.Root = TPageLocation::FromByteOffset(3000, 10, EPage::DataPage, 2);
+        seed.LevelCount = 0;
+        seed.QueueDataPages = true;
+        host.KeepCollection(owner);
+
+        walks.UpdateSeeds(*host.Collection, owner, { seed });
+        walks.Advance();
+        walks.Advance();
+        walks.FinishReady();
+        UNIT_ASSERT(!walks.HasActiveWalks());
+        UNIT_ASSERT_VALUES_EQUAL(host.ExpiredChecks, 1);
+        UNIT_ASSERT(host.PendingInMemoryPages.at(host.Collection->Id()).contains(seed.Root));
+
+        // The final completion consumes its bookkeeping; later calls have no host side effects.
+        host.CollectionLookups = 0;
+        const ui32 continuations = host.ScheduledContinuations;
+        walks.Advance();
+        walks.FinishReady();
+        UNIT_ASSERT_VALUES_EQUAL(host.CollectionLookups, 0);
+        UNIT_ASSERT_VALUES_EQUAL(host.ExpiredChecks, 1);
+        UNIT_ASSERT_VALUES_EQUAL(host.ScheduledContinuations, continuations);
+    }
+
+    Y_UNIT_TEST(CancelledRunWaitsForDispatchedFetch) {
+        TWalkHostMock host;
+        host.AllowFetch = true;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        auto seed = MakeSeed(host, 0);
+        seed.IndexCollectionId = host.Collection->Id();
+
+        walks.UpdateSeeds(*host.Collection, owner, { seed });
+        walks.Advance();
+        UNIT_ASSERT_VALUES_EQUAL(host.FetchWalkCollectionId, host.Collection->Id());
+        walks.FetchStarted(host.FetchWalkCollectionId);
+
+        walks.UpdateSeeds(*host.Collection, owner, {});
+        UNIT_ASSERT(walks.HasActiveWalks());
+        UNIT_ASSERT_VALUES_EQUAL(host.ExpiredChecks, 0);
+
+        walks.FinishFetch(host.FetchWalkCollectionId);
+        UNIT_ASSERT(!walks.HasActiveWalks());
+        UNIT_ASSERT_VALUES_EQUAL(host.ExpiredChecks, 1);
+    }
+
+    Y_UNIT_TEST(CancelledWalkKeepsQueuedDataPages) {
+        TWalkHostMock host;
+        TCacheBTreeWalkController walks(host);
+        const TActorId owner(1, TStringBuf("owner"));
+        auto seed = MakeSeed(host, 0);
+        seed.IndexCollectionId = host.Collection->Id();
+        seed.Root = TPageLocation::FromByteOffset(3000, 10, EPage::DataPage, 2);
+        seed.LevelCount = 0;
+        host.KeepCollection(owner);
+        auto& pending = host.PendingInMemoryPages[host.Collection->Id()];
+        pending.emplace(TPageLocation::FromByteOffset(2000, 10, EPage::DataPage, 1));
+
+        walks.UpdateSeeds(*host.Collection, owner, { seed });
+        walks.Advance();
+        walks.UpdateSeeds(*host.Collection, owner, {});
+        UNIT_ASSERT(!walks.HasActiveWalks());
+        UNIT_ASSERT_VALUES_EQUAL(pending.size(), 2);
+        UNIT_ASSERT(pending.contains(seed.Root));
+        UNIT_ASSERT_VALUES_EQUAL(host.ExpiredChecks, 1);
+    }
+}
+
+} // namespace NKikimr::NSharedCache

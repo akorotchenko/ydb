@@ -31,7 +31,7 @@ namespace NKikimr {
     ui64 GetTabletTxCompleted(TTestActorRuntime& runtime, ui64 tabletId, const TString& txName, ui32 nodeIndex = 0);
     void SetupTabletServices(TTestActorRuntime& runtime, TAppPrepare* app = nullptr, bool mockDisk = false,
                              NFake::TStorage storage = {}, const NSharedCache::TSharedCacheConfig* sharedCacheConfig = nullptr, bool forceFollowers = false,
-                             TVector<TIntrusivePtr<NFake::TProxyDS>> dsProxies = {});
+                             TVector<TIntrusivePtr<NFake::TProxyDS>> dsProxies = {}, ui64 sharedCacheExpectedPageSize = 0);
 
     const TString DEFAULT_STORAGE_POOL = "Storage Pool with id: 1";
 

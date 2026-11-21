@@ -5,16 +5,19 @@
 #include "flat_scan_eggs.h"
 #include "flat_scan_spent.h"
 #include "flat_bio_events.h"
-#include "flat_fwd_iface.h"
+#include "flat_bio_stats.h"
 #include "flat_fwd_conf.h"
+#include "flat_fwd_iface.h"
 #include "flat_fwd_sieve.h"
+#include "flat_load_blob_queue.h"
 #include "util_fmt_abort.h"
 #include "util_fmt_logger.h"
 #include "util_fmt_desc.h"
 #include "shared_sausagecache.h"
-#include "flat_part_store.h"
 #include "flat_part_loader.h"
-#include "flat_load_blob_queue.h"
+#include "flat_part_store.h"
+#include "shared_cache_collection_load.h"
+#include <ydb/library/actors/core/actorsystem.h>
 
 #include <ydb/core/base/appdata.h>
 #include <ydb/core/base/counters.h>
@@ -23,6 +26,8 @@
 #include <ydb/library/actors/core/hfunc.h>
 #include <ydb/library/actors/prof/tag.h>
 #include <util/generic/cast.h>
+
+#include <optional>
 
 namespace NKikimr {
 namespace NTabletFlatExecutor {
@@ -35,6 +40,8 @@ namespace NOps {
             , private NTable::IDriver
             , private ILoadBlob
     {
+        friend class TColdPartLoadTestAccess;
+
     public:
         using TSubset = NTable::TSubset;
         using TPartView = NTable::TPartView;
@@ -87,10 +94,10 @@ namespace NOps {
     private:
         struct TEvPrivate {
             enum EEv {
-                EvLoadBlob = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
-                EvBlobLoaded,
-                EvPartLoaded,
+                EvPartLoaded = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
                 EvPartFailed,
+                EvLoadBlob,
+                EvBlobLoaded,
             };
 
             struct TEvLoadBlob : public TEventLocal<TEvLoadBlob, EvLoadBlob> {
@@ -136,95 +143,133 @@ namespace NOps {
 
         public:
             TColdPartLoader(TActorId owner, TIntrusiveConstPtr<TColdPartStore> part, EPriority readPriority,
-                THolder<NTable::IPartLoaderEnv> environment, TIntrusivePtr<IPageMetadataWorkingSet> metadataWorkingSet)
+                THolder<NTable::IPartLoaderEnv> environment, TIntrusivePtr<IPageMetadataWorkingSet> workingSet)
                 : Owner(owner)
                 , Part(std::move(part))
                 , ReadPriority(readPriority)
                 , PageCacheProtocol(environment->Protocol())
-                , MetadataWorkingSet(std::move(metadataWorkingSet))
-                , LoaderEnv(std::move(environment))
-            { }
+                , WorkingSet(std::move(workingSet))
+                , Loader(std::move(environment), MakeComponents(*Part, WorkingSet.Get()))
+            {}
 
             void Bootstrap() {
-                TVector<NTable::TPageCollectionComponents> components(Part->LargeGlobIds.size());
-                for (ui32 slot = 0; slot < Part->LargeGlobIds.size(); ++slot) {
-                    components[slot].LargeGlobId = Part->LargeGlobIds[slot];
-                }
-                NTable::TPartComponents parts{
-                    .PageCollectionComponents = std::move(components),
-                    .Legacy = Part->Legacy,
-                    .Opaque = Part->Opaque,
-                    .Epoch = Part->Epoch,
-                };
-                Loader.emplace(std::move(LoaderEnv), std::move(parts));
-                Become(&TThis::StateLoadPageCollections);
-                Loader->BeginMetadata(MetadataContext());
-                if (Loader->MetadataReady()) {
-                    StartLoader();
+                Become(&TThis::StateWork);
+                try {
+                    Loader.BeginMetadata(MetadataContext());
+                    if (Loader.MetadataReady()) {
+                        RunLoader();
+                    }
+                } catch (const yexception&) {
+                    Fail();
                 }
             }
 
         private:
-            STFUNC(StateLoadPageCollections) {
+            static NTable::TPartComponents MakeComponents(
+                const TColdPartStore& part, IPageMetadataWorkingSet* workingSet) {
+                TVector<NTable::TPageCollectionComponents> components(part.LargeGlobIds.size());
+                for (ui32 slot = 0; slot < components.size(); ++slot) {
+                    components[slot].LargeGlobId = part.LargeGlobIds[slot];
+                }
+                // The driver constructs same-mailbox children before their first metadata requests
+                if (workingSet) {
+                    workingSet->AddCollections(components);
+                }
+                return {
+                    .PageCollectionComponents = std::move(components),
+                    .Legacy = part.Legacy,
+                    .Opaque = part.Opaque,
+                    .Epoch = part.Epoch,
+                };
+            }
+
+            STFUNC(StateWork) {
                 STFUNC_BODY(
                     {
                         sFunc(TEvents::TEvPoison, PassAway);
                         hFunc(TEvPrivate::TEvBlobLoaded, Handle);
+                        hFunc(NBlockIO::TEvStat, Handle);
                     },
-                    { HandleMetadata(ev); });
+                    { HandleCacheEvent(ev); });
             }
 
-            void Handle(TEvPrivate::TEvBlobLoaded::TPtr& ev) {
-                auto* msg = ev->Get();
-                const ui64 slot = ev->Cookie;
-                Y_ENSURE(slot < PageCollectionLoaders.size());
-                auto& loader = PageCollectionLoaders[slot];
-                Y_ENSURE(!loader, "Duplicate metadata blob result");
-                if (loader.Apply(msg->BlobId, std::move(msg->Body))) {
-                    const auto result = Loader->SaveMetadata(slot, loader.ExtractSharedData());
-                    if (result == NTable::EMetadataLoadResult::Error) {
-                        return Fail();
+            void HandleCacheEvent(TAutoPtr<NActors::IEventHandle>& ev) {
+                const ui32 etype = ev->GetTypeRewrite();
+                if (ev->HasEvent()) {
+                    const auto kind = PageCacheProtocol.EventKind(etype);
+                    if (kind == EPageCacheEvent::Updated) {
+                        return;
                     }
-                    if (result == NTable::EMetadataLoadResult::Ready) {
-                        StartLoader();
+                    if (kind == EPageCacheEvent::Result) {
+                        return HandlePageResult(*ev->GetBase());
+                    }
+                    TPageCacheMetadataResult metadata;
+                    if (PageCacheProtocol.ReadMetadataResult(*ev, metadata)) {
+                        return HandleMetadata(ev->Cookie, metadata, *ev->GetBase());
                     }
                 }
+                STFUNC_STRICT_UNHANDLED_MSG_HANDLER;
             }
 
-            void HandleMetadata(TAutoPtr<NActors::IEventHandle>& ev) {
-                TPageCacheMetadataResult metadata;
-                if (!PageCacheProtocol.ReadMetadataResult(*ev, metadata)) {
-                    const ui32 etype = ev->GetTypeRewrite();
-                    STFUNC_STRICT_UNHANDLED_MSG_HANDLER;
+            void HandleMetadata(ui64 slot, const TPageCacheMetadataResult& metadata, NActors::IEventBase& event) {
+                if (slot >= Part->LargeGlobIds.size() || Loader.MetadataReady()) {
                     return;
                 }
                 try {
-                    const auto result = Loader->AcceptMetadata(ev->Cookie, metadata, *ev->GetBase(), MetadataContext());
+                    const auto result = Loader.AcceptMetadata(slot, metadata, event, MetadataContext());
+                    if (result == NTable::EMetadataLoadResult::Error) {
+                        LOG_ERROR_S(*TlsActivationContext, NKikimrServices::TABLET_OPS_HOST,
+                            "Collection metadata load failed for " << Part->LargeGlobIds[slot].Lead << ": "
+                                                                   << metadata.Error);
+                        return Fail();
+                    }
+                    if (result == NTable::EMetadataLoadResult::Ready) {
+                        RunLoader();
+                    }
+                } catch (const yexception&) {
+                    Fail();
+                }
+            }
+
+            void Handle(TEvPrivate::TEvBlobLoaded::TPtr& ev) {
+                const ui64 slot = ev->Cookie;
+                if (ev->Sender != Owner || Loader.MetadataReady() || slot >= RawMetadata.size() || !RawMetadata[slot]) {
+                    return;
+                }
+                try {
+                    auto& restore = RawMetadata[slot];
+                    auto* msg = ev->Get();
+                    if (!restore->Apply(msg->BlobId, std::move(msg->Body))) {
+                        return;
+                    }
+                    auto data = restore->ExtractSharedData();
+                    restore.reset();
+                    const auto result = Loader.SaveMetadata(slot, std::move(data));
                     if (result == NTable::EMetadataLoadResult::Error) {
                         return Fail();
                     }
                     if (result == NTable::EMetadataLoadResult::Ready) {
-                        StartLoader();
+                        RunLoader();
                     }
                 } catch (const yexception&) {
-                    return Fail();
+                    Fail();
                 }
             }
 
             NTable::TMetadataLoadContext MetadataContext() {
-                return { *this, TActivationContext::ActorSystem(), SelfId(), 0, ReadPriority,
-                    MetadataWorkingSet.Get() };
+                return { *this, TActivationContext::ActorSystem(), SelfId(), 0, ReadPriority, WorkingSet.Get() };
             }
 
             void LoadRawMetadata(ui32 slot, const NPageCollection::TLargeGlobId& descriptor) {
-                if (PageCollectionLoaders.empty()) {
-                    PageCollectionLoaders.resize(Part->LargeGlobIds.size());
+                Y_ENSURE(descriptor && descriptor.Lead.BlobSize() &&
+                         descriptor.Group != NPageCollection::TLargeGlobId::InvalidGroup);
+                if (RawMetadata.empty()) {
+                    RawMetadata.resize(Part->LargeGlobIds.size());
                 }
-                Y_ENSURE(slot < PageCollectionLoaders.size());
-                auto& loader = PageCollectionLoaders[slot];
-                loader = NPageCollection::TLargeGlobIdRestoreState(descriptor);
-                for (const auto& blobId : loader.GetBlobs()) {
-                    Send(Owner, new TEvPrivate::TEvLoadBlob(blobId, descriptor.Group), 0, slot);
+                Y_ENSURE(slot < RawMetadata.size() && !RawMetadata[slot]);
+                const auto& restore = RawMetadata[slot].emplace(descriptor);
+                for (const auto& blob : restore.GetBlobs()) {
+                    Send(Owner, new TEvPrivate::TEvLoadBlob(blob, descriptor.Group), 0, slot);
                 }
             }
 
@@ -237,63 +282,33 @@ namespace NOps {
                 Send(MakeSharedPageCacheId(), std::move(event));
             }
 
-            void Fail() {
-                Send(Owner, new TEvPrivate::TEvPartFailed(Part->Label));
+            void RunLoader() {
+                Y_DEBUG_ABORT_UNLESS(Loader.MetadataReady() && !PageReadPending);
+                if (auto fetch = Loader.Run({ .PreloadIndex = false, .PreloadData = false })) {
+                    PageReadPending = true;
+                    Send(MakeSharedPageCacheId(), Loader.MakeRequest(ReadPriority, std::move(fetch), ++PageCookie));
+                    return;
+                }
+
+                Send(Owner, new TEvPrivate::TEvPartLoaded(Loader.Result()));
                 PassAway();
             }
 
-        private:
-            void StartLoader() {
-                Y_ENSURE(Loader && Loader->MetadataReady());
-                PageCollectionLoaders.clear();
-                Become(&TThis::StateLoadPart);
-                RunLoader();
-            }
-
-            void RunLoader() {
-                if (auto fetch = Loader->Run({.PreloadIndex = false, .PreloadData = false})) {
-                    Send(MakeSharedPageCacheId(), Loader->MakeRequest(ReadPriority, std::move(fetch)));
-                    ++ReadsLeft;
-                }
-
-                if (!ReadsLeft) {
-                    TPartView partView = Loader->Result();
-                    Send(Owner, new TEvPrivate::TEvPartLoaded(std::move(partView)));
-                    return PassAway();
-                }
-            }
-
-            STFUNC(StateLoadPart) {
-                STFUNC_BODY(
-                    {
-                        sFunc(TEvents::TEvPoison, PassAway);
-                        hFunc(NBlockIO::TEvStat, Handle);
-                    },
-                    { HandlePageCacheResult(ev); });
-            }
-
-            void HandlePageCacheResult(TAutoPtr<NActors::IEventHandle>& ev) {
-                const ui32 etype = ev->GetTypeRewrite();
-                if (PageCacheProtocol.EventKind(etype) != EPageCacheEvent::Result) {
-                    STFUNC_STRICT_UNHANDLED_MSG_HANDLER;
+            void HandlePageResult(NActors::IEventBase& event) {
+                const auto msg = PageCacheProtocol.ReadResult(event);
+                if (!PageReadPending || msg.Cookie != PageCookie) {
                     return;
                 }
-                auto& event = *ev->GetBase();
-                const auto msg = PageCacheProtocol.ReadResult(event);
                 if (msg.Status != NKikimrProto::OK) {
-                    Send(Owner, new TEvPrivate::TEvPartFailed(Part->Label));
-                    return PassAway();
+                    return Fail();
                 }
 
-                Y_ENSURE(ReadsLeft > 0);
-                --ReadsLeft;
-
-                Y_ENSURE(Loader);
-                Y_ENSURE(msg.Cookie == 0);
-                Loader->Save(event);
-
-                if (ReadsLeft == 0) {
+                PageReadPending = false;
+                try {
+                    Loader.Save(event);
                     RunLoader();
+                } catch (const yexception&) {
+                    Fail();
                 }
             }
 
@@ -302,12 +317,13 @@ namespace NOps {
                 TActivationContext::Send(ev.Release());
             }
 
+            void Fail() {
+                Send(Owner, new TEvPrivate::TEvPartFailed(Part->Label));
+                PassAway();
+            }
+
             void PassAway() override {
-                if (Loader) {
-                    Loader->CancelMetadata();
-                } else if (LoaderEnv) {
-                    LoaderEnv->CancelMetadata();
-                }
+                Loader.CancelMetadata();
                 Send(MakeSharedPageCacheId(), PageCacheProtocol.MakeUnregisterRequest());
                 TActorBootstrapped::PassAway();
             }
@@ -317,11 +333,11 @@ namespace NOps {
             TIntrusiveConstPtr<TColdPartStore> Part;
             EPriority ReadPriority;
             const IPageCacheProtocol& PageCacheProtocol;
-            TIntrusivePtr<IPageMetadataWorkingSet> MetadataWorkingSet;
-            THolder<NTable::IPartLoaderEnv> LoaderEnv;
-            TVector<NPageCollection::TLargeGlobIdRestoreState> PageCollectionLoaders;
-            std::optional<NTable::TLoader> Loader;
-            size_t ReadsLeft = 0;
+            TIntrusivePtr<IPageMetadataWorkingSet> WorkingSet;
+            NTable::TLoader Loader;
+            TVector<std::optional<NPageCollection::TLargeGlobIdRestoreState>> RawMetadata;
+            ui64 PageCookie = 0;
+            bool PageReadPending = false;
         };
 
     private:
@@ -347,16 +363,14 @@ namespace NOps {
             conf.Tablet = Args.Tablet;
 
             Cache = NTable::NFwd::MakeEnv(conf, Subset);
-
             BlobQueue.Config.TabletID = Args.Tablet;
-
             switch (Args.ReadPrio) {
                 case NBlockIO::EPriority::None:
                 case NBlockIO::EPriority::Fast:
                     BlobQueue.Config.ReadPrio = NKikimrBlobStorage::FastRead;
                     break;
                 case NBlockIO::EPriority::Bulk:
-                case NBlockIO::EPriority::Bkgr: /* switch to LowRead in the future */
+                case NBlockIO::EPriority::Bkgr:
                     BlobQueue.Config.ReadPrio = NKikimrBlobStorage::AsyncRead;
                     break;
                 case NBlockIO::EPriority::Low:
@@ -616,17 +630,22 @@ namespace NOps {
             }
         }
 
-        void Handle(TEvPrivate::TEvLoadBlob::TPtr& ev)
+        void Handle(NBlockIO::TEvStat::TPtr& ev)
         {
+            ev->Rewrite(ev->GetTypeRewrite(), Owner);
+            TActivationContext::Send(ev.Release());
+        }
+
+        void Handle(TEvPrivate::TEvLoadBlob::TPtr& ev) {
             Y_ENSURE(ev->Sender);
-            auto* msg = ev->Get();
-
-            auto& req = BlobQueueRequests.emplace_back();
-            req.Sender = ev->Sender;
-            req.Cookie = ev->Cookie;
-            ui64 reqId = BlobQueueRequestsOffset + BlobQueueRequests.size() - 1;
-
-            BlobQueue.Enqueue(msg->BlobId, msg->Group, this, reqId);
+            if (!BlobQueue.Config.NoDataCounter) {
+                BlobQueue.Config.NoDataCounter =
+                    GetServiceCounters(AppData()->Counters, "tablets")->GetCounter("alerts_scan_nodata", true);
+            }
+            const auto* msg = ev->Get();
+            BlobQueueRequests.push_back({ ev->Sender, ev->Cookie });
+            const auto request = BlobQueueRequestsOffset + BlobQueueRequests.size() - 1;
+            BlobQueue.Enqueue(msg->BlobId, msg->Group, this, request);
             BlobQueue.SendRequests(SelfId());
         }
 
@@ -635,29 +654,22 @@ namespace NOps {
             if (!BlobQueue.ProcessResult(ev->Get())) {
                 return Terminate(EStatus::StorageError);
             }
-
             BlobQueue.SendRequests(SelfId());
         }
 
         void OnBlobLoaded(const TLogoBlobID& id, TString body, uintptr_t cookie) override
         {
             Y_ENSURE(cookie >= BlobQueueRequestsOffset);
-            size_t idx = cookie - BlobQueueRequestsOffset;
-            Y_ENSURE(idx < BlobQueueRequests.size());
-            auto& req = BlobQueueRequests[idx];
-            Y_ENSURE(req.Sender);
-            Send(req.Sender, new TEvPrivate::TEvBlobLoaded(id, std::move(body)), 0, req.Cookie);
-            req.Sender = {};
+            const auto index = cookie - BlobQueueRequestsOffset;
+            Y_ENSURE(index < BlobQueueRequests.size());
+            auto& request = BlobQueueRequests[index];
+            Y_ENSURE(request.Sender);
+            Send(request.Sender, new TEvPrivate::TEvBlobLoaded(id, std::move(body)), 0, request.Slot);
+            request.Sender = {};
             while (!BlobQueueRequests.empty() && !BlobQueueRequests.front().Sender) {
                 BlobQueueRequests.pop_front();
                 ++BlobQueueRequestsOffset;
             }
-        }
-
-        void Handle(NBlockIO::TEvStat::TPtr& ev)
-        {
-            ev->Rewrite(ev->GetTypeRewrite(), Owner);
-            TActivationContext::Send(ev.Release());
         }
 
         void Handle(TEvPrivate::TEvPartLoaded::TPtr& ev)
@@ -665,7 +677,11 @@ namespace NOps {
             auto* msg = ev->Get();
 
             const auto label = msg->Part->Label;
-            ColdPartLoaders.erase(label);
+            const auto it = ColdPartLoaders.find(label);
+            if (it == ColdPartLoaders.end() || it->second != ev->Sender) {
+                return;
+            }
+            ColdPartLoaders.erase(it);
 
             auto& partView = ColdPartLoaded[label];
             partView = std::move(msg->Part);
@@ -686,7 +702,11 @@ namespace NOps {
             auto* msg = ev->Get();
 
             const auto label = msg->Label;
-            ColdPartLoaders.erase(label);
+            const auto it = ColdPartLoaders.find(label);
+            if (it == ColdPartLoaders.end() || it->second != ev->Sender) {
+                return;
+            }
+            ColdPartLoaders.erase(it);
 
             Terminate(EStatus::StorageError);
         }
@@ -694,16 +714,17 @@ namespace NOps {
         void HandlePageCacheEvent(TAutoPtr<NActors::IEventHandle>& ev)
         {
             const ui32 etype = ev->GetTypeRewrite();
-            const auto kind = Cache->Protocol().EventKind(etype);
+            const auto& protocol = Cache->Protocol();
+            const auto kind = protocol.EventKind(etype);
             if (kind == EPageCacheEvent::Updated) {
                 return;
             }
-            if (kind != EPageCacheEvent::Result) {
+            if (kind != EPageCacheEvent::Result || !ev->HasEvent()) {
                 STFUNC_STRICT_UNHANDLED_MSG_HANDLER;
                 return;
             }
             auto& event = *ev->GetBase();
-            const auto msg = Cache->Protocol().ReadResult(event);
+            const auto msg = protocol.ReadResult(event);
 
             auto lvl = msg.Status ? ELnLev::Error : ELnLev::Debug;
 
@@ -738,13 +759,14 @@ namespace NOps {
 
         void Terminate(EStatus status, const std::exception* exc = nullptr)
         {
-            auto trace = Args.Trace ? Cache->GrabTraces() : nullptr;
+            auto trace = Args.Trace && Cache ? Cache->GrabTraces() : nullptr;
 
             if (auto logl = Logger->Log(ELnLev::Info)) {
-                logl
-                    << NFmt::Do(*this) << " end=" << status
-                    << ", " << Seen << "r seen, " << NFmt::Do(Cache->Stats())
-                    << ", bio " << NFmt::If(Spent.Get());
+                logl << NFmt::Do(*this) << " end=" << status << ", " << Seen << "r seen";
+                if (Cache) {
+                    logl << ", " << NFmt::Do(Cache->Stats());
+                }
+                logl << ", bio " << NFmt::If(Spent.Get());
 
                 if (trace)
                     logl
@@ -777,7 +799,9 @@ namespace NOps {
                 Send(pr.second, new TEvents::TEvPoison);
             }
 
-            Send(MakeSharedPageCacheId(), Cache->Protocol().MakeUnregisterRequest());
+            if (Cache) {
+                Send(MakeSharedPageCacheId(), Cache->Protocol().MakeUnregisterRequest());
+            }
             PassAway();
         }
 
@@ -820,12 +844,6 @@ namespace NOps {
         }
 
     private:
-        struct TBlobQueueRequest {
-            TActorId Sender;
-            ui64 Cookie;
-        };
-
-    private:
         const ui64 Serial = 0;
         const NOps::TConf Args;
         TAutoPtr<NUtil::ILogger> Logger;
@@ -840,9 +858,14 @@ namespace NOps {
         THashMap<TLogoBlobID, TActorId> ColdPartLoaders;
         THashMap<TLogoBlobID, TPartView> ColdPartLoaded;
 
+        struct TBlobQueueRequest {
+            TActorId Sender;
+            ui64 Slot;
+        };
+
         TLoadBlobQueue BlobQueue;
         TDeque<TBlobQueueRequest> BlobQueueRequests;
-        ui64 BlobQueueRequestsOffset = 0;
+        uintptr_t BlobQueueRequestsOffset = 0;
 
         bool ContinueInFly = false;
 

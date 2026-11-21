@@ -15,6 +15,7 @@
 #include <library/cpp/testing/unittest/tests_data.h>
 #include <library/cpp/testing/unittest/registar.h>
 #include <google/protobuf/text_format.h>
+#include <util/generic/size_literals.h>
 #include <util/generic/xrange.h>
 #include <util/random/mersenne.h>
 #include <util/system/sanitizers.h>
@@ -2984,6 +2985,9 @@ Y_UNIT_TEST_SUITE(TFlatTest) {
         UNIT_ASSERT_C(found, "DbDataBytes counter not found");
     }
 
+    // Fit the 700 x 100 KiB read in the cache so these tests reach the reply-size limit
+    constexpr ui64 LargeReplyCacheLimit = 128_MB;
+
     void LargeDatashardReplyRO(TServer& cleverServer, TFlatMsgBusClient& client) {
         const ui32 TABLE_ROWS = 700;
         const ui32 BLOB_SIZE = 100 * 1024; // 100 Kb
@@ -3015,7 +3019,9 @@ Y_UNIT_TEST_SUITE(TFlatTest) {
     Y_UNIT_TEST(LargeDatashardReply) {
         TPortManager pm;
         ui16 port = pm.GetPort(2134);
-        TServer cleverServer = TServer(TServerSettings(port));
+        TServerSettings settings(port);
+        settings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(LargeReplyCacheLimit);
+        TServer cleverServer = TServer(settings);
         TFlatMsgBusClient annoyingClient(port);
 
         annoyingClient.InitRoot();
@@ -3034,7 +3040,9 @@ Y_UNIT_TEST_SUITE(TFlatTest) {
     Y_UNIT_TEST(LargeDatashardReplyDistributed) {
         TPortManager pm;
         ui16 port = pm.GetPort(2134);
-        TServer cleverServer = TServer(TServerSettings(port));
+        TServerSettings settings(port);
+        settings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(LargeReplyCacheLimit);
+        TServer cleverServer = TServer(settings);
         TFlatMsgBusClient annoyingClient(port);
 
         annoyingClient.InitRoot();
@@ -3058,7 +3066,9 @@ Y_UNIT_TEST_SUITE(TFlatTest) {
 
         TPortManager pm;
         ui16 port = pm.GetPort(2134);
-        TServer cleverServer = TServer(TServerSettings(port));
+        TServerSettings settings(port);
+        settings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(LargeReplyCacheLimit);
+        TServer cleverServer = TServer(settings);
         TFlatMsgBusClient annoyingClient(port);
 
         annoyingClient.InitRoot();

@@ -52,7 +52,7 @@ void SetupTabletServicesWithBlobStorage(TTestActorRuntime& runtime, TAppPrepare*
         SetupTabletResolver(runtime, node);
         SetupTabletPipePerNodeCaches(runtime, node, false);
         SetupResourceBroker(runtime, node, app->ResourceBrokerConfig);
-        SetupSharedPageCache(runtime, node, cache);
+        SetupSharedPageCache(runtime, node, cache, app->FeatureFlags.GetEnableLockFreePageCache());
         SetupMonitoringProxy(runtime, node);
         SetupNodeWhiteboard(runtime, node);
         SetupNodeTabletMonitor(runtime, node);

@@ -9,6 +9,7 @@
 #include "flat_row_misc.h"
 #include "flat_part_writer.h"
 #include "flat_part_loader.h"
+#include "flat_transaction_pages.h"
 #include "util_fmt_abort.h"
 #include "util_fmt_logger.h"
 #include "util_fmt_desc.h"
@@ -16,7 +17,6 @@
 #include "flat_comp.h"
 #include "flat_executor_misc.h"
 #include "flat_bio_stats.h"
-#include "flat_transaction_pages.h"
 #include "shared_sausagecache.h"
 #include "util_channel.h"
 
@@ -1081,6 +1081,7 @@ namespace NTabletFlatExecutor {
         const TLogoBlobID Mask;
         const TActorId Owner;
         TMessageRelevanceOwner RelevanceTracker = std::make_shared<TMessageRelevanceTracker>();
+        TWrittenPageCache PageCache;
         TAutoPtr<NUtil::ILogger> Logger;
         IDriver * Driver = nullptr;
         THolder<TCompactCfg> Conf;
@@ -1092,7 +1093,6 @@ namespace NTabletFlatExecutor {
         TVector<TCompactionOutputs::TResult> Results;
         TVector<TIntrusiveConstPtr<NTable::TTxStatusPart>> TxStatus;
         const NScheme::TTypeRegistry * Registry = nullptr;
-        TWrittenPageCache PageCache;
 
         bool Finished = false;
         bool Failed = false;/* Failed to write blobs    */

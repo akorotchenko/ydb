@@ -49,7 +49,7 @@ namespace NFake {
     // StateStorage, NodeWarden, TabletResolver, ResourceBroker, SharedPageCache
     void SetupBasicServices(TTestActorRuntime &runtime, TAppPrepare &app, bool mockDisk = false,
                             NFake::INode *factory = nullptr, NFake::TStorage storage = {}, const NSharedCache::TSharedCacheConfig* sharedCacheConfig = nullptr, bool forceFollowers = false,
-                            TVector<TIntrusivePtr<NFake::TProxyDS>> dsProxies = {});
+                            TVector<TIntrusivePtr<NFake::TProxyDS>> dsProxies = {}, ui64 sharedCacheExpectedPageSize = 0);
 
     class TStrandedPDiskSubsystem final : public IPDiskSubsystem {
         TTestActorRuntime &Runtime;

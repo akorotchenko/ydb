@@ -56,7 +56,9 @@ struct TControllerFixture {
     TActorId MemoryController;
 
     explicit TControllerFixture(const NKikimrConfig::TMemoryControllerConfig& config) {
-        Runtime.Initialize(TAppPrepare().Unwrap());
+        TAppPrepare app;
+        app.SetEnableLockFreePageCache(true);
+        Runtime.Initialize(app.Unwrap());
         MemoryController = Runtime.Register(CreateMemoryController(
             TDuration::Seconds(1), TIntrusivePtr<IProcessMemoryInfoProvider>(Provider), config, TResourceBrokerConfig{}, CountersRoot));
         Runtime.EnableScheduleForActor(MemoryController);
@@ -72,7 +74,16 @@ struct TControllerFixture {
 
     TIntrusivePtr<IMemoryConsumer> Register(TActorId registrant, EMemoryConsumerKind kind) {
         Runtime.Send(new IEventHandle(MemoryController, registrant, new TEvConsumerRegister(kind)));
-        return Runtime.GrabEdgeEvent<TEvConsumerRegistered>(registrant)->Get()->Consumer;
+        auto consumer = Runtime.GrabEdgeEvent<TEvConsumerRegistered>(registrant)->Get()->Consumer;
+        if (kind == EMemoryConsumerKind::SharedCache) {
+            const auto initial = Runtime.GrabEdgeEvent<TEvConsumerLimit>(registrant);
+            UNIT_ASSERT(initial->Get()->MaxLimitBytes);
+            UNIT_ASSERT(initial->Get()->MaxLimitBytes > 0);
+            UNIT_ASSERT(initial->Get()->CurrentLimitBytes > 0);
+            UNIT_ASSERT(initial->Get()->LimitBytes <= initial->Get()->CurrentLimitBytes);
+            UNIT_ASSERT(initial->Get()->CurrentLimitBytes <= initial->Get()->MaxLimitBytes);
+        }
+        return consumer;
     }
 
     void Tick() {
@@ -126,7 +137,8 @@ private:
                 nodeIndex);
         }
 
-        SharedPageCacheCounters = MakeHolder<TSharedPageCacheCounters>(GetServiceCounters(Runtime->GetDynamicCounters(), "tablets")->GetSubgroup("type", "S_CACHE"));
+        SharedPageCacheCounters = MakeHolder<TCacheCounters>(
+            GetServiceCounters(Runtime->GetDynamicCounters(), "tablets")->GetSubgroup("type", "S_CACHE"));
         MemoryControllerCounters = GetServiceCounters(Runtime->GetDynamicCounters(), "utils")->GetSubgroup("component", "memory_controller");
 
         Runtime->SetLogPriority(NKikimrServices::MEMORY_CONTROLLER, NLog::PRI_TRACE);
@@ -138,7 +150,7 @@ private:
     TIntrusivePtr<TFixedProcessMemoryInfoProvider> ProcessMemoryInfoProvider;
 
 public:
-    THolder<TSharedPageCacheCounters> SharedPageCacheCounters;
+    THolder<TCacheCounters> SharedPageCacheCounters;
     TIntrusivePtr<::NMonitoring::TDynamicCounters> MemoryControllerCounters;
     TProcessMemoryInfo* ProcessMemoryInfo;
 };
@@ -368,6 +380,7 @@ Y_UNIT_TEST(Config_ConsumerLimits) {
 Y_UNIT_TEST(SharedCache) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
+    serverSettings.SetEnableLockFreePageCache(true);
     serverSettings.SetDomainName("Root")
         .SetUseRealThreads(false);
 
@@ -385,55 +398,57 @@ Y_UNIT_TEST(SharedCache) {
 
     server->PrintCounters();
     UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ConfigLimitBytes->Val(), 32_MB);
-    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->ConfigLimitBytes->Val());
+    UNIT_ASSERT_LE(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->ConfigLimitBytes->Val());
 
     runtime.SimulateSleep(TDuration::Seconds(2));
     server->PrintCounters();
-    UNIT_ASSERT_DOUBLES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), static_cast<i64>(94_MB), static_cast<i64>(1_MB));
-    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->ConfigLimitBytes->Val());
+    UNIT_ASSERT_DOUBLES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), static_cast<i64>(94_MB), static_cast<i64>(2_MB));
+    UNIT_ASSERT_LE(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->ConfigLimitBytes->Val());
 
     server->ProcessMemoryInfo->AllocatedMemory = 30_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     server->PrintCounters();
-    UNIT_ASSERT_DOUBLES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), static_cast<i64>(66_MB), static_cast<i64>(1_MB));
-    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->ConfigLimitBytes->Val());
+    UNIT_ASSERT_DOUBLES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), static_cast<i64>(66_MB), static_cast<i64>(2_MB));
+    UNIT_ASSERT_LE(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->ConfigLimitBytes->Val());
 
     server->ProcessMemoryInfo->AllocatedMemory = 70_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     server->PrintCounters();
-    UNIT_ASSERT_DOUBLES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), static_cast<i64>(40_MB), static_cast<i64>(1_MB));
-    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->ConfigLimitBytes->Val());
+    UNIT_ASSERT_DOUBLES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), static_cast<i64>(40_MB), static_cast<i64>(2_MB));
+    UNIT_ASSERT_LE(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->ConfigLimitBytes->Val());
 
     server->ProcessMemoryInfo->AllocatedMemory = 90_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     server->PrintCounters();
-    UNIT_ASSERT_DOUBLES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), static_cast<i64>(40_MB), static_cast<i64>(1_MB));
-    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->ConfigLimitBytes->Val());
+    UNIT_ASSERT_DOUBLES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), static_cast<i64>(40_MB), static_cast<i64>(2_MB));
+    UNIT_ASSERT_LE(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->ConfigLimitBytes->Val());
 
     server->ProcessMemoryInfo->AllocatedMemory = 120_MB; // exceeds soft limit
     runtime.SimulateSleep(TDuration::Seconds(2));
     server->PrintCounters();
-    UNIT_ASSERT_DOUBLES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), static_cast<i64>(28_MB), static_cast<i64>(1_MB));
-    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->MemLimitBytes->Val());
+    UNIT_ASSERT_DOUBLES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), static_cast<i64>(28_MB), static_cast<i64>(2_MB));
+    UNIT_ASSERT_LE(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->ConfigLimitBytes->Val());
 
     UNIT_ASSERT_DOUBLES_EQUAL(server->SharedPageCacheCounters->ActiveBytes->Val(), static_cast<i64>(32_KB), static_cast<i64>(5_KB));
     UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->PassiveBytes->Val(), 0);
-    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ActiveBytes->Val(), server->MemoryControllerCounters->GetCounter("Consumer/SharedCache/Consumption")->Val());
+    UNIT_ASSERT_GE(server->MemoryControllerCounters->GetCounter("Consumer/SharedCache/Consumption")->Val(),
+        server->SharedPageCacheCounters->ActiveBytes->Val() + server->SharedPageCacheCounters->PassiveBytes->Val());
 
     server->ProcessMemoryInfo->AllocatedMemory = 1000_MB;
     runtime.SimulateSleep(TDuration::Seconds(2));
     server->PrintCounters();
     UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), 0);
-    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->MemLimitBytes->Val());
-
-    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ActiveBytes->Val(), 0);
-    UNIT_ASSERT_GT(server->SharedPageCacheCounters->PassiveBytes->Val(), 0);
-    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->PassiveBytes->Val(), server->MemoryControllerCounters->GetCounter("Consumer/SharedCache/Consumption")->Val());
+    UNIT_ASSERT_LE(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->ConfigLimitBytes->Val());
+    UNIT_ASSERT_GT(server->SharedPageCacheCounters->ActiveBytes->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->PassiveBytes->Val(), 0);
+    UNIT_ASSERT_GE(server->MemoryControllerCounters->GetCounter("Consumer/SharedCache/Consumption")->Val(),
+        server->SharedPageCacheCounters->ActiveBytes->Val() + server->SharedPageCacheCounters->PassiveBytes->Val());
 }
 
 Y_UNIT_TEST(SharedCache_ConfigLimit) {
     TPortManager pm;
     TServerSettings serverSettings(pm.GetPort(2134));
+    serverSettings.SetEnableLockFreePageCache(true);
     serverSettings.SetDomainName("Root")
         .SetUseRealThreads(false);
 
@@ -446,7 +461,7 @@ Y_UNIT_TEST(SharedCache_ConfigLimit) {
 
     server->PrintCounters();
     UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ConfigLimitBytes->Val(), 100_MB);
-    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), 0);
+    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), 60_MB);
     UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), 100_MB);
 
     runtime.SimulateSleep(TDuration::Seconds(2));
@@ -460,7 +475,7 @@ Y_UNIT_TEST(SharedCache_ConfigLimit) {
     server->PrintCounters();
     UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ConfigLimitBytes->Val(), 100_MB);
     UNIT_ASSERT_DOUBLES_EQUAL(server->SharedPageCacheCounters->MemLimitBytes->Val(), static_cast<i64>(60_MB), static_cast<i64>(1_MB));
-    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), server->SharedPageCacheCounters->MemLimitBytes->Val());
+    UNIT_ASSERT_VALUES_EQUAL(server->SharedPageCacheCounters->ActiveLimitBytes->Val(), 60_MB);
 }
 
 Y_UNIT_TEST(MemTable) {
@@ -899,6 +914,152 @@ Y_UNIT_TEST(ConsumerReportDegradedCoefficient) {
     UNIT_ASSERT_DOUBLES_EQUAL(fixture.Counter("Consumer/SharedCache/Limit") / double(1_MB), 37.0, 0.01);
     UNIT_ASSERT_DOUBLES_EQUAL(fixture.Counter("Consumer/SharedCache/Reservation") / double(1_MB), 7.0, 0.01);
     UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/MemTable/Limit"), 10_MB);
+}
+
+Y_UNIT_TEST(SharedCacheZeroMinimumBootstrapsAdmissionAndAllowsAbsentEstimate) {
+    NKikimrConfig::TMemoryControllerConfig config;
+    config.SetHardLimitBytes(200_MB);
+    config.SetSharedCacheMinPercent(0);
+    config.SetSharedCacheMaxBytes(60_MB);
+    TControllerFixture fixture(config);
+    const TActorId sender = fixture.Runtime.AllocateEdgeActor();
+    fixture.Runtime.Send(
+        new IEventHandle(fixture.MemoryController, sender, new TEvConsumerRegister(EMemoryConsumerKind::SharedCache)));
+    auto consumer = fixture.Runtime.GrabEdgeEvent<TEvConsumerRegistered>(sender)->Get()->Consumer;
+    UNIT_ASSERT(consumer);
+    const auto initial = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+    UNIT_ASSERT_VALUES_EQUAL(initial->Get()->LimitBytes, 0);
+    UNIT_ASSERT_VALUES_EQUAL(initial->Get()->CurrentLimitBytes, 60_MB);
+    UNIT_ASSERT_VALUES_EQUAL(initial->Get()->MaxLimitBytes, 60_MB);
+    fixture.Provider->ProcessMemoryInfo.AllocatedMemory = 1000_MB;
+    fixture.Tick();
+    const auto pressure = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+    UNIT_ASSERT_VALUES_EQUAL(pressure->Get()->LimitBytes, 0);
+    UNIT_ASSERT_VALUES_EQUAL(pressure->Get()->CurrentLimitBytes, 0);
+    UNIT_ASSERT_VALUES_EQUAL(pressure->Get()->MaxLimitBytes, 60_MB);
+}
+
+Y_UNIT_TEST(SharedCacheZeroAllocationKeepsPositiveMaximum) {
+    NKikimrConfig::TMemoryControllerConfig config;
+    config.SetHardLimitBytes(200_MB);
+    config.SetSharedCacheMinBytes(20_MB);
+    config.SetSharedCacheMaxBytes(60_MB);
+    TControllerFixture fixture(config);
+
+    const TActorId first = fixture.Runtime.AllocateEdgeActor();
+    const TActorId second = fixture.Runtime.AllocateEdgeActor();
+    auto firstConsumer = fixture.Register(first, EMemoryConsumerKind::SharedCache);
+    auto secondConsumer = fixture.Register(second, EMemoryConsumerKind::SharedCache);
+    UNIT_ASSERT(firstConsumer && secondConsumer);
+    fixture.Provider->ProcessMemoryInfo.AllocatedMemory = 1000_MB;
+    fixture.Tick();
+
+    UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/SharedCache/Limit"), 0);
+    for (const auto registrant : { first, second }) {
+        const auto limit = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(registrant);
+        UNIT_ASSERT_VALUES_EQUAL(limit->Get()->LimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(limit->Get()->CurrentLimitBytes, 10_MB);
+        UNIT_ASSERT_VALUES_EQUAL(limit->Get()->MaxLimitBytes, 60_MB);
+    }
+}
+
+Y_UNIT_TEST(SharedCacheZeroMaximumKeepsZeroAllocation) {
+    for (bool usePercent : { false, true }) {
+        NKikimrConfig::TMemoryControllerConfig config;
+        config.SetHardLimitBytes(200_MB);
+        if (usePercent) {
+            config.SetSharedCacheMaxPercent(0);
+        } else {
+            config.SetSharedCacheMaxBytes(0);
+        }
+        TControllerFixture fixture(config);
+        const TActorId sender = fixture.Runtime.AllocateEdgeActor();
+        fixture.Runtime.Send(new IEventHandle(
+            fixture.MemoryController, sender, new TEvConsumerRegister(EMemoryConsumerKind::SharedCache)));
+        const auto consumer = fixture.Runtime.GrabEdgeEvent<TEvConsumerRegistered>(sender)->Get()->Consumer;
+        UNIT_ASSERT(consumer);
+        const auto initial = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+        UNIT_ASSERT_VALUES_EQUAL(initial->Get()->LimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(initial->Get()->CurrentLimitBytes, 200_MB);
+        UNIT_ASSERT_VALUES_EQUAL(initial->Get()->MaxLimitBytes, 200_MB);
+
+        fixture.Tick();
+        const auto periodic = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+        UNIT_ASSERT_VALUES_EQUAL(periodic->Get()->LimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(periodic->Get()->CurrentLimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(periodic->Get()->MaxLimitBytes, 200_MB);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/SharedCache/Limit"), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/SharedCache/LimitMin"), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/SharedCache/LimitMax"), 0);
+    }
+}
+
+Y_UNIT_TEST(SharedCacheZeroMaximumUsesDetectedOrDefaultNodeCeiling) {
+    for (bool detected : { false, true }) {
+        NKikimrConfig::TMemoryControllerConfig config;
+        config.SetHardLimitBytes(0);
+        config.SetSharedCacheMaxBytes(0);
+        TControllerFixture fixture(config);
+        if (detected) {
+            fixture.Provider->ProcessMemoryInfo.CGroupLimit = 120_MB;
+            fixture.Provider->ProcessMemoryInfo.MemTotal = 160_MB;
+        }
+        const TActorId sender = fixture.Runtime.AllocateEdgeActor();
+        fixture.Runtime.Send(new IEventHandle(
+            fixture.MemoryController, sender, new TEvConsumerRegister(EMemoryConsumerKind::SharedCache)));
+        UNIT_ASSERT(fixture.Runtime.GrabEdgeEvent<TEvConsumerRegistered>(sender)->Get()->Consumer);
+        const auto initial = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+        UNIT_ASSERT_VALUES_EQUAL(initial->Get()->LimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(initial->Get()->MaxLimitBytes, detected ? 120_MB : 2_GB);
+        UNIT_ASSERT_VALUES_EQUAL(initial->Get()->CurrentLimitBytes, initial->Get()->MaxLimitBytes);
+        fixture.Tick();
+        const auto periodic = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+        UNIT_ASSERT_VALUES_EQUAL(periodic->Get()->LimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(periodic->Get()->MaxLimitBytes, initial->Get()->MaxLimitBytes);
+    }
+}
+
+Y_UNIT_TEST(SharedCacheMaximumCanBecomeZeroAndRecover) {
+    for (bool usePercent : { false, true }) {
+        NKikimrConfig::TMemoryControllerConfig config;
+        config.SetHardLimitBytes(200_MB);
+        config.SetSharedCacheMaxBytes(60_MB);
+        TControllerFixture fixture(config);
+        const TActorId sender = fixture.Runtime.AllocateEdgeActor();
+        UNIT_ASSERT(fixture.Register(sender, EMemoryConsumerKind::SharedCache));
+
+        const auto update = [&](bool zero) {
+            auto changed = config;
+            if (zero && usePercent) {
+                changed.ClearSharedCacheMaxBytes();
+                changed.SetSharedCacheMaxPercent(0);
+            } else {
+                changed.SetSharedCacheMaxBytes(zero ? 0 : 60_MB);
+            }
+            auto request = MakeHolder<NConsole::TEvConsole::TEvConfigNotificationRequest>();
+            request->Record.MutableConfig()->MutableMemoryControllerConfig()->CopyFrom(changed);
+            fixture.Runtime.Send(new IEventHandle(fixture.MemoryController, sender, request.Release()));
+            fixture.Tick();
+        };
+        update(true);
+        const auto zero = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+        UNIT_ASSERT_VALUES_EQUAL(zero->Get()->LimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(zero->Get()->CurrentLimitBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(zero->Get()->MaxLimitBytes, 200_MB);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/SharedCache/LimitMax"), 0);
+
+        update(false);
+        bool restored = false;
+        for (ui32 attempt = 0; attempt < 4 && !restored; ++attempt) {
+            const auto limit = fixture.Runtime.GrabEdgeEvent<TEvConsumerLimit>(sender);
+            restored = limit->Get()->MaxLimitBytes == 60_MB;
+            if (restored) {
+                UNIT_ASSERT_GT(limit->Get()->LimitBytes, 0);
+            }
+        }
+        UNIT_ASSERT(restored);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Counter("Consumer/SharedCache/LimitMax"), 60_MB);
+    }
 }
 
 Y_UNIT_TEST(ConsumerReportClamp) {

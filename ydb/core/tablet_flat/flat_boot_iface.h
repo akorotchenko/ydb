@@ -12,6 +12,10 @@
 #include <typeinfo>
 
 namespace NKikimr {
+namespace NTable {
+    enum class EMetadataLoadResult;
+}
+
 namespace NTabletFlatExecutor {
     class TExecutorBootLogic;
 
@@ -77,17 +81,17 @@ namespace NBoot {
             Y_TABLET_ERROR("Boot IStep got an unhandled page-cache result event");
         }
 
-        virtual NTable::EMetadataLoadResult HandleMetadata(ui32, const TPageCacheMetadataResult&, NActors::IEventBase&)
-        {
-            Y_TABLET_ERROR("Boot IStep got unhandled collection metadata");
-        }
-
-        virtual void CancelMetadata() noexcept {}
-
         virtual void HandleStep(TIntrusivePtr<IStep>)
         {
             Y_TABLET_ERROR("Boot IStep got an unhandled child step result");
         }
+
+        virtual NTable::EMetadataLoadResult HandleMetadata(ui32, const TPageCacheMetadataResult&, NActors::IEventBase&)
+        {
+            Y_TABLET_ERROR("Boot IStep got an unhandled collection metadata result");
+        }
+
+        virtual void CancelMetadata() noexcept {}
 
         template<typename TStep, typename ... TArgs>
         TSpawned Spawn(TArgs&& ... args)

@@ -518,6 +518,11 @@ namespace Tests {
         // forcibly turn on some feature flags
         app.FeatureFlags = Settings->FeatureFlags;
         app.FeatureFlags.SetCheckDatabaseAccessPermission(true);
+        // Resolve the cache flag before choosing the test service and its thread subsystem
+        const auto& appConfigFlags = Settings->AppConfig->GetFeatureFlags();
+        if (appConfigFlags.HasEnableLockFreePageCache()) {
+            app.FeatureFlags.SetEnableLockFreePageCache(appConfigFlags.GetEnableLockFreePageCache());
+        }
 
         if (!Settings->UseRealThreads)
             Runtime->SetRegistrationObserverFunc([](TTestActorRuntimeBase& runtime, const TActorId&, const TActorId& actorId) {
@@ -658,7 +663,8 @@ namespace Tests {
             Settings->CustomDiskParams,
             &Settings->AppConfig->GetSharedCacheConfig(),
             Settings->EnableForceFollowers,
-            Settings->ProxyDSMocks);
+            Settings->ProxyDSMocks,
+            Settings->SharedCacheExpectedPageSize);
 
         {
             auto& appData = Runtime->GetAppData(0);

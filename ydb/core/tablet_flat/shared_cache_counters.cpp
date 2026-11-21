@@ -42,17 +42,21 @@ TCacheCounters::TCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounte
     , FailedRequests(counters->GetCounter("FailedRequests", true))
 {}
 
-TSharedPageCacheCounters::TSharedPageCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters)
-    : TPageCacheCounters(counters)
-    , S3FIFOEvictOps(counters->GetCounter("S3FIFOEvictOps", true))
-    // page collection counters:
-    , PageCollections(counters->GetCounter("PageCollections"))
-    , Owners(counters->GetCounter("Owners"))
-    , PageCollectionOwners(counters->GetCounter("PageCollectionOwners"))
-    // request counters:
-    , PendingRequests(counters->GetCounter("PendingRequests"))
-    , SucceedRequests(counters->GetCounter("SucceedRequests", true))
-    , FailedRequests(counters->GetCounter("FailedRequests", true))
-{}
+namespace NLegacy {
+
+    TSharedPageCacheCounters::TSharedPageCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters)
+        : TPageCacheCounters(counters)
+        , S3FIFOEvictOps(counters->GetCounter("S3FIFOEvictOps", true))
+        // page collection counters:
+        , PageCollections(counters->GetCounter("PageCollections"))
+        , Owners(counters->GetCounter("Owners"))
+        , PageCollectionOwners(counters->GetCounter("PageCollectionOwners"))
+        // request counters:
+        , PendingRequests(counters->GetCounter("PendingRequests"))
+        , SucceedRequests(counters->GetCounter("SucceedRequests", true))
+        , FailedRequests(counters->GetCounter("FailedRequests", true))
+    {}
+
+} // namespace NLegacy
 
 } // namespace NKikimr::NSharedCache

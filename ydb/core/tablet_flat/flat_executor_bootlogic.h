@@ -46,6 +46,7 @@ namespace NBoot {
 class TExecutorBootLogic
     : private ILoadBlob
 {
+    friend class TBootMetadataTestAccess;
     friend class NBoot::TBundleLoadStep;
     friend class NBoot::TRedo;
     friend class NBoot::TStages;
@@ -72,6 +73,7 @@ private:
 
 private:
     bool Restored = false;
+    TIntrusivePtr<NBoot::TStages> PageCacheWaiter;
 
     IOps * const Ops = nullptr;
     IExecutorPageCache& PageCache;
@@ -80,7 +82,6 @@ private:
     TAutoPtr<NBoot::TResult> Result_;
     TAutoPtr<NBoot::TRoot> Steps;
     TActorId LeaseWaiter;
-    TIntrusivePtr<NBoot::TStages> PageCacheWaiter;
 
     const ui64 BootAttempt;
     TMonotonic BootTimestamp;
@@ -98,7 +99,7 @@ private:
     };
 
     THashMap<const void*, TMetadataLoad> MetadataLoads;
-    bool MetadataCancelled = false;
+    bool Cancelled = false;
 
     ui32 GroupResolveCachedChannel;
     ui32 GroupResolveCachedGeneration;
@@ -107,16 +108,16 @@ private:
     EOpResult CheckCompletion();
 
     void PrepareEnv(bool follower, ui32 generation, TExecutorCaches caches);
+    void WaitForPageCache(NBoot::TStages* step);
     void StartLeaseWaiter(TMonotonic bootTimestamp, const TEvTablet::TDependencyGraph& graph);
     ui32 GetBSGroupFor(const TLogoBlobID &logo) const;
     ui32 GetBSGroupID(ui32 channel, ui32 generation);
-    void WaitForPageCache(NBoot::TStages* step);
     void LoadEntry(TIntrusivePtr<NBoot::TLoadBlobs>);
-    bool LoadMetadata(NBoot::IStep* step, ui32 slot, const NPageCollection::TLargeGlobId& descriptor,
-        const void* request, THolder<NActors::IEventBase> event);
+    NBoot::TSpawned LoadPages(NBoot::IStep*, NTable::TLoader& loader, NTable::TLoader::TFetch&& fetch);
+    bool LoadMetadata(NBoot::IStep*, ui32 slot, const NPageCollection::TLargeGlobId& descriptor, const void* request,
+        THolder<NActors::IEventBase> event);
     void UpdateMetadata(THolder<NActors::IEventBase> event);
     void CancelMetadataLoads() noexcept;
-    NBoot::TSpawned LoadPages(NBoot::IStep*, NTable::TLoader& loader, NTable::TLoader::TFetch&& fetch);
 
     void OnBlobLoaded(const TLogoBlobID& id, TString body, uintptr_t cookie) override;
     void SeenBlob(const TLogoBlobID& id);
@@ -126,7 +127,7 @@ private:
 
 public:
     TExecutorBootLogic(IOps*, IExecutorPageCache& pageCache, const TActorId&, ui64 bootAttempt,
-        TTabletStorageInfo *info, ui64 maxBytesInFly);
+        TTabletStorageInfo* info, ui64 maxBytesInFly);
     ~TExecutorBootLogic();
 
     void Describe(IOutputStream&) const;

@@ -30,7 +30,8 @@ namespace NKikimr {
     void SetupNodeWhiteboard(TTestActorRuntime&, ui32 nodeIndex);
     void SetupNodeTabletMonitor(TTestActorRuntime&, ui32 nodeIndex);
     void SetupMonitoringProxy(TTestActorRuntime&, ui32 nodeIndex);
-    void SetupSharedPageCache(TTestActorRuntime&, ui32 nodeIndex, const NSharedCache::TSharedCacheConfig&);
+    void SetupSharedPageCache(TTestActorRuntime&, ui32 nodeIndex, const NSharedCache::TSharedCacheConfig&,
+        bool useLockFreePageCache, ui64 expectedPageSize = 0);
     void SetupStateStorageGroups(TTestActorRuntime&, ui32 nodeIndex);
     TActorId MakeBoardReplicaID(ui32 node, ui32 replicaIndex);
 }

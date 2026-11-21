@@ -21,7 +21,7 @@ namespace NTable {
     public:
         TPartGroupRowIter(const TPart* part, IPages* env, NPage::TGroupId groupId)
             : Part(part)
-            , Env(env) 
+            , Env(env)
             , GroupId(groupId)
             , Index_(CreateIndexIter(part, env, groupId))
             , Index(*Index_.Get())
@@ -47,6 +47,8 @@ namespace NTable {
             }
 
             Data = { };
+
+            auto readScope = Env->BeginOpBatch();
 
             // Make sure we're at the correct index position first
             if (auto ready = Index.Seek(rowId); ready != EReady::Data) {
@@ -136,6 +138,7 @@ namespace NTable {
             Y_DEBUG_ABORT_UNLESS(seek == ESeek::Exact || seek == ESeek::Lower || seek == ESeek::Upper,
                     "Only ESeek{Exact, Upper, Lower} are currently supported here");
 
+            auto readScope = Env->BeginOpBatch();
             if (auto ready = Index.Seek(seek, key, keyDefaults); ready != EReady::Data) {
                 return Terminate(ready);
             }
@@ -221,6 +224,7 @@ namespace NTable {
             Y_DEBUG_ABORT_UNLESS(seek == ESeek::Exact || seek == ESeek::Lower || seek == ESeek::Upper,
                     "Only ESeek{Exact, Upper, Lower} are currently supported here");
 
+            auto readScope = Env->BeginOpBatch();
             if (auto ready = Index.SeekReverse(seek, key, keyDefaults); ready != EReady::Data) {
                 return Terminate(ready);
             }
@@ -273,7 +277,7 @@ namespace NTable {
                     // Row is outside of bounds
                     return Exhausted();
                 }
-                
+
                 if (auto ready = Index.Prev(); ready != EReady::Data) {
                     return Terminate(ready);
                 }
@@ -298,6 +302,7 @@ namespace NTable {
                 return Exhausted();
             }
 
+            auto readScope = Env->BeginOpBatch();
             if (auto ready = SeekIndex(rowId); ready != EReady::Data) {
                 return Terminate(ready);
             }
@@ -322,7 +327,7 @@ namespace NTable {
 
         /**
          * If has Data, goes to the next row
-         * 
+         *
          * If doesn't have Data, loads the current row
          */
         EReady Next()
@@ -345,7 +350,10 @@ namespace NTable {
                     ++Data;
                     return EReady::Data;
                 }
+            }
 
+            auto readScope = Env->BeginOpBatch();
+            if (Data) {
                 // Go to the next data page
                 // Keep Data in case we have page faulted on Index.Next and need to call it again
                 auto ready = Index.Next();
@@ -369,7 +377,7 @@ namespace NTable {
 
         /**
          * If has Data, goes to the prev row
-         * 
+         *
          * If doesn't have Data, loads the current row
          */
         EReady Prev()
@@ -392,7 +400,10 @@ namespace NTable {
                     --Data;
                     return EReady::Data;
                 }
-                
+            }
+
+            auto readScope = Env->BeginOpBatch();
+            if (Data) {
                 // Go to the prev data page
                 // Keep Data in case we have page faulted on Index.Prev and need to call it again
                 auto ready = Index.Prev();
@@ -431,7 +442,7 @@ namespace NTable {
         {
             return Terminate(EReady::Gone);
         }
-        
+
         Y_FORCE_INLINE EReady Terminate(EReady ready)
         {
             Data = { };
@@ -546,6 +557,7 @@ namespace NTable {
                     }
 
                     if (!Data) {
+                        auto readScope = Env->BeginOpBatch();
                         // Row is not on current page, move to the next
                         switch (Index.Next()) {
                             case EReady::Page: {
@@ -622,6 +634,8 @@ namespace NTable {
                     RowId = Max<TRowId>();
                 }
             }
+
+            auto readScope = Env->BeginOpBatch();
 
             // Special case when we are following a previous Index estimate
             if (rowId == RowId && RowVersion <= rowVersion && rowVersion <= MaxVersion) {
@@ -1409,6 +1423,9 @@ namespace NTable {
         IPages* const Env;
 
     private:
+        friend class TRunIter;
+
+        // Cells from every version of the current key may remain in compaction's saved rows.
         const TPinout Pinout;
         const TIntrusiveConstPtr<TKeyCellDefaults> KeyCellDefaults;
 
@@ -1561,7 +1578,7 @@ namespace NTable {
                     if (pos != Run.end() &&
                         TSlice::CompareLastKeySearchKey(pos->Slice, key, *KeyCellDefaults) <= 0)
                     {
-                        // LastKey <= key 
+                        // LastKey <= key
                         seekToSliceLastRow = true;
                     }
                     break;
@@ -1643,7 +1660,7 @@ namespace NTable {
 
             ready = SeekToSliceFirstRow();
             if (ready == EReady::Page) {
-                // we haven't sought start, will do it again later  
+                // we haven't sought start, will do it again later
                 Current--;
                 UpdateCurrent();
             }
@@ -1675,7 +1692,7 @@ namespace NTable {
 
             ready = SeekToSliceLastRow();
             if (ready == EReady::Page) {
-                // we haven't sought end, will do it again later  
+                // we haven't sought end, will do it again later
                 Current++;
                 UpdateCurrent();
             }
@@ -1780,6 +1797,9 @@ namespace NTable {
         }
 
     private:
+        template <class TIteratorOps>
+        friend class TTableIterBase;
+
         Y_FORCE_INLINE void InitCurrent()
         {
             const auto* part = Current->Part.Get();

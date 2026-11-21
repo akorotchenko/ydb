@@ -1,5 +1,6 @@
 #pragma once
 
+#include "flat_sausagecache_lf.h"
 #include "flat_sausage_packet.h"
 #include "flat_sausage_writer.h"
 #include "flat_sausage_solid.h"
@@ -12,8 +13,8 @@ namespace NWriter {
 
     struct TWrittenPageCollection : TMoveOnly {
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
-        TVector<NPageCollection::TLoadedPage> RegularPages;
-        TVector<NPageCollection::TLoadedPage> StickyPages;
+        TVector<NPageCollection::TPageData> RegularPages;
+        TVector<NPageCollection::TPageData> StickyPages;
     };
 
     class TBlocks {

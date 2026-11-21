@@ -53,22 +53,27 @@ struct TCacheCounters final : public TAtomicRefCount<TCacheCounters>, public TPa
     explicit TCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters);
 };
 
-struct TSharedPageCacheCounters final : public TAtomicRefCount<TSharedPageCacheCounters>, public TPageCacheCounters {
-    using TReplacementPolicy = NKikimrSharedCache::TReplacementPolicy;
+namespace NLegacy {
 
-    const TCounterPtr S3FIFOEvictOps;
+    struct TSharedPageCacheCounters final : public TAtomicRefCount<TSharedPageCacheCounters>,
+                                            public TPageCacheCounters {
+        using TReplacementPolicy = NKikimrSharedCache::TReplacementPolicy;
 
-    // page collection counters:
-    const TCounterPtr PageCollections;
-    const TCounterPtr Owners;
-    const TCounterPtr PageCollectionOwners;
+        const TCounterPtr S3FIFOEvictOps;
 
-    // request counters:
-    const TCounterPtr PendingRequests;
-    const TCounterPtr SucceedRequests;
-    const TCounterPtr FailedRequests;
+        // page collection counters:
+        const TCounterPtr PageCollections;
+        const TCounterPtr Owners;
+        const TCounterPtr PageCollectionOwners;
 
-    explicit TSharedPageCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters);
-};
+        // request counters:
+        const TCounterPtr PendingRequests;
+        const TCounterPtr SucceedRequests;
+        const TCounterPtr FailedRequests;
+
+        explicit TSharedPageCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters);
+    };
+
+} // namespace NLegacy
 
 } // namespace NKikimr::NSharedCache

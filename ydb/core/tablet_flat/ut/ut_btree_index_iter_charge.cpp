@@ -1,7 +1,9 @@
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include "flat_page_btree_index.h"
 #include "flat_part_charge_flat_index.h"
 #include "flat_part_index_iter_bree_index.h"
 #include "flat_part_charge_btree_index.h"
+#include "flat_executor_tx_env.h"
 #include "flat_part_charge_range.h"
 #include "test/libs/table/test_writer.h"
 #include "test/libs/table/wrap_part.h"
@@ -25,17 +27,17 @@ namespace {
             if (Touch(groupId, ResolvePageId(part, location, part->DataSlot(groupId)))) {
                 return NTest::TTestEnv::TryGetPage(part, location, groupId);
             }
-            return nullptr;
+            return {};
         }
 
-        const TSharedData* TryGetIndexPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
-        {
+        const TSharedData* TryGetIndexPage(
+            const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             // index pages are tracked as pages of their page collection
             const ui32 slot = part->IndexSlot(groupId);
             if (Touch(TGroupId(slot), ResolvePageId(part, location, slot))) {
                 return NTest::TTestEnv::TryGetIndexPage(part, location, groupId);
             }
-            return nullptr;
+            return {};
         }
 
         bool Touch(TGroupId groupId, TPageId pageId)
@@ -66,6 +68,47 @@ namespace {
         TMap<TGroupId, TSet<TPageId>> Loaded;
         TMap<TGroupId, TSet<TPageId>> Touched;
         TMap<TGroupId, TSet<TPageId>> Sticky;
+    };
+
+    class TReadTransaction final : public NTabletFlatExecutor::ITransaction {
+        bool Execute(TTransactionContext&, const NActors::TActorContext&) override {
+            return true;
+        }
+
+        void Complete(const NActors::TActorContext&) override {}
+    };
+
+    ui32 ActiveReadOperations() {
+        return NSharedCache::SpaceHazardActiveCount(
+            NSharedCache::TlsCacheHazards[0].State.load(std::memory_order_relaxed));
+    }
+
+    class TReadEnv : public NTabletFlatExecutor::TPageCollectionReadEnv {
+    public:
+        using TPageCollectionReadEnv::TPageCollectionReadEnv;
+
+        const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+            UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+            ++DataReads;
+            if (ThrowOnData) {
+                ythrow yexception() << "read scope data failure";
+            }
+            return MissData ? nullptr : Storage_.TryGetPage(part, location, groupId);
+        }
+
+        const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+            UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+            ++IndexReads;
+            return Storage_.TryGetIndexPage(part, location, groupId);
+        }
+
+        ui32 DataReads = 0;
+        ui32 IndexReads = 0;
+        bool MissData = false;
+        bool ThrowOnData = false;
+
+    private:
+        NTest::TTestEnv Storage_;
     };
 
     void AssertLoadedTheSame(const TPartStore& part, const TTouchEnv& bTree, const TTouchEnv& flat, const TString& message,
@@ -347,8 +390,8 @@ namespace {
             return TryGetRoomPage(location, part->DataSlot(groupId));
         }
 
-        const TSharedData* TryGetIndexPage(const TPart* part, const NPage::TPageLocation& location,
-                NPage::TGroupId groupId) override {
+        const TSharedData* TryGetIndexPage(
+            const TPart* part, const NPage::TPageLocation& location, NPage::TGroupId groupId) override {
             return TryGetRoomPage(location, part->IndexSlot(groupId));
         }
 
@@ -368,11 +411,11 @@ namespace {
                 << " room " << room
                 << ": charger asked " << static_cast<ui16>(location.Type)
                 << " store says " << static_cast<ui16>(trueType));
-            if (auto* p = Loaded[room].FindPtr(location.Offset)) {
-                return p;
+            if (Loaded[room].contains(location.Offset)) {
+                return NTest::TTestEnv::TryGetSlotPage(Part, location, room);
             }
             Touched[room].push_back(location);
-            return nullptr;
+            return {};
         }
 
         // Simulate ObtainToLoad -> fetch -> save: every miss becomes available.
@@ -398,7 +441,213 @@ namespace {
     };
 }
 
-Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIter) {
+Y_UNIT_TEST_SUITE_F(TPageReadScope, ::NKikimr::NTable::NTest::TTableCacheTest) {
+    Y_UNIT_TEST(DefaultEnvironmentDoesNotStartAnOperation) {
+        TTestEnv env;
+        auto scope = env.BeginOpBatch();
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+        env.RestartOpBatch();
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+    }
+
+    Y_UNIT_TEST(NestedScopesReuseTheOuterOperation) {
+        NTabletFlatExecutor::TCacheSeat seat(1, TAutoPtr<NTabletFlatExecutor::ITransaction>(new TReadTransaction));
+        NTabletFlatExecutor::TPageCollectionReadEnv env(seat);
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+        {
+            auto outer = env.BeginOpBatch();
+            UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+            {
+                auto inner = env.BeginOpBatch();
+                UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+                env.RestartOpBatch();
+                UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+    }
+
+    Y_UNIT_TEST(BTreeSeekSharesTheOperationThroughTheDataPage) {
+        auto eggs = MakePart({ .Levels = 3 });
+        const auto& part = *eggs.Lone();
+        NTabletFlatExecutor::TCacheSeat seat(1, TAutoPtr<NTabletFlatExecutor::ITransaction>(new TReadTransaction));
+        TReadEnv env(seat);
+        TPartGroupRowIter iter(&part, &env, {});
+        {
+            auto outer = env.BeginOpBatch();
+            UNIT_ASSERT(iter.Seek(0) == EReady::Data);
+            UNIT_ASSERT_VALUES_EQUAL(env.IndexReads, 3);
+            UNIT_ASSERT_VALUES_EQUAL(env.DataReads, 1);
+            UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+        UNIT_ASSERT(iter.Seek(1) == EReady::Data);
+        UNIT_ASSERT_VALUES_EQUAL(env.DataReads, 1);
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+        UNIT_ASSERT(iter.GetRecord());
+    }
+
+    Y_UNIT_TEST(PageMissEndsTheScopeBeforeRetry) {
+        auto eggs = MakePart({ .Levels = 3 });
+        const auto& part = *eggs.Lone();
+        NTabletFlatExecutor::TCacheSeat seat(1, TAutoPtr<NTabletFlatExecutor::ITransaction>(new TReadTransaction));
+        TReadEnv env(seat);
+        TPartGroupRowIter iter(&part, &env, {});
+        env.MissData = true;
+        UNIT_ASSERT(iter.Seek(0) == EReady::Page);
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+        env.MissData = false;
+        UNIT_ASSERT(iter.Seek(0) == EReady::Data);
+        UNIT_ASSERT_VALUES_EQUAL(env.IndexReads, 3);
+        UNIT_ASSERT_VALUES_EQUAL(env.DataReads, 2);
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+    }
+
+    Y_UNIT_TEST(DataPageExceptionEndsTheScope) {
+        auto eggs = MakePart({ .Levels = 3 });
+        const auto& part = *eggs.Lone();
+        NTabletFlatExecutor::TCacheSeat seat(1, TAutoPtr<NTabletFlatExecutor::ITransaction>(new TReadTransaction));
+        TReadEnv env(seat);
+        TPartGroupRowIter iter(&part, &env, {});
+        env.ThrowOnData = true;
+        UNIT_ASSERT_EXCEPTION(iter.Seek(0), yexception);
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+        env.ThrowOnData = false;
+        UNIT_ASSERT(iter.Seek(0) == EReady::Data);
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+    }
+
+    Y_UNIT_TEST(ForwardAndBackwardPageCrossingsShareTheOperation) {
+        auto eggs = MakePart({ .Levels = 3 });
+        const auto& part = *eggs.Lone();
+        NTabletFlatExecutor::TCacheSeat seat(1, TAutoPtr<NTabletFlatExecutor::ITransaction>(new TReadTransaction));
+        TReadEnv env(seat);
+        TPartGroupKeyIter iter(&part, &env, {});
+        UNIT_ASSERT(iter.Seek(1) == EReady::Data);
+        UNIT_ASSERT(iter.Next() == EReady::Data);
+        UNIT_ASSERT_VALUES_EQUAL(iter.GetRowId(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+        UNIT_ASSERT(iter.Prev() == EReady::Data);
+        UNIT_ASSERT_VALUES_EQUAL(iter.GetRowId(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(env.DataReads, 3);
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+    }
+
+    Y_UNIT_TEST(CollectionLookupReturnsAnOwnerBeyondTheOperation) {
+        auto eggs = MakePart({ .Levels = 3 });
+        const auto& part = *eggs.Lone();
+        const auto location = IndexTools::GetFirstPageLocation(part, {});
+        TTestEnv storage;
+        auto original = storage.TryGetPage(&part, location, {});
+        UNIT_ASSERT(original);
+        TCacheCollectionRef collection;
+        UNIT_ASSERT(TCache::Get().Find(part.GetPageCollection(0)->Label(), collection) ==
+                    NSharedCache::ECacheResultStatus::Hit);
+        TCachePageRef page;
+        {
+            auto cacheOp = TCache::Get().BeginOperation();
+            page = collection->TryGetPage(cacheOp, location);
+            UNIT_ASSERT(page);
+            UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+        UNIT_ASSERT(page.data() == original->data());
+        UNIT_ASSERT_VALUES_EQUAL(page.size(), original->size());
+        UNIT_ASSERT(page.GetCollectionId() == part.GetPageCollection(0)->Label());
+    }
+
+    Y_UNIT_TEST(TransactionEnvironmentSharesExplicitAndImplicitReadScopes) {
+        auto eggs = MakePart({ .Levels = 3 });
+        const auto& part = *eggs.Lone();
+        const auto location = IndexTools::GetFirstPageLocation(part, {});
+        TTestEnv storage;
+        auto original = storage.TryGetPage(&part, location, {});
+        UNIT_ASSERT(original);
+        NTable::TPart::TParams params{
+            .Epoch = part.Epoch,
+            .Scheme = part.Scheme,
+            .IndexPages = part.IndexPages,
+            .IndexesRawSize = part.IndexesRawSize,
+            .MinRowVersion = part.MinRowVersion,
+            .MaxRowVersion = part.MaxRowVersion,
+        };
+        NTable::TCachePartStore stored(part.Label, std::move(params), part.Stat);
+        TCacheCollectionRef collection;
+        UNIT_ASSERT(TCache::Get().Find(part.GetPageCollection(0)->Label(), collection) ==
+                    NSharedCache::ECacheResultStatus::Hit);
+        stored.PageCollections.push_back(std::move(collection));
+        NTabletFlatExecutor::TCacheSeat seat(1, TAutoPtr<NTabletFlatExecutor::ITransaction>(new TReadTransaction));
+        NTabletFlatExecutor::TPageCollectionReadEnv cacheEnv(seat);
+        IPages& env = cacheEnv;
+        const TSharedData* retained = nullptr;
+        {
+            auto scope = env.BeginOpBatch();
+            retained = env.TryGetPage(&stored, location, {});
+            auto repeated = env.TryGetPage(&stored, location, {});
+            UNIT_ASSERT(retained && repeated);
+            UNIT_ASSERT(retained == repeated);
+            for (ui32 visit = 2; visit < 2 * NSharedCache::CacheOperationBatchSize + 1; ++visit) {
+                auto page = env.TryGetPage(&stored, location, {});
+                UNIT_ASSERT(page && page == retained);
+                UNIT_ASSERT(page->data() == original->data());
+                UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+            }
+            {
+                auto inner = env.BeginOpBatch();
+                UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(seat.Pinned.size(), 1);
+            UNIT_ASSERT_VALUES_EQUAL(cacheEnv.GetStats().NewlyPinnedPages, 1);
+            UNIT_ASSERT_VALUES_EQUAL(cacheEnv.GetStats().NewlyPinnedBytes, original->size());
+        }
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+        UNIT_ASSERT(retained->data() == original->data());
+        UNIT_ASSERT(seat.Pinned
+                        .at(NTabletFlatExecutor::TCacheSeat::TPageKey{
+                            stored.PageCollections.front().CacheItem(), location.Offset })
+                        .GetCollectionId() == stored.PageCollections.front()->Id());
+        retained = env.TryGetPage(&stored, location, {});
+        UNIT_ASSERT(retained);
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(seat.Pinned.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(cacheEnv.GetStats().NewlyPinnedPages, 1);
+
+        const auto missing = IndexTools::GetLastPageLocation(part, {});
+        // Part construction may have cached this page; remove it before testing misses
+        {
+            auto cacheOp = TCache::Get().BeginOperation();
+            NSharedCache::NDetail::TFoundItem found;
+            if (cacheOp.FindPage(stored.PageCollections.front().CacheItem(), static_cast<ui64>(missing.Offset),
+                    found) == NSharedCache::ECacheResultStatus::Hit) {
+                NSharedCache::TOperationItemRef<NSharedCache::TProdTraits> owner(
+                    cacheOp.SpaceOperation(), cacheOp.TryAcquireStructural(found.Item));
+                UNIT_ASSERT(owner);
+                auto state = NSharedCache::THandleState::FromRaw(
+                    cacheOp.Handles()[found.Item.Index()].State.load(std::memory_order_acquire));
+                UNIT_ASSERT(cacheOp.TryBeginErase(owner.Get(), state));
+                cacheOp.Eviction().FinishPageErase(found.Item);
+            }
+        }
+        {
+            auto scope = env.BeginOpBatch();
+            for (ui32 visit = 0; visit < NSharedCache::CacheOperationBatchSize + 1; ++visit) {
+                UNIT_ASSERT(!env.TryGetPage(&stored, missing, {}));
+                UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+            }
+            {
+                auto inner = env.BeginOpBatch();
+                UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 1);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(ActiveReadOperations(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(cacheEnv.GetStats().ToLoadPages, 1);
+    }
+}
+
+Y_UNIT_TEST_SUITE_F(TPartGroupBtreeIndexIter, ::NKikimr::NTable::NTest::TTableCacheTest) {
     void AssertEqual(const TPartGroupBtreeIndexIter& bTree, EReady bTreeReady, const TPartGroupFlatIndexIter& flat, EReady flatReady, const TString& message, bool allowFirstLastPageDifference = false) {
         // Note: it's possible that B-Tree index don't return Gone status for keys before the first page or keys after the last page
         if (allowFirstLastPageDifference && flatReady == EReady::Gone && bTreeReady == EReady::Data &&
@@ -567,7 +816,7 @@ Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIter) {
     }
 }
 
-Y_UNIT_TEST_SUITE(TChargeBTreeIndex) {
+Y_UNIT_TEST_SUITE_F(TChargeBTreeIndex, ::NKikimr::NTable::NTest::TTableCacheTest) {
     void StickSomePages(TTestParams params, const TPartStore& part, TTagsRef tags, const TKeyCellDefaults &keyDefaults, TTouchEnv& bTreeEnv, TTouchEnv& flatEnv) {
         if (params.StickSomePages) {
             TChargeBTreeIndex bTree(&bTreeEnv, part, tags, true);
@@ -886,7 +1135,7 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndex) {
     }
 }
 
-Y_UNIT_TEST_SUITE(TPartBtreeIndexIteration) {
+Y_UNIT_TEST_SUITE_F(TPartBtreeIndexIteration, ::NKikimr::NTable::NTest::TTableCacheTest) {
     void MakeRuns(const TPartEggs& eggs, TRun& btreeRun, TRun& flatRun) {
         const auto part = *eggs.Lone();
 
@@ -1390,7 +1639,7 @@ namespace {
 // Section 3.2: V2 twin tests — V2 B-tree produces same results as V1
 // ========================================================================
 
-Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIterV2) {
+Y_UNIT_TEST_SUITE_F(TPartGroupBtreeIndexIterV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     // V2 twin: verify v2 btree iteration produces same results as v1 btree
@@ -1500,7 +1749,7 @@ Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIterV2) {
 
 }
 
-Y_UNIT_TEST_SUITE(TChargeBTreeIndexV2) {
+Y_UNIT_TEST_SUITE_F(TChargeBTreeIndexV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     // Basic sanity: V2 part can be charged (charge returns ready, produces non-zero results)
@@ -1838,7 +2087,7 @@ Y_UNIT_TEST_SUITE(TChargeBTreeIndexV2) {
 // V2 reverse-iteration twin for the raw group index
 // ========================================================================
 
-Y_UNIT_TEST_SUITE(TPartGroupBtreeIndexIterReverseV2) {
+Y_UNIT_TEST_SUITE_F(TPartGroupBtreeIndexIterReverseV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     // Reverse iteration

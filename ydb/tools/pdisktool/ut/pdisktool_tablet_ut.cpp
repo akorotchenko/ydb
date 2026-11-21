@@ -11,6 +11,7 @@
 #include <ydb/core/tablet_flat/flat_database.h>
 #include <ydb/core/tablet_flat/flat_dbase_scheme.h>
 #include <ydb/core/tablet_flat/protos/flat_executor.pb.h>
+#include <ydb/core/tablet_flat/flat_iterator.h>
 #include <ydb/core/tablet_flat/flat_part_scheme.h>
 #include <ydb/core/tablet_flat/flat_part_writer.h>
 #include <ydb/core/tablet_flat/flat_row_state.h>
@@ -172,6 +173,9 @@ struct TRestored {
     TTabletLogHistory History;
     TDumpStats Dump;
     bool Ok = false;
+    ui64 InitialCacheHandles = 0;
+    ui64 FinalCacheHandles = 0;
+    ui64 FinalCacheBytes = 0;
 
     TVector<TString> Lines(ui32 table, const TString& name) const {
         const TString file = ToString(table) + "_" + name + (Options.Csv ? ".csv" : ".tsv");
@@ -179,7 +183,7 @@ struct TRestored {
     }
 };
 
-void Restore(const TString& dir, TRestored& out, TMaybe<TErasureType> erasure = {}) {
+void Restore(const TString& dir, TRestored& out, TMaybe<TErasureType> erasure = {}, ui64 cacheBytes = 128_MB) {
     TBlobStore store(erasure, out.Issues);
     UNIT_ASSERT(store.AddDirectory(dir));
     store.FlushIssues();
@@ -189,13 +193,18 @@ void Restore(const TString& dir, TRestored& out, TMaybe<TErasureType> erasure = 
         return;
     }
 
-    TTabletBoot boot(store, Tablet, out.Issues);
+    TTabletBoot boot(store, Tablet, out.Issues, cacheBytes);
+    out.InitialCacheHandles = NSharedCache::TCache::Get().PhysicalHandleCount();
     if (!boot.Run(out.History)) {
         return;
     }
 
     out.Options.Output = out.Output.Name();
     out.Ok = DumpTablet(boot.Database(), boot.Pages(), out.Options, out.Issues, out.Dump);
+    out.FinalCacheHandles = NSharedCache::TCache::Get().PhysicalHandleCount();
+    out.FinalCacheBytes = NSharedCache::TCache::Get().CurrentLimit();
+    UNIT_ASSERT_VALUES_EQUAL(NSharedCache::TCache::Get().SoftLimit(), 0u);
+    UNIT_ASSERT_VALUES_EQUAL(NSharedCache::TCache::Get().PayloadUsage(), 0u);
 }
 
 // A database to take scheme deltas and redo bodies from, standing in for the tablet that wrote the log.
@@ -210,24 +219,28 @@ struct TSourceDb {
         }
 
         const TSharedData* TryGetPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
-            return nullptr;
+            return {};
         }
 
         const TSharedData* TryGetIndexPage(const NTable::TPart*, const TPageLocation&, TGroupId) override {
-            return nullptr;
+            return {};
         }
     };
 
     TNoPages Env;
     NTable::TDatabase Db;
 
-    TString MakeScheme(ui32 gen, ui32 step) {
+    TString MakeScheme(ui32 gen, ui32 step, ui32 valueColumns = 1) {
         Db.Begin(NTable::TTxStamp(gen, step), Env);
         Db.Alter()
             .AddTable("data", TableId)
             .AddColumn(TableId, "key", 1, NScheme::NTypeIds::Uint64, false, false)
             .AddColumn(TableId, "value", 2, NScheme::NTypeIds::String, false, false)
             .AddColumnToKey(TableId, 1);
+        for (ui32 index = 1; index < valueColumns; ++index) {
+            Db.Alter().AddColumn(
+                TableId, TStringBuilder() << "value" << index, index + 2, NScheme::NTypeIds::String, false, false);
+        }
         auto prod = Db.Commit(NTable::TTxStamp(gen, step), true);
         return prod.Change->Scheme;
     }
@@ -403,6 +416,15 @@ Y_UNIT_TEST_SUITE(TPDiskToolBlobStore) {
         UNIT_ASSERT(store.Get(largeGlobId, out));
         UNIT_ASSERT_VALUES_EQUAL(out, body);
 
+        NActors::TSharedData sharedOut;
+        UNIT_ASSERT(store.Get(largeGlobId, sharedOut));
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(sharedOut.data(), sharedOut.size()), body);
+
+        const NPageCollection::TLargeGlobId singleGlobId(0, lead);
+        NActors::TSharedData singleOut;
+        UNIT_ASSERT(store.Get(singleGlobId, singleOut));
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(singleOut.data(), singleOut.size()), body.substr(0, 100));
+
         // The last blob of the run is missing, so the body cannot be handed out at all.
         TExport partial;
         partial.PutPart(lead, 1, body.substr(0, 100));
@@ -412,6 +434,21 @@ Y_UNIT_TEST_SUITE(TPDiskToolBlobStore) {
         TBlobStore incomplete({}, issues);
         UNIT_ASSERT(incomplete.AddDirectory(partial.Path()));
         UNIT_ASSERT(!incomplete.Get(largeGlobId, out));
+        UNIT_ASSERT_VALUES_EQUAL(out, body);
+        const char* sharedBuffer = sharedOut.data();
+        UNIT_ASSERT(!incomplete.Get(largeGlobId, sharedOut));
+        UNIT_ASSERT(sharedOut.data() == sharedBuffer);
+        UNIT_ASSERT_VALUES_EQUAL(TStringBuf(sharedOut.data(), sharedOut.size()), body);
+
+        auto malformed = largeGlobId;
+        malformed.Bytes = lead.BlobSize() - 1;
+        for (const auto& id : { NPageCollection::TLargeGlobId{}, malformed }) {
+            UNIT_ASSERT(!store.Get(id, out));
+            UNIT_ASSERT_VALUES_EQUAL(out, body);
+            UNIT_ASSERT(!store.Get(id, sharedOut));
+            UNIT_ASSERT(sharedOut.data() == sharedBuffer);
+            UNIT_ASSERT_VALUES_EQUAL(TStringBuf(sharedOut.data(), sharedOut.size()), body);
+        }
     }
 }
 
@@ -662,7 +699,7 @@ Y_UNIT_TEST_SUITE(TPDiskToolRestoreTablet) {
     };
 
     TWrittenPart WritePart(TIntrusiveConstPtr<NTable::TRowScheme> rowScheme,
-            const TVector<std::pair<ui64, TString>>& rows)
+        const TVector<std::pair<ui64, TString>>& rows, bool external = false, bool versions = false)
     {
         NTabletFlatExecutor::NWriter::TConf conf;
         conf.Groups[0].Channel = 1;
@@ -677,17 +714,30 @@ Y_UNIT_TEST_SUITE(TPDiskToolRestoreTablet) {
         NTabletFlatExecutor::NWriter::TBundle bundle(base, conf);
 
         NTable::NPage::TConf pageConf{true, 4096};
+        if (external) {
+            pageConf.LargeEdge = 1;
+        }
         const auto tags = rowScheme->Tags();
         NTable::TPartWriter writer(new NTable::TPartScheme(rowScheme->Cols), tags, bundle, pageConf,
             NTable::TEpoch::Zero());
 
-        for (const auto& [key, value] : rows) {
+        for (size_t index = 0; index < rows.size();) {
+            const ui64 key = rows[index].first;
             const TCell keyCell(reinterpret_cast<const char*>(&key), sizeof(key));
-            NTable::TRowState row(tags.size());
-            row.Touch(NTable::ERowOp::Upsert);
-            row.Set(1, NTable::ECellOp::Set, TCell(value.data(), value.size()));
             writer.BeginKey({&keyCell, 1});
-            writer.AddKeyVersion(row, TRowVersion::Min());
+            do {
+                const auto& value = rows[index].second;
+                NTable::TRowState row(tags.size());
+                row.Touch(NTable::ERowOp::Upsert);
+                TVector<TString> values;
+                values.reserve(tags.size() - 1);
+                for (size_t column = 1; column < tags.size(); ++column) {
+                    values.push_back(column == 1 ? value : TStringBuilder() << value << ":" << column);
+                    row.Set(column, NTable::ECellOp::Set, TCell(values.back().data(), values.back().size()));
+                }
+                writer.AddKeyVersion(row, versions ? TRowVersion(1, rows.size() - index) : TRowVersion::Min());
+                ++index;
+            } while (versions && index < rows.size() && rows[index].first == key);
             writer.EndKey();
         }
         const auto written = writer.Finish();
@@ -718,6 +768,192 @@ Y_UNIT_TEST_SUITE(TPDiskToolRestoreTablet) {
             bundle->SetOpaque(part.Opaque);
         }
         bundle->SetEpoch(NTable::TEpoch::Zero().ToProto());
+    }
+
+    void ExportPart(TExport & dir, const TWrittenPart& part, const TString& scheme) {
+        for (const auto& glob : part.Blobs) {
+            dir.PutGlob(glob.GId, glob.Data);
+        }
+        const auto alter = dir.PutWhole(1, 1, 0, CookieFor(EIdx::Alter), scheme);
+        NKikimrExecutorFlat::TLogSnapshot snap;
+        snap.SetSerial(1);
+        PutLogoBlobId(snap.AddSchemeInfoBodies(), alter);
+        FillBundle(snap.AddDbParts(), part);
+        const auto snapId = dir.PutWhole(1, 2, 0, CookieFor(EIdx::SnapLz4), Pack(snap.SerializeAsString()));
+        dir.PutWhole(1, 2, 0, 0, TLogEntryBuilder(1, 2).Snapshot().Confirmed(0).Ref(snapId).Serialize());
+    }
+
+    struct TPartReader {
+        TExport Dir;
+        TIssueLog Issues;
+        TBlobStore Store;
+        THolder<TTabletBoot> Boot;
+
+        TPartReader(const TWrittenPart& part, const TString& scheme)
+            : Store({}, Issues)
+        {
+            ExportPart(Dir, part, scheme);
+            UNIT_ASSERT(Store.AddDirectory(Dir.Path()));
+            const auto history = RebuildTabletHistory(Store, Tablet, 0, Issues);
+            UNIT_ASSERT_C(history.Ok, Complaints(Issues));
+            Boot = MakeHolder<TTabletBoot>(Store, Tablet, Issues, 8_MB);
+            UNIT_ASSERT_C(Boot->Run(history), Complaints(Issues));
+        }
+    };
+
+    Y_UNIT_TEST(IteratorRetainsExternalValuesAcrossRowVersions) {
+        TSourceDb source;
+        const TString scheme = source.MakeScheme(1, 1);
+        const TVector<std::pair<ui64, TString>> rows{ { 1, TString(64_KB, 'a') }, { 1, TString(64_KB, 'b') } };
+        const auto written = WritePart(source.Db.GetRowScheme(TableId), rows, true, true);
+        TPartReader reader(written, scheme);
+        auto& db = reader.Boot->Database();
+        const auto parts = db.GetTableParts(TableId);
+        UNIT_ASSERT_VALUES_EQUAL(parts.size(), 1u);
+        const auto* part = parts[0].Part.Get();
+        const TVector<NTable::TTag> tags{ 1, 2 };
+        NTable::TPartIter it(part, tags, db.GetRowScheme(TableId)->Keys, &reader.Boot->Pages());
+        UNIT_ASSERT(it.Seek(NTable::TRowId(0)) == NTable::EReady::Data);
+        NTable::TRowState newer(tags.size());
+        it.Apply(newer, nullptr, nullptr);
+        UNIT_ASSERT_VALUES_EQUAL(newer.Get(1).AsBuf(), rows[0].second);
+        NTable::TIteratorStats stats;
+        NTable::TTransactionSet decided;
+        UNIT_ASSERT(it.SkipToRowVersion(TRowVersion(1, 1), stats, nullptr, nullptr, decided) == NTable::EReady::Data);
+        NTable::TRowState older(tags.size());
+        it.Apply(older, nullptr, nullptr);
+        auto& cache = NSharedCache::TCache::Get();
+        cache.RunMaintenance();
+        UNIT_ASSERT_VALUES_EQUAL(newer.Get(1).AsBuf(), rows[0].second);
+        UNIT_ASSERT_VALUES_EQUAL(older.Get(1).AsBuf(), rows[1].second);
+        UNIT_ASSERT(cache.PayloadUsage() >= rows[0].second.size() + rows[1].second.size());
+        UNIT_ASSERT(it.Next() == NTable::EReady::Gone);
+        ReleaseRowBuffers(reader.Boot->Pages());
+        UNIT_ASSERT(cache.PayloadUsage() < rows[0].second.size());
+    }
+
+    Y_UNIT_TEST(PointSelectRetainsExternalValues) {
+        TSourceDb source;
+        const TString scheme = source.MakeScheme(1, 1);
+        const TVector<std::pair<ui64, TString>> rows{ { 1, TString(64_KB, 'a') }, { 2, TString(64_KB, 'b') } };
+        const auto written = WritePart(source.Db.GetRowScheme(TableId), rows, true);
+        TPartReader reader(written, scheme);
+        auto& db = reader.Boot->Database();
+        db.Begin(NTable::TTxStamp(Max<ui32>(), 0), reader.Boot->Pages());
+        const TVector<NTable::TTag> tags{ 1, 2 };
+        auto& cache = NSharedCache::TCache::Get();
+        for (const auto& [key, value] : rows) {
+            const TRawTypeValue keyValue(&key, sizeof(key), NScheme::NTypeIds::Uint64);
+            NTable::TRowState row;
+            UNIT_ASSERT(db.Select(TableId, { &keyValue, 1 }, tags, row) == NTable::EReady::Data);
+            cache.RunMaintenance();
+            UNIT_ASSERT_VALUES_EQUAL(row.Get(1).AsBuf(), value);
+            UNIT_ASSERT(cache.PayloadUsage() >= value.size());
+        }
+        const ui64 missing = 100;
+        const TRawTypeValue keyValue(&missing, sizeof(missing), NScheme::NTypeIds::Uint64);
+        NTable::TRowState row;
+        UNIT_ASSERT(db.Select(TableId, { &keyValue, 1 }, tags, row) == NTable::EReady::Gone);
+        ReleaseRowBuffers(reader.Boot->Pages());
+        UNIT_ASSERT(cache.PayloadUsage() < rows.back().second.size());
+    }
+
+    Y_UNIT_TEST(ScanReleasesPagesBeyondInitialCapacity) {
+        TSourceDb source;
+        const TString scheme = source.MakeScheme(1, 1);
+        const TString value(64_KB, 'x');
+        TVector<std::pair<ui64, TString>> rows;
+        for (ui64 key = 1; key <= 2304; ++key) {
+            rows.emplace_back(key, value);
+        }
+        const auto part = WritePart(source.Db.GetRowScheme(TableId), rows, true);
+        TExport dir;
+        ExportPart(dir, part, scheme);
+        TRestored restored;
+        Restore(dir.Path(), restored, {}, 1_MB);
+        UNIT_ASSERT_C(restored.Ok, Complaints(restored.Issues));
+        UNIT_ASSERT_VALUES_EQUAL(restored.Dump.Incomplete, 0u);
+        UNIT_ASSERT_VALUES_EQUAL(restored.Dump.Rows, rows.size());
+        UNIT_ASSERT(restored.Dump.Tables[0].Bytes > 128_MB);
+        UNIT_ASSERT(rows.size() > restored.InitialCacheHandles);
+        UNIT_ASSERT_VALUES_EQUAL(restored.FinalCacheHandles, restored.InitialCacheHandles);
+        UNIT_ASSERT_VALUES_EQUAL(restored.FinalCacheBytes, 1_MB);
+        const auto lines = restored.Lines(TableId, "data");
+        UNIT_ASSERT_VALUES_EQUAL(lines.size(), rows.size() + 1);
+        for (const auto& [key, body] : rows) {
+            UNIT_ASSERT_VALUES_EQUAL(lines[key], TStringBuilder() << key << "\t" << body);
+        }
+    }
+
+    Y_UNIT_TEST(LargerPageReclaimsSmallerPagesWithinBudget) {
+        TSourceDb source;
+        const TString scheme = source.MakeScheme(1, 1);
+        TVector<std::pair<ui64, TString>> rows;
+        for (ui64 key = 1; key <= 400; ++key) {
+            rows.emplace_back(key, TString(4096, 's'));
+        }
+        rows.emplace_back(rows.size() + 1, TString(8_MB - 256_KB, 'l'));
+        const auto part = WritePart(source.Db.GetRowScheme(TableId), rows, true);
+        TExport dir;
+        ExportPart(dir, part, scheme);
+        TIssueLog issues;
+        TBlobStore store({}, issues);
+        UNIT_ASSERT(store.AddDirectory(dir.Path()));
+        const auto history = RebuildTabletHistory(store, Tablet, 0, issues);
+        UNIT_ASSERT_C(history.Ok, Complaints(issues));
+        TTabletBoot boot(store, Tablet, issues, 8_MB);
+        UNIT_ASSERT_C(boot.Run(history), Complaints(issues));
+        auto& cache = NSharedCache::TCache::Get();
+        const ui64 handles = cache.PhysicalHandleCount();
+        UNIT_ASSERT(cache.UpdateSoftLimitOverride(1));
+        auto& db = boot.Database();
+        db.Begin(NTable::TTxStamp(Max<ui32>(), 0), boot.Pages());
+        const TVector<NTable::TTag> tags{ 1, 2 };
+        auto it = db.IterateRange(TableId, {}, tags, TRowVersion::Max());
+        for (size_t index = 0; index + 1 < rows.size(); ++index) {
+            ReleaseRowBuffers(boot.Pages());
+            UNIT_ASSERT(it->Next(NTable::ENext::Data) == NTable::EReady::Data);
+            UNIT_ASSERT_VALUES_EQUAL(it->Row().Get(1).AsBuf(), rows[index].second);
+        }
+        ReleaseRowBuffers(boot.Pages());
+        UNIT_ASSERT(cache.ColdReclaimableItems() > NSharedCache::CacheTransitionWorkBatch);
+        const ui64 smallPageBytes = 4096 + 128 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(cache.PayloadUsage() + rows.back().second.size() >
+                    cache.CurrentLimit() + NSharedCache::CacheTransitionWorkBatch * smallPageBytes);
+        UNIT_ASSERT(it->Next(NTable::ENext::Data) == NTable::EReady::Data);
+        UNIT_ASSERT_VALUES_EQUAL(it->Row().Get(1).AsBuf(), rows.back().second);
+        UNIT_ASSERT_VALUES_EQUAL(cache.PhysicalHandleCount(), handles);
+        UNIT_ASSERT_VALUES_EQUAL(cache.CurrentLimit(), 8_MB);
+    }
+
+    Y_UNIT_TEST(ExternalValuesRemainValidUntilRendered) {
+        constexpr ui32 valueColumns = 256;
+        TSourceDb source;
+        const TString scheme = source.MakeScheme(1, 1, valueColumns);
+        const TVector<std::pair<ui64, TString>> rows{ { 1, TString(4096, 'a') }, { 2, TString(4096, 'b') } };
+        const auto part = WritePart(source.Db.GetRowScheme(TableId), rows, true);
+        TExport dir;
+        ExportPart(dir, part, scheme);
+        TRestored restored;
+        Restore(dir.Path(), restored, {}, 8_MB);
+        UNIT_ASSERT_C(restored.Ok, Complaints(restored.Issues));
+        UNIT_ASSERT_VALUES_EQUAL(restored.Dump.Incomplete, 0u);
+        UNIT_ASSERT_VALUES_EQUAL(restored.Dump.Rows, rows.size());
+        UNIT_ASSERT(valueColumns < restored.InitialCacheHandles);
+        UNIT_ASSERT_VALUES_EQUAL(restored.FinalCacheHandles, restored.InitialCacheHandles);
+        const auto lines = restored.Lines(TableId, "data");
+        UNIT_ASSERT_VALUES_EQUAL(lines.size(), rows.size() + 1);
+        for (const auto& [key, body] : rows) {
+            TStringBuilder expected;
+            expected << key;
+            for (ui32 index = 1; index <= valueColumns; ++index) {
+                expected << "\t" << body;
+                if (index > 1) {
+                    expected << ":" << index;
+                }
+            }
+            UNIT_ASSERT_VALUES_EQUAL(lines[key], TString(expected));
+        }
     }
 
     Y_UNIT_TEST(PartEndToEnd) {
@@ -790,6 +1026,20 @@ Y_UNIT_TEST_SUITE(TPDiskToolRestoreTablet) {
             Pack(snap.SerializeAsString()));
 
         dir.PutWhole(1, 2, 0, 0, TLogEntryBuilder(1, 2).Snapshot().Confirmed(0).Ref(snapId).Serialize());
+
+        // Warm the shared core from a complete input with exactly the same blob identities.
+        // The incomplete inspection below must still read its own source and reject the part.
+        TExport complete;
+        for (const auto& glob : part.Blobs) {
+            complete.PutGlob(glob.GId, glob.Data);
+        }
+        complete.PutWhole(1, 1, 0, CookieFor(EIdx::Alter), scheme);
+        complete.PutWhole(1, 2, 0, CookieFor(EIdx::SnapLz4), Pack(snap.SerializeAsString()));
+        complete.PutWhole(1, 2, 0, 0, TLogEntryBuilder(1, 2).Snapshot().Confirmed(0).Ref(snapId).Serialize());
+        TRestored warm;
+        Restore(complete.Path(), warm);
+        UNIT_ASSERT_C(warm.Ok, Complaints(warm.Issues));
+        UNIT_ASSERT_VALUES_EQUAL(warm.Dump.Rows, rows.size());
 
         TRestored restored;
         Restore(dir.Path(), restored);

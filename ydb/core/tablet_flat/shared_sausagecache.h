@@ -19,9 +19,11 @@ using TSharedCacheConfig = NKikimrSharedCache::TSharedCacheConfig;
 TSharedCacheConfig ResolveSharedCacheConfig(
     const NKikimrConfig::TAppConfig& config, const TAppData* fallback = nullptr);
 
+// A zero expectedPageSize uses the internal estimate; fixtures may override it in C++
 IActor* CreateSharedPageCache(
     const TSharedCacheConfig& config,
-    const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters
+    const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters,
+    ui64 expectedPageSize = 0
 );
 
 inline TActorId MakeSharedPageCacheId(ui64 id = 0) {
@@ -30,4 +32,17 @@ inline TActorId MakeSharedPageCacheId(ui64 id = 0) {
     return TActorId(0, TStringBuf(x, 12));
 }
 
-}
+class TSharedCachePages;
+
+namespace NLegacy {
+
+    // Uses the node's legacy GC holder when the service starts
+    IActor* CreateSharedPageCache(
+        const TSharedCacheConfig& config, const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters);
+
+    IActor* CreateSharedPageCache(const TSharedCacheConfig& config,
+        const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters, TIntrusivePtr<TSharedCachePages> pages);
+
+} // namespace NLegacy
+
+} // namespace NKikimr::NSharedCache

@@ -6,7 +6,7 @@
 
 #include <util/generic/set.h>
 
-namespace NKikimr::NSharedCache {
+namespace NKikimr::NSharedCache::NLegacy {
 
 struct TRequest : public TSimpleRefCount<TRequest>, public TIntrusiveListItem<TRequest> {
     bool IsResponded() const {
@@ -96,4 +96,4 @@ struct TCollection {
     }
 };
 
-} // namespace NKikimr::NSharedCache
+} // namespace NKikimr::NSharedCache::NLegacy

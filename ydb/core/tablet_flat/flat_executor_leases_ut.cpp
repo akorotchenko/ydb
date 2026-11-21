@@ -1,9 +1,11 @@
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
 #include <ydb/core/tablet_flat/flat_cxx_database.h>
+#include <ydb/core/tablet_flat/cache_thread.h>
 #include <ydb/core/testlib/tablet_helpers.h>
 #include <ydb/core/base/statestorage.h>
 #include <ydb/library/actors/core/hfunc.h>
 #include <library/cpp/testing/unittest/registar.h>
+#include <util/generic/scope.h>
 
 namespace NKikimr::NTabletFlatExecutor {
 
@@ -220,6 +222,7 @@ Y_UNIT_TEST_SUITE(TFlatExecutorLeases) {
     };
 
     void DoBasics(bool deliverDropLease, bool enableInitialLease, bool sleepAfterInitialWrite = false) {
+        Y_ABORT_UNLESS(!TlsActivationContext && !NSharedCache::TlsCacheHazards);
         TTestBasicRuntime runtime(2);
         SetupTabletServices(runtime);
         runtime.SetLogPriority(NKikimrServices::TABLET_MAIN, NActors::NLog::PRI_DEBUG);

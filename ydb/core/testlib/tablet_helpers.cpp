@@ -190,13 +190,14 @@ namespace NKikimr {
 
     void SetupTabletServices(TTestActorRuntime &runtime, TAppPrepare *app, bool mockDisk, NFake::TStorage storage,
                             const NSharedCache::TSharedCacheConfig* sharedCacheConfig, bool forceFollowers,
-                            TVector<TIntrusivePtr<NFake::TProxyDS>> dsProxies) {
+                            TVector<TIntrusivePtr<NFake::TProxyDS>> dsProxies, ui64 sharedCacheExpectedPageSize) {
         TAutoPtr<TAppPrepare> dummy;
         if (app == nullptr) {
             dummy = app = new TAppPrepare;
         }
         TUltimateNodes nodes(runtime, app);
-        SetupBasicServices(runtime, *app, mockDisk, &nodes, storage, sharedCacheConfig, forceFollowers, dsProxies);
+        SetupBasicServices(runtime, *app, mockDisk, &nodes, storage, sharedCacheConfig, forceFollowers, dsProxies,
+            sharedCacheExpectedPageSize);
     }
 
     TDomainsInfo::TDomain::TStoragePoolKinds DefaultPoolKinds(ui32 count) {

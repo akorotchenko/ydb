@@ -3,6 +3,7 @@
 #include "consumer_collection.h"
 #include "memtable_collection.h"
 
+#include <ydb/core/base/appdata_fwd.h>
 #include <ydb/core/base/counters.h>
 #include <ydb/core/base/localdb.h>
 #include <ydb/core/base/memory_controller_iface.h>
@@ -52,6 +53,15 @@ using TCounterPtr = ::NMonitoring::TDynamicCounters::TCounterPtr;
 
 ui64 SafeDiff(ui64 a, ui64 b) {
     return a - Min(a, b);
+}
+
+ui64 GetCacheCapacityCeiling(ui64 hardLimitBytes, const TProcessMemoryInfo& memoryInfo) {
+    if (hardLimitBytes) {
+        return hardLimitBytes;
+    }
+    bool hasMemTotalHardLimit = false;
+    const ui64 detectedLimit = GetHardLimitBytes({}, memoryInfo, hasMemTotalHardLimit);
+    return detectedLimit ? detectedLimit : GetHardLimitBytes({}, {}, hasMemTotalHardLimit);
 }
 
 ui64 GetMemoryMapsCountOrZero() {
@@ -417,6 +427,7 @@ private:
 
         bool hasMemTotalHardLimit = false;
         ui64 hardLimitBytes = GetHardLimitBytes(Config, processMemoryInfo, hasMemTotalHardLimit);
+        const ui64 cacheCapacityCeiling = GetCacheCapacityCeiling(hardLimitBytes, processMemoryInfo);
         ui64 softLimitBytes = GetSoftLimitBytes(Config, hardLimitBytes);
         ui64 targetUtilizationBytes = GetTargetUtilizationBytes(Config, hardLimitBytes);
         ui64 activitiesLimitBytes = ResourceBrokerSelfConfig.LimitBytes
@@ -511,7 +522,8 @@ private:
 
         ui64 consumersLimitBytes = 0;
         for (const auto& consumer : consumers) {
-            ui64 limitBytes = consumer.GetLimit(coefficient);
+            const ui64 currentLimitBytes = consumer.GetLimit(coefficient);
+            ui64 limitBytes = currentLimitBytes;
             if (resultingConsumersConsumption + otherConsumption + externalConsumption > softLimitBytes && consumer.CanZeroLimit) {
                 limitBytes = SafeDiff(limitBytes, resultingConsumersConsumption + otherConsumption + externalConsumption - softLimitBytes);
             }
@@ -535,7 +547,7 @@ private:
             counters.LimitMaxBytes->Set(consumer.MaxBytes);
             AddMemoryStats(consumer, memoryStats, limitBytes);
 
-            ApplyLimit(consumer, limitBytes);
+            ApplyLimit(consumer, limitBytes, currentLimitBytes, cacheCapacityCeiling);
         }
 
         Counters->GetCounter("Stats/ConsumersLimit")->Set(consumersLimitBytes);
@@ -556,6 +568,17 @@ private:
             {"msgKind", msg->Kind},
             {"sender", ev->Sender});
         Send(ev->Sender, new TEvConsumerRegistered(std::move(consumer)));
+        if (msg->Kind == EMemoryConsumerKind::SharedCache &&
+            (!HasAppData(ctx.ActorSystem()) || AppData(ctx)->UseLockFreePageCache())) {
+            bool hasMemTotalHardLimit = false;
+            const auto memoryInfo = ProcessMemoryInfoProvider->Get();
+            const ui64 hardLimitBytes = GetHardLimitBytes(Config, memoryInfo, hasMemTotalHardLimit);
+            const auto state = BuildConsumerState(msg->Kind, Collections.at(msg->Kind), hardLimitBytes);
+            const ui64 capacityLimit =
+                state.MaxBytes ? state.MaxBytes : GetCacheCapacityCeiling(hardLimitBytes, memoryInfo);
+            // Bootstrap admission from the positive ceiling; retention starts at the minimum, which may be zero.
+            SendLimitShares(msg->Kind, state.MinBytes, capacityLimit, capacityLimit, ev->Sender);
+        }
     }
 
     void Handle(TEvConsumerUnregister::TPtr &ev, const TActorContext& ctx) {
@@ -676,28 +699,46 @@ private:
             : consumer.Consumption;
     }
 
-    void ApplyLimit(const TConsumerState& consumer, ui64 limitBytes) const {
+    void ApplyLimit(
+        const TConsumerState& consumer, ui64 limitBytes, ui64 currentLimitBytes, ui64 cacheCapacityCeiling) const {
         switch (GetConsumerTraits(consumer.Kind).LimitDelivery) {
             case ELimitDelivery::MemTableCompaction:
                 ApplyMemTableLimit(limitBytes);
                 break;
-            case ELimitDelivery::LimitShares:
-                SendLimitShares(consumer.Kind, limitBytes);
+            case ELimitDelivery::LimitShares: {
+                const ui64 capacityLimit = consumer.Kind == EMemoryConsumerKind::SharedCache && !consumer.MaxBytes
+                                               ? cacheCapacityCeiling
+                                               : consumer.MaxBytes;
+                SendLimitShares(consumer.Kind, limitBytes, capacityLimit, currentLimitBytes);
                 break;
+            }
             case ELimitDelivery::PortionsCacheSetter:
                 NKikimr::NOlap::NStorageOptimizer::IOptimizerPlanner::SetPortionsCacheLimit(limitBytes);
                 break;
         }
     }
 
-    void SendLimitShares(EMemoryConsumerKind kind, ui64 limitBytes) const {
+    void SendLimitShares(EMemoryConsumerKind kind, ui64 limitBytes, ui64 maxLimitBytes, ui64 currentLimitBytes,
+        TActorId registrant = {}) const {
         const auto* collection = Collections.FindPtr(kind);
         if (!collection) {
             return;
         }
+        TMap<TActorId, ui64> currentShares;
+        if (kind == EMemoryConsumerKind::SharedCache) {
+            Y_ENSURE(maxLimitBytes > 0, "Shared-cache maximum allocation must be positive");
+            for (const auto& share : collection->ComputeLimitShares(currentLimitBytes)) {
+                currentShares.emplace(share.Registrant, share.Bytes);
+            }
+        }
         for (const auto& share : collection->ComputeLimitShares(limitBytes)) {
-            // Delivery tracking turns a send to a dead registrant into TEvUndelivered, which drops its entry
-            Send(share.Registrant, new TEvConsumerLimit(share.Bytes), IEventHandle::FlagTrackDelivery);
+            if (registrant && share.Registrant != registrant) {
+                continue;
+            }
+            // Zero cache budgets use the node ceiling for capacity; demand only redistributes current allocations.
+            const ui64 maximum = kind == EMemoryConsumerKind::SharedCache ? maxLimitBytes : 0;
+            const ui64 current = kind == EMemoryConsumerKind::SharedCache ? currentShares.at(share.Registrant) : 0;
+            Send(share.Registrant, new TEvConsumerLimit(share.Bytes, maximum, current), IEventHandle::FlagTrackDelivery);
         }
     }
 

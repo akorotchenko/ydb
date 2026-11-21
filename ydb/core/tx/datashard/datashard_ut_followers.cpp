@@ -2,6 +2,8 @@
 #include "datashard_ut_common_kqp.h"
 #include "datashard_ut_read_table.h"
 
+#include <ydb/core/tablet_flat/shared_cache_events.h>
+#include <ydb/core/tablet_flat/shared_cache_events_lf.h>
 #include <ydb/core/testlib/actors/block_events.h>
 #include <ydb/library/actors/core/mon.h>
 
@@ -14,6 +16,7 @@ using namespace NSchemeShard;
 using namespace Tests;
 
 Y_UNIT_TEST_SUITE(DataShardFollowers) {
+    namespace NLegacy = NSharedCache::NLegacy;
 
     Y_UNIT_TEST(FollowerKeepsWorkingAfterMvccReadTable) {
         TPortManager pm;
@@ -345,6 +348,7 @@ Y_UNIT_TEST_SUITE(DataShardFollowers) {
     Y_UNIT_TEST(FollowerAfterSysCompaction_BTreeIndexV2) {
         TPortManager pm;
         TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetEnableLockFreePageCache(false);
         serverSettings.SetDomainName("Root")
             .SetUseRealThreads(false)
             .SetEnableForceFollowers(true);
@@ -391,8 +395,8 @@ Y_UNIT_TEST_SUITE(DataShardFollowers) {
             "{ items { uint32_value: 3 } items { uint32_value: 33 } }");
 
         size_t preloadedDataPages = 0;
-        auto observer = runtime.AddObserver<NSharedCache::TEvRequest>([&](NSharedCache::TEvRequest::TPtr& ev) {
-            if (ev->Cookie == ui64(NSharedCache::ERequestTypeCookie::PendingInit)) {
+        auto observer = runtime.AddObserver<NLegacy::TEvRequest>([&](NLegacy::TEvRequest::TPtr& ev) {
+            if (ev->Cookie == ui64(NLegacy::ERequestTypeCookie::PendingInit)) {
                 for (const auto& location : ev->Get()->Pages) {
                     preloadedDataPages += location.Type == NTable::NPage::EPage::DataPage;
                 }
@@ -449,6 +453,7 @@ Y_UNIT_TEST_SUITE(DataShardFollowers) {
     Y_UNIT_TEST(FollowerAfterDataCompaction) {
         TPortManager pm;
         TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetEnableLockFreePageCache(true);
         serverSettings.SetDomainName("Root")
             .SetUseRealThreads(false)
             .SetEnableForceFollowers(true);
@@ -549,6 +554,7 @@ Y_UNIT_TEST_SUITE(DataShardFollowers) {
     Y_UNIT_TEST(FollowerDuringSysPartSwitch) {
         TPortManager pm;
         TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetEnableLockFreePageCache(false);
         serverSettings.SetDomainName("Root")
             .SetUseRealThreads(false)
             .SetEnableForceFollowers(true);
@@ -591,8 +597,8 @@ Y_UNIT_TEST_SUITE(DataShardFollowers) {
             "{ items { uint32_value: 3 } items { uint32_value: 33 } }");
 
         TVector<THolder<IEventHandle>> blockedReads;
-        auto observer = runtime.AddObserver<NSharedCache::TEvRequest>([&](NSharedCache::TEvRequest::TPtr& ev) {
-            NSharedCache::TEvRequest *msg = ev->Get();
+        auto observer = runtime.AddObserver<NLegacy::TEvRequest>([&](NLegacy::TEvRequest::TPtr& ev) {
+            NLegacy::TEvRequest *msg = ev->Get();
             for (auto& location : msg->Pages) {
                 auto type = location.Type;
                 if (type == NTable::NPage::EPage::Schem2) {
@@ -633,8 +639,8 @@ Y_UNIT_TEST_SUITE(DataShardFollowers) {
         Cerr << "... unblocking read" << Endl;
         observer.Remove();
         ui32 readDataPages = 0;
-        observer = runtime.AddObserver<NSharedCache::TEvRequest>([&](NSharedCache::TEvRequest::TPtr& ev) {
-            NSharedCache::TEvRequest *msg = ev->Get();
+        observer = runtime.AddObserver<NLegacy::TEvRequest>([&](NLegacy::TEvRequest::TPtr& ev) {
+            NLegacy::TEvRequest *msg = ev->Get();
             for (auto& location : msg->Pages) {
                 readDataPages += location.Type == NTable::NPage::EPage::DataPage;
             }
@@ -677,6 +683,7 @@ Y_UNIT_TEST_SUITE(DataShardFollowers) {
     Y_UNIT_TEST(FollowerDuringDataPartSwitch) {
         TPortManager pm;
         TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetEnableLockFreePageCache(false);
         serverSettings.SetDomainName("Root")
             .SetUseRealThreads(false)
             .SetEnableForceFollowers(true);
@@ -719,8 +726,8 @@ Y_UNIT_TEST_SUITE(DataShardFollowers) {
             "{ items { uint32_value: 3 } items { uint32_value: 33 } }");
 
         TVector<THolder<IEventHandle>> blockedReads;
-        auto observer = runtime.AddObserver<NSharedCache::TEvRequest>([&](NSharedCache::TEvRequest::TPtr& ev) {
-            NSharedCache::TEvRequest *msg = ev->Get();
+        auto observer = runtime.AddObserver<NLegacy::TEvRequest>([&](NLegacy::TEvRequest::TPtr& ev) {
+            NLegacy::TEvRequest *msg = ev->Get();
             for (auto& location : msg->Pages) {
                 auto type = location.Type;
                 if (type == NTable::NPage::EPage::Schem2) {
@@ -760,8 +767,8 @@ Y_UNIT_TEST_SUITE(DataShardFollowers) {
         Cerr << "... unblocking read" << Endl;
         observer.Remove();
         ui32 readDataPages = 0;
-        observer = runtime.AddObserver<NSharedCache::TEvRequest>([&](NSharedCache::TEvRequest::TPtr& ev) {
-            NSharedCache::TEvRequest *msg = ev->Get();
+        observer = runtime.AddObserver<NLegacy::TEvRequest>([&](NLegacy::TEvRequest::TPtr& ev) {
+            NLegacy::TEvRequest *msg = ev->Get();
             for (auto& location : msg->Pages) {
                 readDataPages += location.Type == NTable::NPage::EPage::DataPage;
             }
@@ -789,8 +796,8 @@ Y_UNIT_TEST_SUITE(DataShardFollowers) {
         ExecSQL(server, sender, "UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 44), (2, 55), (3, 66);");
         runtime.SimulateSleep(TDuration::Seconds(1));
 
-        observer = runtime.AddObserver<NSharedCache::TEvRequest>([&](NSharedCache::TEvRequest::TPtr& ev) {
-            NSharedCache::TEvRequest *msg = ev->Get();
+        observer = runtime.AddObserver<NLegacy::TEvRequest>([&](NLegacy::TEvRequest::TPtr& ev) {
+            NLegacy::TEvRequest *msg = ev->Get();
             for (auto& location : msg->Pages) {
                 UNIT_ASSERT_C(location.Type != NTable::NPage::EPage::DataPage, "Shouldn't read any data");
             }

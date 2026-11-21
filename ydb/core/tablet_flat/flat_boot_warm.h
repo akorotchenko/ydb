@@ -5,7 +5,6 @@
 #include "flat_bio_events.h"
 #include "flat_dbase_naked.h"
 #include "flat_mem_blobs.h"
-#include "flat_sausage_fetch.h"
 
 namespace NKikimr {
 namespace NTabletFlatExecutor {
@@ -59,10 +58,9 @@ namespace NBoot {
 
             ui32 page = ui32(load->Cookie);
             Y_ENSURE(page < state.Pages.size());
-            Y_ENSURE(!state.Pages[page].Data);
+            Y_ENSURE(!state.Pages[page]);
 
-            state.Pages[page].Data = load->PlainData();
-            state.Pages[page].Location = TPageLocation::FromPageIndex(page, state.Pages[page].Data.size());
+            state.Pages[page] = load->PlainData();
 
             if (!--state.Pending) {
                 state.Blobs->Assign(state.Pages);
@@ -78,7 +76,7 @@ namespace NBoot {
     private:
         struct TLoadState {
             TBlobs* Blobs;
-            TVector<NPageCollection::TLoadedPage> Pages;
+            TVector<TSharedData> Pages;
             size_t Pending = 0;
         };
 

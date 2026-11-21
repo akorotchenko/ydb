@@ -1,6 +1,7 @@
 #pragma once
 
 #include "test_part.h"
+#include <ydb/core/tablet_flat/test/libs/table/cache_context.h>
 #include <ydb/core/tablet_flat/flat_table_misc.h>
 #include <ydb/core/tablet_flat/flat_fwd_cache.h>
 #include <ydb/core/tablet_flat/flat_fwd_blobs.h>
@@ -42,13 +43,12 @@ namespace NTest {
                 pass ? TTestEnv::Locate(part, ref, lob) : TResult{need, nullptr };
         }
 
-        const TSharedData* TryGetPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
-        {
+        const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             return Pages ? TTestEnv::TryGetPage(part, location, groupId) : nullptr;
         }
 
-        const TSharedData* TryGetIndexPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
-        {
+        const TSharedData* TryGetIndexPage(
+            const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             return Pages ? TTestEnv::TryGetIndexPage(part, location, groupId) : nullptr;
         }
 
@@ -68,7 +68,7 @@ namespace NTest {
             {
                 return Token == seen.Token && Ref == seen.Ref;
             }
-            
+
             bool operator<(const TSeen &seen) const
             {
                 return Token < seen.Token || Token == seen.Token && Ref < seen.Ref;
@@ -111,15 +111,15 @@ namespace NTest {
         const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
         {
             return ShouldPass(part, location, part->DataSlot(groupId), false)
-                ? TTestEnv::TryGetPage(part, location, groupId)
-                : nullptr;
+                       ? TTestEnv::TryGetPage(part, location, groupId)
+                       : nullptr;
         }
 
-        const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
-        {
+        const TSharedData* TryGetIndexPage(
+            const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             return ShouldPass(part, location, part->IndexSlot(groupId), true)
-                ? TTestEnv::TryGetIndexPage(part, location, groupId)
-                : nullptr;
+                       ? TTestEnv::TryGetIndexPage(part, location, groupId)
+                       : nullptr;
         }
 
         bool ShouldPass(const TPart* part, const TPageLocation& location, ui32 slot, bool isIndex)
@@ -196,7 +196,7 @@ namespace NTest {
             {
             }
 
-            TResult DoLoad(NFwd::TPageOffset offset, EPage type, ui64 lower, ui64 upper)
+            NFwd::IPageLoadingLogic::TResult DoLoad(NFwd::TPageOffset offset, EPage type, ui64 lower, ui64 upper)
             {
                 if (std::exchange(Grow, false)) {
                     PageLoadingLogic->Forward(this, upper);
@@ -205,17 +205,17 @@ namespace NTest {
                 {
                     for (auto &fetchEntry: IndexFetch) {
                         auto* pageData = Store->GetPage(IndexRoom, fetchEntry.Offset);
-                        NPageCollection::TLoadedPage page(
-                            TPageLocation(fetchEntry.Offset, pageData->size(), fetchEntry.Type),
-                            *pageData);
-                        PageLoadingLogic->Fill(page, {}, fetchEntry.Type);
+                        auto ref = NTable::NTest::AdmitPage(
+                            TCache::Get(), IndexPageCollection, fetchEntry, TSharedData(*pageData));
+                        PageLoadingLogic->Fill(std::move(ref), fetchEntry.Type);
                     }
                 }
                 {
                     for (auto &fetchEntry: GroupFetch) {
                         auto* pageData = Store->GetPage(GroupRoom, fetchEntry.Offset);
-                        NPageCollection::TLoadedPage page(fetchEntry, *pageData);
-                        PageLoadingLogic->Fill(page, {}, fetchEntry.Type);
+                        auto ref = NTable::NTest::AdmitPage(
+                            TCache::Get(), GroupPageCollection, fetchEntry, TSharedData(*pageData));
+                        PageLoadingLogic->Fill(std::move(ref), fetchEntry.Type);
                     }
                 }
 
@@ -226,7 +226,7 @@ namespace NTest {
 
                 Y_ENSURE((Grow = got.Grow) || IndexFetch || GroupFetch || got.Page);
 
-                return { got.Need, got.Page };
+                return got;
             }
 
             void ReleaseRowHistory()
@@ -311,7 +311,8 @@ namespace NTest {
             if (!std::exchange(queue.RowActive, true)) {
                 RowBlobQueues.push_back(&queue);
             }
-            return queue.DoLoad(TPageOffset::FromPageIndex(ref), EPage::Opaque, AheadLo, AheadHi);
+            auto got = queue.DoLoad(TPageOffset::FromPageIndex(ref), EPage::Opaque, AheadLo, AheadHi);
+            return { got.Need, got.Page ? &got.Page->GetData() : nullptr };
         }
 
         const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
@@ -320,8 +321,8 @@ namespace NTest {
             return Get(part, location, groupId);
         }
 
-        const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
-        {
+        const TSharedData* TryGetIndexPage(
+            const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             Y_ENSURE(location.Type == EPage::Undef || IsIndexPage(location.Type),
                 "Page " << location << " is requested as an index page");
             // the group queue loads both index and data pages of the group
@@ -337,7 +338,8 @@ namespace NTest {
 
             ui32 queueIndex = (groupId.Historic ? part->GroupsCount + 2 : 0) + groupId.Index;
 
-            return Get(part, queueIndex).DoLoad(location.Offset, location.Type, AheadLo, AheadHi).Page;
+            auto got = Get(part, queueIndex).DoLoad(location.Offset, location.Type, AheadLo, AheadHi);
+            return got.Page ? &got.Page->GetData() : nullptr;
         }
 
         TPartGroupLoadingQueue& Get(const TPart *part, ui32 queueIndex)

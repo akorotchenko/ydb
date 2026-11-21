@@ -18,10 +18,14 @@
 namespace NActors {
 class IEventHandle;
 class TActorSystem;
-} // namespace NActors
+}
 
 namespace NWilson {
 class TTraceId;
+}
+
+namespace NKikimr {
+struct TAppData;
 }
 
 namespace NKikimr::NPageCollection {
@@ -35,14 +39,13 @@ class TLoader;
 class TMetadataLoadContext;
 struct IPartLoaderEnv;
 struct TPageCollectionComponents;
-enum class EMetadataLoadResult;
 }
 
 namespace NKikimr::NTabletFlatExecutor {
 
 class ITransaction;
-struct TSeat;
 struct TTransactionEnv;
+struct TSeat;
 
 namespace NWriter {
     struct TWrittenPageCollection;
@@ -61,6 +64,11 @@ public:
 struct TExecutorCaches {
     THolder<IPageCacheRestartState> PageCollections;
     THashMap<TLogoBlobID, TSharedData> TxStatusCaches;
+};
+
+enum class EPageCacheBackend : ui8 {
+    Legacy,
+    LF,
 };
 
 struct TPageReadStats {
@@ -103,7 +111,7 @@ public:
         , AddWrittenPages_(addWrittenPages)
     {}
 
-    // The sender is called synchronously and is not retained
+    // The sender is borrowed for the synchronous call
     THolder<NTable::IPartLoaderEnv> AddWrittenPages(
         TArrayRef<NWriter::TWrittenPageCollection> collections, TPageCacheEventSender send) const;
 
@@ -174,6 +182,16 @@ enum class EPageResultStatus {
     Ready,
 };
 
+struct TPageResultOptions {
+    bool Sticky = false;
+    bool AbandonedTransaction = false;
+};
+
+enum class EAttachmentUpdate {
+    CacheMode,
+    StickyPages,
+};
+
 // Immutable protocol instances outlive all actors and environments that use them
 class IPageCacheProtocol {
 public:
@@ -190,6 +208,7 @@ public:
     virtual bool ReadMetadataResult(NActors::IEventHandle&, TPageCacheMetadataResult&) const {
         return false;
     }
+
     virtual THolder<NActors::IEventBase> MakePageRequest(NBlockIO::EPriority priority,
         TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
         TVector<NTable::NPage::TPageLocation> locations, ui64 cookie = 0) const = 0;
@@ -199,7 +218,7 @@ public:
     virtual THolder<NActors::IEventBase> MakeUnregisterRequest() const = 0;
 };
 
-// Backend operations shared by the executor; concrete pin owners stay private
+// Transaction-facing backend selected once for an executor; concrete owners stay private
 class IExecutorPageCache {
 public:
     virtual ~IExecutorPageCache() = default;
@@ -218,22 +237,19 @@ public:
     // Resolve this executor's requested modes in place using backend-specific Sticky rules
     virtual void PrepareCollectionModes(const NTable::TPartStore& partStore, TVector<NTable::NPage::ECacheMode>& modes,
         const TVector<bool>& stickyGroups) = 0;
+    // Returns the collections requiring owner registration updates
     virtual TVector<bool> UpdateCollectionModes(const NTable::TPartStore& partStore,
         TVector<NTable::NPage::ECacheMode>& modes, const TVector<bool>& stickyGroups) = 0;
     virtual void ReadCollectionModes(const NTable::TPartStore& partStore, TVector<NTable::NPage::ECacheMode>& modes,
         const TVector<bool>& stickyGroups) const = 0;
 
-    // Sends attachment and optional synchronization events synchronously, in that order
     virtual void RegisterCollection(const NTable::TPartStore& partStore, ui32 slot, NTable::NPage::ECacheMode cacheMode,
         TVector<NPageCollection::TBtreeSeed> btreeSeeds, bool replayStickyWalk, TPageCacheEventSender send) = 0;
+    virtual void UpdateAttachment(const NTable::TPartStore& partStore, ui32 slot, NTable::NPage::ECacheMode cacheMode,
+        TVector<NPageCollection::TBtreeSeed> btreeSeeds, EAttachmentUpdate reason, TPageCacheEventSender send) = 0;
     virtual void RegisterPseudoCollection(const NTable::TPartStore& partStore, TPageCacheEventSender send) = 0;
     virtual THolder<NActors::IEventBase> DetachCollection(const TLogoBlobID& collectionId) = 0;
-
-    virtual std::unique_ptr<TSeat> MakeSeat(ui64 uniqueId, TAutoPtr<ITransaction> transaction) = 0;
-
-    // Calls execute once synchronously; frame references must not escape
-    virtual void WithTransactionPages(
-        NTable::TDatabase& database, TSeat& seat, TFunctionRef<void(ITransactionPages&, TTransactionEnv&)> execute) = 0;
+    virtual bool ReadStats(TPageCacheStats& stats) const noexcept = 0;
 
     virtual TIntrusivePtr<IPageMetadataWorkingSet> MakeMetadataWorkingSet() const {
         return {};
@@ -241,11 +257,30 @@ public:
 
     virtual bool BeginPartMetadata(
         NTable::TLoader& loader, const NTable::TMetadataLoadContext& context, bool frontStep) const;
+
+    virtual EPageCacheBackend Backend() const noexcept = 0;
     virtual const IPageCacheProtocol& Protocol() const noexcept = 0;
 
     THolder<NActors::IEventBase> MakeUnregisterRequest() const {
         return Protocol().MakeUnregisterRequest();
     }
+    virtual std::unique_ptr<TSeat> MakeSeat(ui64 uniqueId, TAutoPtr<ITransaction> transaction) = 0;
+
+    // Calls execute once synchronously; frame references must not escape the callback
+    // The concrete frame is destroyed on normal return or exception
+    virtual void WithTransactionPages(NTable::TDatabase& database, TSeat& seat,
+        TFunctionRef<void(ITransactionPages&, TTransactionEnv&)> execute) = 0;
+
+    virtual void ProcessCacheUpdate(const NActors::IEventBase&) {}
+
+    virtual THolder<NActors::IEventBase> MakeStickyPageRequest(const NActors::IEventBase&) {
+        return {};
+    }
+
+    // Calls consume once synchronously while the backend retains the active collection
+    virtual void ProcessLoadedPages(
+        NActors::IEventBase& result, TPageResultOptions options, TFunctionRef<void(EPageResultStatus)> consume) = 0;
+    virtual bool AdoptLoadedPages(TSeat& seat, NActors::IEventBase* result) = 0;
 
     // Prepares the fresh wait pad before the executor sends any page requests
     virtual TPageRequests PreparePageRequests(
@@ -253,17 +288,18 @@ public:
         return pages.ObtainToLoad();
     }
 
-    virtual THolder<NActors::IEventBase> MakeTransactionRequest(const TLogoBlobID& collectionId,
+    // The sender runs synchronously while the backend retains the collection
+    virtual void SendTransactionRequest(const TLogoBlobID& collectionId,
         TVector<NTable::NPage::TPageLocation> locations, TIntrusivePtr<NPageCollection::TPagesWaitPad> waitPad,
-        NWilson::TTraceId traceId) = 0;
+        NWilson::TTraceId traceId, TPageCacheEventSender send) = 0;
 
-    virtual void ProcessCacheUpdate(const NActors::IEventBase& update) = 0;
-    virtual THolder<NActors::IEventBase> MakeStickyPageRequest(const NActors::IEventBase& notification) = 0;
-
-    virtual EPageResultStatus ProcessLoadedPages(NActors::IEventBase& result, bool sticky) = 0;
-    virtual bool AdoptLoadedPages(TSeat& seat, NActors::IEventBase* result) = 0;
+    // DB commit/rollback callbacks and reader cleanup precede release; transaction Complete follows it
     virtual void ReleasePins(TSeat& seat) = 0;
-    virtual bool ReadStats(TPageCacheStats& stats) const noexcept = 0;
 };
+
+const IPageCacheProtocol& GetLFPageCacheProtocol() noexcept;
+
+THolder<IExecutorPageCache> MakeLFExecutorPageCache();
+THolder<IExecutorPageCache> MakeExecutorPageCache(const TAppData& appData);
 
 } // namespace NKikimr::NTabletFlatExecutor

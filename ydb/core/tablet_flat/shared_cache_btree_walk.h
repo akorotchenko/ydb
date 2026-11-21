@@ -22,8 +22,6 @@ class TBtreeIndexNode;
 }
 
 namespace NKikimr::NSharedCache {
-
-struct TCollection;
 class TSharedCachePages;
 
 using TPageLocation = NTable::NPage::TPageLocation;
@@ -311,6 +309,12 @@ private:
     bool ContinuationNeeded = false;
 };
 
+} // namespace NKikimr::NSharedCache
+
+namespace NKikimr::NSharedCache::NLegacy {
+
+struct TCollection;
+
 class ICacheBTreeWalkHost {
 public:
     virtual ~ICacheBTreeWalkHost() = default;
@@ -337,8 +341,7 @@ public:
 
     explicit TCacheBTreeWalkController(ICacheBTreeWalkHost& host)
         : Host(host)
-    {
-    }
+    {}
 
     void UpdateSeeds(TCollection& collection, const TActorId& owner, TVector<NPageCollection::TBtreeSeed> seeds,
         bool replayStickyWalk = false);
@@ -379,4 +382,4 @@ private:
     ICacheBTreeWalkHost& Host;
 };
 
-} // namespace NKikimr::NSharedCache
+} // namespace NKikimr::NSharedCache::NLegacy

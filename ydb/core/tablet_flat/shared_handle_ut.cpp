@@ -222,4 +222,4 @@ Y_UNIT_TEST_SUITE(TPageHandleTest) {
     }
 }
 
-}
+} // namespace NKikimr::NSharedCache

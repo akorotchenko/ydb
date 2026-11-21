@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include <ydb/core/tablet_flat/flat_part_dump.h>
 #include "ydb/core/tablet_flat/flat_part_charge_range.h"
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
@@ -64,8 +65,8 @@ namespace {
             return NTest::TTestEnv::TryGetPage(part, location, groupId);
         }
 
-        const TSharedData* TryGetIndexPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
-        {
+        const TSharedData* TryGetIndexPage(
+            const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             // index pages are tracked as pages of their page collection
             const ui32 slot = part->IndexSlot(groupId);
             Touch(TGroupId(slot), ResolvePageId(part, location, slot));
@@ -118,7 +119,7 @@ namespace {
     }
 }
 
-Y_UNIT_TEST_SUITE(TPart) {
+Y_UNIT_TEST_SUITE_F(TPart, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     Y_UNIT_TEST(State)

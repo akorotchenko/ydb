@@ -47,6 +47,7 @@ public:
 
     // Concatenates the whole run of blobs a TLargeGlobId spans.
     bool Get(const NPageCollection::TLargeGlobId& largeGlobId, TString& out);
+    bool Get(const NPageCollection::TLargeGlobId& largeGlobId, NActors::TSharedData& out);
 
     const TBlobStoreStats& Stats() const {
         return Stats_;
@@ -70,6 +71,8 @@ private:
     TEntry* Find(const TLogoBlobID& id);
     const TEntry* Find(const TLogoBlobID& id) const;
     bool Restore(const TLogoBlobID& id, TEntry& entry);
+    template <class TBody>
+    bool RestoreLargeGlob(const NPageCollection::TLargeGlobId& largeGlobId, TBody& out);
     ui64 ExpectedPartSize(const TLogoBlobID& id, ui32 partId) const;
     ui32 UsableParts(const TLogoBlobID& id, const TEntry& entry) const;
 

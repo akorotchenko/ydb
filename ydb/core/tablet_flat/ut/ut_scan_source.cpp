@@ -1,4 +1,5 @@
 #include <ydb/core/tablet_flat/flat_scan_feed.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_part.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_writer.h>
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
@@ -299,7 +300,7 @@ namespace {
 
 }
 
-Y_UNIT_TEST_SUITE(TVersionScanSourceTest) {
+Y_UNIT_TEST_SUITE_F(TVersionScanSourceTest, NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(KeysAndVersionsFollowTheDocumentedOrder) {
         TFixture f;

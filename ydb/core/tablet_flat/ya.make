@@ -1,11 +1,6 @@
 LIBRARY()
 
 SRCS(
-    cache_space.cpp
-    cache_space_resize.cpp
-    cache_memory.cpp
-    cache_thread.cpp
-    cache_accounting.cpp
     defs.cpp
     defs.h
     flat_backup.cpp
@@ -27,6 +22,7 @@ SRCS(
     flat_exec_commit.cpp
     flat_exec_commit_mgr.cpp
     flat_exec_seat.cpp
+    flat_page_cache_lf.cpp
     flat_executor.cpp
     flat_executor.h
     flat_executor_backup.cpp
@@ -59,6 +55,8 @@ SRCS(
     flat_mem_warm.cpp
     flat_sausagecache.cpp
     flat_sausagecache.h
+    flat_sausagecache_lf.cpp
+    flat_sausagecache_lf.h
     flat_sausage_meta.cpp
     flat_part_charge_create.cpp
     flat_part_charge_range.cpp
@@ -72,6 +70,7 @@ SRCS(
     flat_range_cache.cpp
     flat_row_versions.cpp
     flat_stat_part.h
+    flat_stat_page.h
     flat_stat_table.h
     flat_stat_table.cpp
     flat_stat_table_btree_index.cpp
@@ -95,13 +94,42 @@ SRCS(
     flat_tier_predicate.h
     flat_update_op.h
     probes.cpp
-    shared_handle.cpp
     shared_cache_counters.cpp
+    shared_cache_counters.h
+    shared_cache_event_format.h
+    shared_cache_collection_load.cpp
+    shared_cache_collections.cpp
     shared_cache_btree_walk.cpp
     shared_cache_btree_walk.h
+    shared_cache_btree_walk_lf.cpp
+    shared_cache_btree_walk_lf.h
+    shared_cache_pages.h
     shared_sausagecache_state.h
+    shared_sausagecache_state_lf.h
+    cache.cpp
+    cache_capacity.cpp
+    cache_collection.cpp
+    cache_collections.cpp
+    shared_cache_events_lf.cpp
+    cache_eviction.cpp
+    cache_eviction_resize.cpp
+    cache_fetches.cpp
+    cache_hot_policy.cpp
+    cache_cold_policy.cpp
+    cache_items.cpp
+    cache_memory.cpp
+    cache_accounting.cpp
+    cache_resize.cpp
+    cache_space.cpp
+    cache_space_resize.cpp
+    cache_table.cpp
+    cache_thread.cpp
+    cache_table_resize.cpp
+    shared_handle.cpp
     shared_sausagecache.cpp
     shared_sausagecache.h
+    shared_sausagecache_lf.cpp
+    shared_sausagecache_format.h
     tablet_flat_executor.h
     tablet_flat_executor.cpp
     tablet_flat_executed.h
@@ -130,8 +158,9 @@ GENERATE_ENUM_SERIALIZATION(flat_page_iface.h)
 GENERATE_ENUM_SERIALIZATION(flat_part_loader.h)
 GENERATE_ENUM_SERIALIZATION(flat_row_eggs.h)
 GENERATE_ENUM_SERIALIZATION(flat_scan_iface.h)
-GENERATE_ENUM_SERIALIZATION(shared_cache_s3fifo.h)
 GENERATE_ENUM_SERIALIZATION(shared_cache_events.h)
+GENERATE_ENUM_SERIALIZATION(shared_cache_events_lf.h)
+GENERATE_ENUM_SERIALIZATION(shared_cache_s3fifo.h)
 
 IF (KIKIMR_TABLET_BORROW_WITHOUT_META)
     CFLAGS(

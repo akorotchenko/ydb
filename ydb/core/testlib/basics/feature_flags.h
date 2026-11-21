@@ -92,6 +92,7 @@ public:
     FEATURE_FLAG_SETTER(EnableTopicDeferredPublish)
     FEATURE_FLAG_SETTER(TransferInternalDataDecompression)
     FEATURE_FLAG_SETTER(EnableCdcAggregator)
+    FEATURE_FLAG_SETTER(EnableLockFreePageCache)
     #undef FEATURE_FLAG_SETTER
 };
 

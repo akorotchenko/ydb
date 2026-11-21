@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include <flat_part_loader.h>
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
@@ -20,7 +21,6 @@ namespace NTable {
 
 using namespace NTest;
 using TPageCollectionProtoHelper = NTabletFlatExecutor::TPageCollectionProtoHelper;
-using TPageCollection = NTabletFlatExecutor::TPrivatePageCache::TPageCollection;
 
 namespace {
     NPage::TConf PageConf()
@@ -66,7 +66,9 @@ namespace {
         TTestPartPageCollection(TIntrusiveConstPtr<NTest::TPartStore> part, ui32 room)
             : Part(std::move(part))
             , Room(room)
+            , Id(reinterpret_cast<ui64>(this), 0, room, 0, 0, 0)
         {
+            // Each loader run starts with an uncached collection so fetch counts are deterministic.
             // Build byte-offset to pageId map
             for (ui32 i = 0; i < Total(); i++) {
                 auto type = Part->Store->GetPageType(Room, i);
@@ -79,7 +81,7 @@ namespace {
 
         const TLogoBlobID& Label() const noexcept override
         {
-            return Part->Label;
+            return Id;
         }
 
         ui32 Total() const noexcept override
@@ -91,7 +93,7 @@ namespace {
         {
             const auto array = Part->Store->PageCollectionArray(Room);
 
-            return { array.at(page).size(), ui32(EPage::Undef) };
+            return { array.at(page).size(), ui32(Part->Store->GetPageType(Room, page)) };
         }
 
         NPageCollection::TBorder Bounds(ui32 page) const override
@@ -126,17 +128,17 @@ namespace {
             return data.size() == location.Size;
         }
 
+        size_t BackingSize() const noexcept override
+        {
+            return Part->Store->PageCollectionBytes(Room);
+        }
+
         i64 GetMetadataMemoryUsage() const noexcept override {
             return sizeof(TTestPartPageCollection);
         }
 
         const TSharedData* GetMetadataBuffer() const noexcept override {
             return nullptr;
-        }
-
-        size_t BackingSize() const noexcept override
-        {
-            return Part->Store->PageCollectionBytes(Room);
         }
 
         NTable::NPage::TPageLocation GetLocation(ui32 pageId) const override
@@ -147,6 +149,7 @@ namespace {
     private:
         TIntrusiveConstPtr<NTest::TPartStore> Part;
         ui32 Room;
+        const TLogoBlobID Id;
         THashMap<ui64, ui32> ByteOffsetToPageId;
     };
 
@@ -183,7 +186,9 @@ namespace {
         TCheckResult result;
 
         TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection = new TTestPartPageCollection(part, 0);
-        NTable::TLoader::TLoaderEnv env({ new TPageCollection(pageCollection) }, part->Slots);
+        TVector<TCacheCollectionRef> collections;
+        collections.push_back(NTable::NTest::AdmitCollection(TCache::Get(), pageCollection));
+        NTable::TLoader::TLoaderEnv env(std::move(collections), part->Slots);
         env.ProvidePart(part.Get());
         TKeysLoader loader(part.Get(), &env);
 
@@ -197,7 +202,7 @@ namespace {
                 for (auto& location : fetch.Pages) {
                     auto* page = part->Store->GetPage(0, location.Offset);
                     UNIT_ASSERT_C(page, "TLoader wants a missing page at offset " << location.Offset);
-                    env.Save({ location.Offset, location.Size, NSharedCache::TSharedPageRef::MakePrivate(*page) });
+                    env.Save(NPageCollection::TPageData(location, *page));
                 }
             } else {
                 UNIT_ASSERT_C(false, "TKeysLoader was stalled");
@@ -230,7 +235,7 @@ namespace {
 
 }
 
-Y_UNIT_TEST_SUITE(TPartSliceLoader) {
+Y_UNIT_TEST_SUITE_F(TPartSliceLoader, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(RestoreMissingSlice) {
         auto result = RunLoaderTest(Part0(), nullptr);

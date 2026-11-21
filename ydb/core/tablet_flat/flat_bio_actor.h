@@ -38,6 +38,7 @@ namespace NBlockIO {
         TActorId Sender;
         EPriority Priority;
         TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
+        NSharedCache::TCacheCollectionRef Collection;
         TVector<TPageLocation> Pages;
         NWilson::TTraceId TraceId;
         ui64 RequestCookie;
@@ -54,6 +55,7 @@ namespace NBlockIO {
         };
 
         TVector<TLoadState> BlockStates;
+        NSharedCache::TCachePendingBuffers PendingBuffers;
         TAutoPtr<TPagesToBlobsConverter> PagesToBlobsConverter;
         ui64 Pending = 0;
         ui64 TotalOps = 0;

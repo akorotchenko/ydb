@@ -101,19 +101,19 @@ public:
     // called on loaner at moment of attaching part
     void LoanBundle(
         const TLogoBlobID &bundleId,
-        TPageCollectionTxEnv::TLoanBundle &loaned,
+        TTransactionEnv::TLoanBundle &loaned,
         TLogCommit *commit);
 
     // called on loaner at moment of attaching part
     void LoanTxStatus(
         const TLogoBlobID &bundleId,
-        TPageCollectionTxEnv::TLoanTxStatus &loaned,
+        TTransactionEnv::TLoanTxStatus &loaned,
         TLogCommit *commit);
 
     // called on lender
     void UpdateBorrow(
         const TLogoBlobID &bundleId,
-        TPageCollectionTxEnv::TBorrowUpdate &borrowUpdate,
+        TTransactionEnv::TBorrowUpdate &borrowUpdate,
         TLogCommit *commit);
 
     // confirmation for loaner

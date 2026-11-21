@@ -157,7 +157,7 @@ namespace NKikimr {
 
     void SetupBasicServices(TTestActorRuntime& runtime, TAppPrepare& app, bool mock,
                             NFake::INode* factory, NFake::TStorage storage, const NSharedCache::TSharedCacheConfig* sharedCacheConfig, bool forceFollowers,
-                            TVector<TIntrusivePtr<NFake::TProxyDS>> dsProxies)
+                            TVector<TIntrusivePtr<NFake::TProxyDS>> dsProxies, ui64 sharedCacheExpectedPageSize)
     {
         runtime.SetDispatchTimeout(storage.UseDisk ? storage.EventDispatchTimeout.value_or(DISK_DISPATCH_TIMEOUT) : DEFAULT_DISPATCH_TIMEOUT);
 
@@ -210,7 +210,8 @@ namespace NKikimr {
             SetupTabletResolver(runtime, nodeIndex);
             SetupTabletPipePerNodeCaches(runtime, nodeIndex, forceFollowers);
             SetupResourceBroker(runtime, nodeIndex, app.ResourceBrokerConfig);
-            SetupSharedPageCache(runtime, nodeIndex, sharedCacheConfig ? *sharedCacheConfig : defaultSharedCacheConfig);
+            SetupSharedPageCache(runtime, nodeIndex, sharedCacheConfig ? *sharedCacheConfig : defaultSharedCacheConfig,
+                app.FeatureFlags.GetEnableLockFreePageCache(), sharedCacheExpectedPageSize);
             SetupBlobCache(runtime, nodeIndex, app.BlobCacheConfig);
             SetupCSMetadataCache(runtime, nodeIndex);
             SetupCSColumnDataCache(runtime, nodeIndex);

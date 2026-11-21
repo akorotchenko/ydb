@@ -50,19 +50,30 @@ void TBlockIO::Inbox(TEventHandlePtr &eh)
         RequestCookie = ev->Cookie;
 
         PageCollection = std::move(ev->PageCollection);
+        Collection = std::move(ev->Collection);
         Pages = std::move(ev->Pages);
         Y_ENSURE(Pages, "Got TFetch request without pages list");
         PagesToBlobsConverter = new TPagesToBlobsConverter(*PageCollection, Pages);
+        if (Collection) {
+            PendingBuffers = NSharedCache::TCache::Get().TrackPendingBuffers();
+        }
         BlockStates.reserve(Pages.size());
         for (auto& page: Pages) {
             BlockStates.emplace_back(page.Size);
+            if (Collection) {
+                PendingBuffers.AccountBuffer(BlockStates.back().Data, page.Type == NTable::NPage::EPage::Globs);
+            }
         }
 
         Dispatch();
     } else if (eh->CastAsLocal<TEvents::TEvUndelivered>()) {
         Terminate(NKikimrProto::UNKNOWN);
     } else if (eh->CastAsLocal<TEvents::TEvPoison>()) {
-        PassAway();
+        if (Sender) {
+            Terminate(NKikimrProto::ERROR);
+        } else {
+            PassAway();
+        }
     } else {
         Y_TABLET_ERROR("Page collection blocks IO actor got an unexpected event");
     }
@@ -202,6 +213,13 @@ void TBlockIO::Terminate(EStatus code)
     }
 
     auto *ev = new TEvData(code, PageCollection, RequestCookie);
+    // Transfer the canonical owner to the reply before this actor terminates
+    ev->Collection = std::move(Collection);
+    if (code == NKikimrProto::OK) {
+        ev->PendingBuffers = std::move(PendingBuffers);
+    } else {
+        PendingBuffers.Reset();
+    }
 
     ev->Pages.reserve(Pages.size());
     for (auto index : xrange(Pages.size())) {

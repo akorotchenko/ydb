@@ -6,7 +6,7 @@
 #include <ydb/core/formats/arrow/converter.h>
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
 #include <ydb/core/protos/schemeshard/operations.pb.h>
-#include <ydb/core/tablet_flat/shared_cache_events.h>
+#include <ydb/core/tablet_flat/shared_cache_events_lf.h>
 #include <ydb/core/tx/tx_proxy/proxy.h>
 #include <ydb/core/tx/tx_proxy/read_table.h>
 #include <ydb/core/tx/long_tx_service/public/lock_handle.h>

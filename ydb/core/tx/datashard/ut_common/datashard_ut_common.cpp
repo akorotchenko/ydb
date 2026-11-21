@@ -6,7 +6,7 @@
 #include <ydb/core/scheme/scheme_types_defs.h>
 #include <ydb/core/scheme/scheme_types_proto.h>
 #include <ydb/core/tablet_flat/flat_bio_events.h>
-#include <ydb/core/tablet_flat/shared_cache_events.h>
+#include <ydb/core/tablet_flat/shared_cache_events_lf.h>
 #include <ydb/core/testlib/basics/appdata.h>
 #include <ydb/core/tx/balance_coverage/balance_coverage_builder.h>
 #include <ydb/core/tx/data_events/events.h>

@@ -3251,11 +3251,12 @@ partitioning_settings {
 
         THolder<IEventHandle> injectResult;
         auto prevObserver = Runtime().SetObserverFunc([&](TAutoPtr<IEventHandle>& ev) {
-            if (ev->GetTypeRewrite() == NSharedCache::EvResult) {
-                const auto* msg = ev->Get<NSharedCache::TEvResult>();
+            if (ev->GetTypeRewrite() == NSharedCache::NLegacy::EvResult) {
+                const auto* msg = ev->Get<NSharedCache::NLegacy::TEvResult>();
                 UNIT_ASSERT_VALUES_EQUAL(msg->Status, NKikimrProto::OK);
 
-                auto result = MakeHolder<NSharedCache::TEvResult>(msg->PageCollection, NKikimrProto::ERROR, msg->Cookie);
+                auto result =
+                    MakeHolder<NSharedCache::NLegacy::TEvResult>(msg->PageCollection, NKikimrProto::ERROR, msg->Cookie);
                 std::move(msg->Pages.begin(), msg->Pages.end(), std::back_inserter(result->Pages));
 
                 injectResult = MakeHolder<IEventHandle>(ev->Recipient, ev->Sender, result.Release(), ev->Flags, ev->Cookie);

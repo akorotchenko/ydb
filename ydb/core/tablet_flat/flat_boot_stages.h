@@ -124,7 +124,10 @@ namespace NBoot {
                 Back->Redo = new NRedo::TQueue(std::move(Back->Edges));
             }
 
-            for (auto &se: std::exchange(Back->Switches, { })) {
+            auto switches = std::exchange(Back->Switches, {});
+            auto workingSet = Logic->PageCache.MakeMetadataWorkingSet();
+
+            for (auto& se : switches) {
                 auto &wrap = Back->DatabaseImpl->Get(se.Table, false);
 
                 if (!wrap) {
@@ -154,7 +157,7 @@ namespace NBoot {
                                 continue;
                             }
 
-                            Pending += Spawn<TBundleLoadStep>(se.Table, bundle);
+                            Pending += Spawn<TBundleLoadStep>(se.Table, bundle, workingSet);
                         }
                     }
                 };

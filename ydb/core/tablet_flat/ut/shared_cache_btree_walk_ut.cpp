@@ -7,15 +7,14 @@
 #include <shared_cache_pages.h>
 #include <shared_sausagecache_state.h>
 
-namespace NKikimr::NSharedCache {
+namespace NKikimr::NSharedCache::NLegacy {
 namespace {
 
     class TPageCollectionStub final : public NPageCollection::IPageCollection {
     public:
         explicit TPageCollectionStub(TLogoBlobID id)
             : Id(std::move(id))
-        {
-        }
+        {}
 
         const TLogoBlobID& Label() const noexcept override {
             return Id;
@@ -52,6 +51,7 @@ namespace {
         size_t BackingSize() const noexcept override {
             return 0;
         }
+
         i64 GetMetadataMemoryUsage() const noexcept override {
             return sizeof(TPageCollectionStub);
         }
@@ -59,7 +59,6 @@ namespace {
         const TSharedData* GetMetadataBuffer() const noexcept override {
             return nullptr;
         }
-
 
         TPageLocation GetLocation(ui32) const override {
             return {};
@@ -157,7 +156,7 @@ namespace {
 
 } // namespace
 
-Y_UNIT_TEST_SUITE(TCacheBTreeWalkController) {
+Y_UNIT_TEST_SUITE(TLegacyCacheBTreeWalkController) {
     Y_UNIT_TEST(MissingInMemoryIndexUsesPendingQueue) {
         TWalkHostMock host;
         TCacheBTreeWalkController walks(host);
@@ -372,4 +371,4 @@ Y_UNIT_TEST_SUITE(TCacheBTreeWalkController) {
     }
 }
 
-} // namespace NKikimr::NSharedCache
+} // namespace NKikimr::NSharedCache::NLegacy

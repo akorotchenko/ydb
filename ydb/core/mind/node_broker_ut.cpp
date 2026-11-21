@@ -3,6 +3,7 @@
 #include "dynamic_nameserver_impl.h"
 
 #include <ydb/core/cms/console/console.h>
+#include <ydb/core/base/memory_controller_iface.h>
 
 #include <ydb/core/testlib/basics/appdata.h>
 #include <ydb/core/testlib/basics/storage.h>
@@ -22,6 +23,7 @@
 #include <ydb/core/protos/schemeshard/operations.pb.h>
 #include <ydb/core/protos/tx_proxy.pb.h>
 #include <ydb/core/protos/blobstorage_distributed_config.pb.h>
+#include <ydb/core/tablet_flat/shared_cache_events_lf.h>
 #include <ydb/core/tablet_flat/shared_cache_events.h>
 #include <ydb/core/tablet_flat/shared_sausagecache.h>
 #include <ydb/core/tx/schemeshard/schemeshard.h>
@@ -188,8 +190,8 @@ void SetupServices(TTestActorRuntime &runtime,
         SetupTabletResolver(runtime, nodeIndex);
         SetupResourceBroker(runtime, nodeIndex, {});
         NSharedCache::TSharedCacheConfig sharedCacheConfig;
-        sharedCacheConfig.SetMemoryLimit(0);
-        SetupSharedPageCache(runtime, nodeIndex, sharedCacheConfig);
+        sharedCacheConfig.SetMemoryLimit(32_MB);
+        SetupSharedPageCache(runtime, nodeIndex, sharedCacheConfig, app.FeatureFlags.GetEnableLockFreePageCache());
         SetupSchemeCache(runtime, nodeIndex, DOMAIN_NAME);
     }
 
@@ -206,6 +208,10 @@ void SetupServices(TTestActorRuntime &runtime,
 
     SetupPDiskSubsystem(&runtime, STRAND_PDISK);
     runtime.Initialize(app.Unwrap());
+    for (ui32 nodeIndex = 0; nodeIndex < runtime.GetNodeCount(); ++nodeIndex) {
+        runtime.Send(new IEventHandle(NSharedCache::MakeSharedPageCacheId(), TActorId{},
+                         new NMemory::TEvConsumerLimit(0, 32_MB)), nodeIndex);
+    }
 
     runtime.GetAppData().DynamicNameserviceConfig = new TDynamicNameserviceConfig;
     auto dnConfig = runtime.GetAppData().DynamicNameserviceConfig;
@@ -2223,7 +2229,8 @@ Y_UNIT_TEST_SUITE(TNodeBrokerTest) {
         private:
             TTestActorRuntime::EEventAction OnEvent(TAutoPtr<IEventHandle>& ev) {
                 switch (ev->GetTypeRewrite()) {
-                    case NSharedCache::EvRequest: {
+                    case NSharedCache::EvRequest:
+                    case NSharedCache::NLegacy::EvRequest: {
                         if (Activated) {
                             Cerr << "... captured cache request" << Endl;
                             CacheRequests.emplace_back(ev.Release());

@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include <ydb/core/tablet_flat/flat_mem_warm.h>
 #include <ydb/core/tablet_flat/flat_mem_iter.h>
 #include <ydb/core/tablet_flat/flat_table_subset.h>
@@ -56,7 +57,7 @@ namespace {
 using TCheckIter = NTest::TChecker<NTest::TWrapIter, TSubset>;
 using TCheckReverseIter = NTest::TChecker<NTest::TWrapReverseIter, TSubset>;
 
-Y_UNIT_TEST_SUITE(TIterator) {
+Y_UNIT_TEST_SUITE_F(TIterator, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     Y_UNIT_TEST(Basics)
@@ -186,16 +187,17 @@ Y_UNIT_TEST_SUITE(TIterator) {
             if (Touch(groupId, ResolvePageId(part, location, part->DataSlot(groupId)))) {
                 return NTest::TTestEnv::TryGetPage(part, location, groupId);
             }
-            return nullptr;
+            return {};
         }
 
-        const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+        const TSharedData* TryGetIndexPage(
+            const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             // index pages are tracked as pages of their page collection
             const ui32 slot = part->IndexSlot(groupId);
             if (Touch(TGroupId(slot), ResolvePageId(part, location, slot))) {
                 return NTest::TTestEnv::TryGetIndexPage(part, location, groupId);
             }
-            return nullptr;
+            return {};
         }
 
         bool Touch(TGroupId groupId, TPageId pageId) {

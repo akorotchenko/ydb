@@ -1,5 +1,7 @@
 #include <ydb/core/base/feature_flags.h>
+#include <ydb/core/tablet_flat/flat_sausagecache.h>
 #include <ydb/core/tablet_flat/flat_part_loader.h>
+#include <ydb/core/tablet_flat/flat_part_store_cache.h>
 #include <ydb/core/tablet_flat/flat_part_index_iter_iface.h>
 #include <ydb/core/tablet_flat/flat_part_writer.h>
 #include <ydb/core/tablet_flat/flat_writer_bundle.h>
@@ -9,9 +11,10 @@
 #include <ydb/core/tablet_flat/test/libs/table/wrap_part.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_writer.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_wreck.h>
-#include <ydb/core/testlib/actor_helpers.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 
 #include <library/cpp/testing/unittest/registar.h>
+#include <ydb/library/testlib/helpers.h>
 
 #include <util/generic/map.h>
 #include <util/string/join.h>
@@ -238,7 +241,7 @@ namespace {
     }
 }
 
-Y_UNIT_TEST_SUITE(TPartLayout) {
+Y_UNIT_TEST_SUITE_F(TPartLayout, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(Placement) {
         for (EIndex index : { EIndex::V1, EIndex::V2, EIndex::V2WithV1Shadow }) {
@@ -445,7 +448,7 @@ namespace {
 
     class TTrackedLoaderEnv : public NTable::TLoader::TLoaderEnv {
     public:
-        TTrackedLoaderEnv(TVector<TIntrusivePtr<NTable::TLoader::TPageCollection>> collections, TLoadStats& stats)
+        TTrackedLoaderEnv(TVector<TCacheCollectionRef> collections, TLoadStats& stats)
             : TLoaderEnv(std::move(collections))
             , Stats(stats)
         {}
@@ -476,7 +479,24 @@ namespace {
         const auto& result = bundlePart.Result;
 
         TVector<THashMap<NPage::TPageOffset, TSharedData>> pages(result.PageCollections.size());
-        TVector<TIntrusivePtr<NTable::TLoader::TPageCollection>> collections;
+        auto& cache = TCache::Get();
+        if (!cachedPart) {
+            // Keep cold-load cases independent of pages retained by an earlier load of the same bundle
+            for (const auto& written : result.PageCollections) {
+                TCacheCollectionRef previous;
+                if (cache.Find(written.PageCollection->Label(), previous) == NSharedCache::ECacheResultStatus::Hit) {
+                    previous->DrainStickyPages();
+                    UNIT_ASSERT(cache.DetachCollection(previous.CacheItem()));
+                    for (ui64 step = 0; previous->HasPageItems(); ++step) {
+                        UNIT_ASSERT(step < cache.TargetHandleCount() * 4 + 4096);
+                        cache.ReclaimForAdmission(cache.CurrentLimit());
+                        cache.RunMaintenance();
+                    }
+                    UNIT_ASSERT(cache.EraseCollection(previous.CacheItem()));
+                }
+            }
+        }
+        TVector<TCacheCollectionRef> collections;
         for (ui32 slot : xrange(result.PageCollections.size())) {
             const auto& written = result.PageCollections[slot];
             for (const auto* loaded : { &written.RegularPages, &written.StickyPages }) {
@@ -484,8 +504,8 @@ namespace {
                     pages[slot][page.Location.Offset] = page.Data;
                 }
             }
-            collections.push_back(cachedPart ? cachedPart.As<NTable::TPrivatePartStore>()->PageCollections[slot]
-                : MakeIntrusive<NTable::TLoader::TPageCollection>(written.PageCollection));
+            collections.push_back(cachedPart ? cachedPart.As<NTable::TCachePartStore>()->PageCollections[slot].Acquire()
+                                             : NTable::NTest::AdmitCollection(cache, written.PageCollection));
         }
         collections.resize(collections.size() - dropSlots);
 
@@ -523,7 +543,10 @@ namespace {
             for (const auto& location : fetch.Pages) {
                 auto* data = pages[slot].FindPtr(location.Offset);
                 UNIT_ASSERT_C(data, "Fetch of an unknown page " << location << " of page collection " << slot);
-                loaded.emplace_back(location.Offset, location.Size, NSharedCache::TSharedPageRef::MakePrivate(*data));
+                auto page = NTable::NTest::AdmitPage(cache, fetch.PageCollection, location, TSharedData(*data),
+                    NTable::TLoader::NeedIn(location.Type) || location.Type == EPage::FlatIndex);
+                UNIT_ASSERT(page);
+                loaded.emplace_back(location.Offset, location.Size, std::move(page));
             }
             NSharedCache::TEvResult reply(std::move(fetch.PageCollection), NKikimrProto::OK, 0);
             reply.Pages = std::move(loaded);
@@ -560,7 +583,7 @@ namespace {
     }
 }
 
-Y_UNIT_TEST_SUITE(TPartLayoutLoader) {
+Y_UNIT_TEST_SUITE_F(TPartLayoutLoader, ::NKikimr::NTable::NTest::TTableCacheTest) {
     Y_UNIT_TEST(MetadataRestoreCanBeInitializedWhenRawIOIsRequested) {
         const auto bundlePart = WriteBundlePart(SeparateLayouts.front(), EIndex::V2);
         const auto& packet = *CheckedCast<const NPageCollection::TPageCollection*>(
@@ -601,8 +624,9 @@ Y_UNIT_TEST_SUITE(TPartLayoutLoader) {
         const auto bundlePart = WriteBundlePart(SeparateLayouts.front(), EIndex::V2);
         const auto& written = bundlePart.Result.PageCollections;
         UNIT_ASSERT(written.size() > 2);
-        TVector<TIntrusivePtr<NTable::TLoader::TPageCollection>> collections(written.size());
-        collections[0] = MakeIntrusive<NTable::TLoader::TPageCollection>(written[0].PageCollection);
+        TVector<TIntrusivePtr<NTabletFlatExecutor::TPrivatePageCache::TPageCollection>> collections(written.size());
+        collections[0] =
+            MakeIntrusive<NTabletFlatExecutor::TPrivatePageCache::TPageCollection>(written[0].PageCollection);
         TVector<TSharedData> raw;
         TPartComponents components{
             .PageCollectionComponents = TVector<TPageCollectionComponents>(written.size()),
@@ -616,7 +640,7 @@ Y_UNIT_TEST_SUITE(TPartLayoutLoader) {
         }
         components.PageCollectionComponents[1].RawMeta = raw[1];
         written[0].PageCollection->SetSkipBTreeIndexV1Shadow(true);
-        auto environment = MakeHolder<NTable::TLoader::TLoaderEnv>(std::move(collections));
+        auto environment = NTabletFlatExecutor::MakePrivateLoaderEnvironment(std::move(collections));
         THost host;
         const TMetadataLoadContext context(host, nullptr, {}, 19, NTabletFlatExecutor::NBlockIO::EPriority::Fast);
         NTable::TLoader loader(std::move(environment), std::move(components));
@@ -645,6 +669,39 @@ Y_UNIT_TEST_SUITE(TPartLayoutLoader) {
         UNIT_ASSERT(loader.SaveMetadata(2, raw[2]) == EMetadataLoadResult::Ignored);
     }
 
+    Y_UNIT_TEST_TWIN(PrepareRootBeforeOtherCollectionsArrive, LockFree) {
+        for (EIndex index : { EIndex::V1, EIndex::V2, EIndex::V2WithV1Shadow }) {
+            const auto bundlePart = WriteBundlePart(SeparateLayouts.front(), index);
+            const auto& written = bundlePart.Result.PageCollections;
+            UNIT_ASSERT(written.size() > 1);
+            THolder<IPartLoaderEnv> environment;
+            if constexpr (LockFree) {
+                TVector<TCacheCollectionRef> collections(written.size());
+                collections[0] = NTest::AdmitCollection(TCache::Get(), written[0].PageCollection);
+                environment = MakeHolder<NTable::TLoader::TLoaderEnv>(std::move(collections));
+            } else {
+                using TPrivatePageCollection = NTabletFlatExecutor::TPrivatePageCache::TPageCollection;
+                TVector<TIntrusivePtr<TPrivatePageCollection>> collections(written.size());
+                collections[0] = MakeIntrusive<TPrivatePageCollection>(written[0].PageCollection);
+                environment = NTabletFlatExecutor::MakePrivateLoaderEnvironment(std::move(collections));
+            }
+            auto* rootEnv = environment.Get();
+            TPartComponents components{
+                .PageCollectionComponents = TVector<TPageCollectionComponents>(written.size()),
+                .Epoch = TEpoch::Max(),
+            };
+            NTable::TLoader loader(std::move(environment), std::move(components));
+            loader.PrepareRoot();
+            UNIT_ASSERT(loader.HasOuterCollection());
+            loader.PrepareRoot();
+            UNIT_ASSERT(loader.HasOuterCollection());
+            UNIT_ASSERT(rootEnv->GetCollection(0) == written[0].PageCollection);
+            for (ui32 slot = 1; slot < written.size(); ++slot) {
+                UNIT_ASSERT(!rootEnv->HasCollection(slot));
+            }
+        }
+    }
+
     Y_UNIT_TEST(MetadataRootCallbackAppliesSelectionToLaterSlots) {
         struct THost {
             void LoadRawMetadata(ui32, const NPageCollection::TLargeGlobId&) {
@@ -660,23 +717,22 @@ Y_UNIT_TEST_SUITE(TPartLayoutLoader) {
 
         class TMetadataEnv : public NTable::TLoader::TLoaderEnv {
         public:
-            TMetadataEnv(
-                TVector<TIntrusivePtr<NTable::TLoader::TPageCollection>> collections, TPageCollectionComponents ready)
+            TMetadataEnv(TVector<TCacheCollectionRef> collections, TPageCollectionComponents ready)
                 : TLoaderEnv(std::move(collections))
                 , Ready(std::move(ready))
             {}
 
             bool BeginMetadata(TArrayRef<TPageCollectionComponents>, const TMetadataLoadContext&,
-                TFunctionRef<bool()> prepareRoot) override {
-                Outer = prepareRoot();
+                TFunctionRef<bool(ui32)> prepareRoot) override {
+                Outer = prepareRoot(0);
                 return true;
             }
 
             EMetadataLoadResult AcceptMetadata(ui32 slot, const NTabletFlatExecutor::TPageCacheMetadataResult&,
-                NActors::IEventBase&, const TMetadataLoadContext&, TFunctionRef<bool()> prepareRoot) override {
+                NActors::IEventBase&, const TMetadataLoadContext&, TFunctionRef<bool(ui32)> prepareRoot) override {
                 PrepareCollection(slot, Ready, false);
-                GetCollection(slot)->SetSkipBTreeIndexV1Shadow(true);
-                UNIT_ASSERT(prepareRoot() == Outer);
+                TLoaderEnv::SetSkipBTreeIndexV1Shadow(slot, true);
+                UNIT_ASSERT(prepareRoot(slot) == Outer);
                 return EMetadataLoadResult::Pending;
             }
 
@@ -697,9 +753,9 @@ Y_UNIT_TEST_SUITE(TPartLayoutLoader) {
         const auto& written = bundlePart.Result.PageCollections;
         const auto& packet = *CheckedCast<const NPageCollection::TPageCollection*>(written[1].PageCollection.Get());
         const bool expectedSelection = packet.SkipBTreeIndexV1Shadow();
-        TVector<TIntrusivePtr<NTable::TLoader::TPageCollection>> collections(written.size());
-        collections[0] = MakeIntrusive<NTable::TLoader::TPageCollection>(written[0].PageCollection);
-        written[0].PageCollection->SetSkipBTreeIndexV1Shadow(true);
+        TVector<TCacheCollectionRef> collections(written.size());
+        collections[0] = NTest::AdmitCollection(TCache::Get(), written[0].PageCollection);
+        collections[0]->SetSkipBTreeIndexV1Shadow(true);
         auto environment = MakeHolder<TMetadataEnv>(std::move(collections), TPageCollectionComponents{
                                                                                 .LargeGlobId = packet.LargeGlobId,
                                                                                 .RawMeta = packet.Meta.Raw,
@@ -726,54 +782,9 @@ Y_UNIT_TEST_SUITE(TPartLayoutLoader) {
         UNIT_ASSERT(metadata->PreviousSelections.back().second);
     }
 
-    Y_UNIT_TEST(PrepareRootBeforeOtherCollectionsArrive) {
-        class TRootEnv : public NTable::TLoader::TLoaderEnv {
-        public:
-            using TLoaderEnv::TLoaderEnv;
-
-            void Initialize(TPartSlots slots) override {
-                ++Initialized;
-                TLoaderEnv::Initialize(slots);
-            }
-
-            void PrepareCollection(ui32 slot, TPageCollectionComponents& components, bool outer) override {
-                ++Prepared;
-                TLoaderEnv::PrepareCollection(slot, components, outer);
-            }
-
-            ui32 Initialized = 0;
-            ui32 Prepared = 0;
-        };
-
-        for (EIndex index : { EIndex::V1, EIndex::V2, EIndex::V2WithV1Shadow }) {
-            const auto bundlePart = WriteBundlePart(SeparateLayouts.front(), index);
-            const auto& written = bundlePart.Result.PageCollections;
-            UNIT_ASSERT(written.size() > 1);
-            TVector<TIntrusivePtr<NTable::TLoader::TPageCollection>> collections(written.size());
-            collections[0] = MakeIntrusive<NTable::TLoader::TPageCollection>(written[0].PageCollection);
-            auto environment = MakeHolder<TRootEnv>(std::move(collections));
-            auto* rootEnv = environment.Get();
-            TPartComponents components{
-                .PageCollectionComponents = TVector<TPageCollectionComponents>(written.size()),
-                .Epoch = TEpoch::Max(),
-            };
-            NTable::TLoader loader(std::move(environment), std::move(components));
-            loader.PrepareRoot();
-            UNIT_ASSERT(loader.HasOuterCollection());
-            loader.PrepareRoot();
-            UNIT_ASSERT(loader.HasOuterCollection());
-            UNIT_ASSERT_VALUES_EQUAL(rootEnv->Initialized, 0);
-            UNIT_ASSERT_VALUES_EQUAL(rootEnv->Prepared, 0);
-            for (ui32 slot = 1; slot < written.size(); ++slot) {
-                UNIT_ASSERT(!rootEnv->HasCollection(slot));
-            }
-        }
-    }
-
     Y_UNIT_TEST(InjectedEnvironmentCreatesPartAndSavesReplies) {
-        TActorSystemStub actorSystem;
-        actorSystem.AppData.FeatureFlags.SetEnableLocalDBBtreeIndex(true);
-        actorSystem.AppData.FeatureFlags.SetEnableLocalDBBtreeIndexV2(true);
+        AppData()->FeatureFlags.SetEnableLocalDBBtreeIndex(true);
+        AppData()->FeatureFlags.SetEnableLocalDBBtreeIndexV2(true);
         const auto& layout = SeparateLayouts.front();
         const auto bundlePart = WriteBundlePart(layout, EIndex::V2WithV1Shadow);
         TLoadStats stats;
@@ -792,6 +803,44 @@ Y_UNIT_TEST_SUITE(TPartLayoutLoader) {
             skipped |= selections.front();
         }
         UNIT_ASSERT(skipped);
+    }
+
+    Y_UNIT_TEST(ClonePreservesCacheOwnersAndCommonDescriptors) {
+        for (const auto& layout : { TPartLayout{}, SeparateLayouts.front() }) {
+            const auto bundlePart = WriteBundlePart(layout, EIndex::V2);
+            TLoadStats stats;
+            auto source = LoadBundlePart(bundlePart, true, false, stats);
+            const auto* cachePart = source.As<NTable::TCachePartStore>();
+            UNIT_ASSERT(cachePart);
+            TVector<NSharedCache::TCollectionCacheItem> collections;
+            for (const auto& collection : cachePart->PageCollections) {
+                collections.push_back(collection.CacheItem());
+            }
+            UNIT_ASSERT(cachePart->Pseudo);
+            const auto pseudo = cachePart->Pseudo.CacheItem();
+            const auto backingSize = cachePart->BackingSize();
+            auto clone = source.CloneWithEpoch(TEpoch::FromIndex(42));
+            source = {};
+
+            cachePart = clone.As<NTable::TCachePartStore>();
+            UNIT_ASSERT(cachePart);
+            const NTable::TPartStore& common = *cachePart;
+            UNIT_ASSERT(common.Epoch == TEpoch::FromIndex(42));
+            UNIT_ASSERT_VALUES_EQUAL(common.GetPageCollectionCount(), collections.size());
+            UNIT_ASSERT_VALUES_EQUAL(common.BackingSize(), backingSize);
+            UNIT_ASSERT(common.BundleId() == common.GetPageCollection(0)->Label());
+            for (ui32 slot : xrange(collections.size())) {
+                const auto& owner = cachePart->PageCollections[slot];
+                UNIT_ASSERT(owner.CacheItem() == collections[slot]);
+                UNIT_ASSERT(common.GetPageCollection(slot) == owner->PageCollection().Get());
+                UNIT_ASSERT(common.GetPageCollectionRef(slot).Get() == owner->PageCollection().Get());
+                UNIT_ASSERT_VALUES_EQUAL(common.GetSlotChannel(slot), owner->Id().Channel());
+            }
+            UNIT_ASSERT(cachePart->Pseudo.CacheItem() == pseudo);
+            UNIT_ASSERT(common.GetPseudoPageCollection() == cachePart->Pseudo->PageCollection().Get());
+            UNIT_ASSERT(common.GetPageCollection(ELargeObj::Extern, 0) == common.GetPseudoPageCollection());
+            UNIT_ASSERT(common.GetPageCollection(ELargeObj::Outer, 0) == common.GetPageCollection(common.OuterSlot()));
+        }
     }
 
     Y_UNIT_TEST(Load) {
@@ -861,7 +910,7 @@ Y_UNIT_TEST_SUITE(TPartLayoutLoader) {
                 const auto bundlePart = WriteBundlePart(layout, index);
                 TLoadStats initialStats;
                 const auto cachedPart = LoadBundlePart(bundlePart, true, false, initialStats);
-                const auto* part = cachedPart.As<NTable::TPrivatePartStore>();
+                const auto* part = cachedPart.As<NTable::TCachePartStore>();
                 const ui32 indexSlot = part->IndexSlot({ });
                 const ui32 dataSlot = part->DataSlot({ });
                 UNIT_ASSERT_VALUES_UNEQUAL(indexSlot, dataSlot);
@@ -876,7 +925,12 @@ Y_UNIT_TEST_SUITE(TPartLayoutLoader) {
                 }
 
                 // Cache only the rightmost index path, without loading any data pages.
-                NTable::TLoader::TLoaderEnv env(part->PageCollections, part->Slots);
+                TVector<TCacheCollectionRef> collections;
+                collections.reserve(part->PageCollections.size());
+                for (const auto& collection : part->PageCollections) {
+                    collections.push_back(collection.Acquire());
+                }
+                NTable::TLoader::TLoaderEnv env(std::move(collections), part->Slots);
                 env.ProvidePart(part);
                 auto iter = CreateIndexIter(part, &env, { });
                 ui32 indexFetches = 0;
@@ -892,7 +946,7 @@ Y_UNIT_TEST_SUITE(TPartLayoutLoader) {
                     for (const auto& location : fetch.Pages) {
                         auto* data = indexPages.FindPtr(location.Offset);
                         UNIT_ASSERT(data);
-                        env.Save({ location.Offset, location.Size, NSharedCache::TSharedPageRef::MakePrivate(*data) });
+                        env.Save(NPageCollection::TPageData{ location, TSharedData(*data) });
                     }
                     ++indexFetches;
                 }

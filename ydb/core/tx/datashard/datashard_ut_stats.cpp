@@ -1,6 +1,9 @@
+#include <ydb/core/tablet_flat/cache_thread_test.h>
 #include "datashard_ut_common_kqp.h"
 #include <ydb/core/tablet_flat/shared_cache_counters.h>
-#include <ydb/core/tablet_flat/shared_cache_events.h>
+#include <ydb/core/tablet_flat/shared_cache_events_lf.h>
+#include <ydb/core/base/memory_controller_iface.h>
+#include <util/generic/scope.h>
 #include <ydb/core/tx/datashard/ut_common/datashard_ut_common.h>
 #include <ydb/core/tx/schemeshard/ut_helpers/helpers_flags_n.h>  // for Y_UNIT_TEST_FLAGS_N
 #include <ydb/core/tablet_flat/shared_sausagecache.h>
@@ -393,7 +396,8 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
         }
 
         // each batch ~70KB, ~700KB in total
-        auto counters = MakeHolder<TSharedPageCacheCounters>(GetServiceCounters(runtime.GetDynamicCounters(), "tablets")->GetSubgroup("type", "S_CACHE"));
+        auto counters = MakeHolder<TCacheCounters>(
+            GetServiceCounters(runtime.GetDynamicCounters(), "tablets")->GetSubgroup("type", "S_CACHE"));
         Cerr << "ActiveBytes = " << counters->ActiveBytes->Val() << " PassiveBytes = " << counters->PassiveBytes->Val() << Endl;
         UNIT_ASSERT_LE(counters->Owners->Val(), 2);
         UNIT_ASSERT_LE(counters->PageCollectionOwners->Val(), 2);
@@ -476,6 +480,7 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
 
         TPortManager pm;
         TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.AppConfig->MutableFeatureFlags()->SetEnableLockFreePageCache(true);
         serverSettings.SetDomainName("Root")
             .SetUseRealThreads(false);
 
@@ -494,15 +499,35 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
 
         UpsertRows(server, sender);
 
-        TBlockEvents<NSharedCache::TEvResult> block(runtime, [&](const NSharedCache::TEvResult::TPtr& event) {
-            return runtime.FindActorName(event->GetRecipientRewrite()) == "DATASHARD_STATS_BUILDER";
+        // Cached pages do not send a reply; force a statistics page miss after compaction.
+        auto& cache = *runtime.GetAppData().SharedCache;
+        TBlockEvents<NMemory::TEvConsumerLimit> limits(runtime, [&](const auto& event) {
+            return event->GetRecipientRewrite() == NSharedCache::MakeSharedPageCacheId() && event->Sender != sender;
+        });
+        runtime.Send(new IEventHandle(NSharedCache::MakeSharedPageCacheId(), sender,
+            new NMemory::TEvConsumerLimit(0, cache.HardLimit(), cache.CurrentLimit())));
+        runtime.WaitFor("disabled cache retention", [&] {
+            return cache.SoftLimit() == 0;
+        }, TDuration::Seconds(10));
+        std::deque<NSharedCache::TEvResult::TPtr> blocked;
+        auto block = runtime.AddObserver<NSharedCache::TEvResult>([&](auto& event) {
+            if (runtime.FindActorName(event->GetRecipientRewrite()) == "DATASHARD_STATS_BUILDER") {
+                blocked.emplace_back(std::move(event));
+            }
         });
 
         CompactTable(runtime, shard1, tableId1, false);
 
-        runtime.WaitFor("blocked read", [&]{ return block.size(); }, TDuration::Seconds(10));
+        runtime.WaitFor("blocked read", [&] {
+            return !blocked.empty();
+        }, TDuration::Seconds(10));
 
-        block.Stop().Unblock();
+        block.Remove();
+        while (!blocked.empty()) {
+            const ui32 nodeIndex = blocked.front()->GetRecipientRewrite().NodeId() - runtime.GetFirstNodeId();
+            runtime.Send(blocked.front().Release(), nodeIndex, true);
+            blocked.pop_front();
+        }
 
         {
             Cerr << "Waiting stats.." << Endl;
@@ -515,6 +540,311 @@ Y_UNIT_TEST_SUITE(DataShardStats) {
 
         NDataShard::gDbStatsDataSizeResolution = gDbStatsDataSizeResolutionBefore;
         NDataShard::gDbStatsRowCountResolution = gDbStatsRowCountResolutionBefore;
+    }
+
+    enum class EStatsPageBudget {
+        Fits,
+        TooSmall,
+        Wait,
+        EarlyReady,
+        Cancel,
+        ShrinkWhileWaiting,
+    };
+
+    void ReviewStatsPageBudget(EStatsPageBudget mode) {
+        const bool fits = mode != EStatsPageBudget::TooSmall && mode != EStatsPageBudget::ShrinkWhileWaiting;
+        const bool retry = mode == EStatsPageBudget::Wait || mode == EStatsPageBudget::EarlyReady ||
+                           mode == EStatsPageBudget::Cancel || mode == EStatsPageBudget::ShrinkWhileWaiting;
+        const ui32 savedBuckets = NDataShard::gDbStatsHistogramBucketsCount;
+        NDataShard::gDbStatsHistogramBucketsCount = 256;
+        Y_DEFER {
+            NDataShard::gDbStatsHistogramBucketsCount = savedBuckets;
+        };
+        TPortManager pm;
+        TServerSettings settings(pm.GetPort(2134));
+        settings.SetEnableLockFreePageCache(true);
+        settings.SetDomainName("Root").SetUseRealThreads(false);
+        settings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(32_MB);
+        TServer::TPtr server = new TServer(settings);
+        auto& runtime = *server->GetRuntime();
+        auto sender = runtime.AllocateEdgeActor();
+        InitRoot(server, sender);
+        auto policy = NLocalDb::CreateDefaultUserTablePolicy();
+        policy->MinDataPageSize = 1024;
+        policy->MinBTreeIndexNodeSize = 128;
+        policy->MinBTreeIndexNodeKeys = 2;
+        auto options = TShardedTableOptions().Policy(policy.Get());
+        CreateShardedTable(server, sender, "/Root", "table-1", options);
+        const ui64 shard = GetTableShards(server, sender, "/Root/table-1").at(0);
+        const auto tableId = ResolveTableId(server, sender, "/Root/table-1");
+        constexpr ui32 rows = 32768;
+        UpsertRows(server, sender, 0, rows);
+        auto& cache = *runtime.GetAppData().SharedCache;
+        const ui64 savedLimit = cache.CurrentLimit();
+        Y_DEFER {
+            cache.UpdateCurrentLimit(savedLimit);
+            cache.UpdateSoftLimitOverride(Max<ui64>());
+        };
+        // Keep the actor's limit stable while the test exercises one-page admission.
+        TBlockEvents<NMemory::TEvConsumerLimit> allocations(runtime, [&](const auto& event) {
+            return event->GetRecipientRewrite() == NSharedCache::MakeSharedPageCacheId() && event->Sender != sender;
+        });
+        runtime.Send(new IEventHandle(NSharedCache::MakeSharedPageCacheId(), sender,
+            new NMemory::TEvConsumerLimit(0, cache.HardLimit(), savedLimit)));
+        runtime.WaitFor("disabled cache retention", [&] {
+            return cache.SoftLimit() == 0;
+        }, TDuration::Seconds(10));
+        TBlockEvents<NSharedCache::TEvRequest> requests(runtime, [&](const auto& event) {
+            return runtime.FindActorName(event->Sender) == "DATASHARD_STATS_BUILDER";
+        });
+        CompactTable(runtime, shard, tableId, false);
+        runtime.WaitFor("statistics page request", [&] {
+            return !requests.empty();
+        }, TDuration::Seconds(10));
+        const auto statsActor = requests.front()->Sender;
+        const auto collection = requests.front()->Get()->PageCollection;
+        if (!fits) {
+            const auto stats = GetTableStats(runtime, shard, tableId.PathId.LocalPathId);
+            UNIT_ASSERT_VALUES_EQUAL(stats.GetIndexSize(), 0);
+            UNIT_ASSERT(stats.GetRowCountHistogram().GetBuckets().empty());
+        }
+        ui64 pageBudget = 0;
+        ui64 indexBytes = 0;
+        for (ui32 page = 0; page < collection->Total(); ++page) {
+            const auto info = collection->Page(page);
+            if (info.Type == ui32(NTable::EPage::BTreeIndex) || info.Type == ui32(NTable::EPage::BTreeIndexV2)) {
+                pageBudget = Max(pageBudget, info.Size + NActors::TSharedData::OverheadSize);
+                indexBytes += info.Size;
+            }
+        }
+        pageBudget = Max(pageBudget, requests.front()->Get()->Pages.front().Size + NActors::TSharedData::OverheadSize);
+        UNIT_ASSERT_GT(indexBytes, 4 * pageBudget);
+        {
+            while (cache.EnforceCurrentLimit()) {
+            }
+        }
+        const ui64 baselineBytes = cache.PayloadUsage();
+        ui64 targetLimit = baselineBytes + 32 * pageBudget;
+        UNIT_ASSERT_C(indexBytes > targetLimit, "Index bytes " << indexBytes << " must exceed budget " << targetLimit
+                                                               << " (baseline " << baselineBytes
+                                                               << ", maximum page charge " << pageBudget << ")");
+        runtime.Send(new IEventHandle(NSharedCache::MakeSharedPageCacheId(), sender,
+            new NMemory::TEvConsumerLimit(0, cache.HardLimit(), targetLimit)));
+        runtime.WaitFor("statistics page budget", [&] {
+            return cache.CurrentLimit() == targetLimit;
+        }, TDuration::Seconds(10));
+        ui64 readBytes = 0;
+        THashSet<NTable::TPageOffset> readPages;
+        bool resourcePressure = false;
+        bool workingSetTooLarge = false;
+        auto results = runtime.AddObserver<NSharedCache::TEvResult>([&](const auto& event) {
+            if (event->GetRecipientRewrite() == statsActor) {
+                if (event->Get()->ResourcesReady) {
+                    return;
+                }
+                if (event->Get()->WorkingSetTooLarge) {
+                    UNIT_ASSERT(!fits);
+                    workingSetTooLarge = true;
+                    return;
+                }
+                if (event->Get()->ResourcePressure) {
+                    UNIT_ASSERT(retry);
+                    resourcePressure = true;
+                    return;
+                }
+                UNIT_ASSERT_VALUES_EQUAL(event->Get()->Status, NKikimrProto::OK);
+                for (const auto& page : event->Get()->Pages) {
+                    if (readPages.insert(page.Offset).second) {
+                        readBytes += page.Size + NActors::TSharedData::OverheadSize;
+                    }
+                }
+            }
+        });
+        bool completed = false;
+        auto unregister = runtime.AddObserver<NSharedCache::TEvUnregister>([&](const auto& event) {
+            if (event->Sender == statsActor) {
+                completed = true;
+            }
+        });
+        TIntrusivePtr<NPageCollection::TPagesWaitPad> waitingPad;
+        std::deque<NSharedCache::TEvResult::TPtr> ready;
+        std::deque<NSharedCache::TEvResult::TPtr> pressure;
+        std::deque<NSharedCache::TEvResult::TPtr> initialPages;
+        bool blockInitialPages = mode == EStatsPageBudget::TooSmall;
+        bool blockReady = true;
+        bool blockPressure = mode == EStatsPageBudget::EarlyReady;
+        auto delayedResults = runtime.AddObserver<NSharedCache::TEvResult>([&](auto& event) {
+            if (event->GetRecipientRewrite() != statsActor) {
+                return;
+            }
+            if (blockReady && event->Get()->ResourcesReady && event->Get()->WaitPad == waitingPad) {
+                ready.emplace_back(std::move(event));
+            } else if (blockPressure && event->Get()->ResourcePressure) {
+                pressure.emplace_back(std::move(event));
+            } else if (blockInitialPages && !event->Get()->Pages.empty()) {
+                initialPages.emplace_back(std::move(event));
+            }
+        });
+        const auto release = [&](auto& events) {
+            while (!events.empty()) {
+                runtime.Send(events.front().Release(), 0, true);
+                events.pop_front();
+            }
+        };
+        if (mode == EStatsPageBudget::TooSmall) {
+            requests.Stop().Unblock();
+            runtime.WaitFor("initial statistics page before reducing its frontier budget", [&] {
+                return !initialPages.empty();
+            }, TDuration::Seconds(10));
+            // The root is already admitted; the next miss must need more than this whole budget.
+            targetLimit = initialPages.front()->Get()->Pages.front().Size + NActors::TSharedData::OverheadSize;
+            runtime.Send(new IEventHandle(NSharedCache::MakeSharedPageCacheId(), sender,
+                new NMemory::TEvConsumerLimit(0, cache.HardLimit(), targetLimit)));
+            runtime.WaitFor("statistics budget only fits its retained root", [&] {
+                return cache.CurrentLimit() == targetLimit;
+            }, TDuration::Seconds(10));
+            blockInitialPages = false;
+            release(initialPages);
+        } else if (retry) {
+            while (!requests.front()->Get()->WaitPad->HasPinnedPages.load(std::memory_order_acquire)) {
+                requests.Unblock(1);
+                runtime.WaitFor("statistics request with a retained frontier", [&] {
+                    return !requests.empty() || completed;
+                }, TDuration::Seconds(10));
+                UNIT_ASSERT(!completed);
+            }
+            const auto pad = requests.front()->Get()->WaitPad;
+            waitingPad = pad;
+            const ui64 workingSetBytes = pad->WorkingSetBytes;
+            const ui64 pressureBytes = targetLimit - baselineBytes - 1;
+            UNIT_ASSERT_GT(pressureBytes, NActors::TSharedData::OverheadSize);
+            const auto pressureLocation = NTable::NPage::TPageLocation::FromPageIndex(collection->Total(),
+                pressureBytes - NActors::TSharedData::OverheadSize, NTable::NPage::EPage::DataPage);
+            TCacheCollectionRef metadata;
+            {
+                auto cacheOp = cache.BeginOperation();
+                UNIT_ASSERT(
+                    cacheOp.AdmitCollection(collection, metadata) != NSharedCache::ECacheResultStatus::NoResource);
+            }
+            NSharedCache::TEvSaveCompactedPages pressureAdmission(std::move(metadata));
+            TCachePageRef foreign;
+            {
+                auto cacheOp = cache.BeginOperation();
+                foreign = pressureAdmission.AddWrittenPage(
+                    cacheOp, NPageCollection::TPageData(pressureLocation,
+                                 NActors::TSharedData::Uninitialized(pressureLocation.Size)), false);
+            }
+            UNIT_ASSERT(foreign && !foreign.IsSticky());
+            requests.Unblock(1);
+            runtime.WaitFor("statistics resource pressure", [&] {
+                return mode == EStatsPageBudget::EarlyReady ? !pressure.empty() : resourcePressure;
+            }, TDuration::Seconds(10));
+            if (mode != EStatsPageBudget::EarlyReady) {
+                runtime.WaitFor("statistics attempt releases its frontier before readiness", [&] {
+                    return cache.PayloadUsage() <= baselineBytes + pressureBytes;
+                }, TDuration::Seconds(10));
+            }
+            UNIT_ASSERT(!completed);
+            UNIT_ASSERT(requests.empty());
+            UNIT_ASSERT(ready.empty());
+            auto* stale = new NSharedCache::TEvResult(collection, NKikimrProto::OK, 0);
+            stale->WaitPad = MakeIntrusive<NPageCollection::TPagesWaitPad>();
+            stale->ResourcesReady = true;
+            runtime.Send(new IEventHandle(statsActor, NSharedCache::MakeSharedPageCacheId(), stale));
+            // Let this deliberately stale notification reach the coroutine.
+            runtime.SimulateSleep(TDuration::MilliSeconds(1));
+            UNIT_ASSERT(!completed);
+            UNIT_ASSERT(requests.empty());
+            if (mode == EStatsPageBudget::ShrinkWhileWaiting) {
+                targetLimit = workingSetBytes - 1;
+                runtime.Send(new IEventHandle(NSharedCache::MakeSharedPageCacheId(), sender,
+                    new NMemory::TEvConsumerLimit(0, cache.HardLimit(), targetLimit)));
+                runtime.WaitFor("statistics rejects its recorded set after a capacity decrease", [&] {
+                    return completed;
+                }, TDuration::Seconds(10));
+            }
+            if (mode == EStatsPageBudget::Cancel) {
+                blockReady = false;
+                release(ready);
+                runtime.Send(new IEventHandle(statsActor, sender, new TEvents::TEvPoison));
+                runtime.WaitFor("statistics cancellation unregisters its resource gate", [&] {
+                    return completed;
+                }, TDuration::Seconds(10));
+            }
+            foreign.Drop();
+            if (mode != EStatsPageBudget::Cancel && mode != EStatsPageBudget::ShrinkWhileWaiting) {
+                runtime.WaitFor("matching statistics readiness", [&] {
+                    return !ready.empty();
+                }, TDuration::Seconds(10));
+                UNIT_ASSERT(ready.front()->Get()->WaitPad == pad);
+                UNIT_ASSERT_VALUES_EQUAL(pad->WorkingSetBytes, workingSetBytes);
+                blockReady = false;
+                release(ready);
+                if (mode == EStatsPageBudget::EarlyReady) {
+                    runtime.SimulateSleep(TDuration::MilliSeconds(1));
+                    UNIT_ASSERT(!completed);
+                    UNIT_ASSERT(requests.empty());
+                }
+                blockPressure = false;
+                release(pressure);
+                runtime.WaitFor("same statistics actor restarts with a fresh pad", [&] {
+                    return !requests.empty() || completed;
+                }, TDuration::Seconds(10));
+                UNIT_ASSERT(!completed);
+                UNIT_ASSERT(requests.front()->Sender == statsActor);
+                UNIT_ASSERT(requests.front()->Get()->WaitPad != pad);
+                auto* duplicate = new NSharedCache::TEvResult(collection, NKikimrProto::OK, 0);
+                duplicate->WaitPad = pad;
+                duplicate->ResourcesReady = true;
+                runtime.Send(new IEventHandle(statsActor, NSharedCache::MakeSharedPageCacheId(), duplicate));
+            }
+        }
+        requests.Stop().Unblock();
+        runtime.WaitFor("statistics completion within its page budget", [&] {
+            return completed;
+        }, TDuration::Seconds(30));
+        UNIT_ASSERT_VALUES_EQUAL(resourcePressure, retry);
+        UNIT_ASSERT_VALUES_EQUAL(workingSetTooLarge, mode == EStatsPageBudget::ShrinkWhileWaiting);
+        UNIT_ASSERT_VALUES_EQUAL(cache.CurrentLimit(), targetLimit);
+        if (!fits) {
+            const auto stats = GetTableStats(runtime, shard, tableId.PathId.LocalPathId);
+            UNIT_ASSERT_VALUES_EQUAL(stats.GetIndexSize(), 0);
+            UNIT_ASSERT(stats.GetRowCountHistogram().GetBuckets().empty());
+        }
+        if (fits && mode != EStatsPageBudget::Cancel) {
+            const auto stats = GetTableStats(runtime, shard, tableId.PathId.LocalPathId);
+            UNIT_ASSERT_VALUES_EQUAL(stats.GetRowCount(), rows);
+            UNIT_ASSERT_GT(stats.GetRowCountHistogram().GetBuckets().size(), 0);
+            UNIT_ASSERT_GT(readPages.size(), 4);
+            UNIT_ASSERT_GT(readBytes, targetLimit);
+        }
+        runtime.WaitFor("statistics native-page release", [&] {
+            return cache.PayloadUsage() <= baselineBytes;
+        }, TDuration::Seconds(10));
+    }
+
+    Y_UNIT_TEST(ReviewR11StatsCompleteWithFittingFrontier) {
+        ReviewStatsPageBudget(EStatsPageBudget::Fits);
+    }
+
+    Y_UNIT_TEST(ReviewR11StatsFailWithoutWaitingOnOwnPages) {
+        ReviewStatsPageBudget(EStatsPageBudget::TooSmall);
+    }
+
+    Y_UNIT_TEST(ReviewR11StatsReleaseFrontierAndRestartOnResources) {
+        ReviewStatsPageBudget(EStatsPageBudget::Wait);
+    }
+
+    Y_UNIT_TEST(ReviewR11StatsHandleReadinessBeforePressure) {
+        ReviewStatsPageBudget(EStatsPageBudget::EarlyReady);
+    }
+
+    Y_UNIT_TEST(ReviewR11StatsCancelWhileWaitingForResources) {
+        ReviewStatsPageBudget(EStatsPageBudget::Cancel);
+    }
+
+    Y_UNIT_TEST(ReviewR20StatsRejectCapacityDecreaseWhileWaiting) {
+        ReviewStatsPageBudget(EStatsPageBudget::ShrinkWhileWaiting);
     }
 
     Y_UNIT_TEST(Follower) {

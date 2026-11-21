@@ -124,6 +124,7 @@ namespace Tests {
         ui16 MonitoringPortOffset = 0;
         bool MonitoringTypeAsync = false;
         bool NeedStatsCollectors = false;
+        ui64 SharedCacheExpectedPageSize = 0; // Fixture-only geometry override; zero uses the production default
         NKikimrProto::TAuthConfig AuthConfig;
         NKikimrPQ::TPQConfig PQConfig;
         NKikimrPQ::TPQClusterDiscoveryConfig PQClusterDiscoveryConfig;

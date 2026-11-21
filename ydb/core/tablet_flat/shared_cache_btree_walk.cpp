@@ -73,13 +73,15 @@ bool TWalkCollectionState::StartWalkRun() {
     return true;
 }
 
-void TCacheBTreeWalkController::FinishWalkRunIfDrained(TLogoBlobID collectionId) {
-    if (FinishDrainedRun(collectionId)) {
-        if (auto* current = Host.FindWalkCollection(collectionId)) {
-            Host.TryDropExpiredCollection(*current);
+namespace NLegacy {
+
+    void TCacheBTreeWalkController::FinishWalkRunIfDrained(TLogoBlobID collectionId) {
+        if (FinishDrainedRun(collectionId)) {
+            if (auto* current = Host.FindWalkCollection(collectionId)) {
+                Host.TryDropExpiredCollection(*current);
+            }
         }
     }
-}
 
 void TCacheBTreeWalkController::CancelWalkRun(TCollection& collection) {
     const TLogoBlobID collectionId = collection.Id;
@@ -90,8 +92,8 @@ void TCacheBTreeWalkController::CancelWalkRun(TCollection& collection) {
     }
 }
 
-void TCacheBTreeWalkController::UpdateSeeds(TCollection& collection, const TActorId& owner,
-    TVector<NSharedCache::TEvAttach::TBtreeSeed> seeds, bool replayStickyWalk) {
+void TCacheBTreeWalkController::UpdateSeeds(
+    TCollection& collection, const TActorId& owner, TVector<TEvAttach::TBtreeSeed> seeds, bool replayStickyWalk) {
     auto* current = State(collection.Id).SeedsByOwner.FindPtr(owner);
     // Production seeds are ordered current then historic, with at most two per owner.
     const bool same = current ? *current == seeds : seeds.empty();
@@ -155,6 +157,8 @@ void TCacheBTreeWalkController::InvalidateDataCollection(const TLogoBlobID& coll
     }
 }
 
+} // namespace NLegacy
+
 void TCacheBTreeWalk::PrepareIndexBatch() {
     if (Next >= BatchEnd) {
         ui64 batchBytes = 0;
@@ -182,6 +186,8 @@ TVector<TPageLocation> TCacheBTreeWalk::ReadChildren(const NTable::NPage::TBtree
     }
     return children;
 }
+
+namespace NLegacy {
 
 void TCacheBTreeWalkController::AdvanceWalk(TCacheBTreeWalk& walk, const TLogoBlobID& walkCollectionId) {
     auto* indexCollection = Host.FindWalkCollection(walk.Seed.IndexCollectionId);
@@ -309,6 +315,8 @@ TCacheBTreeWalkController::EBatchResult TCacheBTreeWalkController::FlushDataPage
     return queued ? EBatchResult::Queued : EBatchResult::Flushed;
 }
 
+} // namespace NLegacy
+
 bool TCacheBTreeWalk::AppendNodeDataPages(bool queueDataPages, TFunctionRef<bool()> flush) {
     if (!Seed.Sticky && !queueDataPages) {
         PendingDataPages.clear();
@@ -340,6 +348,8 @@ bool TCacheBTreeWalk::AppendNodeDataPages(bool queueDataPages, TFunctionRef<bool
     }
     return true;
 }
+
+namespace NLegacy {
 
 bool TCacheBTreeWalkController::AddNodeDataPagesToBatch(TCacheBTreeWalk& walk, TCollection& dataCollection) {
     const bool queueDataPages =
@@ -432,4 +442,7 @@ void TCacheBTreeWalkController::RestartForIndexCollection(const TLogoBlobID& ind
         RestartWalkRun(*collection);
     }
 }
+
+} // namespace NLegacy
+
 } // namespace NKikimr::NSharedCache

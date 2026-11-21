@@ -20,6 +20,7 @@
 #include <ydb/core/persqueue/writer/writer.h>
 #include <ydb/core/tx/cdc_aggregator/public/events.h>
 #include <ydb/core/testlib/actors/block_events.h>
+#include <ydb/core/tablet_flat/shared_cache_events_lf.h>
 #include <ydb/core/tablet_flat/shared_cache_events.h>
 #include <ydb/core/tablet_flat/flat_scan_events.h>
 #include <ydb/core/tablet/resource_broker.h>
@@ -4706,6 +4707,7 @@ Y_UNIT_TEST_SUITE(Cdc) {
             .SetUseRealThreads(false)
             .SetDomainName("Root")
             .SetEnableChangefeedInitialScan(true)
+            .SetEnableLockFreePageCache(true)
         );
 
         auto& runtime = *server->GetRuntime();
@@ -5807,7 +5809,7 @@ Y_UNIT_TEST_SUITE(Cdc) {
             }
         });
         ui32 dataPages = 0;
-        auto observePages = runtime.AddObserver<NSharedCache::TEvRequest>([&](auto& ev) {
+        auto observePages = runtime.AddObserver<NSharedCache::NLegacy::TEvRequest>([&](auto& ev) {
             if (ev->Get()->PageCollection->Label().TabletID() == shard &&
                 ev->Cookie == static_cast<ui64>(NSharedCache::ERequestTypeCookie::Transaction))
             {

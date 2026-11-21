@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include "ydb/core/tablet_flat/flat_table_key_blocks.h"
 #include "ydb/core/tablet_flat/flat_page_data.h"
 #include "ydb/core/tablet_flat/flat_part_index_iter_iface.h"
@@ -109,7 +110,7 @@ void ReplaceSlices(TPartView& view, TVector<TSlice> slices) {
 struct TIndexOnlyEnv : TTestEnv {
     const TSharedData* TryGetPage(const TPart*, const TPageLocation&, TGroupId) override {
         UNIT_FAIL("key-block iterator fetched a data page");
-        return nullptr;
+        return {};
     }
 
     const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
@@ -135,7 +136,7 @@ struct TLoadOnRetryEnv : TTrackingIndexEnv {
     const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         if (Requested.emplace(part, part->IndexSlot(groupId), location.Offset).second) {
             ++Faults;
-            return nullptr;
+            return {};
         }
         return TTrackingIndexEnv::TryGetIndexPage(part, location, groupId);
     }
@@ -209,7 +210,7 @@ TVector<TCell> RowKey(const NPage::TDataPage::TRecord& record, const TPartScheme
 
 } // namespace
 
-Y_UNIT_TEST_SUITE(KeyBlocks) {
+Y_UNIT_TEST_SUITE_F(KeyBlocks, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(SinglePartPartition) {
         for (auto indexFormat : { EIndexFormat::BTreeV1, EIndexFormat::BTreeV2 }) {

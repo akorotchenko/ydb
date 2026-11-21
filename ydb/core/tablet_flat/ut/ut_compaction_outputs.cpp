@@ -1,13 +1,16 @@
+#include <ydb/core/tablet_flat/cache_thread_test.h>
 #include <ydb/core/tablet_flat/flat_compaction_outputs.h>
 #include <ydb/core/tablet_flat/flat_fwd_blobs.h>
 #include <ydb/core/tablet_flat/flat_page_label.h>
 #include <ydb/core/tablet_flat/flat_part_loader.h>
+#include <ydb/core/tablet_flat/flat_part_store_cache.h>
 #include <ydb/core/tablet_flat/flat_ops_compact.h>
 #include <ydb/core/tablet_flat/flat_scan_actor.h>
 #include <ydb/core/tablet_flat/flat_table.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
 #include <ydb/core/tablet_flat/test/libs/rows/tool.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include <ydb/core/testlib/actors/test_runtime.h>
 #include <ydb/core/testlib/basics/appdata.h>
 
@@ -82,9 +85,10 @@ namespace {
     }
 
     TPartView LoadPart(const TCompactionOutputs::TResult& result) {
-        TVector<TIntrusivePtr<TLoader::TPageCollection>> collections;
+        auto& cache = TCache::Get();
+        TVector<TCacheCollectionRef> collections;
         for (const auto& written : result.PageCollections) {
-            collections.push_back(MakeIntrusive<TLoader::TPageCollection>(written.PageCollection));
+            collections.push_back(NTable::NTest::AdmitCollection(cache, written.PageCollection));
         }
         TPartComponents components{
             .PageCollectionComponents = TVector<TPageCollectionComponents>(collections.size()),
@@ -96,6 +100,7 @@ namespace {
             TVector<NSharedCache::TEvResult::TLoaded> loaded;
             for (const auto& location : fetch.Pages) {
                 const TSharedData* data = nullptr;
+                bool sticky = false;
                 for (const auto& written : result.PageCollections) {
                     if (written.PageCollection->Label() != fetch.PageCollection->Label()) {
                         continue;
@@ -104,13 +109,15 @@ namespace {
                         for (const auto& page : *pages) {
                             if (page.Location.Offset == location.Offset) {
                                 data = &page.Data;
+                                sticky = pages == &written.StickyPages;
                             }
                         }
                     }
                 }
                 UNIT_ASSERT_C(data, "Missing freshly written page " << location);
-                loaded.emplace_back(location.Offset, location.Size,
-                    NSharedCache::TSharedPageRef::MakePrivate(*data));
+                auto page = NTable::NTest::AdmitPage(cache, fetch.PageCollection, location, TSharedData(*data), sticky);
+                UNIT_ASSERT(page);
+                loaded.emplace_back(location.Offset, location.Size, std::move(page));
             }
             NSharedCache::TEvResult reply(std::move(fetch.PageCollection), NKikimrProto::OK, 0);
             reply.Pages = std::move(loaded);
@@ -140,17 +147,10 @@ namespace {
     class TWrittenPages final : public IPages {
     public:
         void Add(const TPart* part) {
-            const auto* store = dynamic_cast<const NTable::TPrivatePartStore*>(part);
+            const auto* store = dynamic_cast<const NTable::TPartStore*>(part);
             UNIT_ASSERT(store);
             auto& slots = Pages[part];
-            slots.resize(store->PageCollections.size());
-            for (ui32 slot = 0; slot < slots.size(); ++slot) {
-                for (const auto& page : store->PageCollections[slot]->GetPageMap()) {
-                    auto body = page->SharedBody;
-                    UNIT_ASSERT(body.Use());
-                    slots[slot][page->Offset] = NSharedCache::TPinnedPageRef(body).GetData();
-                }
-            }
+            slots.resize(store->GetPageCollectionCount());
         }
 
         void Add(const TPart* part, const TCompactionOutputs::TResult& result) {
@@ -178,15 +178,27 @@ namespace {
 
         const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location,
                 TGroupId groupId) override {
-            return &Pages.at(part).at(part->DataSlot(groupId)).at(location.Offset);
+            return GetPage(part, part->DataSlot(groupId), location);
         }
 
         const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location,
                 TGroupId groupId) override {
-            return &Pages.at(part).at(part->IndexSlot(groupId)).at(location.Offset);
+            return GetPage(part, part->IndexSlot(groupId), location);
         }
 
     private:
+        const TSharedData* GetPage(const TPart* part, ui32 slot, const TPageLocation& location) {
+            auto& pages = Pages.at(part).at(slot);
+            if (const auto* page = pages.FindPtr(location.Offset)) {
+                return page;
+            }
+            const auto* store = CheckedCast<const NTable::TCachePartStore*>(part);
+            auto cacheOp = TCache::Get().BeginOperation();
+            auto page = store->PageCollections.at(slot)->TryGetPage(cacheOp, location);
+            UNIT_ASSERT_C(page, "Missing freshly written page " << location);
+            return &pages.emplace(location.Offset, page.GetData()).first->second;
+        }
+
         THashMap<const TPart*, TVector<THashMap<NPage::TPageOffset, TSharedData>>> Pages;
     };
 
@@ -229,6 +241,8 @@ namespace {
     public:
         TCompactionScanEnv() {
             TAppPrepare app;
+            app.SetEnableLockFreePageCache(true);
+            NSharedCache::TCacheThreadTestAccess::Setup(Runtime);
             Runtime.Initialize(app.Unwrap());
             Owner = Runtime.Register(new TReceiver(*this));
             Storage = Owner;
@@ -376,7 +390,7 @@ namespace {
     }
 }
 
-Y_UNIT_TEST_SUITE(TCompactionOutputsTest) {
+Y_UNIT_TEST_SUITE_F(TCompactionOutputsTest, ::NKikimr::NTable::NTest::TTableCacheTest) {
     Y_UNIT_TEST(RouteAlternatingKeysWithSharedChannels) {
         TCompactCfg conf(MakeHolder<TCompactionParams>());
         conf.Epoch = TEpoch(i64(7));
@@ -586,8 +600,8 @@ Y_UNIT_TEST_SUITE(TCompactionOutputsTest) {
             AddOutput(conf, 17);
             conf.Outputs[0].Layout.LargeEdge = 256;
             conf.Outputs[0].MaterializeExtEdge = 256;
-            TCompactionOutputs outputs(TLogoBlobID(1, 2, 3, 0, 0, 0), conf,
-                MakeHolder<TDefaultCompactionRouter>());
+            // Different contents must have distinct collection identities in the shared cache
+            TCompactionOutputs outputs(TLogoBlobID(1, 2, size, 0, 0, 0), conf, MakeHolder<TDefaultCompactionRouter>());
             outputs.Start(*Layout());
             WriteKey(outputs, 0, TString(size, 'a'));
             TWriteStats stats;
@@ -595,6 +609,7 @@ Y_UNIT_TEST_SUITE(TCompactionOutputsTest) {
             UNIT_ASSERT_VALUES_EQUAL(results.size(), 1);
             const auto part = LoadPart(results[0]);
             UNIT_ASSERT(part->Blobs);
+            UNIT_ASSERT_VALUES_EQUAL(part->Large->Relation(0).Size, size + sizeof(NPage::TLabel));
 
             // Raising the leader family's large edge must retain the old scan
             // decision: compare the wrapped blob size, not its payload size.

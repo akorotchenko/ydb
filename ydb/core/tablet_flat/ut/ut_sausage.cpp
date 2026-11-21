@@ -1,3 +1,5 @@
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
+#include "cache.h"
 #include <ydb/core/tablet_flat/flat_sausage_align.h>
 #include <ydb/core/tablet_flat/flat_sausage_meta.h>
 #include <ydb/core/tablet_flat/flat_sausage_writer.h>
@@ -74,6 +76,54 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         }
 
         return meta.Finish();
+    }
+
+    Y_UNIT_TEST(DescriptorEmbeddedMetadataIsCountedOnce)
+    {
+        TRecord record(0);
+        auto raw = record.Finish();
+        const TLargeGlobId id(0, TLogoBlobID(10, 20, 30, 1, raw.size(), 0), raw.size());
+        const TPageCollection collection(id, raw);
+        const IPageCollection& descriptor = collection;
+        UNIT_ASSERT_VALUES_EQUAL(
+            descriptor.GetMetadataMemoryUsage(), sizeof(TPageCollection) + raw.GetAllocationSize());
+        UNIT_ASSERT(descriptor.GetMetadataBuffer() == &collection.Meta.Raw);
+    }
+
+    Y_UNIT_TEST(DescriptorMemoryFootprintTracksRetainedAllocation)
+    {
+        auto raw = MakeMeta();
+        const TLargeGlobId id(0, TLogoBlobID(10, 20, 30, 1, raw.size(), 0), raw.size());
+        const TPageCollection first(id, raw);
+        const TOuterPageCollection second(id, raw);
+        UNIT_ASSERT_VALUES_EQUAL(first.GetMetadataMemoryUsage(),
+            sizeof(TPageCollection) + Blobs.size() * sizeof(ui64) + raw.GetAllocationSize());
+        UNIT_ASSERT_VALUES_EQUAL(second.GetMetadataMemoryUsage(), first.GetMetadataMemoryUsage());
+        UNIT_ASSERT(first.Meta.Raw.data() == second.Meta.Raw.data());
+
+        auto oversized = TSharedData::Uninitialized(raw.size() + 4096);
+        ::memcpy(oversized.mutable_data(), raw.data(), raw.size());
+        oversized.TrimBack(raw.size());
+        const TPageCollection retained(id, std::move(oversized));
+        UNIT_ASSERT_VALUES_EQUAL(retained.GetMetadataMemoryUsage(), first.GetMetadataMemoryUsage() + 4096);
+    }
+
+    Y_UNIT_TEST(CanonicalDescriptorRequiresMatchingGroupAndAddressingRole)
+    {
+        auto raw = MakeMeta();
+        const TLargeGlobId id(0, TLogoBlobID(10, 20, 30, 1, raw.size(), 0), raw.size());
+        const TPageCollection first(id, raw);
+        const TPageCollection same(id, raw);
+        const TOuterPageCollection outer(id, raw);
+        auto moved = id;
+        moved.Group = 1;
+        const TPageCollection otherGroup(moved, raw);
+        UNIT_ASSERT(first.IsCompatible(same));
+        UNIT_ASSERT(same.IsCompatible(first));
+        UNIT_ASSERT(!first.IsCompatible(outer));
+        UNIT_ASSERT(!outer.IsCompatible(first));
+        UNIT_ASSERT(!first.IsCompatible(otherGroup));
+        UNIT_ASSERT(!otherGroup.IsCompatible(first));
     }
 
     Y_UNIT_TEST(Align)
@@ -580,6 +630,9 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
 
         auto blob = writer.Make();
         NTable::NPage::TExtBlobs extBlobs(blob, TLogoBlobID(1, 2, 3, 1, blob.size(), 0));
+        UNIT_ASSERT_VALUES_EQUAL(
+            extBlobs.GetMetadataMemoryUsage(), sizeof(NTable::NPage::TExtBlobs) + blob.GetAllocationSize());
+        UNIT_ASSERT(extBlobs.GetMetadataBuffer() == &extBlobs.Raw);
 
         // For independently addressed blobs, Offset equals pageId (index in Array)
         //   0:   0,  1:   1,  2:   2,  3:   3,  4:   4
@@ -635,7 +688,7 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         }
     }
 
-    Y_UNIT_TEST(ByteOffset_TryGetPage)
+    Y_UNIT_TEST_F(ByteOffset_TryGetPage, ::NKikimr::NTable::NTest::TTableCacheTest)
     {
         using NTable::IPages;
         using NTable::NPage::TPageLocation;
@@ -646,20 +699,31 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         // — no page-index conversion, no CRC32 check (delegated to Verify)
         struct TByteOffsetStore : public IPages {
             THashMap<TPageOffset, TSharedData> Map;
+            TIntrusiveConstPtr<IPageCollection> Collection;
+
+            explicit TByteOffsetStore(TIntrusiveConstPtr<IPageCollection> collection)
+                : Collection(std::move(collection))
+            {
+            }
 
             void Add(const TPageLocation& loc, TSharedData data)
             {
                 Map[loc.Offset] = std::move(data);
             }
 
-            const TSharedData* TryGetPage(const TPart*, const TPageLocation& location, TGroupId) override
-            {
+            const TSharedData* TryGetPage(const TPart*, const TPageLocation& location, TGroupId) override {
                 auto it = Map.find(location.Offset);
-                return it != Map.end() ? &it->second : nullptr;
+                if (it == Map.end()) {
+                    return {};
+                }
+                auto page = location;
+                page.Type = NTable::NPage::EPage::DataPage;
+                NTable::NTest::AdmitPage(TCache::Get(), Collection, page, TSharedData(it->second));
+                return &it->second;
             }
 
-            const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
-            {
+            const TSharedData* TryGetIndexPage(
+                const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 return TryGetPage(part, location, groupId);
             }
 
@@ -679,9 +743,9 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         // Build TPageCollection — production path for IPageCollection::Verify
         auto metaBlob = MakeMeta();
         TLargeGlobId largeGlobId(0, TLogoBlobID(10, 20, 30, 1, metaBlob.size(), 0), metaBlob.size());
-        const TPageCollection pageCollection(largeGlobId, metaBlob);
+        auto pageCollection = MakeIntrusiveConst<TPageCollection>(largeGlobId, metaBlob);
 
-        TByteOffsetStore store;
+        TByteOffsetStore store(pageCollection);
 
         // Phase 1: fill with same '9'-filled data as MakeMeta — CRC32 matches TMeta
         for (ui32 i = 0; i < 9; i++) {
@@ -700,10 +764,10 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         // — the same production path as flat_bio_actor.cpp
         for (ui32 i = 0; i < 9; i++) {
             auto loc = meta.GetLocation(i);
-            const TSharedData* page = store.TryGetPage(nullptr, loc, {});
+            auto page = store.TryGetPage(nullptr, loc, {});
             UNIT_ASSERT(page);
             UNIT_ASSERT_VALUES_EQUAL(page->size(), loc.Size);
-            UNIT_ASSERT(pageCollection.Verify(loc,
+            UNIT_ASSERT(pageCollection->Verify(loc,
                 TArrayRef<const char>(page->data(), page->size())));
         }
 
@@ -716,11 +780,14 @@ Y_UNIT_TEST_SUITE(NPageCollection) {
         auto loc0 = meta.GetLocation(0);
         TString badData(loc0.Size, 'X');               // different content → different CRC32
         UNIT_ASSERT(Crc32c(badData.data(), badData.size()) != loc0.Crc32);
+        // Cache entries are immutable; the replacement body belongs to a new collection generation.
+        TLargeGlobId replacementGlobId(0, TLogoBlobID(10, 21, 30, 1, metaBlob.size(), 0), metaBlob.size());
+        store.Collection = MakeIntrusiveConst<TPageCollection>(replacementGlobId, metaBlob);
         store.Add(loc0, TSharedData::Copy(badData.data(), badData.size()));
         {
-            const TSharedData* page = store.TryGetPage(nullptr, loc0, {});
+            auto page = store.TryGetPage(nullptr, loc0, {});
             UNIT_ASSERT(page);                          // lookup succeeds (no CRC32 inside TryGetPage)
-            UNIT_ASSERT(!pageCollection.Verify(loc0,    // but Verify catches the mismatch
+            UNIT_ASSERT(!pageCollection->Verify(loc0,    // but Verify catches the mismatch
                 TArrayRef<const char>(page->data(), page->size())));
         }
     }

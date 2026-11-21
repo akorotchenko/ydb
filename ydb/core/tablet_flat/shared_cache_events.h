@@ -5,6 +5,7 @@
 #include "flat_transaction_pages.h"
 #include "shared_handle.h"
 #include "shared_page.h"
+#include "shared_cache_event_format.h"
 #include <ydb/core/protos/shared_cache.pb.h>
 
 #include <util/generic/map.h>
@@ -12,7 +13,9 @@
 #include <util/generic/hash.h>
 #include <util/generic/hash_set.h>
 
-namespace NKikimr::NSharedCache {
+#include <numeric>
+
+namespace NKikimr::NSharedCache::NLegacy {
     using EPriority = NTabletFlatExecutor::NBlockIO::EPriority;
     using TPageId = NTable::NPage::TPageId;
 
@@ -26,7 +29,8 @@ namespace NKikimr::NSharedCache {
     enum EEv {
         EvBegin = EventSpaceBegin(TKikimrEvents::ES_FLAT_EXECUTOR),
 
-        EvTouch = EvBegin + 512,
+        // Legacy cache local events occupy a separate range below scan events
+        EvTouch = EvBegin + 768,
         EvUnregister,
         EvDetach,
         EvAttach,
@@ -36,17 +40,14 @@ namespace NKikimr::NSharedCache {
         EvUpdated,
         EvStickyCollectionPages,
 
-        EvEnd
-
-        /* +1024 range is reserved for scan events */
+        EvEnd,
     };
 
     using ERequestTypeCookie = NTabletFlatExecutor::ERequestTypeCookie;
 
-    static_assert(EvEnd < EventSpaceEnd(TKikimrEvents::ES_FLAT_EXECUTOR), "");
+    static_assert(EvEnd <= EvBegin + 1024);
 
-    struct TEvUnregister : public TEventLocal<TEvUnregister, EvUnregister> {
-    };
+    struct TEvUnregister : public TEventLocal<TEvUnregister, EvUnregister> {};
 
     struct TEvDetach : public TEventLocal<TEvDetach, EvDetach> {
         const TLogoBlobID PageCollectionId;
@@ -82,8 +83,7 @@ namespace NKikimr::NSharedCache {
             , CacheMode(cacheMode)
             , BtreeSeeds(std::move(btreeSeeds))
             , ReplayStickyWalk(replayStickyWalk)
-        {
-        }
+        {}
     };
 
     // Note: compacted pages do not have an owner yet
@@ -95,12 +95,12 @@ namespace NKikimr::NSharedCache {
 
         TEvSaveCompactedPages(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection)
             : PageCollection(std::move(pageCollection))
-        {
-        }
+        {}
     };
 
     struct TEvRequest : public TEventLocal<TEvRequest, EvRequest> {
-        TEvRequest(EPriority priority, TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, TVector<TPageLocation> pages, ui64 cookie = 0)
+        TEvRequest(EPriority priority, TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection,
+            TVector<TPageLocation> pages, ui64 cookie = 0)
             : Priority(priority)
             , PageCollection(std::move(pageCollection))
             , Pages(std::move(pages))
@@ -124,21 +124,18 @@ namespace NKikimr::NSharedCache {
             , Cookie(cookie)
         { }
 
-        void Describe(IOutputStream &out) const
-        {
-            out
-                << "TEvResult{" << Pages.size() << " pages"
-                << " " << PageCollection->Label()
-                << " " << (Status == NKikimrProto::OK ? "ok" : "fail")
-                << " " << NKikimrProto::EReplyStatus_Name(Status) << "}";
+        void Describe(IOutputStream& out) const {
+            out << "TEvResult{" << Pages.size() << " pages"
+                << " " << PageCollection->Label() << " " << (Status == NKikimrProto::OK ? "ok" : "fail") << " "
+                << NKikimrProto::EReplyStatus_Name(Status) << "}";
         }
 
-        ui64 Bytes() const
-        {
-            return
-                std::accumulate(Pages.begin(), Pages.end(), ui64(0),
-                    [](ui64 bytes, const TLoaded& loaded)
-                        { return bytes + loaded.Size; });
+        ui64 Bytes() const {
+            return std::accumulate(Pages.begin(), Pages.end(), ui64(0),
+                [](ui64 bytes, const TLoaded& loaded)
+                {
+                    return bytes + loaded.Size;
+                });
         }
 
         struct TLoaded {
@@ -176,51 +173,4 @@ namespace NKikimr::NSharedCache {
         const TLogoBlobID CollectionId;
         TVector<TPageLocation> Locations;
     };
-}
-
-template<> inline
-void Out<NKikimr::NTable::NPage::TPageLocation>(IOutputStream& o, const NKikimr::NTable::NPage::TPageLocation& val) {
-    val.Describe(o);
-}
-
-template<> inline
-void Out<NKikimr::NTable::NPage::TPageOffset>(IOutputStream& o, const NKikimr::NTable::NPage::TPageOffset& val) {
-    val.Describe(o);
-}
-
-template<> inline
-void Out<TVector<NKikimr::NTable::NPage::TPageLocation>>(IOutputStream& o, const TVector<NKikimr::NTable::NPage::TPageLocation>& vec) {
-    o << "[ ";
-    for (const auto& x : vec)
-        o << x << ' ';
-    o << "]";
-}
-
-template<> inline
-void Out<THashSet<NKikimr::NTable::NPage::TPageOffset>>(IOutputStream& o, const THashSet<NKikimr::NTable::NPage::TPageOffset>& set) {
-    o << "[ ";
-    for (const auto& x : set)
-        o << x << ' ';
-    o << "]";
-}
-
-template<> inline
-void Out<NKikimr::NTabletFlatExecutor::NBlockIO::EPriority>(
-        IOutputStream& o,
-        NKikimr::NTabletFlatExecutor::NBlockIO::EPriority value)
-{
-    switch (value) {
-    case NKikimr::NTabletFlatExecutor::NBlockIO::EPriority::Fast:
-        o << "Online";
-        break;
-    case NKikimr::NTabletFlatExecutor::NBlockIO::EPriority::Bkgr:
-        o << "AsyncLoad";
-        break;
-    case NKikimr::NTabletFlatExecutor::NBlockIO::EPriority::Bulk:
-        o << "Scan";
-        break;
-    default:
-        o << static_cast<ui32>(value);
-        break;
-    }
-}
+} // namespace NKikimr::NSharedCache::NLegacy

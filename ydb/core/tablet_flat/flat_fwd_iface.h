@@ -1,10 +1,11 @@
 #pragma once
 
+#include "flat_page_iface.h"
 #include "flat_part_iface.h"
 #include "flat_transaction_pages.h"
 #include "flat_sausage_fetch.h"
 #include "flat_fwd_misc.h"
-#include "shared_handle.h"
+#include "cache.h"
 
 namespace NKikimr {
 namespace NTable {
@@ -18,7 +19,6 @@ namespace NFwd {
     using TPageOffset = NPage::TPageOffset;
     using TPageLocation = NPage::TPageLocation;
 
-    struct TPage;
     struct TConf;
     struct TSeen;
 
@@ -38,12 +38,11 @@ namespace NFwd {
             NTabletFlatExecutor::NBlockIO::EPriority priority, TFetch fetch) const = 0;
         virtual THolder<IPartLoaderEnv> MakeLoaderEnvironment() const = 0;
 
-        // One working set covers the existing subset, cold loaders and newly discovered collections
+        // The scan and its cold loaders share one working set through resets
         virtual TIntrusivePtr<NTabletFlatExecutor::IPageMetadataWorkingSet> MetadataWorkingSet() const {
             return {};
         }
 
-        // Include physical and Pseudo identities in the backend's metadata group
         virtual void AddCold(const TPartView& partView) = 0;
         virtual bool MayProgress() const = 0;
         virtual void Save(NActors::IEventBase& event) = 0;
@@ -54,6 +53,7 @@ namespace NFwd {
     };
 
     THolder<IEnv> MakeEnv(const TConf& conf, const TSubset& subset);
+    THolder<IEnv> MakePrivateEnv(const TConf& conf, const TSubset& subset);
 
     class IPageLoadingQueue {
     public:
@@ -62,24 +62,26 @@ namespace NFwd {
         virtual ui64 AddToQueue(TPageOffset offset, EPage type, ui64 size, ui32 crc32) = 0;
     };
 
-    class IPageLoadingLogic {
+    template <class TPageRef>
+    class IPageLoadingLogicImpl {
     public:
         struct TResult {
-            const TSharedData *Page;
+            const TPageRef* Page;
             bool Grow; /* Should give more pages on Forward() */
             bool Need; /* Is vital to client to make progress */
         };
 
-        virtual ~IPageLoadingLogic() = default;
+        virtual ~IPageLoadingLogicImpl() = default;
 
         virtual TResult Get(IPageLoadingQueue *head, TPageOffset offset, EPage type, ui64 lower) = 0;
         virtual void Forward(IPageLoadingQueue *head, ui64 upper) = 0;
-        virtual void Fill(NPageCollection::TLoadedPage& page, NSharedCache::TSharedPageRef sharedPageRef, EPage type) = 0;
+        virtual void Fill(TPageRef&& page, EPage type) = 0;
 
         IPageLoadingQueue* Head = nullptr; /* will be set outside of IPageLoadingLogic impl */
         TStat Stat;
     };
 
+    using IPageLoadingLogic = IPageLoadingLogicImpl<TCachePageRef>;
 }
 }
 }

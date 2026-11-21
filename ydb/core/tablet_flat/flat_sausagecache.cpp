@@ -1,4 +1,5 @@
 #include "flat_sausagecache.h"
+#include "shared_cache_event_format.h"
 #include <util/generic/xrange.h>
 
 namespace NKikimr {
@@ -9,7 +10,8 @@ TSharedPageRef UnUse(TSharedPageRef sharedBody) {
     return sharedBody;
 }
 
-TPrivatePageCache::TPage::TPage(TPageOffset offset, size_t size, TSharedPageRef sharedBody, TPageCollection* pageCollection)
+TPrivatePageCache::TPage::TPage(
+    TPageOffset offset, size_t size, TSharedPageRef sharedBody, TPageCollection* pageCollection)
     : Offset(offset)
     , Size(size)
     , SharedBody(UnUse(std::move(sharedBody)))
@@ -18,7 +20,8 @@ TPrivatePageCache::TPage::TPage(TPageOffset offset, size_t size, TSharedPageRef 
     Y_ENSURE(SharedBody);
 }
 
-TPrivatePageCache::TPageCollection::TPageCollection(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection)
+TPrivatePageCache::TPageCollection::TPageCollection(
+    TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection)
     : Id(pageCollection->Label())
     , PageCollection(std::move(pageCollection))
 {
@@ -49,8 +52,10 @@ TPrivatePageCache::TPageCollection* TPrivatePageCache::GetPageCollection(const T
     return pageCollection;
 }
 
-THashMap<TLogoBlobID, THashSet<TPageOffset>> TPrivatePageCache::AddPageCollection(TIntrusivePtr<TPageCollection> pageCollection) {
-    auto inserted = PageCollections.insert(decltype(PageCollections)::value_type(pageCollection->Id, pageCollection));
+THashMap<TLogoBlobID, THashSet<TPageOffset>> TPrivatePageCache::AddPageCollection(
+    TIntrusivePtr<TPageCollection> pageCollection) {
+    auto inserted =
+        PageCollections.insert(decltype(PageCollections)::value_type(pageCollection->Id, pageCollection));
     Y_ENSURE(inserted.second, "double registration of page collection is forbidden");
     ++Stats.PageCollections;
 
@@ -118,14 +123,16 @@ void TPrivatePageCache::DropPage(TPageOffset offset, TPageCollection* pageCollec
     }
 }
 
-void TPrivatePageCache::AddPage(TPageOffset offset, size_t size, const TSharedPageRef& sharedBody, TPageCollection *pageCollection)
+void TPrivatePageCache::AddPage(
+    TPageOffset offset, size_t size, const TSharedPageRef& sharedBody, TPageCollection* pageCollection)
 {
     if (pageCollection->AddPage(offset, size, sharedBody)) {
         Stats.SharedBodyBytes += size;
     }
 }
 
-void TPrivatePageCache::AddStickyPage(TPageOffset offset, size_t size, TSharedPageRef sharedBody, TPageCollection *pageCollection)
+void TPrivatePageCache::AddStickyPage(
+    TPageOffset offset, size_t size, TSharedPageRef sharedBody, TPageCollection* pageCollection)
 {
     AddPage(offset, size, sharedBody, pageCollection);
     if (pageCollection->AddStickyPage(offset, size, std::move(sharedBody))) {
@@ -154,7 +161,8 @@ bool TPrivatePageCache::UpdateCacheMode(ECacheMode newCacheMode, TPageCollection
     return true;
 };
 
-THashMap<TLogoBlobID, TIntrusivePtr<TPrivatePageCache::TPageCollection>> TPrivatePageCache::DetachPrivatePageCache() {
+THashMap<TLogoBlobID, TIntrusivePtr<TPrivatePageCache::TPageCollection>>
+TPrivatePageCache::DetachPrivatePageCache() {
     THashMap<TLogoBlobID, TIntrusivePtr<TPrivatePageCache::TPageCollection>> result;
 
     for (const auto &[pageCollectionId, pageCollection] : PageCollections) {
@@ -164,4 +172,5 @@ THashMap<TLogoBlobID, TIntrusivePtr<TPrivatePageCache::TPageCollection>> TPrivat
     return result;
 }
 
-}}
+} // namespace NTabletFlatExecutor
+} // namespace NKikimr

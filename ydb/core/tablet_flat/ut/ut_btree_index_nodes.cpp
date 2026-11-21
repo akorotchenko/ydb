@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include "flat_page_btree_index.h"
 #include "flat_page_btree_index_writer.h"
 #include "flat_part_walker.h"
@@ -159,7 +160,7 @@ namespace {
             intend += " |";
         }
 
-        auto dumpChild = [&] (TBtreeIndexNode node, TRecIdx pos) {
+        auto dumpChild = [&] (const TBtreeIndexNode& node, TRecIdx pos) {
             auto ref = node.GetChild(pos, /* isDataPage */ false);
             TChild child{
                 std::holds_alternative<TPageId>(ref) ? std::get<TPageId>(ref) : Max<TPageId>(),
@@ -273,7 +274,7 @@ namespace {
     }
 }
 
-Y_UNIT_TEST_SUITE(TBtreeIndexNode) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexNode, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
     using TChild = TBtreeIndexNode::TChild;
 
@@ -599,7 +600,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexNode) {
 
 }
 
-Y_UNIT_TEST_SUITE(TBtreeIndexBuilder) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexBuilder, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
     using TChild = TBtreeIndexNode::TChild;
 
@@ -773,7 +774,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexBuilder) {
 
 }
 
-Y_UNIT_TEST_SUITE(TBtreeIndexTPart) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexTPart, ::NKikimr::NTable::NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(Conf) {
         NPage::TConf conf;
@@ -1059,7 +1060,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexTPart) {
     }
 }
 
-Y_UNIT_TEST_SUITE(TBtreeIndexNodeV2) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexNodeV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using TChildV2 = TBtreeIndexNode::TChildV2;
     using TShortChildV2 = TBtreeIndexNode::TShortChildV2;
 
@@ -1116,7 +1117,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexNodeV2) {
 // Section 3: Twin format tests — v1 and v2 produce identical results
 // ========================================================================
 
-Y_UNIT_TEST_SUITE(TBtreeIndexTPartV2) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexTPartV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     // Twin test: write same data in v1 and v2, compare row-level stats and iteration.
@@ -1364,7 +1365,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexTPartV2) {
 // Section 4: V2 format-specific tests
 // ========================================================================
 
-Y_UNIT_TEST_SUITE(TBtreeIndexV2Specific) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexV2Specific, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
     using TChildV2 = TBtreeIndexNode::TChildV2;
     using TShortChildV2 = TBtreeIndexNode::TShortChildV2;
@@ -2147,7 +2148,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexV2Specific) {
 // Section 5.2: Read format flag tests
 // ========================================================================
 
-Y_UNIT_TEST_SUITE(TBtreeIndexReadFlags) {
+Y_UNIT_TEST_SUITE_F(TBtreeIndexReadFlags, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     Y_UNIT_TEST(ReadFlag_Off_KeepsV2OnlyRoot) {
@@ -2186,7 +2187,7 @@ Y_UNIT_TEST_SUITE(TBtreeIndexReadFlags) {
 }
 
 // ========================================================================
-Y_UNIT_TEST_SUITE(TBTreePartWalker) {
+Y_UNIT_TEST_SUITE_F(TBTreePartWalker, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     Y_UNIT_TEST(WalkMultiLevelBTree) {
@@ -2311,7 +2312,7 @@ Y_UNIT_TEST_SUITE(TBTreePartWalker) {
         const auto& meta = part->IndexPages.BTreeGroups[0];
         UNIT_ASSERT(meta.LevelCount() > 0);
 
-        struct TMockPages : public IPages {
+        struct TMockPages : public NTest::TTestEnv {
             const TPartStore* Part;
             THashSet<ui64>& Loaded;
             TVector<TPageLocation> Missed;
@@ -2325,18 +2326,23 @@ Y_UNIT_TEST_SUITE(TBTreePartWalker) {
             TResult Locate(const TPart*, ui64, ELargeObj) override {
                 Y_TABLET_ERROR("Unused");
             }
-            const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+
+            const TSharedData* TryGetPage(
+                const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 return TryGetSlotPage(location, part->DataSlot(groupId));
             }
-            const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+
+            const TSharedData* TryGetIndexPage(
+                const TPart* part, const TPageLocation& location, TGroupId groupId) override {
                 return TryGetSlotPage(location, part->IndexSlot(groupId));
             }
+
             const TSharedData* TryGetSlotPage(const TPageLocation& location, ui32 slot) {
                 if (Loaded.count(location.GetByteOffset())) {
-                    return Part->Store->GetPage(slot, location.Offset);
+                    return NTest::TTestEnv::TryGetSlotPage(Part, location, slot);
                 }
                 Missed.push_back(location);
-                return nullptr;
+                return {};
             }
         };
 

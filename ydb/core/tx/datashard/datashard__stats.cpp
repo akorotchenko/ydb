@@ -5,10 +5,16 @@
 #include <ydb/core/split/split.h>
 #include <ydb/core/tablet/resource_broker.h>
 #include <ydb/core/tablet_flat/flat_stat_table.h>
+#include <ydb/core/tablet_flat/flat_stat_page.h>
 #include <ydb/core/tablet_flat/flat_bio_stats.h>
 #include <ydb/core/tablet_flat/flat_dbase_sz_env.h>
+#include <ydb/core/tablet_flat/flat_part_store_cache.h>
+#include <ydb/core/tablet_flat/flat_part_store.h>
+#include <ydb/core/tablet_flat/shared_cache_events.h>
 #include "ydb/core/tablet_flat/shared_sausagecache.h"
 #include <ydb/core/protos/datashard_config.pb.h>
+
+#include <util/generic/scope.h>
 
 namespace NKikimr {
 namespace NDataShard {
@@ -35,50 +41,194 @@ struct TTableStatsCoroBuilderArgs {
 };
 
 class TPrivateStatsPageCache {
-public:
-    using TResultEvent = NSharedCache::TEvResult;
+    using TPrivatePageCache = NTabletFlatExecutor::TPrivatePageCache;
 
+public:
     template <class THost>
     const TSharedData* TryGetIndexPage(
         THost& host, const TPart* part, const TPageLocation& location, NPage::TGroupId groupId) {
-        auto partStore = CheckedCast<const TPrivatePartStore*>(part);
-        auto info = partStore->PageCollections.at(part->IndexSlot(groupId)).Get();
+        const auto* store = CheckedCast<const TPrivatePartStore*>(part);
+        const auto* collection = store->PageCollections.at(part->IndexSlot(groupId)).Get();
         Y_ENSURE(NPage::IsIndexPage(location.Type));
 
-        auto& partPages = Pages[info];
-        auto page = partPages.FindPtr(location.Offset);
-        if (page != nullptr) {
-            return page;
+        auto& pages = Pages[collection];
+        if (const auto* page = pages.FindPtr(location.Offset)) {
+            return &page->PinnedBody;
         }
 
         PagesSize += location.Size;
         host.Send(MakeSharedPageCacheId(),
-            new NSharedCache::TEvRequest(NSharedCache::EPriority::Bkgr, info->PageCollection, { location }));
+            new NLegacy::TEvRequest(NLegacy::EPriority::Bkgr, collection->PageCollection, { location }));
 
         host.Interrupt();
-        auto ev = host.WaitForPageResult();
-        if (auto status = ev->Get()->Status; status != NKikimrProto::OK) {
-            host.FailPageFetch(status);
+        auto event = host.WaitForStatsEvent([](IEventHandle& reply) {
+            return reply.GetTypeRewrite() == NLegacy::TEvResult::EventType;
+        });
+        auto* result = event->template Get<NLegacy::TEvResult>();
+        if (result->Status != NKikimrProto::OK) {
+            host.FailPageFetch(result->Status);
         }
         host.Resume();
 
-        for (auto& loaded : ev->Get()->Pages) {
-            partPages.emplace(loaded.Offset, TPinnedPageRef(loaded.Page).GetData());
-            PageRefs.emplace_back(std::move(loaded.Page));
+        for (auto& loaded : result->Pages) {
+            pages.try_emplace(loaded.Offset, std::move(loaded.Page));
         }
+        const auto* page = pages.FindPtr(location.Offset);
+        Y_ENSURE(page);
+        return &page->PinnedBody;
+    }
 
-        page = partPages.FindPtr(location.Offset);
-        Y_ENSURE(page != nullptr);
-
-        return page;
+    template <class THost, class TBuildAttempt>
+    void BuildWithRetries(THost&, const TSubset&, TStats&, TBuildAttempt&& buildAttempt) {
+        buildAttempt(nullptr);
     }
 
     ui64 GetLoadedSize() const noexcept {
         return PagesSize;
     }
 
-    bool HandleEvent(const IEventHandle& ev) {
-        return ev.GetTypeRewrite() == ui32(NSharedCache::EEv::EvUpdated);
+    template <class THost>
+    bool HandleEvent(THost&, IEventHandle& event) {
+        return event.GetTypeRewrite() == NLegacy::TEvUpdated::EventType;
+    }
+
+    template <class THost>
+    void Unregister(THost& host) {
+        host.Send(MakeSharedPageCacheId(), new NLegacy::TEvUnregister);
+    }
+
+private:
+    THashMap<const TPrivatePageCache::TPageCollection*, THashMap<TPageOffset, TPrivatePageCache::TPinnedPage>> Pages;
+    ui64 PagesSize = 0;
+};
+
+class TLFStatsPageCache {
+    struct TRetryStats {};
+
+public:
+    template <class THost>
+    const TSharedData* TryGetIndexPage(
+        THost& host, const TPart* part, const TPageLocation& location, NPage::TGroupId groupId) {
+        PageTracker.ClearPendingPage();
+        auto partStore = CheckedCast<const TCachePartStore*>(part);
+        auto info = partStore->PageCollections.at(part->IndexSlot(groupId)).Get();
+        Y_ENSURE(NPage::IsIndexPage(location.Type));
+
+        PagesSize += location.Size;
+        if (auto cacheOp = TCache::Get().BeginOperation(); auto cached = info->TryGetPage(cacheOp, location)) {
+            return PageTracker.ProvidePage(std::move(cached));
+        }
+
+        const auto workingSet = PageTracker.WorkingSet();
+        const ui64 requestedBytes = location.Size + TSharedData::OverheadSize;
+        RequestWorkingSet = workingSet;
+        RequestWorkingSet.Bytes += requestedBytes;
+        RequestWorkingSet.TotalBytes += requestedBytes;
+        ++RequestWorkingSet.Pages;
+        CheckWorkingSet(host);
+        RequestPad = MakeIntrusive<NPageCollection::TPagesWaitPad>();
+        RequestPad->WorkingSetBytes = RequestWorkingSet.Bytes;
+        RequestPad->RetainedCollections = RetainedCollections;
+        PageTracker.CollectPageLocations(RequestPad->WorkingSetPages);
+        RequestPad->WorkingSetPages[info->Id()].push_back(location);
+        // Sticky pages may be demoted while this request waits, so publish every retained pin.
+        RequestPad->HasPinnedPages.store(workingSet.Pages != 0, std::memory_order_release);
+        ResourcesReady = false;
+        auto request = MakeHolder<NSharedCache::TEvRequest>(
+            NSharedCache::EPriority::Bkgr, info->PageCollection(), TVector<TPageLocation>{ location });
+        request->WaitPad = RequestPad;
+        host.Send(MakeSharedPageCacheId(), request.Release());
+
+        host.Interrupt();
+        THolder<IEventHandle> ev = host.WaitForStatsEvent([this](IEventHandle& event) {
+            if (event.GetTypeRewrite() != NSharedCache::TEvResult::EventType) {
+                return false;
+            }
+            const auto* result = event.Get<NSharedCache::TEvResult>();
+            return result->WaitPad == RequestPad && !result->ResourcesReady;
+        });
+        auto* result = ev->Get<NSharedCache::TEvResult>();
+        if (result->WorkingSetTooLarge) {
+            host.FailWorkingSet();
+        }
+        if (result->ResourcePressure) {
+            throw TRetryStats{};
+        }
+        if (auto status = result->Status; status != NKikimrProto::OK) {
+            host.FailPageFetch(status);
+        }
+        host.Resume();
+        RequestPad.Drop();
+
+        auto& loaded = result->Pages;
+        Y_ENSURE(loaded.size() == 1 && loaded.front().Offset == location.Offset);
+        return PageTracker.ProvidePage(std::move(loaded.front().Page));
+    }
+
+    template <class THost, class TBuildAttempt>
+    void BuildWithRetries(THost& host, const TSubset& subset, TStats& stats, TBuildAttempt&& buildAttempt) {
+        THashSet<ui64> collections;
+        const auto retainCollection = [&](const TCacheCollectionRef& collection) {
+            if (collection && collections.insert(collection.CacheItem().Raw()).second) {
+                RetainedCollections.push_back(collection.CacheItem());
+            }
+        };
+        for (const auto& part : subset.Flatten) {
+            const auto* store = CheckedCast<const TCachePartStore*>(part.Part.Get());
+            for (const auto& collection : store->PageCollections) {
+                retainCollection(collection);
+            }
+            retainCollection(store->Pseudo);
+        }
+
+        for (;;) {
+            try {
+                buildAttempt(&PageTracker);
+                break;
+            } catch (const TRetryStats&) {
+                // BuildStats has unwound every page owner before we wait for the whole working set.
+                Y_DEBUG_ABORT_UNLESS(PageTracker.Empty());
+                stats.Clear();
+                CheckRetainedWorkingSet(host);
+                if (!ResourcesReady) {
+                    THolder<IEventHandle> ready = host.WaitForStatsEvent([this](IEventHandle& event) {
+                        if (event.GetTypeRewrite() != NSharedCache::TEvResult::EventType) {
+                            return false;
+                        }
+                        const auto* result = event.Get<NSharedCache::TEvResult>();
+                        return (result->ResourcesReady || result->WorkingSetTooLarge) && result->WaitPad == RequestPad;
+                    });
+                    if (ready->Get<NSharedCache::TEvResult>()->WorkingSetTooLarge) {
+                        host.FailWorkingSet();
+                    }
+                }
+                CheckWorkingSet(host);
+                CheckRetainedWorkingSet(host);
+                RequestPad.Drop();
+                host.Resume();
+            }
+        }
+    }
+
+    ui64 GetLoadedSize() const noexcept {
+        return PagesSize;
+    }
+
+    template <class THost>
+    bool HandleEvent(THost& host, IEventHandle& event) {
+        if (event.GetTypeRewrite() != NSharedCache::TEvResult::EventType) {
+            return false;
+        }
+
+        const auto* result = event.Get<NSharedCache::TEvResult>();
+        if (result->WorkingSetTooLarge && result->WaitPad == RequestPad) {
+            host.FailWorkingSet();
+        }
+        // Readiness may arrive before pressure; replies for older pads cannot wake this attempt.
+        if (result->ResourcesReady && result->WaitPad == RequestPad) {
+            ResourcesReady = true;
+        }
+        return true;
     }
 
     template <class THost>
@@ -87,8 +237,33 @@ public:
     }
 
 private:
-    THashMap<const NTabletFlatExecutor::TPrivatePageCache::TPageCollection*, THashMap<TPageOffset, TSharedData>> Pages;
-    TVector<TSharedPageRef> PageRefs;
+    template <class THost>
+    void CheckWorkingSet(THost& host) const {
+        const auto& cache = TCache::Get();
+        if (RequestWorkingSet.TotalBytes > cache.CurrentLimit() ||
+            RequestWorkingSet.Pages + RetainedCollections.size() > cache.TargetHandleCount() - 2) {
+            host.FailWorkingSet();
+        }
+    }
+
+    template <class THost>
+    void CheckRetainedWorkingSet(THost& host) const {
+        TVector<TCacheHandleRequirement> requirements;
+        for (const auto& [id, pages] : RequestPad->WorkingSetPages) {
+            requirements.push_back({ id, pages });
+        }
+        auto& cache = TCache::Get();
+        TCacheWorkingSetStats stats;
+        if (cache.WorkingSetExceedsCapacity(RequestPad->RetainedCollections, requirements, stats)) {
+            host.FailWorkingSet();
+        }
+    }
+
+    NStats::TPageTracker PageTracker;
+    NStats::TPageTracker::TWorkingSet RequestWorkingSet;
+    TIntrusivePtr<NPageCollection::TPagesWaitPad> RequestPad;
+    bool ResourcesReady = false;
+    TVector<TCollectionCacheItem> RetainedCollections;
     ui64 PagesSize = 0;
 };
 
@@ -96,7 +271,6 @@ template <class TPageCache>
 class TTableStatsCoroBuilder : public TActorCoroImpl, private IPages, TTableStatsCoroBuilderArgs {
 private:
     friend TPageCache;
-    using TPageResultEvent = typename TPageCache::TResultEvent;
     using ECode = TDataShard::TEvPrivate::TEvBuildTableStatsError::ECode;
 
     static constexpr TDuration MaxCoroutineExecutionTime = TDuration::MilliSeconds(5);
@@ -121,7 +295,20 @@ public:
         , TTableStatsCoroBuilderArgs(args)
     {}
 
+#if CORO_THROUGH_THREADS
+    void BeforeResume() override {
+        CacheHazards_ = TlsCacheHazards;
+    }
+#endif
+
     void Run() override {
+#if CORO_THROUGH_THREADS
+        // Borrow the waiting executor's cache hazard array on the coroutine thread
+        TlsCacheHazards = CacheHazards_;
+        Y_DEFER {
+            TlsCacheHazards = {};
+        };
+#endif
         try {
             RunImpl();
         } catch (const TDtorException&) {
@@ -153,16 +340,37 @@ public:
     }
 
 private:
-    auto WaitForPageResult() {
-        return WaitForSpecificEvent<TPageResultEvent>(&TTableStatsCoroBuilder::ProcessUnexpectedEvent);
+    template <class TFilter>
+    THolder<IEventHandle> WaitForStatsEvent(TFilter&& filter) {
+        for (;;) {
+            THolder<IEventHandle> event;
+            {
+#if CORO_THROUGH_THREADS
+                TlsCacheHazards = {};
+                Y_DEFER {
+                    // BeforeResume captured the new executor's array, including teardown's empty view
+                    TlsCacheHazards = CacheHazards_;
+                };
+#endif
+                event = WaitForEvent();
+            }
+            if (!event || filter(*event)) {
+                return event;
+            }
+            ProcessUnexpectedEvent(event);
+        }
     }
 
-    void FailPageFetch(NKikimrProto::EReplyStatus status) {
-        YDB_LOG_ERROR_CTX_COMP(GetActorContext(), NKikimrServices::TABLET_STATS_BUILDER, "Failed to build at datashard for table when requested pages",
-            {"tabletId", TabletId},
-            {"tableId", TableId},
-            {"status", status});
+    [[noreturn]] void FailPageFetch(NKikimrProto::EReplyStatus status) {
+        YDB_LOG_ERROR_CTX_COMP(GetActorContext(), NKikimrServices::TABLET_STATS_BUILDER,
+            "Failed to build at datashard for table when requested pages", { "tabletId", TabletId },
+            { "tableId", TableId }, { "status", status });
         throw TExTableStatsError(ECode::FETCH_PAGE_FAILED, NKikimrProto::EReplyStatus_Name(status));
+    }
+
+    [[noreturn]] static void FailWorkingSet() {
+        throw TExTableStatsError(
+            ECode::RESOURCE_ALLOCATION_FAILED, "Statistics page working set does not fit the shared cache");
     }
 
     void RunImpl() {
@@ -183,19 +391,24 @@ private:
         Spent = new TSpent(TAppData::TimeProvider.Get());
         CoroutineDeadline = GetCycleCountFast() + DurationToCycles(MaxCoroutineExecutionTime);
 
-        BuildStats(*Subset, ev->Stats, RowCountResolution, DataSizeResolution, HistogramBucketsCount, this, [this](){
-            const auto now = GetCycleCountFast();
+        PageCache.BuildWithRetries(*this, *Subset, ev->Stats, [&](NStats::TPageTracker* pageTracker) {
+            BuildStats(*Subset, ev->Stats, RowCountResolution, DataSizeResolution, HistogramBucketsCount, this,
+                [this]() {
+                    const auto now = GetCycleCountFast();
 
-            if (now > CoroutineDeadline) {
-                Send(new IEventHandle(EvResume, 0, SelfActorId, {}, nullptr, 0));
+                    if (now > CoroutineDeadline) {
+                        Send(new IEventHandle(EvResume, 0, SelfActorId, {}, nullptr, 0));
 
-                Interrupt();
-                WaitForSpecificEvent([](IEventHandle& ev) {
-                    return ev.Type == EvResume;
-                }, &TTableStatsCoroBuilder::ProcessUnexpectedEvent);
-                Resume();
-            }
-        }, TStringBuilder() << "Building stats at datashard " << TabletId << ", for tableId " << TableId << ": ");
+                        Interrupt();
+                        WaitForStatsEvent([](IEventHandle& ev) {
+                            return ev.Type == EvResume;
+                        });
+                        Resume();
+                    }
+                },
+                TStringBuilder() << "Building stats at datashard " << TabletId << ", for tableId " << TableId << ": ",
+                pageTracker);
+        });
 
         Y_ASSERT(IndexSize == ev->Stats.IndexSize.Size);
 
@@ -213,7 +426,7 @@ private:
     }
 
     void ProcessUnexpectedEvent(TAutoPtr<IEventHandle> ev) {
-        if (PageCache.HandleEvent(*ev)) {
+        if (PageCache.HandleEvent(*this, *ev)) {
             return;
         }
         switch (ev->GetTypeRewrite()) {
@@ -252,8 +465,10 @@ private:
         submit->SetOwner(TabletId);
         Send(MakeResourceBrokerID(), submit.Release());
 
-        auto ev = WaitForSpecificEvent<TEvResourceBroker::TEvResourceAllocated>(&TTableStatsCoroBuilder::ProcessUnexpectedEvent);
-        auto msg = ev->Get();
+        THolder<IEventHandle> ev = WaitForStatsEvent([](IEventHandle& event) {
+            return event.GetTypeRewrite() == TEvResourceBroker::TEvResourceAllocated::EventType;
+        });
+        auto msg = ev->Get<TEvResourceBroker::TEvResourceAllocated>();
         Y_ENSURE(!msg->Cookie.Get(), "Unexpected cookie in TEvResourceAllocated");
         Y_ENSURE(msg->TaskId == 1, "Unexpected task id in TEvResourceAllocated");
     }
@@ -267,13 +482,21 @@ private:
         CoroutineDeadline = GetCycleCountFast() + DurationToCycles(MaxCoroutineExecutionTime);
     }
 
+#if CORO_THROUGH_THREADS
+    TArrayRef<TSpaceHazard> CacheHazards_;
+#endif
+
     TPageCache PageCache;
     ui64 CoroutineDeadline;
     TAutoPtr<TSpent> Spent;
 };
 
-THolder<TActorCoroImpl> MakeTableStatsBuilder(TTableStatsCoroBuilderArgs args) {
-    return MakeHolder<TTableStatsCoroBuilder<TPrivateStatsPageCache>>(std::move(args));
+THolder<TActorCoroImpl> MakeTableStatsBuilder(
+    TTableStatsCoroBuilderArgs args, NTabletFlatExecutor::EPageCacheBackend backend) {
+    if (backend == NTabletFlatExecutor::EPageCacheBackend::Legacy) {
+        return MakeHolder<TTableStatsCoroBuilder<TPrivateStatsPageCache>>(std::move(args));
+    }
+    return MakeHolder<TTableStatsCoroBuilder<TLFStatsPageCache>>(std::move(args));
 }
 
 class TDataShard::TTxGetTableStats : public NTabletFlatExecutor::TTransactionBase<TDataShard> {
@@ -746,23 +969,26 @@ public:
                     shadowSubset->ColdParts.end());
             }
 
-            auto builder = new TActorCoro(MakeTableStatsBuilder(
-                TTableStatsCoroBuilderArgs{
-                    .ReplyTo = ctx.SelfID,
-                    .TabletId = Self->TabletID(),
-                    .TableId = tableId,
-                    .ExecutorId = Self->ExecutorID(),
-                    .IndexSize = indexSize,
-                    .Subset = subsetForStats,
-                    .MemRowCount = memRowCount,
-                    .MemDataSize = memDataSize,
-                    .RowCountResolution = rowCountResolution,
-                    .DataSizeResolution = dataSizeResolution,
-                    .HistogramBucketsCount = histogramBucketsCount,
-                    .SearchHeight = searchHeight,
-                    .HasSchemaChanges = hasSchemaChanges,
-                    .StatsUpdateTime = AppData(ctx)->TimeProvider->Now()
-                }), NKikimrServices::TActivity::DATASHARD_STATS_BUILDER);
+            TTableStatsCoroBuilderArgs args{
+                .ReplyTo = ctx.SelfID,
+                .TabletId = Self->TabletID(),
+                .TableId = tableId,
+                .ExecutorId = Self->ExecutorID(),
+                .IndexSize = indexSize,
+                .Subset = subsetForStats,
+                .MemRowCount = memRowCount,
+                .MemDataSize = memDataSize,
+                .RowCountResolution = rowCountResolution,
+                .DataSizeResolution = dataSizeResolution,
+                .HistogramBucketsCount = histogramBucketsCount,
+                .SearchHeight = searchHeight,
+                .HasSchemaChanges = hasSchemaChanges,
+                .StatsUpdateTime = AppData(ctx)->TimeProvider->Now(),
+            };
+            const auto backend = AppData()->UseLockFreePageCache() ? NTabletFlatExecutor::EPageCacheBackend::LF
+                                                                   : NTabletFlatExecutor::EPageCacheBackend::Legacy;
+            auto builder = new TActorCoro(
+                MakeTableStatsBuilder(std::move(args), backend), NKikimrServices::TActivity::DATASHARD_STATS_BUILDER);
 
             TActorId actorId = ctx.Register(builder, TMailboxType::HTSwap, AppData(ctx)->BatchPoolId);
             Self->Actors.insert(actorId);

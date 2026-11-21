@@ -1,5 +1,6 @@
 #include <shared_cache_counters.h>
 #include <shared_cache_events.h>
+#include <shared_cache_pages.h>
 #include <shared_sausagecache.h>
 #include <ydb/core/cms/console/console.h>
 #include <ydb/core/base/counters.h>
@@ -11,7 +12,7 @@
 #include <library/cpp/testing/unittest/registar.h>
 #include <ydb/core/protos/bootstrap.pb.h>
 
-namespace NKikimr::NSharedCache {
+namespace NKikimr::NSharedCache::NLegacy {
 using namespace NActors;
 using namespace NTabletFlatExecutor;
 using namespace NPageCollection;
@@ -85,16 +86,16 @@ struct TPageCollectionMock : public IPageCollection {
         return data.size() == location.Size;
     }
 
+    size_t BackingSize() const noexcept override {
+        return 10 * TotalPages;
+    }
+
     i64 GetMetadataMemoryUsage() const noexcept override {
         return sizeof(TPageCollectionMock);
     }
 
     const TSharedData* GetMetadataBuffer() const noexcept override {
         return nullptr;
-    }
-
-    size_t BackingSize() const noexcept override {
-        return 10 * TotalPages;
     }
 
     TPageLocation GetLocation(ui32 pageId) const override {
@@ -115,7 +116,7 @@ private:
 
 struct TExecutorMock : public TActorBootstrapped<TExecutorMock> {
 public:
-    TExecutorMock(std::deque<NSharedCache::TEvResult::TPtr>& results)
+    TExecutorMock(std::deque<TEvResult::TPtr>& results)
         : Results(results)
     {}
 
@@ -125,16 +126,14 @@ public:
 
 private:
     STFUNC(StateWork) {
-        switch (ev->GetTypeRewrite()) {
-            hFunc(NSharedCache::TEvResult, Handle);
-        }
+        switch (ev->GetTypeRewrite()) { hFunc(TEvResult, Handle); }
     }
 
-    void Handle(NSharedCache::TEvResult::TPtr& ev) {
+    void Handle(TEvResult::TPtr& ev) {
         Results.push_back(ev);
     }
 
-    std::deque<NSharedCache::TEvResult::TPtr>& Results;
+    std::deque<TEvResult::TPtr>& Results;
 };
 
 struct TSharedPageCacheMock {
@@ -152,7 +151,7 @@ struct TSharedPageCacheMock {
         Runtime.SetLogPriority(NKikimrServices::TABLET_EXECUTOR, NLog::PRI_TRACE);
         Runtime.SetLogPriority(NKikimrServices::TABLET_SAUSAGECACHE, NLog::PRI_TRACE);
 
-        ActorId = Runtime.Register(CreateSharedPageCache(config, Runtime.GetDynamicCounters()));
+        ActorId = Runtime.Register(CreateSharedPageCache(config, Runtime.GetDynamicCounters(), CachePages));
         if (enableSchedule) {
             Runtime.EnableScheduleForActor(ActorId);
         }
@@ -167,7 +166,8 @@ struct TSharedPageCacheMock {
 
         Fetches = MakeHolder<TBlockEvents<NBlockIO::TEvFetch>>(Runtime);
 
-        Counters = MakeHolder<TSharedPageCacheCounters>(GetServiceCounters(Runtime.GetDynamicCounters(), "tablets")->GetSubgroup("type", "S_CACHE"));
+        Counters = MakeHolder<TSharedPageCacheCounters>(
+            GetServiceCounters(Runtime.GetDynamicCounters(), "tablets")->GetSubgroup("type", "S_CACHE"));
     }
 
     TSharedPageCacheMock& Wakeup() {
@@ -201,7 +201,8 @@ struct TSharedPageCacheMock {
         return *this;
     }
 
-    TSharedPageCacheMock& Request(TActorId sender, TIntrusiveConstPtr<TPageCollectionMock> collection, TVector<TPageLocation> locations, EPriority priority = EPriority::Fast) {
+    TSharedPageCacheMock& Request(TActorId sender, TIntrusiveConstPtr<TPageCollectionMock> collection,
+        TVector<TPageLocation> locations, EPriority priority = EPriority::Fast) {
         auto request = new TEvRequest(priority, collection, std::move(locations), ++RequestId);
         Send(sender, request, RequestId);
 
@@ -295,8 +296,9 @@ struct TSharedPageCacheMock {
         if (expected.empty()) {
             Runtime.SimulateSleep(TDuration::Seconds(1));
         } else {
-            Runtime.WaitFor(TStringBuilder() << "fetches #" << RequestId, 
-                [&]{return Fetches->size() >= expected.size();}, TDuration::Seconds(5));
+            Runtime.WaitFor(TStringBuilder() << "fetches #" << RequestId, [&] {
+                return Fetches->size() >= expected.size();
+            }, TDuration::Seconds(5));
         }
 
         TVector<TFetch> actual;
@@ -315,14 +317,16 @@ struct TSharedPageCacheMock {
         return *this;
     }
 
-    THashMap<TPageId, TSharedPageRef> CheckResults(TVector<TFetch> expected, NKikimrProto::EReplyStatus status = NKikimrProto::OK) {
+    THashMap<TPageId, TSharedPageRef> CheckResults(
+        TVector<TFetch> expected, NKikimrProto::EReplyStatus status = NKikimrProto::OK) {
         if (expected.empty()) {
             Runtime.SimulateSleep(TDuration::Seconds(1));
         } else {
-            Runtime.WaitFor(TStringBuilder() << "results #" << RequestId, 
-                [&]{return Results.size() >= expected.size();}, TDuration::Seconds(5));
+            Runtime.WaitFor(TStringBuilder() << "results #" << RequestId, [&] {
+                return Results.size() >= expected.size();
+            }, TDuration::Seconds(5));
         }
-        
+
         TVector<TFetch> actual;
         THashMap<TPageId, TSharedPageRef> pages;
         for (auto& r : Results) {
@@ -335,7 +339,7 @@ struct TSharedPageCacheMock {
             }
         }
         Results.clear();
-        
+
         Cerr << "Checking results#" << RequestId << Endl;
         CheckFetches(expected, actual);
 
@@ -356,8 +360,12 @@ struct TSharedPageCacheMock {
         Sort(expected, cmp);
         Sort(actual, cmp);
         // pages within a single fetch may also be in any order (e.g. from THashSet iteration)
-        for (auto& f : expected) Sort(f.Pages);
-        for (auto& f : actual) Sort(f.Pages);
+        for (auto& f : expected) {
+            Sort(f.Pages);
+        }
+        for (auto& f : actual) {
+            Sort(f.Pages);
+        }
 
         Cerr << "Expected:" << Endl;
         for (auto f : expected) {
@@ -380,13 +388,14 @@ struct TSharedPageCacheMock {
         Runtime.Send(new IEventHandle(ActorId, sender, ev, 0, cookie), 0, true);
     }
 
+    TIntrusivePtr<TSharedCachePages> CachePages = MakeIntrusive<TSharedCachePages>();
     TTestActorRuntime Runtime;
     TActorId ActorId;
     ui64 RequestId = 0;
     THolder<TSharedPageCacheCounters> Counters;
 
     THolder<TBlockEvents<NBlockIO::TEvFetch>> Fetches;
-    std::deque<NSharedCache::TEvResult::TPtr> Results;
+    std::deque<TEvResult::TPtr> Results;
     THashMap<TLogoBlobID, THashMap<TPageOffset, TActorId>> FetchActors;
 
     TActorId Sender1;
@@ -396,24 +405,19 @@ struct TSharedPageCacheMock {
     TIntrusiveConstPtr<TPageCollectionMock> Collection2 = new TPageCollectionMock(2, 100);
 };
 
-Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
-
+Y_UNIT_TEST_SUITE(TLegacySharedPageCache_Actor) {
     Y_UNIT_TEST(Request_Basics) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
 
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
@@ -422,17 +426,15 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Request_Failed) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection2, {_P(4), _P(5)});
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, {_P(5), _P(6)});
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, {_P(6), _P(7)});
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
             TFetch{20, sharedCache.Collection2, {_P(4), _P(5)}},
             TFetch{20, sharedCache.Collection1, {_P(5), _P(6)}},
-            TFetch{20, sharedCache.Collection2, {_P(6), _P(7)}}
-        });
+            TFetch{ 20, sharedCache.Collection2, { _P(6), _P(7) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 9);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 9);
@@ -442,12 +444,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 4);
 
         auto data = new NBlockIO::TEvData(NKikimrProto::ERROR, sharedCache.Collection1, 30);
-        data->Pages = {TLoadedPageData(_P(1).Offset, TSharedData{}), TLoadedPageData(_P(2).Offset, TSharedData{}), TLoadedPageData(_P(3).Offset, TSharedData{})};
+        data->Pages = { TLoadedPageData(_P(1).Offset, TSharedData{}), TLoadedPageData(_P(2).Offset, TSharedData{}),
+            TLoadedPageData(_P(3).Offset, TSharedData{}) };
         sharedCache.Send(sharedCache.BlockIoSender, data, NO_QUEUE_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {}},
-            TFetch{3, sharedCache.Collection1, {}}
-        }, NKikimrProto::ERROR);
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, {} }, TFetch{ 3, sharedCache.Collection1, {} } },
+            NKikimrProto::ERROR);
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 6);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
@@ -470,10 +471,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         sharedCache.Provide(sharedCache.Collection2, {_P(6), _P(7)});
         sharedCache.Provide(sharedCache.Collection2, {_P(4), _P(5)});
-        sharedCache.CheckResults({
-            TFetch{4, sharedCache.Collection2, {_P(6), _P(7)}},
-            TFetch{2, sharedCache.Collection2, {_P(4), _P(5)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 4, sharedCache.Collection2, { _P(6), _P(7) } },
+            TFetch{ 2, sharedCache.Collection2, { _P(4), _P(5) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
@@ -486,20 +485,17 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Request_Queue) {
         TSharedPageCacheMock sharedCache;
-        
-        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4), _P(5)}, EPriority::Bkgr);
+
+        sharedCache.Request(
+            sharedCache.Sender1, sharedCache.Collection1, { _P(1), _P(2), _P(3), _P(4), _P(5) }, EPriority::Bkgr);
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, {_P(1), _P(2), _P(3)}, EPriority::Bkgr);
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection1, {_P(1), _P(2)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(1), _P(2) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 8);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
 
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2)}, ASYNC_QUEUE_COOKIE);
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection1, {_P(3), _P(4)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(3), _P(4) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
 
@@ -521,10 +517,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         sharedCache.Provide(sharedCache.Collection2, {_P(3)});
         sharedCache.Provide(sharedCache.Collection1, {_P(5)});
-        sharedCache.CheckResults({
-            TFetch{2, sharedCache.Collection2, {_P(1), _P(2), _P(3)}},
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4), _P(5)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection2, { _P(1), _P(2), _P(3) } },
+            TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3), _P(4), _P(5) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 2);
@@ -532,7 +526,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Request_Queue_Failed) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1)}, EPriority::Bkgr);
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(2)}, EPriority::Bkgr);
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(3)}, EPriority::Bkgr);
@@ -586,10 +580,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         sharedCache.Provide(sharedCache.Collection2, {_P(6)}, ASYNC_QUEUE_COOKIE);
         sharedCache.Provide(sharedCache.Collection2, {_P(4)}, ASYNC_QUEUE_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{6, sharedCache.Collection2, {_P(6)}},
-            TFetch{4, sharedCache.Collection2, {_P(4)}}
-        });
+        sharedCache.CheckResults(
+            { TFetch{ 6, sharedCache.Collection2, { _P(6) } }, TFetch{ 4, sharedCache.Collection2, { _P(4) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 2);
@@ -601,19 +593,17 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Request_Queue_Fast) {
         TSharedPageCacheMock sharedCache;
-        
-        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4), _P(5)}, EPriority::Bkgr);
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection1, {_P(1), _P(2)}}
-        });
+
+        sharedCache.Request(
+            sharedCache.Sender1, sharedCache.Collection1, { _P(1), _P(2), _P(3), _P(4), _P(5) }, EPriority::Bkgr);
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(1), _P(2) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 5);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
 
-        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4), _P(6)}, EPriority::Fast);
-        sharedCache.CheckFetches({
-            TFetch{50, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4), _P(6)}}
-        });
+        sharedCache.Request(
+            sharedCache.Sender1, sharedCache.Collection1, { _P(1), _P(2), _P(3), _P(4), _P(6) }, EPriority::Fast);
+        sharedCache.CheckFetches({ TFetch{ 50, sharedCache.Collection1, { _P(1), _P(2), _P(3), _P(4), _P(6) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 7);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 10);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
@@ -626,9 +616,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
 
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2)}, ASYNC_QUEUE_COOKIE);
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection1, {_P(5)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(5) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
 
@@ -642,37 +630,29 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Request_Sequential) {
         TSharedPageCacheMock sharedCache;
-        
+
         {
             sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-            sharedCache.CheckFetches({
-                TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-            });
+            sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
 
             UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 3);
             UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
 
             sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-            sharedCache.CheckResults({
-                TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-            });
+            sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
 
             UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         }
 
         {
             sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, {_P(1), _P(2)});
-            sharedCache.CheckFetches({
-                TFetch{20, sharedCache.Collection2, {_P(1), _P(2)}}
-            });
+            sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection2, { _P(1), _P(2) } } });
 
             UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 5);
             UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
 
             sharedCache.Provide(sharedCache.Collection2, {_P(1), _P(2)});
-            sharedCache.CheckResults({
-                TFetch{2, sharedCache.Collection2, {_P(1), _P(2)}}
-            });
+            sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection2, { _P(1), _P(2) } } });
 
             UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         }
@@ -680,17 +660,13 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Request_Cached) {
         TSharedPageCacheMock sharedCache;
-        
+
         for (TPageId pageId : xrange(1, 8)) {
             sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(pageId)});
-            sharedCache.CheckFetches({
-                TFetch{10, sharedCache.Collection1, {_P(pageId)}}
-            });
+            sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(pageId) } } });
 
             sharedCache.Provide(sharedCache.Collection1, {_P(pageId)});
-            sharedCache.CheckResults({
-                TFetch{pageId, sharedCache.Collection1, {_P(pageId)}}
-            });
+            sharedCache.CheckResults({ TFetch{ pageId, sharedCache.Collection1, { _P(pageId) } } });
         }
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 7);
@@ -698,17 +674,15 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 0);
 
         {
-            sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4), _P(5), _P(6), _P(7)});
-            sharedCache.CheckFetches({
-                TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-            });
+            sharedCache.Request(
+                sharedCache.Sender1, sharedCache.Collection1, { _P(1), _P(2), _P(3), _P(4), _P(5), _P(6), _P(7) });
+            sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
 
             UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 10);
 
             sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-            sharedCache.CheckResults({
-                TFetch{8, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4), _P(5), _P(6), _P(7)}}
-            });
+            sharedCache.CheckResults(
+                { TFetch{ 8, sharedCache.Collection1, { _P(1), _P(2), _P(3), _P(4), _P(5), _P(6), _P(7) } } });
 
             UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 2);
             UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 5);
@@ -717,14 +691,12 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Request_Different_Collections) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, {_P(1), _P(2)});
 
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{20, sharedCache.Collection2, {_P(1), _P(2)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 20, sharedCache.Collection2, { _P(1), _P(2) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 5);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
@@ -732,22 +704,18 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Provide(sharedCache.Collection2, {_P(1), _P(2)});
 
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{2, sharedCache.Collection2, {_P(1), _P(2)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 2, sharedCache.Collection2, { _P(1), _P(2) } } });
     }
 
     Y_UNIT_TEST(Request_Different_Pages) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, {_P(4), _P(5)});
 
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{20, sharedCache.Collection1, {_P(4), _P(5)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 20, sharedCache.Collection1, { _P(4), _P(5) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 5);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
@@ -755,22 +723,18 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Provide(sharedCache.Collection1, {_P(4), _P(5)});
 
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{2, sharedCache.Collection1, {_P(4), _P(5)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 2, sharedCache.Collection1, { _P(4), _P(5) } } });
     }
 
     Y_UNIT_TEST(Request_Different_Pages_Reversed) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, {_P(4), _P(5)});
 
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{20, sharedCache.Collection1, {_P(4), _P(5)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 20, sharedCache.Collection1, { _P(4), _P(5) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 5);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
@@ -778,64 +742,52 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection1, {_P(4), _P(5)});
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
 
-        sharedCache.CheckResults({
-            TFetch{2, sharedCache.Collection1, {_P(4), _P(5)}},
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection1, { _P(4), _P(5) } },
+            TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
     }
 
     Y_UNIT_TEST(Request_Subset) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, {_P(1), _P(2)});
 
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 5);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
 
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
 
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{2, sharedCache.Collection1, {_P(1), _P(2)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 2, sharedCache.Collection1, { _P(1), _P(2) } } });
     }
 
     Y_UNIT_TEST(Request_Subset_Shuffled) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, {_P(3), _P(1)});
 
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 5);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
 
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
 
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{2, sharedCache.Collection1, {_P(3), _P(1)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 2, sharedCache.Collection1, { _P(3), _P(1) } } });
     }
 
     Y_UNIT_TEST(Request_Superset) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4)});
 
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{10, sharedCache.Collection1, {_P(4)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 10, sharedCache.Collection1, { _P(4) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 7);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
@@ -843,22 +795,18 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Provide(sharedCache.Collection1, {_P(4)});
 
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{2, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 2, sharedCache.Collection1, { _P(1), _P(2), _P(3), _P(4) } } });
     }
 
     Y_UNIT_TEST(Request_Superset_Reversed) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4)});
 
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{10, sharedCache.Collection1, {_P(4)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 10, sharedCache.Collection1, { _P(4) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 7);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
@@ -866,22 +814,18 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection1, {_P(4)});
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
 
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{2, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 2, sharedCache.Collection1, { _P(1), _P(2), _P(3), _P(4) } } });
     }
 
     Y_UNIT_TEST(Request_Crossing) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, {_P(3), _P(4)});
 
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{10, sharedCache.Collection1, {_P(4)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 10, sharedCache.Collection1, { _P(4) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 5);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
@@ -889,22 +833,18 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Provide(sharedCache.Collection1, {_P(4)});
 
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{2, sharedCache.Collection1, {_P(3), _P(4)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 2, sharedCache.Collection1, { _P(3), _P(4) } } });
     }
 
     Y_UNIT_TEST(Request_Crossing_Reversed) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, {_P(3), _P(4)});
 
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{10, sharedCache.Collection1, {_P(4)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 10, sharedCache.Collection1, { _P(4) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 5);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
@@ -912,22 +852,18 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection1, {_P(4)});
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
 
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{2, sharedCache.Collection1, {_P(3), _P(4)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 2, sharedCache.Collection1, { _P(3), _P(4) } } });
     }
 
     Y_UNIT_TEST(Request_Crossing_Shuffled) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, {_P(4), _P(3)});
 
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{10, sharedCache.Collection1, {_P(4)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 10, sharedCache.Collection1, { _P(4) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 5);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
@@ -935,15 +871,13 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         sharedCache.Provide(sharedCache.Collection1, {_P(4)});
 
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}},
-            TFetch{2, sharedCache.Collection1, {_P(4), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } },
+            TFetch{ 2, sharedCache.Collection1, { _P(4), _P(3) } } });
     }
 
     Y_UNIT_TEST(Attach_Basics) {
         TSharedPageCacheMock sharedCache;
-        
+
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 0);
@@ -977,7 +911,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Attach_Request) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->Owners->Val(), 1);
@@ -996,7 +930,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Detach_Basics) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1);
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection2);
         sharedCache.Attach(sharedCache.Sender2, sharedCache.Collection2);
@@ -1028,15 +962,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Detach_Cached) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 0);
@@ -1054,15 +984,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Detach_Expired) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Detach(sharedCache.Sender1, sharedCache.Collection1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 0);
@@ -1071,13 +997,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 0);
 
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, {_P(1)});
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection2, {_P(1)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection2, { _P(1) } } });
         sharedCache.Provide(sharedCache.Collection2, {_P(1)});
-        sharedCache.CheckResults({
-            TFetch{2, sharedCache.Collection2, {_P(1)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection2, { _P(1) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
@@ -1085,13 +1007,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 1);
 
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, {_P(2), _P(3), _P(4), _P(5), _P(6)});
-        sharedCache.CheckFetches({
-            TFetch{50, sharedCache.Collection2, {_P(2), _P(3), _P(4), _P(5), _P(6)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 50, sharedCache.Collection2, { _P(2), _P(3), _P(4), _P(5), _P(6) } } });
         sharedCache.Provide(sharedCache.Collection2, {_P(2), _P(3), _P(4), _P(5), _P(6)});
-        sharedCache.CheckResults({
-            TFetch{3, sharedCache.Collection2, {_P(2), _P(3), _P(4), _P(5), _P(6)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 3, sharedCache.Collection2, { _P(2), _P(3), _P(4), _P(5), _P(6) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
@@ -1118,9 +1036,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 3);
 
         sharedCache.Detach(sharedCache.Sender1, sharedCache.Collection1);
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {}}
-        }, NKikimrProto::RACE);
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, {} } }, NKikimrProto::RACE);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
@@ -1130,17 +1046,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 2);
 
         sharedCache.Provide(sharedCache.Collection1, {_P(1)});
-        sharedCache.CheckResults({
-            TFetch{3, sharedCache.Collection1, {_P(1)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 3, sharedCache.Collection1, { _P(1) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(3)});
-        sharedCache.CheckResults({
-            TFetch{4, sharedCache.Collection1, {_P(1), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 4, sharedCache.Collection1, { _P(1), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection2, {_P(2)});
-        sharedCache.CheckResults({
-            TFetch{2, sharedCache.Collection2, {_P(2)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection2, { _P(2) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 3);
@@ -1153,13 +1063,13 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
     Y_UNIT_TEST(Detach_Queued) {
         TSharedPageCacheMock sharedCache;
 
-        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4), _P(5)}, EPriority::Bkgr);
+        sharedCache.Request(
+            sharedCache.Sender1, sharedCache.Collection1, { _P(1), _P(2), _P(3), _P(4), _P(5) }, EPriority::Bkgr);
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(6), _P(7)}, EPriority::Bkgr);
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection2, {_P(10), _P(11), _P(12)}, EPriority::Bkgr);
-        sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, {_P(1), _P(5), _P(9), _P(10)}, EPriority::Bkgr);
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection1, {_P(1), _P(2)}}
-        });
+        sharedCache.Request(
+            sharedCache.Sender2, sharedCache.Collection1, { _P(1), _P(5), _P(9), _P(10) }, EPriority::Bkgr);
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(1), _P(2) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
@@ -1167,10 +1077,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 3);
 
         sharedCache.Detach(sharedCache.Sender1, sharedCache.Collection1);
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {}},
-            TFetch{2, sharedCache.Collection1, {}}
-        }, NKikimrProto::RACE);
+        sharedCache.CheckResults(
+            { TFetch{ 1, sharedCache.Collection1, {} }, TFetch{ 2, sharedCache.Collection1, {} } }, NKikimrProto::RACE);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
@@ -1180,26 +1088,18 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 2);
 
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2)}, ASYNC_QUEUE_COOKIE);
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection1, {_P(5), _P(9)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(5), _P(9) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(5), _P(9)}, ASYNC_QUEUE_COOKIE);
         sharedCache.CheckFetches({
             TFetch{10, sharedCache.Collection1, {_P(10)}},
             TFetch{10, sharedCache.Collection2, {_P(10)}},
         });
         sharedCache.Provide(sharedCache.Collection1, {_P(10)}, ASYNC_QUEUE_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{4, sharedCache.Collection1, {_P(1), _P(5), _P(9), _P(10)}}
-        });
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection2, {_P(11)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 4, sharedCache.Collection1, { _P(1), _P(5), _P(9), _P(10) } } });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection2, { _P(11) } } });
 
         sharedCache.Provide(sharedCache.Collection2, {_P(10)}, ASYNC_QUEUE_COOKIE);
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection2, {_P(12)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection2, { _P(12) } } });
         sharedCache.Provide(sharedCache.Collection2, {_P(11)}, ASYNC_QUEUE_COOKIE);
         sharedCache.Provide(sharedCache.Collection2, {_P(12)}, ASYNC_QUEUE_COOKIE);
         sharedCache.CheckResults({
@@ -1217,7 +1117,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Unregister_Basics) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1);
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection2);
         sharedCache.Attach(sharedCache.Sender2, sharedCache.Collection2);
@@ -1244,15 +1144,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Unregister_Cached) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 0);
@@ -1270,15 +1166,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
     Y_UNIT_TEST(Unregister_Expired) {
         TSharedPageCacheMock sharedCache;
-        
+
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Unregister(sharedCache.Sender1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 0);
@@ -1287,13 +1179,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 0);
 
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, {_P(1)});
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection2, {_P(1)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection2, { _P(1) } } });
         sharedCache.Provide(sharedCache.Collection2, {_P(1)});
-        sharedCache.CheckResults({
-            TFetch{2, sharedCache.Collection2, {_P(1)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection2, { _P(1) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
@@ -1301,13 +1189,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 1);
 
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, {_P(2), _P(3), _P(4), _P(5), _P(6)});
-        sharedCache.CheckFetches({
-            TFetch{50, sharedCache.Collection2, {_P(2), _P(3), _P(4), _P(5), _P(6)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 50, sharedCache.Collection2, { _P(2), _P(3), _P(4), _P(5), _P(6) } } });
         sharedCache.Provide(sharedCache.Collection2, {_P(2), _P(3), _P(4), _P(5), _P(6)});
-        sharedCache.CheckResults({
-            TFetch{3, sharedCache.Collection2, {_P(2), _P(3), _P(4), _P(5), _P(6)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 3, sharedCache.Collection2, { _P(2), _P(3), _P(4), _P(5), _P(6) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 1);
@@ -1334,10 +1218,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 3);
 
         sharedCache.Unregister(sharedCache.Sender1);
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {}},
-            TFetch{2, sharedCache.Collection2, {}}
-        }, NKikimrProto::RACE);
+        sharedCache.CheckResults(
+            { TFetch{ 1, sharedCache.Collection1, {} }, TFetch{ 2, sharedCache.Collection2, {} } }, NKikimrProto::RACE);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
@@ -1348,13 +1230,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         sharedCache.Provide(sharedCache.Collection1, {_P(1)});
         sharedCache.Provide(sharedCache.Collection2, {_P(2)});
-        sharedCache.CheckResults({
-            TFetch{3, sharedCache.Collection1, {_P(1)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 3, sharedCache.Collection1, { _P(1) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(3)});
-        sharedCache.CheckResults({
-            TFetch{4, sharedCache.Collection1, {_P(1), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 4, sharedCache.Collection1, { _P(1), _P(3) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 2);
@@ -1367,13 +1245,13 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
     Y_UNIT_TEST(Unregister_Queued) {
         TSharedPageCacheMock sharedCache;
 
-        sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4), _P(5)}, EPriority::Bkgr);
+        sharedCache.Request(
+            sharedCache.Sender1, sharedCache.Collection1, { _P(1), _P(2), _P(3), _P(4), _P(5) }, EPriority::Bkgr);
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(6), _P(7)}, EPriority::Bkgr);
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection2, {_P(10), _P(11), _P(12)}, EPriority::Bkgr);
-        sharedCache.Request(sharedCache.Sender2, sharedCache.Collection1, {_P(1), _P(5), _P(9), _P(10)}, EPriority::Bkgr);
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection1, {_P(1), _P(2)}}
-        });
+        sharedCache.Request(
+            sharedCache.Sender2, sharedCache.Collection1, { _P(1), _P(5), _P(9), _P(10) }, EPriority::Bkgr);
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(1), _P(2) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
@@ -1381,11 +1259,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 3);
 
         sharedCache.Unregister(sharedCache.Sender1);
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {}},
-            TFetch{2, sharedCache.Collection1, {}},
-            TFetch{3, sharedCache.Collection2, {}}
-        }, NKikimrProto::RACE);
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, {} }, TFetch{ 2, sharedCache.Collection1, {} },
+                                     TFetch{ 3, sharedCache.Collection2, {} } }, NKikimrProto::RACE);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
@@ -1395,17 +1270,13 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 1);
 
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2)}, ASYNC_QUEUE_COOKIE);
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection1, {_P(5), _P(9)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(5), _P(9) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(5), _P(9)}, ASYNC_QUEUE_COOKIE);
         sharedCache.CheckFetches({
             TFetch{10, sharedCache.Collection1, {_P(10)}},
         });
         sharedCache.Provide(sharedCache.Collection1, {_P(10)}, ASYNC_QUEUE_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{4, sharedCache.Collection1, {_P(1), _P(5), _P(9), _P(10)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 4, sharedCache.Collection1, { _P(1), _P(5), _P(9), _P(10) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 0);
@@ -1422,10 +1293,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1)}, EPriority::Bkgr);
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, {_P(10), _P(11)}, EPriority::Bkgr);
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, {_P(12)}, EPriority::Bkgr);
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection1, {_P(1)}},
-            TFetch{10, sharedCache.Collection2, {_P(10)}}
-        });
+        sharedCache.CheckFetches(
+            { TFetch{ 10, sharedCache.Collection1, { _P(1) } }, TFetch{ 10, sharedCache.Collection2, { _P(10) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 3);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollections->Val(), 2);
@@ -1433,10 +1302,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PageCollectionOwners->Val(), 2);
 
         sharedCache.Unregister(sharedCache.Sender2);
-        sharedCache.CheckResults({
-            TFetch{2, sharedCache.Collection2, {}},
-            TFetch{3, sharedCache.Collection2, {}}
-        }, NKikimrProto::RACE);
+        sharedCache.CheckResults(
+            { TFetch{ 2, sharedCache.Collection2, {} }, TFetch{ 3, sharedCache.Collection2, {} } }, NKikimrProto::RACE);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PendingRequests->Val(), 1);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->SucceedRequests->Val(), 0);
@@ -1476,9 +1343,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 collection1TotalSize = 4 * PAGE_TOTAL_SIZE;
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{40, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 40, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
@@ -1490,9 +1355,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
         sharedCache.CheckFetches({});
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
@@ -1511,9 +1374,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissInMemoryPages->Val(), 0);
 
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 3);
@@ -1538,9 +1399,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
             TFetch{10, sharedCache.Collection2, {_P(1)}},
         });
         sharedCache.Provide(sharedCache.Collection2, {_P(1)});
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection2, {_P(1)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection2, { _P(1) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 1);
@@ -1552,13 +1411,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         // load in-memory collection
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{40, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 40, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.CheckFetches({});
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
@@ -1568,16 +1423,14 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->TargetInMemoryBytes->Val(), collection1TotalSize);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActiveInMemoryBytes->Val(), collection1TotalSize);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActiveLimitBytes->Val(), DefaultMemoryLimit);
-        
+
         // not in-memory page should be loaded again
         sharedCache.Request(sharedCache.Sender2, sharedCache.Collection2, {_P(1)});
         sharedCache.CheckFetches({
             TFetch{10, sharedCache.Collection2, {_P(1)}},
         });
         sharedCache.Provide(sharedCache.Collection2, {_P(1)});
-        sharedCache.CheckResults({
-            TFetch{2, sharedCache.Collection2, {_P(1)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 2, sharedCache.Collection2, { _P(1) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 2);
@@ -1603,13 +1456,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         // only 4 pages should be in memory cache
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{40, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 40, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.CheckFetches({});
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 4);
@@ -1642,13 +1491,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         // The collection itself stays usable.
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(0)});
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection1, {_P(0)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(0) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0)});
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(0)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(0) } } });
     }
 
     Y_UNIT_TEST(InMemory_StickyWalksAreOwnerSpecific) {
@@ -2029,9 +1874,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         seed.LevelCount = 2;
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::Regular, {seed});
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection1, {_P(0)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(0) } } });
 
         sharedCache.Fail(sharedCache.Collection1, { _P(0) }, ASYNC_QUEUE_COOKIE);
 
@@ -2062,9 +1905,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         sharedCache.Fail(sharedCache.Collection1, { seed.Root }, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
 
-        sharedCache.CheckResults(
-            { TFetch{ 0, sharedCache.Collection1, {} } },
-            NKikimrProto::ERROR);
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, {} } }, NKikimrProto::ERROR);
         sharedCache.CheckFetches({});
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
 
@@ -2173,13 +2014,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Collection1 = collection;
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection1, {_P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(2), _P(3)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(2), _P(3) } } });
         sharedCache.CheckFetches({});
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 2);
@@ -2194,13 +2031,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         sharedCache.Collection1 = collection;
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(0), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(0), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(2), _P(3)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(2), _P(3) } } });
         sharedCache.CheckFetches({});
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 3);
@@ -2211,7 +2044,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         TSharedPageCacheMock sharedCache;
 
         const ui64 bootstrapSharedCacheLimit = 2 * PAGE_TOTAL_SIZE;
-        sharedCache.Runtime.GetAppData().BootstrapConfig.MutableSharedCacheConfig()->SetMemoryLimit(bootstrapSharedCacheLimit);
+        sharedCache.Runtime.GetAppData().BootstrapConfig.MutableSharedCacheConfig()->SetMemoryLimit(
+            bootstrapSharedCacheLimit);
 
         NKikimrConfig::TAppConfig update;
         auto* tablet = update.MutableBootstrapConfig()->AddTablet();
@@ -2219,9 +2053,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         sharedCache.UpdateConfig(update);
 
-        UNIT_ASSERT_VALUES_EQUAL_C(
-            sharedCache.Counters->ConfigLimitBytes->Val(),
-            bootstrapSharedCacheLimit,
+        UNIT_ASSERT_VALUES_EQUAL_C(sharedCache.Counters->ConfigLimitBytes->Val(), bootstrapSharedCacheLimit,
             "Partial bootstrap update should preserve bootstrap-level shared cache config");
     }
 
@@ -2231,13 +2063,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 collection1TotalSize = 4 * PAGE_TOTAL_SIZE;
 
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(2)});
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection1, {_P(2)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(2) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(2)});
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(2)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(2) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 1);
@@ -2249,9 +2077,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActiveLimitBytes->Val(), DefaultMemoryLimit);
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(0), _P(1), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(0), _P(1), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1), _P(3)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
         sharedCache.CheckResults({
             TFetch{0, sharedCache.Collection1, {_P(2)}},       // already in cache
@@ -2279,13 +2105,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 collection1TotalSize = 4 * PAGE_TOTAL_SIZE;
 
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{40, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 40, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)});
-        sharedCache.CheckResults({
-            TFetch{1, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 1, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 4);
@@ -2297,9 +2119,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActiveLimitBytes->Val(), DefaultMemoryLimit);
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.CheckFetches({});
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 4);
@@ -2322,13 +2142,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 collection1TotalSize = 4 * PAGE_TOTAL_SIZE;
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{40, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 40, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.CheckFetches({});
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), 0);
@@ -2361,13 +2177,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 collection1TotalSize = 4 * PAGE_TOTAL_SIZE;
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{40, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 40, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.CheckFetches({});
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 4);
@@ -2376,9 +2188,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActiveLimitBytes->Val(), DefaultMemoryLimit);
 
         sharedCache.Attach(sharedCache.Sender2, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.CheckFetches({});
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 4);
@@ -2412,13 +2222,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 collection1TotalSize = 4 * PAGE_TOTAL_SIZE;
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{40, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 40, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.CheckFetches({});
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 4);
@@ -2427,9 +2233,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActiveLimitBytes->Val(), DefaultMemoryLimit);
 
         sharedCache.Attach(sharedCache.Sender2, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.CheckFetches({});
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 4);
@@ -2465,13 +2269,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         // request and hold collection#1 page refs
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(0), _P(1)});
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection1, {_P(0), _P(1)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(0), _P(1) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1)});
-        auto collection1Pages = sharedCache.CheckResults({
-            TFetch{fetchNo++, sharedCache.Collection1, {_P(0), _P(1)}}
-        });
+        auto collection1Pages =
+            sharedCache.CheckResults({ TFetch{ fetchNo++, sharedCache.Collection1, { _P(0), _P(1) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 0);
@@ -2481,19 +2282,13 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         auto ensurePageInCache = [&](auto pageId) {
             sharedCache.Request(sharedCache.Sender1, sharedCache.Collection2, {_P(pageId)});
-            sharedCache.CheckFetches({
-                TFetch{10, sharedCache.Collection2, {_P(pageId)}}
-            });
+            sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection2, { _P(pageId) } } });
             sharedCache.Provide(sharedCache.Collection2, {_P(pageId)});
-            sharedCache.CheckResults({
-                TFetch{fetchNo++, sharedCache.Collection2, {_P(pageId)}}
-            });
+            sharedCache.CheckResults({ TFetch{ fetchNo++, sharedCache.Collection2, { _P(pageId) } } });
 
             sharedCache.Request(sharedCache.Sender1, sharedCache.Collection2, {_P(pageId)});
             sharedCache.CheckFetches({});
-            sharedCache.CheckResults({
-                TFetch{fetchNo++, sharedCache.Collection2, {_P(pageId)}}
-            });
+            sharedCache.CheckResults({ TFetch{ fetchNo++, sharedCache.Collection2, { _P(pageId) } } });
 
             UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), ++cacheHits);
         };
@@ -2511,12 +2306,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
         sharedCache.CheckFetches({}); // all collection#1 pages already loaded
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1) } } });
         collection1Pages.clear(); // release refs and allow collection#1 pages eviction
 
-        // request next 4 pages from collection#2 to try preempt collection#1 pages 
+        // request next 4 pages from collection#2 to try preempt collection#1 pages
         for (TPageId pageId : xrange(4, 8)) {
             ensurePageInCache(pageId);
         }
@@ -2540,20 +2333,15 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 cacheMisses = 0;
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection1, {_P(0), _P(1)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(0), _P(1) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1) } } });
         sharedCache.CheckFetches({});
 
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(0), _P(1)});
         sharedCache.CheckFetches({});
-        auto collection1Pages = sharedCache.CheckResults({
-            TFetch{fetchNo++, sharedCache.Collection1, {_P(0), _P(1)}}
-        });
+        auto collection1Pages =
+            sharedCache.CheckResults({ TFetch{ fetchNo++, sharedCache.Collection1, { _P(0), _P(1) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), cacheHits += 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), cacheMisses);
@@ -2565,23 +2353,15 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         // after loading collection#2 to InMemory, all collection#1 pages should be evicted
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection2, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection2, {_P(0), _P(1)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection2, { _P(0), _P(1) } } });
         sharedCache.Provide(sharedCache.Collection2, {_P(0), _P(1)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection2, {_P(0), _P(1)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection2, { _P(0), _P(1) } } });
 
         // collection#1 pages has reads and prioritized, read collection#2 again to evict their pages
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection2, {_P(0), _P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection2, {_P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection2, { _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection2, {_P(2), _P(3)});
-        sharedCache.CheckResults({
-            TFetch{fetchNo++, sharedCache.Collection2, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ fetchNo++, sharedCache.Collection2, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.Wakeup();
         sharedCache.CheckFetches({});
 
@@ -2590,7 +2370,8 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissInMemoryPages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 2);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 2);
-        UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->TargetInMemoryBytes->Val(), collection1TotalSize + collection2TotalSize);
+        UNIT_ASSERT_VALUES_EQUAL(
+            sharedCache.Counters->TargetInMemoryBytes->Val(), collection1TotalSize + collection2TotalSize);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActiveInMemoryBytes->Val(), 2 * PAGE_TOTAL_SIZE);
 
         // all evicted collection#1 pages should be moved to Regular
@@ -2601,23 +2382,15 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         // should reload collection2 pages after collection1 pages will be unused
         collection1Pages.clear(); // unuse
         sharedCache.Wakeup();
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection2, {_P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection2, { _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection2, {_P(2), _P(3)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection2, {_P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection2, { _P(2), _P(3) } } });
 
         // all collection#1 pages should be GC'ed and loaded again
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(0)});
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection1, {_P(0)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(0) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0)});
-        sharedCache.CheckResults({
-            TFetch{fetchNo++, sharedCache.Collection1, {_P(0)}}
-        });
+        sharedCache.CheckResults({ TFetch{ fetchNo++, sharedCache.Collection1, { _P(0) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), cacheHits);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), ++cacheMisses);
@@ -2629,13 +2402,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         // collection#1 page#1 should be loaded again
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1)});
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection1, {_P(1)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(1) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(1)});
-        sharedCache.CheckResults({
-            TFetch{fetchNo++, sharedCache.Collection1, {_P(1)}}
-        });
+        sharedCache.CheckResults({ TFetch{ fetchNo++, sharedCache.Collection1, { _P(1) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), cacheHits);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheMissPages->Val(), ++cacheMisses);
@@ -2653,13 +2422,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         // only 4 pages should be in memory cache
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{40, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 40, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
         sharedCache.CheckFetches({});
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 4);
@@ -2669,13 +2434,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActiveLimitBytes->Val(), 4 * pageSize);
 
         sharedCache.SetLimit(5 * pageSize);
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection1, {_P(4)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(4) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(4)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(4)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(4) } } });
         sharedCache.CheckFetches({});
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 5);
@@ -2694,13 +2455,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActiveLimitBytes->Val(), 3 * pageSize);
 
         sharedCache.SetLimit(7 * pageSize);
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(0), _P(1), _P(5)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(0), _P(1), _P(5) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1), _P(5)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(5)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1), _P(5) } } });
         sharedCache.CheckFetches({});
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 6);
@@ -2721,33 +2478,21 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 collection1TotalSize = 5 * pageSize;
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection1, {_P(0), _P(1)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(0), _P(1) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 2);
 
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection1, {_P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(2), _P(3)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 4);
 
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection1, {_P(4)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(4) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(4)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(4)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(4) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 5);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 0);
@@ -2762,9 +2507,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 collection1TotalSize = 4 * PAGE_TOTAL_SIZE;
 
         sharedCache.Attach(sharedCache.Sender1, sharedCache.Collection1, ECacheMode::TryKeepInMemory);
-        sharedCache.CheckFetches({
-            TFetch{40, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 40, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
@@ -2776,9 +2519,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         sharedCache.Provide(sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}, TRY_KEEP_IN_MEMORY_PRELOAD_COOKIE);
         sharedCache.CheckFetches({});
-        sharedCache.CheckResults({
-            TFetch{0, sharedCache.Collection1, {_P(0), _P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ 0, sharedCache.Collection1, { _P(0), _P(1), _P(2), _P(3) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->LoadInFlyPages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->CacheHitPages->Val(), 0);
@@ -2811,14 +2552,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 fetchNo = 0;
 
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
 
-        auto results = sharedCache.CheckResults({
-            TFetch{++fetchNo, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        auto results =
+            sharedCache.CheckResults({ TFetch{ ++fetchNo, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Wakeup();
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 3);
@@ -2846,14 +2584,11 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 fetchNo = 0;
 
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
 
-        auto results = sharedCache.CheckResults({
-            TFetch{++fetchNo, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        auto results =
+            sharedCache.CheckResults({ TFetch{ ++fetchNo, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 0);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->PassivePages->Val(), 3);
 
@@ -2879,14 +2614,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         for (TPageId pageId : xrange(0, 10)) {
             sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(pageId)});
-            sharedCache.CheckFetches({
-                TFetch{10, sharedCache.Collection1, {_P(pageId)}}
-            });
+            sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(pageId) } } });
 
             sharedCache.Provide(sharedCache.Collection1, {_P(pageId)});
-            sharedCache.CheckResults({
-                TFetch{++fetchNo, sharedCache.Collection1, {_P(pageId)}}
-            });
+            sharedCache.CheckResults({ TFetch{ ++fetchNo, sharedCache.Collection1, { _P(pageId) } } });
         }
         sharedCache.Wakeup();
 
@@ -2899,13 +2630,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 fetchNo = 0;
 
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        auto results = sharedCache.CheckResults({
-            TFetch{++fetchNo, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        auto results =
+            sharedCache.CheckResults({ TFetch{ ++fetchNo, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Wakeup();
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 3);
@@ -2917,14 +2645,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         for (TPageId pageId : xrange(10, 20)) {
             sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(pageId)});
-            sharedCache.CheckFetches({
-                TFetch{10, sharedCache.Collection1, {_P(pageId)}}
-            });
+            sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(pageId) } } });
 
             sharedCache.Provide(sharedCache.Collection1, {_P(pageId)});
-            sharedCache.CheckResults({
-                TFetch{++fetchNo, sharedCache.Collection1, {_P(pageId)}}
-            });
+            sharedCache.CheckResults({ TFetch{ ++fetchNo, sharedCache.Collection1, { _P(pageId) } } });
         }
         sharedCache.Wakeup();
 
@@ -2944,13 +2668,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 fetchNo = 0;
 
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        auto results = sharedCache.CheckResults({
-            TFetch{++fetchNo, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        auto results =
+            sharedCache.CheckResults({ TFetch{ ++fetchNo, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         for (auto& [_, page] : results) {
             UNIT_ASSERT(page.IsUsed());
             UNIT_ASSERT(!page.UnUse()); // still used by shared cache
@@ -2965,7 +2686,7 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         results[2].IncrementFrequency();
         results[2].IncrementFrequency();
         UNIT_ASSERT(!results[2].UnUse()); // still used by shared cache
-        
+
         // touch page#3
         UNIT_ASSERT(results[3].Use());
         results[3].IncrementFrequency();
@@ -2975,14 +2696,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         for (TPageId pageId : xrange(10, 20)) {
             sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(pageId)});
-            sharedCache.CheckFetches({
-                TFetch{10, sharedCache.Collection1, {_P(pageId)}}
-            });
+            sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(pageId) } } });
 
             sharedCache.Provide(sharedCache.Collection1, {_P(pageId)});
-            sharedCache.CheckResults({
-                TFetch{++fetchNo, sharedCache.Collection1, {_P(pageId)}}
-            });
+            sharedCache.CheckResults({ TFetch{ ++fetchNo, sharedCache.Collection1, { _P(pageId) } } });
         }
         sharedCache.Wakeup();
 
@@ -2991,13 +2708,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         // pages #2 and #3 should be still in cache:
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{10, sharedCache.Collection1, {_P(1)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(1) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(1)});
-        sharedCache.CheckResults({
-            TFetch{++fetchNo, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ ++fetchNo, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
     }
 
     Y_UNIT_TEST(IncrementFrequency_Passive) {
@@ -3005,13 +2718,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 fetchNo = 0;
 
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{30, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 30, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        auto results = sharedCache.CheckResults({
-            TFetch{++fetchNo, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        auto results =
+            sharedCache.CheckResults({ TFetch{ ++fetchNo, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
         sharedCache.Wakeup();
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 3);
@@ -3019,14 +2729,10 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         for (TPageId pageId : xrange(10, 20)) {
             sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(pageId)});
-            sharedCache.CheckFetches({
-                TFetch{10, sharedCache.Collection1, {_P(pageId)}}
-            });
+            sharedCache.CheckFetches({ TFetch{ 10, sharedCache.Collection1, { _P(pageId) } } });
 
             sharedCache.Provide(sharedCache.Collection1, {_P(pageId)});
-            sharedCache.CheckResults({
-                TFetch{++fetchNo, sharedCache.Collection1, {_P(pageId)}}
-            });
+            sharedCache.CheckResults({ TFetch{ ++fetchNo, sharedCache.Collection1, { _P(pageId) } } });
         }
         sharedCache.Wakeup();
 
@@ -3042,13 +2748,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
 
         // pages #2 should be still in cache:
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3)});
-        sharedCache.CheckFetches({
-            TFetch{20, sharedCache.Collection1, {_P(1), _P(3)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 20, sharedCache.Collection1, { _P(1), _P(3) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(3)});
-        sharedCache.CheckResults({
-            TFetch{++fetchNo, sharedCache.Collection1, {_P(1), _P(2), _P(3)}}
-        });
+        sharedCache.CheckResults({ TFetch{ ++fetchNo, sharedCache.Collection1, { _P(1), _P(2), _P(3) } } });
     }
 
     Y_UNIT_TEST(IncrementalGC) {
@@ -3058,13 +2760,9 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         ui64 fetchNo = 0;
 
         sharedCache.Request(sharedCache.Sender1, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4)});
-        sharedCache.CheckFetches({
-            TFetch{40, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4)}}
-        });
+        sharedCache.CheckFetches({ TFetch{ 40, sharedCache.Collection1, { _P(1), _P(2), _P(3), _P(4) } } });
         sharedCache.Provide(sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4)});
-        sharedCache.CheckResults({
-            TFetch{++fetchNo, sharedCache.Collection1, {_P(1), _P(2), _P(3), _P(4)}}
-        });
+        sharedCache.CheckResults({ TFetch{ ++fetchNo, sharedCache.Collection1, { _P(1), _P(2), _P(3), _P(4) } } });
 
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->ActivePages->Val(), 4);
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->EvictedPages->Val(), 0);
@@ -3097,4 +2795,4 @@ Y_UNIT_TEST_SUITE(TSharedPageCache_Actor) {
         UNIT_ASSERT_VALUES_EQUAL(sharedCache.Counters->EvictedPages->Val(), 3);
     }
 }
-}
+} // namespace NKikimr::NSharedCache::NLegacy

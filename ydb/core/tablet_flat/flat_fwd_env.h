@@ -11,6 +11,7 @@
 #include "flat_part_iface.h"
 #include "flat_part_store.h"
 #include "flat_sausage_fetch.h"
+#include "shared_cache_events_lf.h"
 #include "util_fmt_abort.h"
 #include <util/generic/deque.h>
 #include <util/random/random.h>
@@ -26,21 +27,22 @@ namespace NFwd {
     using IPageCollection = NPageCollection::IPageCollection;
     using TGroupId = NPage::TGroupId;
 
-    class TPartGroupLoadingQueue : public IPageLoadingQueue, public TIntrusiveListItem<TPartGroupLoadingQueue> {
+    template <class TPageRef>
+    class TPartGroupLoadingQueueImpl : public IPageLoadingQueue,
+                                       public TIntrusiveListItem<TPartGroupLoadingQueueImpl<TPageRef>> {
+        using TPageLoadingLogic = IPageLoadingLogicImpl<TPageRef>;
+
     public:
-        TPartGroupLoadingQueue(ui32 partIndex, ui64 cookie,
-                TIntrusiveConstPtr<IPageCollection> indexPageCollection, TIntrusiveConstPtr<IPageCollection> groupPageCollection,
-                THolder<IPageLoadingLogic> pageLoadingLogic)
+        TPartGroupLoadingQueueImpl(ui32 partIndex, ui64 cookie, TIntrusiveConstPtr<IPageCollection> indexPageCollection,
+            TIntrusiveConstPtr<IPageCollection> groupPageCollection, THolder<TPageLoadingLogic> pageLoadingLogic)
             : PartIndex(partIndex)
             , Cookie(cookie)
             , IndexPageCollection(std::move(indexPageCollection))
             , GroupPageCollection(std::move(groupPageCollection))
             , PageLoadingLogic(std::move(pageLoadingLogic))
-        {
-        }
+        {}
 
-        IPageLoadingLogic* operator->() const
-        {
+        TPageLoadingLogic* operator->() const {
             return PageLoadingLogic.Get();
         }
 
@@ -75,56 +77,61 @@ namespace NFwd {
         const ui64 Cookie;
         const TIntrusiveConstPtr<IPageCollection> IndexPageCollection;
         const TIntrusiveConstPtr<IPageCollection> GroupPageCollection;
-        const THolder<IPageLoadingLogic> PageLoadingLogic;
+        const THolder<TPageLoadingLogic> PageLoadingLogic;
         bool Grow = false;  /* Should call Forward(...) for preloading */
         bool RowActive = false;
         TFetch GroupFetch;
         TFetch IndexFetch;
     };
 
-    struct TEnv : public IEnv {
+    using TPartGroupLoadingQueue = TPartGroupLoadingQueueImpl<TCachePageRef>;
+
+    template <class TPageRef>
+    struct TEnvImpl : public IEnv {
+        using TPageLoadingLogic = IPageLoadingLogicImpl<TPageRef>;
+        using TPartGroupLoadingQueue = TPartGroupLoadingQueueImpl<TPageRef>;
+        using TBlobs = TBlobsImpl<TPageRef>;
+
         struct TGroupPages {
-            THolder<IPageLoadingLogic> PageLoadingLogic;
+            THolder<TPageLoadingLogic> PageLoadingLogic;
             TIntrusiveConstPtr<IPageCollection> IndexPageCollection;
             TIntrusiveConstPtr<IPageCollection> GroupPageCollection;
         };
 
     public:
-        TEnv(const TConf &conf, const TSubset &subset)
+        TEnvImpl(const TConf& conf, const TSubset& subset,
+            TIntrusivePtr<NTabletFlatExecutor::IPageMetadataWorkingSet> workingSet = {})
             : Salt(RandomNumber<ui32>())
             , Conf(conf)
             , Subset(subset)
             , Keys(Subset.Scheme->Tags(true))
             , MemTable(new TMemTableHandler(Keys, Conf.Edge,
                                         Conf.Trace ? &subset.Frozen : nullptr))
+            , WorkingSet(std::move(workingSet))
         {
             Y_ENSURE(Conf.AheadHi >= Conf.AheadLo);
             Y_ENSURE(std::is_sorted(Keys.begin(), Keys.end()));
 
-            for (auto &one: Subset.Flatten)
-                AddPartView(one);
+            for (const auto& part : Subset.Flatten) {
+                if (WorkingSet) {
+                    WorkingSet->AddPart(*part.As<TPartStore>());
+                }
+                AddPartView(part);
+            }
         }
 
-        const NTabletFlatExecutor::IPageCacheProtocol& Protocol() const noexcept override;
-        THolder<NActors::IEventBase> MakeRequest(
-            NTabletFlatExecutor::NBlockIO::EPriority priority, TFetch fetch) const override;
-        THolder<IPartLoaderEnv> MakeLoaderEnvironment() const override;
-
-        void Save(NActors::IEventBase& event) override {
-            auto& result = *CheckedCast<NSharedCache::TEvResult*>(&event);
-            SavePages(result.PageCollection, result.Cookie, std::move(result.Pages));
+        TIntrusivePtr<NTabletFlatExecutor::IPageMetadataWorkingSet> MetadataWorkingSet() const override {
+            return WorkingSet;
         }
 
-        void AddCold(const TPartView& partView) override
-        {
+        void AddCold(const TPartView& partView) override {
             auto r = ColdParts.insert(partView.Part.Get());
             Y_ENSURE(r.second, "Cannot add a duplicate cold part");
 
             AddPartView(partView);
         }
 
-        bool MayProgress() const override
-        {
+        bool MayProgress() const override {
             return Pending == 0;
         }
 
@@ -140,15 +147,17 @@ namespace NFwd {
         const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
         {
             Y_ENSURE(!IsIndexPage(location.Type), "Index page " << location << " is requested as a data page");
-            return Get(GetQueue(part, groupId), location.Offset, location.Type).Page;
+            auto got = Get(GetQueue(part, groupId), location.Offset, location.Type);
+            return got.Page ? &got.Page->GetData() : nullptr;
         }
 
-        const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override
-        {
+        const TSharedData* TryGetIndexPage(
+            const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             Y_ENSURE(location.Type == EPage::Undef || IsIndexPage(location.Type),
                 "Page " << location << " is requested as an index page");
             // the group queue loads both index and data pages of the group
-            return Get(GetQueue(part, groupId), location.Offset, location.Type).Page;
+            auto got = Get(GetQueue(part, groupId), location.Offset, location.Type);
+            return got.Page ? &got.Page->GetData() : nullptr;
         }
 
         TResult Locate(const TMemTable *memTable, ui64 ref, ui32 tag) override
@@ -170,42 +179,11 @@ namespace NFwd {
             }
 
             // Blob fwd cache is keyed by page-index; TMeta::Bounds handles it as page-index too with the condition
-            return Get(queue, TPageOffset::FromPageIndex(static_cast<ui32>(ref)), EPage::Opaque);
+            auto got = Get(queue, TPageOffset::FromPageIndex(static_cast<ui32>(ref)), EPage::Opaque);
+            return { got.Need, got.Page ? &got.Page->GetData() : nullptr };
         }
 
-    private:
-        void SavePages(TIntrusiveConstPtr<IPageCollection> pageCollection, ui64 cookie, TVector<NSharedCache::TEvResult::TLoaded> pages)
-        {
-            const ui32 epoch = ui32(cookie) - Salt;
-            if (epoch < Epoch) {
-                return; // ignore pages requested before Reset
-            }
-            Y_ENSURE(epoch == Epoch, "Got an invalid part cookie on pages absorption");
-
-            const ui32 groupQueueIndex = cookie >> 32;
-            Y_ENSURE(groupQueueIndex < GroupQueues.size(), "Got save request for unknown TPart cookie index");
-            auto& queue = GroupQueues.at(groupQueueIndex);
-
-            Y_ENSURE(pages.size() <= Pending, "Page fwd cache got more pages than was requested");
-            Pending -= pages.size();
-
-            for (auto& page : pages) {
-                auto type = page.Page.GetType();
-                auto data = NSharedCache::TPinnedPageRef(page.Page).GetData();
-                NPageCollection::TLoadedPage loadedPage{ TPageLocation(page.Offset, data.size(), type), std::move(data) };
-                if (IsIndexPage(type)) {
-                    Y_ENSURE(queue.IndexPageCollection->Label() == pageCollection->Label(), "TPart head storage doesn't match with fetch result");
-                    queue->Fill(loadedPage, std::move(page.Page), type);
-                } else {
-                    Y_ENSURE(queue.GroupPageCollection->Label() == pageCollection->Label(), "TPart head storage doesn't match with fetch result");
-                    queue->Fill(loadedPage, std::move(page.Page), type);
-                }
-            }
-        }
-
-    public:
-        IPages* Reset() override
-        {
+        IPages* Reset() override {
             /* Current version of cache works only on forward iterations over
                 parts and cannot handle backward jumps. This call is temporary
                 workaround for clients that wants to go back. */
@@ -229,8 +207,7 @@ namespace NFwd {
             return this;
         }
 
-        TStat Stats() const override
-        {
+        TStat Stats() const override {
             auto aggr = [](auto &&stat, const TPartGroupLoadingQueue &q) {
                 return stat += q->Stat;
             };
@@ -238,8 +215,7 @@ namespace NFwd {
             return std::accumulate(GroupQueues.begin(), GroupQueues.end(), Total, aggr);
         }
 
-        TFetch GetFetch() override
-        {
+        TFetch GetFetch() override {
             while (FetchingQueues) {
                 auto queue = FetchingQueues.Front();
 
@@ -262,8 +238,7 @@ namespace NFwd {
             return {};
         }
 
-        TAutoPtr<TSeen> GrabTraces() override
-        {
+        TAutoPtr<TSeen> GrabTraces() override {
             TDeque<TSieve> sieves(PartGroupQueues.size() - ColdParts.size() + 1);
 
             sieves.back() = MemTable->Traced(); /* blobs of memtable */
@@ -296,8 +271,34 @@ namespace NFwd {
             return new TSeen{total, seen, std::move(sieves)};
         }
 
+    protected:
+        template <class TLoadedPage, class TConvert>
+        void SavePages(const IPageCollection* collection, ui64 cookie, TVector<TLoadedPage> pages, TConvert&& convert) {
+            const ui32 epoch = ui32(cookie) - Salt;
+            if (epoch < Epoch) {
+                return; // ignore pages requested before Reset
+            }
+            Y_ENSURE(epoch == Epoch, "Got an invalid part cookie on pages absorption");
+
+            const ui32 groupQueueIndex = cookie >> 32;
+            Y_ENSURE(groupQueueIndex < GroupQueues.size(), "Got save request for unknown TPart cookie index");
+            auto& queue = GroupQueues.at(groupQueueIndex);
+
+            Y_ENSURE(pages.size() <= Pending, "Page fwd cache got more pages than was requested");
+            Pending -= pages.size();
+
+            for (auto& loaded : pages) {
+                auto&& page = convert(loaded);
+                auto type = page.GetType();
+                const auto& expected = IsIndexPage(type) ? queue.IndexPageCollection : queue.GroupPageCollection;
+                Y_ENSURE(
+                    expected->Label() == collection->Label(), "TPart head storage doesn't match with fetch result");
+                queue->Fill(std::move(page), type);
+            }
+        }
+
     private:
-        TResult Get(TPartGroupLoadingQueue &queue, TPageOffset offset, EPage type)
+        typename TPageLoadingLogic::TResult Get(TPartGroupLoadingQueue& queue, TPageOffset offset, EPage type)
         {
             auto got = queue->Get(&queue, offset, type, Conf.AheadLo);
 
@@ -310,7 +311,7 @@ namespace NFwd {
                 Y_ENSURE(!(got.Need && got.Page == nullptr), "Cache line head don't want to do fetch but should");
             }
 
-            return { got.Need, got.Page };
+            return got;
         }
 
         void AddPartView(const TPartView& partView)
@@ -346,7 +347,7 @@ namespace NFwd {
             auto it = PartGroupQueues.FindPtr(part);
             Y_ENSURE(it, "NFwd cache trying to access part outside of subset");
             Y_ENSURE(room < it->size(), "NFwd cache trying to access room out of bounds");
-            
+
             auto queue = it->at(room);
             Y_ENSURE(queue, "NFwd cache trying to access room that is not assigned");
 
@@ -358,10 +359,10 @@ namespace NFwd {
             if (pages.PageLoadingLogic || pages.IndexPageCollection || pages.GroupPageCollection) {
                 const ui64 cookie = (ui64(GroupQueues.size()) << 32) | ui32(Salt + Epoch);
 
-                GroupQueues.emplace_back(partIndex, cookie, 
-                    std::move(pages.IndexPageCollection), std::move(pages.GroupPageCollection), 
+                GroupQueues.emplace_back(partIndex, cookie,
+                    std::move(pages.IndexPageCollection), std::move(pages.GroupPageCollection),
                     std::move(pages.PageLoadingLogic));
-                
+
                 return &GroupQueues.back();
             } else {
                 return nullptr; /* Will fail on access in GetQueue(...) */
@@ -377,11 +378,9 @@ namespace NFwd {
             Y_ENSURE(Max(dataSlot, indexSlot) < partStore->GetPageCollectionCount(),
                 "Got part without enough page collections");
 
-            return {CreateCache(part, PartIndexPageLocators[part][groupId], groupId, slices,
-                    partStore->GetPageCollectionRef(dataSlot),
-                    partStore->GetPageCollectionRef(indexSlot)),
-                partStore->GetPageCollectionRef(indexSlot),
-                partStore->GetPageCollectionRef(dataSlot)};
+            return { CreateCache<TPageRef>(part, PartIndexPageLocators[part][groupId], groupId, slices,
+                         partStore->GetPageCollectionRef(dataSlot), partStore->GetPageCollectionRef(indexSlot)),
+                partStore->GetPageCollectionRef(indexSlot), partStore->GetPageCollectionRef(dataSlot) };
         }
 
         TGroupPages MakeExtern(const TPart *part, TIntrusiveConstPtr<TSlices> bounds) const
@@ -443,11 +442,22 @@ namespace NFwd {
         THashSet<const TPart*> ColdParts;
         // Wrapper for memtable blobs
         TAutoPtr<TMemTableHandler> MemTable;
+        const TIntrusivePtr<NTabletFlatExecutor::IPageMetadataWorkingSet> WorkingSet;
         TIntrusiveList<TPartGroupLoadingQueue> FetchingQueues;
         // Pending pages to load
         ui64 Pending = 0;
         // Accumulated stats on resets
         TStat Total;
+    };
+
+    struct TEnv : public TEnvImpl<TCachePageRef> {
+        using TEnvImpl::TEnvImpl;
+
+        const NTabletFlatExecutor::IPageCacheProtocol& Protocol() const noexcept override;
+        THolder<NActors::IEventBase> MakeRequest(
+            NTabletFlatExecutor::NBlockIO::EPriority priority, TFetch fetch) const override;
+        THolder<IPartLoaderEnv> MakeLoaderEnvironment() const override;
+        void Save(NActors::IEventBase& event) override;
     };
 }
 }

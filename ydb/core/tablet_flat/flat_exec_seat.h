@@ -23,6 +23,8 @@ namespace NTabletFlatExecutor {
     };
 
     struct TSeat : public TIntrusiveListItem<TSeat> {
+        virtual ~TSeat() = default;
+
         TSeat(const TSeat&) = delete;
 
         TSeat(ui64 uniqId, TAutoPtr<ITransaction> self)
@@ -31,8 +33,6 @@ namespace NTabletFlatExecutor {
             , TxType(Self->GetTxType())
         {
         }
-
-        virtual ~TSeat() = default;
 
         void Describe(IOutputStream &out) const
         {

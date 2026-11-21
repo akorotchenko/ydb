@@ -55,7 +55,7 @@ namespace {
 
         if (depth > 2) {
             auto index = CreateIndexIter(&part, Env, { });
-            
+
             for (ssize_t i = 0; ; i++) {
                 auto ready = i == 0 ? index->Seek(0) : index->Next();
                 if (ready != EReady::Data) {
@@ -117,12 +117,12 @@ namespace {
                 << " |  Page     Row    Bytes  (";
             return;
         }
-        
+
         auto index = NPage::TFlatIndex(*indexPage);
         auto label = index.Label();
 
         Out
-            << " + FlatIndex{" << indexPageId << "}" 
+            << " + FlatIndex{" << indexPageId << "}"
             << " Label{" << (ui16)label.Type << " rev " << label.Format << ", " << label.Size << "b}"
             << " " << index->Count + (index.GetLastKeyRecord() ? 1 : 0) << " rec" << Endl
             << " |  Page     Row    Bytes  (";
@@ -144,7 +144,7 @@ namespace {
                 << " | " << (Printf(Out, " %4u", record->GetPageId()), " ")
                 << (Printf(Out, " %6lu", record->GetRowId()), " ");
 
-            if (auto *page = Env->TryGetPage(&part, part.GetPageLocation(record->GetPageId(), {}), {})) {
+            if (auto page = Env->TryGetPage(&part, part.GetPageLocation(record->GetPageId(), {}), {})) {
                 Printf(Out, " %6zub  ", page->size());
             } else {
                 Out << "~none~  ";
@@ -252,13 +252,13 @@ namespace {
                         Out << "nof";
                     }
 
-                    if (auto bytes = (blob ? blob.Page->size() : 0)) {
+                    if (auto bytes = (blob ? (*blob)->size() : 0)) {
                         Out << " raw " << bytes << "b";
                     } else {
                         Out << " -";
                     }
 
-                    if (frame.Size && blob && frame.Size != blob.Page->size()) {
+                    if (frame.Size && blob && frame.Size != (*blob)->size()) {
                         Out << " **"; /* error indicator */
                     }
 

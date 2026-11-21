@@ -63,7 +63,8 @@ public:
 
     }
 
-    const TLogoBlobID& BundleId() const noexcept override {
+    const TLogoBlobID& BundleId() const noexcept override
+    {
         return GetPageCollection(0)->Label();
     }
 
@@ -81,6 +82,15 @@ public:
         return BackingSize() - IndexesRawSize;
     }
 
+    using TPart::GetPageSize;
+
+    ui64 GetPageSize(ELargeObj lob, ui64 ref) const override
+    {
+        auto* collection = GetPageCollection(lob, ref);
+
+        return collection->Page(ref).Size;
+    }
+
     virtual ui32 GetPageCollectionCount() const noexcept = 0;
     virtual const TIntrusiveConstPtr<NPageCollection::IPageCollection>& GetPageCollectionRef(ui32 slot) const = 0;
     virtual const TIntrusiveConstPtr<NPageCollection::IPageCollection>& GetPseudoPageCollectionRef() const noexcept = 0;
@@ -89,15 +99,27 @@ public:
         return GetPageCollectionRef(slot).Get();
     }
 
-    const NPageCollection::IPageCollection* GetPageCollection(ELargeObj lob, ui64 ref) const {
-        return IsExternalPageRef(lob, ref) ? GetPseudoPageCollection() : GetPageCollection(OuterSlot());
-    }
-
     const NPageCollection::IPageCollection* GetPseudoPageCollection() const noexcept {
         return GetPseudoPageCollectionRef().Get();
     }
 
-    const NPageCollection::TPageCollection* Packet(ui32 room) const noexcept override {
+    const NPageCollection::IPageCollection* GetPageCollection(ELargeObj lob, ui64 ref) const {
+        return IsExternalPageRef(lob, ref) ? GetPseudoPageCollection() : GetPageCollection(OuterSlot());
+    }
+
+    ui8 GetPageChannel(ELargeObj lob, ui64 ref) const override
+    {
+        const auto* collection = GetPageCollection(lob, ref);
+
+        if (lob == ELargeObj::Extern) {
+            return GetExternalPageChannel(*collection, ref);
+        } else {
+            return collection->Label().Channel();
+        }
+    }
+
+    const NPageCollection::TPageCollection* Packet(ui32 room) const noexcept override
+    {
         auto* pageCollection = room < GetPageCollectionCount() ? GetPageCollection(room) : nullptr;
 
         return dynamic_cast<const NPageCollection::TPageCollection*>(pageCollection);

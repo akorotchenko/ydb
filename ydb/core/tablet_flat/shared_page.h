@@ -5,7 +5,7 @@
 #include "flat_page_iface.h"
 #include <ydb/library/yverify_stream/yverify_stream.h>
 
-namespace NKikimr::NSharedCache {
+namespace NKikimr::NSharedCache::NLegacy {
 
 using TPageId = NTable::NPage::TPageId;
 using TPageOffset = NTable::NPage::TPageOffset;
@@ -24,15 +24,12 @@ enum EPageState {
     PageStateEvicted,
 };
 
-struct TPage
-    : public TSharedPageHandle
-    , public TIntrusiveListItem<TPage>
-{
+struct TPage : public TSharedPageHandle, public TIntrusiveListItem<TPage> {
     // Note: 16-bit types on purpose, MSVC packs bit-fields by declared type size
-    ui16 State : 4 = PageStateNo;
-    ECacheMode CacheMode : 2 = ECacheMode::Regular;
+    ui16 State: 4 = PageStateNo;
+    ECacheMode CacheMode: 2 = ECacheMode::Regular;
 
-    ES3FIFOPageLocation Location : 4 = ES3FIFOPageLocation::None;
+    ES3FIFOPageLocation Location: 4 = ES3FIFOPageLocation::None;
 
     EPage Type = EPage::Undef;
     ui32 Crc32 = 0;
@@ -76,4 +73,4 @@ struct TPage
 
 static_assert(sizeof(TPage) == 120);
 
-}
+} // namespace NKikimr::NSharedCache::NLegacy

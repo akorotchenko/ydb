@@ -11,9 +11,6 @@ ELSE()
 ENDIF()
 
 SRCS(
-    cache_item_ut.cpp
-    cache_cyclic_buffer_ut.cpp
-    cache_accounting_ut.cpp
     flat_cxx_database_ut.cpp
     ut_db_iface.cpp
     ut_db_scheme.cpp
@@ -25,16 +22,28 @@ SRCS(
     flat_range_cache_ut.cpp
     flat_row_versions_ut.cpp
     flat_table_part_ut.cpp
+    flat_part_loader_ut.cpp
+    flat_boot_metadata_ut.cpp
     flat_test_db.h
     flat_test_db.cpp
     flat_test_db_helpers.h
     shared_cache_btree_walk_ut.cpp
+    shared_cache_btree_walk_lf_ut.cpp
+    shared_cache_collection_load_ut.cpp
+    shared_cache_collections_ut.cpp
     shared_cache_s3fifo_ut.cpp
     shared_cache_tiered_ut.cpp
     shared_handle_ut.cpp
+    cache_cyclic_buffer_ut.cpp
+    cache_item_ut.cpp
+    cache_accounting_ut.cpp
+    cache_space_ut.cpp
+    cache_table_ut.cpp
+    cache_thread_ut.cpp
     ut_btree_index_nodes.cpp
     ut_btree_index_iter_charge.cpp
     ut_page_read_env.cpp
+    ut_page_cache_backend.cpp
     ut_self.cpp
     ut_iterator.cpp
     ut_key_blocks.cpp
@@ -68,6 +77,7 @@ SRCS(
     ut_bloom.cpp
     ut_shared_sausagecache.cpp
     ut_shared_sausagecache_actor.cpp
+    ut_shared_sausagecache_lf_actor.cpp
     ut_slice.cpp
     ut_slice_loader.cpp
     ut_tier_predicate.cpp

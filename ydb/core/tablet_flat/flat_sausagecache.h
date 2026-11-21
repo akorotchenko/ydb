@@ -1,19 +1,24 @@
 #pragma once
+
 #include "flat_sausage_gut.h"
 #include "flat_page_iface.h"
 #include "flat_transaction_pages.h"
 #include "shared_handle.h"
-#include "shared_cache_events.h"
+
 #include <ydb/core/util/page_map.h>
 
 namespace NKikimr::NSharedCache {
 class TSharedCachePages;
 }
 
-namespace NKikimr {
-namespace NTabletFlatExecutor {
+namespace NKikimr::NTabletFlatExecutor {
 
-using namespace NSharedCache;
+using NSharedCache::TPinnedPageRef;
+using NSharedCache::TSharedPageRef;
+using NTable::NPage::ECacheMode;
+using NTable::NPage::EPage;
+using NTable::NPage::TPageId;
+using NTable::NPage::TPageOffset;
 
 class TPrivatePageCache {
 public:
@@ -86,8 +91,7 @@ public:
         // Otherwise stat counters would be out of sync
 
         bool AddPage(TPageOffset offset, size_t size, TSharedPageRef sharedBody) {
-            return PageMap.emplace(MakeHolder<TPage>(
-                offset, size, std::move(sharedBody), this)).second;
+            return PageMap.emplace(MakeHolder<TPage>(offset, size, std::move(sharedBody), this)).second;
         }
 
         bool AddStickyPage(TPageOffset offset, size_t size, TSharedPageRef sharedBody) {
@@ -98,8 +102,12 @@ public:
 
         bool DropPage(NTable::NPage::TPageOffset offset, ui64 *size = nullptr) {
             auto it = PageMap.find(offset);
-            if (it == PageMap.end()) return false;
-            if (size) *size = it->Get()->Size;
+            if (it == PageMap.end()) {
+                return false;
+            }
+            if (size) {
+                *size = it->Get()->Size;
+            }
             PageMap.erase(it);
             return true;
         }
@@ -125,14 +133,27 @@ public:
 
     private:
         struct TPageByOffsetHash {
-            size_t operator()(const THolder<TPage>& page) const { return THash<TPageOffset>()(page->Offset); }
-            size_t operator()(TPageOffset offset) const { return THash<TPageOffset>()(offset); }
+            size_t operator()(const THolder<TPage>& page) const {
+                return THash<TPageOffset>()(page->Offset);
+            }
+
+            size_t operator()(TPageOffset offset) const {
+                return THash<TPageOffset>()(offset);
+            }
         };
 
         struct TPageByOffsetEq {
-            bool operator()(const THolder<TPage>& a, const THolder<TPage>& b) const { return a->Offset == b->Offset; }
-            bool operator()(const THolder<TPage>& a, TPageOffset b) const { return a->Offset == b; }
-            bool operator()(TPageOffset a, const THolder<TPage>& b) const { return a == b->Offset; }
+            bool operator()(const THolder<TPage>& a, const THolder<TPage>& b) const {
+                return a->Offset == b->Offset;
+            }
+
+            bool operator()(const THolder<TPage>& a, TPageOffset b) const {
+                return a->Offset == b;
+            }
+
+            bool operator()(TPageOffset a, const THolder<TPage>& b) const {
+                return a == b->Offset;
+            }
         };
 
         // all pages in PageMap have valid unused shared body
@@ -149,7 +170,9 @@ public:
     THashMap<TLogoBlobID, THashSet<TPageOffset>> AddPageCollection(TIntrusivePtr<TPageCollection> pageCollection);
     void DropPageCollection(TPageCollection *pageCollection);
 
-    const TStats& GetStats() const { return Stats; }
+    const TStats& GetStats() const {
+        return Stats;
+    }
 
     TSharedPageRef TryGetPage(TPageOffset offset, TPageCollection *pageCollection);
 
@@ -166,65 +189,12 @@ private:
     TStats Stats;
 };
 
-struct TPrivatePageCacheRestartState final : public IPageCacheRestartState {
-    THashMap<TLogoBlobID, TIntrusivePtr<TPrivatePageCache::TPageCollection>> PageCollections;
-};
-
-struct TPrivateLoadedCollections final : public IPageCacheLoadedCollections {
-    TVector<TIntrusivePtr<TPrivatePageCache::TPageCollection>> PageCollections;
-};
-
 const IPageCacheProtocol& GetPrivatePageCacheProtocol() noexcept;
+
+THolder<IExecutorPageCache> MakePrivateExecutorPageCache();
 TWrittenPageCache MakePrivateWrittenPageCache(NSharedCache::TSharedCachePages& pages) noexcept;
 
-// The holder stays stable when boot recreates the private cache
-class TPrivatePageCacheBackend final : public IExecutorPageCache {
-public:
-    explicit TPrivatePageCacheBackend(THolder<TPrivatePageCache>& cache) noexcept
-        : Cache_(cache)
-    {}
+THolder<NTable::IPartLoaderEnv> MakePrivateLoaderEnvironment(
+    TVector<TIntrusivePtr<TPrivatePageCache::TPageCollection>> prebuilt = {});
 
-    bool PrepareRegistration() override;
-    void CaptureForRestart(THolder<IPageCacheRestartState>& restartState) const override;
-    void CaptureForRestart(
-        const NTable::TPartStore& partStore, THolder<IPageCacheLoadedCollections>& loaded) const override;
-    void MergeForRestart(
-        THolder<IPageCacheRestartState>& restartState, const IPageCacheLoadedCollections* loaded) const override;
-    THolder<NTable::IPartLoaderEnv> MakeLoaderEnvironment(
-        TConstArrayRef<NPageCollection::TLargeGlobId> collections = {},
-        const IPageCacheRestartState* restartState = nullptr) const override;
-    void PrepareCollectionModes(
-        const NTable::TPartStore& partStore, TVector<ECacheMode>& modes, const TVector<bool>& stickyGroups) override;
-    TVector<bool> UpdateCollectionModes(
-        const NTable::TPartStore& partStore, TVector<ECacheMode>& modes, const TVector<bool>& stickyGroups) override;
-    void ReadCollectionModes(const NTable::TPartStore& partStore, TVector<ECacheMode>& modes,
-        const TVector<bool>& stickyGroups) const override;
-    void RegisterCollection(const NTable::TPartStore& partStore, ui32 slot, ECacheMode cacheMode,
-        TVector<NPageCollection::TBtreeSeed> btreeSeeds, bool replayStickyWalk, TPageCacheEventSender send) override;
-    void RegisterPseudoCollection(const NTable::TPartStore& partStore, TPageCacheEventSender send) override;
-    THolder<NActors::IEventBase> DetachCollection(const TLogoBlobID& collectionId) override;
-    std::unique_ptr<TSeat> MakeSeat(ui64 uniqueId, TAutoPtr<ITransaction> transaction) override;
-    void WithTransactionPages(NTable::TDatabase& database, TSeat& seat,
-        TFunctionRef<void(ITransactionPages&, TTransactionEnv&)> execute) override;
-
-    const IPageCacheProtocol& Protocol() const noexcept override {
-        return GetPrivatePageCacheProtocol();
-    }
-    THolder<NActors::IEventBase> MakeTransactionRequest(const TLogoBlobID& collectionId,
-        TVector<NTable::NPage::TPageLocation> locations, TIntrusivePtr<NPageCollection::TPagesWaitPad> waitPad,
-        NWilson::TTraceId traceId) override;
-    void ProcessCacheUpdate(const NActors::IEventBase& update) override;
-    THolder<NActors::IEventBase> MakeStickyPageRequest(const NActors::IEventBase& notification) override;
-    EPageResultStatus ProcessLoadedPages(NActors::IEventBase& result, bool sticky) override;
-    bool AdoptLoadedPages(TSeat& seat, NActors::IEventBase* result) override;
-    void ReleasePins(TSeat& seat) override;
-    bool ReadStats(TPageCacheStats& stats) const noexcept override;
-
-private:
-    void RegisterCollection(const TIntrusivePtr<TPrivatePageCache::TPageCollection>& pageCollection,
-        ECacheMode cacheMode, TVector<NPageCollection::TBtreeSeed> btreeSeeds, bool replayStickyWalk,
-        TPageCacheEventSender send);
-
-    THolder<TPrivatePageCache>& Cache_;
-};
-}}
+} // namespace NKikimr::NTabletFlatExecutor

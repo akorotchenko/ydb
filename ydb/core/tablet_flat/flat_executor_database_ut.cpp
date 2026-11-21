@@ -6,6 +6,8 @@
 #include <library/cpp/testing/unittest/registar.h>
 #include "flat_database.h"
 #include "util_fmt_abort.h"
+#include "cache.h"
+#include "shared_cache_events_lf.h"
 
 #include <util/system/sanitizers.h>
 #include <util/system/valgrind.h>
@@ -361,9 +363,13 @@ private:
     bool SchemaReady = false;
 };
 
-void RunTest(IActor *test)
+void RunTest(IActor *test, ui64 sharedCacheLimit = 8_MB, ui64 sharedCacheSoftLimit = Max<ui64>())
 {
-    NFake::TRunner env;
+    NFake::TRunner env(sharedCacheLimit);
+    if (sharedCacheSoftLimit != Max<ui64>()) {
+        env->Send(
+            NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(sharedCacheSoftLimit));
+    }
 
     env->SetLogPriority(NKikimrServices::TABLET_MAIN, NActors::NLog::PRI_CRIT);
     env->SetLogPriority(NKikimrServices::TABLET_EXECUTOR, NActors::NLog::PRI_INFO);
@@ -391,7 +397,8 @@ Y_UNIT_TEST_SUITE(TExecutorDb) {
 
     Y_UNIT_TEST(FullScan)
     {
-        RunTest(new TFullScan(MultiPageMaxActionCount));
+        // Precharge holds about 100 MiB of pages alongside compaction; retain the original eviction budget.
+        RunTest(new TFullScan(MultiPageMaxActionCount), 256_MB, 8_MB);
     }
 
     Y_UNIT_TEST(CoordinatorSimulation)
@@ -415,7 +422,7 @@ Y_UNIT_TEST_SUITE(TExecutorDb) {
             [&fuzzy](ITestDb& testDb, TTransactionContext &txc){ return fuzzy.ReadTx(testDb, txc, 2); }
         };
 
-        RunTest(new TDbTestPlayerActor(tx));
+        RunTest(new TDbTestPlayerActor(tx), 32_MB);
     }
 
     Y_UNIT_TEST(EncodedPage)

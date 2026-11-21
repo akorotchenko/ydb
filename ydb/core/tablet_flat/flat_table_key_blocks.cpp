@@ -189,7 +189,7 @@ public:
 
     const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
         Y_ENSURE(NPage::IsIndexPage(location.Type), "key-block iterator requested a non-index page");
-        const TSharedData* page = Inner->TryGetIndexPage(part, location, groupId);
+        auto page = Inner->TryGetIndexPage(part, location, groupId);
         if (page) {
             Seen.insert({ part->Label, part->IndexSlot(groupId), location.Offset });
         }
@@ -613,6 +613,7 @@ bool TKeyBlockIterator::HasColdParts() const {
 }
 
 EReady TKeyBlockIterator::Seek(TArrayRef<const TCell> key, bool inclusive) {
+    auto readScope = State->Env.Inner->BeginOpBatch();
     State->Target = FromSeek(key, inclusive);
     State->Telemetry.UnitsTotal = 0;
     State->Telemetry.UnitsMemtable = 0;
@@ -624,6 +625,7 @@ EReady TKeyBlockIterator::Next() {
     if (State->Ready == EReady::Gone) {
         return EReady::Gone;
     }
+    auto readScope = State->Env.Inner->BeginOpBatch();
     State->Target = EndOf(State->Block.Bounds);
     return State->ReadUnit();
 }

@@ -9,113 +9,21 @@
 
 namespace NKikimr::NSharedCache {
 
-void TCacheBTreeWalkController::UpdateWalkIndex(TCollection& collection) {
-    TLogoBlobID indexCollectionId;
-    // Check every owner; production owners have at most two seeds (current and historic).
-    for (const auto& [_, seeds] : State(collection.Id()).SeedsByOwner) {
-        for (const auto& seed : seeds) {
-            Y_ENSURE(seed.DataCollectionId == collection.Id());
-            if (!indexCollectionId) {
-                indexCollectionId = seed.IndexCollectionId;
-            } else {
-                Y_ENSURE(indexCollectionId == seed.IndexCollectionId);
-            }
+void TCacheBTreeWalkController::FinishWalkRunIfDrained(TLogoBlobID collectionId) {
+    if (FinishDrainedRun(collectionId)) {
+        if (auto* current = Host.FindCollection(collectionId)) {
+            Host.TryDropExpiredCollection(*current);
         }
     }
-
-    if (indexCollectionId == State(collection.Id()).IndexCollectionId) {
-        return;
-    }
-
-    if (State(collection.Id()).IndexCollectionId) {
-        auto* walkCollections = WalkCollectionsByIndex.FindPtr(State(collection.Id()).IndexCollectionId);
-        Y_ENSURE(walkCollections);
-        auto it = Find(*walkCollections, collection.Id());
-        Y_ENSURE(it != walkCollections->end());
-        walkCollections->erase(it);
-        if (walkCollections->empty()) {
-            WalkCollectionsByIndex.erase(State(collection.Id()).IndexCollectionId);
-        }
-    }
-    if (indexCollectionId) {
-        WalkCollectionsByIndex[indexCollectionId].push_back(collection.Id());
-    }
-
-    State(collection.Id()).IndexCollectionId = indexCollectionId;
-}
-
-void TCacheBTreeWalkController::StartWalkRun(TCollection& collection) {
-    if (State(collection.Id()).Run || State(collection.Id()).ControllerState != EWalkControllerState::Pending) {
-        return;
-    }
-    State(collection.Id()).ControllerState = EWalkControllerState::Idle;
-
-    if (!State(collection.Id()).SeedsByOwner) {
-        return;
-    }
-
-    TWalkRun run;
-    for (const auto& [owner, seeds] : State(collection.Id()).SeedsByOwner) {
-        for (const auto& seed : seeds) {
-            run.Walks.push_back(TCacheBTreeWalk{
-                .Owner = owner,
-                .Seed = seed,
-            });
-        }
-    }
-    State(collection.Id()).Run.emplace(std::move(run));
-    ++ActiveRunCount;
-    WalkRunsInProgress.insert(collection.Id());
-    AdvanceNeeded = true;
-}
-
-void TCacheBTreeWalkController::FinishWalkRun(TCollection& collection) {
-    Y_ENSURE(State(collection.Id()).Run);
-    Y_DEBUG_ABORT_UNLESS(State(collection.Id()).Run->FetchesInFlight == 0);
-    Y_ENSURE(ActiveRunCount > 0);
-    --ActiveRunCount;
-
-    State(collection.Id()).Run.reset();
-    WalkRunsInProgress.erase(collection.Id());
-
-    RunsToFinish.erase(collection.Id());
-    StartWalkRun(collection);
-}
-
-bool TCacheBTreeWalkController::FinishWalkRunIfDrained(TCollection& collection) {
-    if (!State(collection.Id()).Run || State(collection.Id()).Run->State == EWalkRunState::Walking ||
-        State(collection.Id()).Run->FetchesInFlight != 0)
-    {
-        return false;
-    }
-
-    const TLogoBlobID collectionId = collection.Id();
-    FinishWalkRun(collection);
-    if (auto* current = Host.FindCollection(collectionId)) {
-        Host.TryDropExpiredCollection(*current);
-    }
-    return true;
 }
 
 void TCacheBTreeWalkController::CancelWalkRun(TCollection& collection) {
-    if (!State(collection.Id()).Run) {
-        StartWalkRun(collection);
-        return;
+    const TLogoBlobID collectionId = collection.Id();
+    if (CancelRun(collectionId, [&] {
+            Host.CancelQueuedRequestsAndPump(collectionId);
+        })) {
+        FinishWalkRunIfDrained(collectionId);
     }
-    auto& run = *State(collection.Id()).Run;
-    if (run.State != EWalkRunState::Cancelled) {
-        run.State = EWalkRunState::Cancelled;
-        // Other walks may share index requests that cancellation is about to remove.
-        if (!run.Walks.empty()) {
-            IndexPagesChanged(run.Walks.front().Seed.IndexCollectionId);
-        }
-        run.Walks.clear();
-        // A cancelled run leaves the scheduler immediately; a pending intent starts a fresh
-        // run only after the cancelled one drains.
-        WalkRunsInProgress.erase(collection.Id());
-        Host.CancelQueuedRequestsAndPump(collection.Id());
-    }
-    FinishWalkRunIfDrained(collection);
 }
 
 void TCacheBTreeWalkController::UpdateSeeds(TCollection& collection, const TActorId& owner,
@@ -146,7 +54,7 @@ void TCacheBTreeWalkController::UpdateSeeds(TCollection& collection, const TActo
         State(collection.Id()).SeedsByOwner.erase(owner);
     }
     State(collection.Id()).ControllerState = EWalkControllerState::Pending;
-    UpdateWalkIndex(collection);
+    UpdateWalkIndex(collection.Id());
     CancelWalkRun(collection);
 }
 
@@ -162,12 +70,12 @@ void TCacheBTreeWalkController::FinishFetch(const TLogoBlobID& walkCollectionId)
     Y_ENSURE(run.FetchesInFlight > 0);
     --run.FetchesInFlight;
 
-    FinishWalkRunIfDrained(*collection);
+    FinishWalkRunIfDrained(collection->Id());
 }
 
 void TCacheBTreeWalkController::InvalidateDataCollection(const TLogoBlobID& collectionId) {
     if (auto* collection = Host.FindCollection(collectionId)) {
-        if (const auto* state = States.FindPtr(collectionId); state && state->Run) {
+        if (HasWalkRun(collectionId)) {
             InvalidateWalkRun(*collection);
         }
     }
@@ -195,109 +103,64 @@ void TCacheBTreeWalkController::AdvanceWalk(TCacheBTreeWalk& walk, const TLogoBl
         HandOverIndexLevel(walk, walk.CurrentLevel, walk.Level);
     }
 
-    while (true) {
-        if (walk.PendingDataPages) {
-            if (!AddNodeDataPagesToBatch(walk, *dataCollection)) {
-                return;
+    walk.AdvanceLevels(
+        [&] {
+            return AddNodeDataPagesToBatch(walk, *dataCollection);
+        },
+        [&](const TPageLocation& location) {
+            return AdvanceIndexPage(walk, *indexCollection, walkCollectionId, location);
+        },
+        [&] {
+            if (FlushDataPageBatch(walk, *dataCollection) != EBatchResult::Flushed) {
+                return false;
             }
-        }
+            FlushPagesToNotify(walk);
+            return true;
+        });
+}
 
-        if (walk.Next >= walk.CurrentLevel.size()) {
-            if (!walk.NextLevel) {
-                if (FlushDataPageBatch(walk, *dataCollection) != EBatchResult::Flushed) {
-                    return;
-                }
-                break;
-            }
-            walk.CurrentLevel = std::move(walk.NextLevel);
-            walk.NextLevel.clear();
-            walk.Next = 0;
-            walk.BatchEnd = 0;
-            ++walk.Level;
-            continue;
-        }
-
-        // A zero-level tree has its data page as the root.
-        if (walk.Level >= walk.Seed.LevelCount) {
-            walk.PendingDataPages = std::move(walk.CurrentLevel);
-            walk.CurrentLevel.clear();
-            walk.Next = 0;
-            walk.BatchEnd = 0;
-            continue;
-        }
-
-        if (walk.Next >= walk.BatchEnd) {
-            ui64 batchBytes = 0;
-            walk.BatchEnd = walk.Next;
-            while (walk.BatchEnd < walk.CurrentLevel.size()) {
-                const ui64 pageSize = walk.CurrentLevel[walk.BatchEnd].Size;
-                if (walk.BatchEnd > walk.Next && pageSize > MaxWalkBatchBytes - batchBytes) {
-                    break;
-                }
-
-                batchBytes += pageSize;
-                ++walk.BatchEnd;
-                if (batchBytes >= MaxWalkBatchBytes) {
-                    break;
-                }
-            }
-        }
-
-        const TPageLocation location = walk.CurrentLevel[walk.Next];
-        NActors::TSharedData coreData;
-        TVector<TPageLocation> toRequest;
-        {
-            auto cacheOp = Host.BeginOperation();
-            coreData = Host.FindPage(cacheOp, *indexCollection, location.Offset);
-            if (!coreData) {
-                for (size_t i = walk.Next; i < walk.BatchEnd; ++i) {
-                    const auto& batchLocation = walk.CurrentLevel[i];
-                    if (!Host.FindPage(cacheOp, *indexCollection, batchLocation.Offset)) {
-                        toRequest.push_back(batchLocation);
-                    }
-                }
-            }
-        }
-
+bool TCacheBTreeWalkController::AdvanceIndexPage(
+    TCacheBTreeWalk& walk, TCollection& indexCollection, const TLogoBlobID& walkCollectionId, TPageLocation location) {
+    NActors::TSharedData coreData;
+    TVector<TPageLocation> toRequest;
+    {
+        auto cacheOp = Host.BeginOperation();
+        coreData = Host.FindPage(cacheOp, indexCollection, location.Offset);
         if (!coreData) {
-            // Index pages always live in the main group; its mode decides how they are fetched.
-            if (indexCollection->GetCacheMode() == ECacheMode::TryKeepInMemory) {
-                // Wait for loader progress; a self-continuation cannot unblock a capacity-limited index read.
-                QueueInMemoryPages(*indexCollection, toRequest);
-            } else {
-                Host.FetchIndexLevel(*indexCollection, std::move(toRequest), walkCollectionId);
-            }
-            return; // wait for the pages to arrive, the next drive continues the walk
-        }
-
-        ++walk.Next;
-
-        const bool childrenAreData = (walk.Level + 1 >= walk.Seed.LevelCount);
-        if (childrenAreData && !walk.Seed.QueueDataPages && !walk.Seed.Sticky) {
-            // This walk only keeps the index level resident, its data pages are of no use.
-            continue;
-        }
-
-        NTable::NPage::TBtreeIndexNode node(coreData, /*v2Format=*/true);
-
-        TVector<TPageLocation> children;
-        children.reserve(node.GetChildrenCount());
-        for (NTable::NPage::TRecIdx pos : xrange(node.GetChildrenCount())) {
-            children.push_back(std::get<NTable::NPage::TPageLocation>(node.GetChild(pos, childrenAreData)));
-        }
-
-        if (childrenAreData) {
-            walk.PendingDataPages = std::move(children);
-        } else {
-            HandOverIndexLevel(walk, children, walk.Level + 1);
-            for (auto& child : children) {
-                walk.NextLevel.push_back(std::move(child));
+            for (size_t i = walk.Next; i < walk.BatchEnd; ++i) {
+                const auto& batchLocation = walk.CurrentLevel[i];
+                if (!Host.FindPage(cacheOp, indexCollection, batchLocation.Offset)) {
+                    toRequest.push_back(batchLocation);
+                }
             }
         }
     }
 
-    FlushPagesToNotify(walk);
-    walk.Done = true;
+    if (!coreData) {
+        // Index pages always live in the main group; its mode decides how they are fetched.
+        if (indexCollection.GetCacheMode() == ECacheMode::TryKeepInMemory) {
+            // Wait for loader progress; a self-continuation cannot unblock a capacity-limited index read.
+            QueueInMemoryPages(indexCollection, toRequest);
+        } else {
+            Host.FetchIndexLevel(indexCollection, std::move(toRequest), walkCollectionId);
+        }
+        return false; // wait for the pages to arrive, the next drive continues the walk
+    }
+
+    ++walk.Next;
+
+    const bool childrenAreData = (walk.Level + 1 >= walk.Seed.LevelCount);
+    if (childrenAreData && !walk.Seed.QueueDataPages && !walk.Seed.Sticky) {
+        // This walk only keeps the index level resident, its data pages are of no use.
+        return true;
+    }
+
+    NTable::NPage::TBtreeIndexNode node(coreData, /*v2Format=*/true);
+
+    walk.AcceptChildren(node, childrenAreData, [&](TArrayRef<const TPageLocation> children, ui32 level) {
+        HandOverIndexLevel(walk, children, level);
+    });
+    return true;
 }
 
 void TCacheBTreeWalkController::HandOverIndexLevel(
@@ -341,9 +204,8 @@ TCacheBTreeWalkController::EBatchResult TCacheBTreeWalkController::FlushDataPage
 
     walk.DataPageBatch.clear();
     walk.DataPageBatchBytes = 0;
-    ContinuationNeeded |= queued;
     if (queued) {
-        State(dataCollection.Id()).Run->NeedsAdvance = true;
+        ContinueWalk(dataCollection.Id());
     }
     return queued ? EBatchResult::Queued : EBatchResult::Flushed;
 }
@@ -351,35 +213,9 @@ TCacheBTreeWalkController::EBatchResult TCacheBTreeWalkController::FlushDataPage
 bool TCacheBTreeWalkController::AddNodeDataPagesToBatch(TCacheBTreeWalk& walk, TCollection& dataCollection) {
     const bool queueDataPages =
         walk.Seed.QueueDataPages && dataCollection.GetCacheMode() == ECacheMode::TryKeepInMemory;
-    if (!walk.Seed.Sticky && !queueDataPages) {
-        walk.PendingDataPages.clear();
-        return true;
-    }
-
-    ui64 nodeBytes = 0;
-    for (const auto& location : walk.PendingDataPages) {
-        nodeBytes += location.Size;
-    }
-
-    if (walk.DataPageBatch &&
-        (walk.DataPageBatchBytes >= MaxWalkBatchBytes || nodeBytes > MaxWalkBatchBytes - walk.DataPageBatchBytes))
-    {
-        if (FlushDataPageBatch(walk, dataCollection) != EBatchResult::Flushed) {
-            return false;
-        }
-    }
-
-    walk.DataPageBatch.reserve(walk.DataPageBatch.size() + walk.PendingDataPages.size());
-    for (auto& location : walk.PendingDataPages) {
-        walk.DataPageBatch.push_back(std::move(location));
-    }
-    walk.DataPageBatchBytes += nodeBytes;
-    walk.PendingDataPages.clear();
-
-    if (walk.DataPageBatchBytes >= MaxWalkBatchBytes) {
+    return walk.AppendNodeDataPages(queueDataPages, [&] {
         return FlushDataPageBatch(walk, dataCollection) == EBatchResult::Flushed;
-    }
-    return true;
+    });
 }
 
 void TCacheBTreeWalkController::AppendPageToNotify(
@@ -407,69 +243,31 @@ void TCacheBTreeWalkController::FlushPagesToNotify(TCacheBTreeWalk& walk) {
     walk.NotifyCollectionId = TLogoBlobID();
 }
 
-void TCacheBTreeWalkController::IndexPagesChanged(const TLogoBlobID& collectionId) {
-    if (const auto* collections = WalkCollectionsByIndex.FindPtr(collectionId)) {
-        for (const auto& id : *collections) {
-            auto& run = State(id).Run;
-            if (run && run->State == EWalkRunState::Walking) {
-                run->NeedsAdvance = true;
-                AdvanceNeeded = true;
-            }
-        }
-    }
-}
-
 void TCacheBTreeWalkController::Advance() {
-    if (!std::exchange(AdvanceNeeded, false)) {
-        return;
-    }
-    ContinuationNeeded = false;
-    TVector<TLogoBlobID> invalid;
-    for (const TLogoBlobID& id : WalkRunsInProgress) {
-        auto* collection = Host.FindCollection(id);
-        Y_ENSURE(collection && State(collection->Id()).Run);
-        auto& run = *State(collection->Id()).Run;
-        if (run.State != EWalkRunState::Walking || !std::exchange(run.NeedsAdvance, false)) {
-            continue;
-        }
-
-        bool pending = false;
-        bool failed = false;
-        for (auto& walk : run.Walks) {
-            if (!walk.Done) {
+    const bool schedule = AdvanceRuns(
+        [&](const TLogoBlobID& id) {
+            auto* collection = Host.FindCollection(id);
+            Y_ENSURE(collection && State(collection->Id()).Run);
+            return State(collection->Id()).Run->Advance([&](TCacheBTreeWalk& walk) {
                 AdvanceWalk(walk, collection->Id());
+            });
+        },
+        [&](const TLogoBlobID& id) {
+            if (auto* collection = Host.FindCollection(id)) {
+                InvalidateWalkRun(*collection);
             }
-            failed |= walk.Invalid;
-            pending |= !walk.Done;
-        }
-
-        if (failed) {
-            invalid.push_back(id);
-        } else if (!pending) {
-            run.State = EWalkRunState::Draining;
-            RunsToFinish.insert(id);
-        }
-    }
-
-    for (const TLogoBlobID& id : invalid) {
-        if (auto* collection = Host.FindCollection(id)) {
-            InvalidateWalkRun(*collection);
-        }
-    }
-    if (ContinuationNeeded) {
-        AdvanceNeeded = true;
+        });
+    if (schedule) {
         Host.ScheduleContinuation();
     }
 }
 
 void TCacheBTreeWalkController::FinishReady() {
-    while (!RunsToFinish.empty()) {
-        const TLogoBlobID id = *RunsToFinish.begin();
-        RunsToFinish.erase(id);
+    FinishReadyRuns([&](const TLogoBlobID& id) {
         if (auto* collection = Host.FindCollection(id)) {
-            FinishWalkRunIfDrained(*collection);
+            FinishWalkRunIfDrained(collection->Id());
         }
-    }
+    });
 }
 
 void TCacheBTreeWalkController::DropIndexOnlyWalks(const TLogoBlobID& indexCollectionId) {

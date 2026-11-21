@@ -5,6 +5,7 @@
 #include "flat_table_stats.h"
 #include "flat_row_eggs.h"
 #include "util_basics.h"
+#include "cache.h"
 
 #include <ydb/library/actors/util/shared_data.h>
 

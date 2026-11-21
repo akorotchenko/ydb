@@ -23,40 +23,42 @@ namespace NBoot {
 
         TBundleLoadStep() = delete;
 
-        TBundleLoadStep(IStep *owner, ui32 table, TSwitch::TBundle &bundle)
+        TBundleLoadStep(
+            IStep* owner, ui32 table, TSwitch::TBundle& bundle, TIntrusivePtr<IPageMetadataWorkingSet> workingSet)
             : IStep(owner, NBoot::EStep::Bundle)
             , Table(table)
+            , WorkingSet(std::move(workingSet))
             , LargeGlobIds(std::move(bundle.LargeGlobIds))
-            , Legacy(std::move(bundle.Legacy))
-            , Opaque(std::move(bundle.Opaque))
-            , Deltas(std::move(bundle.Deltas))
-            , Epoch(bundle.Epoch)
+            , Parts(NTable::TPartComponents{
+                  .PageCollectionComponents = TVector<NTable::TPageCollectionComponents>(LargeGlobIds.size()),
+                  .Legacy = std::move(bundle.Legacy),
+                  .Opaque = std::move(bundle.Opaque),
+                  .Deltas = std::move(bundle.Deltas),
+                  .Epoch = bundle.Epoch,
+              })
         {
-
+            for (ui32 slot = 0; slot < LargeGlobIds.size(); ++slot) {
+                Parts.PageCollectionComponents[slot].LargeGlobId = LargeGlobIds[slot];
+            }
+            // Boot queues every bundle step before starting metadata requests
+            if (WorkingSet) {
+                WorkingSet->AddCollections(Parts.PageCollectionComponents);
+            }
         }
 
     private: /* IStep, boot logic DSL actor interface   */
         void Start() override
         {
-            auto environment = Logic->PageCache.MakeLoaderEnvironment(LargeGlobIds, Back->PageCollections.Get());
-            TVector<NTable::TPageCollectionComponents> components(LargeGlobIds.size());
-            for (ui32 slot = 0; slot < LargeGlobIds.size(); ++slot) {
-                components[slot].LargeGlobId = LargeGlobIds[slot];
+            if (Logic->Cancelled) {
+                return;
             }
-            NTable::TPartComponents parts{
-                .PageCollectionComponents = std::move(components),
-                .Legacy = std::move(Legacy),
-                .Opaque = std::move(Opaque),
-                .Deltas = std::move(Deltas),
-                .Epoch = Epoch,
-            };
-            Loader = new NTable::TLoader(std::move(environment), std::move(parts));
+            auto environment = Logic->PageCache.MakeLoaderEnvironment(LargeGlobIds, Back->PageCollections.Get());
+            Loader = new NTable::TLoader(std::move(environment), std::move(Parts));
             Loader->BeginMetadata(MetadataContext());
             TryFinalize();
         }
 
-        bool HandleBio(const TPageCacheResult& msg, NActors::IEventBase& event) override
-        {
+        bool HandleBio(const TPageCacheResult& msg, NActors::IEventBase& event) override {
             Y_ENSURE(Loader, "PageCollections loader got un unexpected pages fetch");
 
             LeftReads -= 1;
@@ -75,8 +77,7 @@ namespace NBoot {
             return msg.Status == NKikimrProto::OK;
         }
 
-        void HandleStep(TIntrusivePtr<IStep> step) override
-        {
+        void HandleStep(TIntrusivePtr<IStep> step) override {
             auto* load = step->FinalCast<TLoadBlobs>();
             const auto result = Loader->SaveMetadata(load->Cookie, load->PlainData());
             if (result == NTable::EMetadataLoadResult::Error) {
@@ -108,30 +109,26 @@ namespace NBoot {
         }
 
     private:
-        NTable::TMetadataLoadContext MetadataContext()
-        {
+        NTable::TMetadataLoadContext MetadataContext() {
             return { *this, TActivationContext::ActorSystem(), Logic->SelfId, Logic->BootAttempt,
-                NBlockIO::EPriority::Fast };
+                NBlockIO::EPriority::Fast, WorkingSet.Get() };
         }
 
-        void LoadRawMetadata(ui32 slot, const NPageCollection::TLargeGlobId& id)
-        {
-            Spawn<TLoadBlobs>(id, slot);
+        void LoadRawMetadata(ui32 slot, const NPageCollection::TLargeGlobId& descriptor) {
+            Spawn<TLoadBlobs>(descriptor, slot);
         }
 
-        bool SendMetadataRequest(ui32 slot, const void* request, THolder<NActors::IEventBase> event)
-        {
-            return Logic->LoadMetadata(this, slot, LargeGlobIds[slot], request, std::move(event));
+        bool SendMetadataRequest(ui32 slot, const void* request, THolder<NActors::IEventBase> event) {
+            return Logic->LoadMetadata(this, slot, LargeGlobIds.at(slot), request, std::move(event));
         }
 
-        void SendMetadataUpdate(THolder<NActors::IEventBase> event)
-        {
+        void SendMetadataUpdate(THolder<NActors::IEventBase> event) {
             Logic->UpdateMetadata(std::move(event));
         }
 
         void TryFinalize()
         {
-            if (!Loader->MetadataReady()) {
+            if (Logic->Cancelled || !Loader->MetadataReady()) {
                 return;
             }
             if (!LeftReads) {
@@ -149,8 +146,9 @@ namespace NBoot {
                         << NFmt::Do(*Back) << " table " << Table
                         << " part loaded, page collections [";
 
-                    for (ui32 slot : xrange(partStore->GetPageCollectionCount()))
-                        logl << " " << partStore->GetPageCollectionRef(slot)->Label();
+                    for (ui32 slot : xrange(partStore->GetPageCollectionCount())) {
+                        logl << " " << partStore->GetPageCollection(slot)->Label();
+                    }
 
                     logl << " ]";
                 }
@@ -164,13 +162,11 @@ namespace NBoot {
 
     private:
         const ui32 Table = Max<ui32>();
+        TIntrusivePtr<IPageMetadataWorkingSet> WorkingSet;
 
         TAutoPtr<NTable::TLoader> Loader;
         TVector<NPageCollection::TLargeGlobId> LargeGlobIds;
-        TString Legacy;
-        TString Opaque;
-        TVector<TString> Deltas;
-        NTable::TEpoch Epoch;
+        NTable::TPartComponents Parts;
 
         TLeft LeftReads;
     };

@@ -21,9 +21,9 @@ class TStatsScreenedPartIterator {
     using TFrames = NPage::TFrames;
 
 public:
-    TStatsScreenedPartIterator(TPartView partView, IPages* env, TIntrusiveConstPtr<TKeyCellDefaults> keyDefaults, 
-            TIntrusiveConstPtr<TFrames> small, TIntrusiveConstPtr<TFrames> large,
-            ui64 rowCountResolution, ui64 dataSizeResolution)
+    TStatsScreenedPartIterator(TPartView partView, IPages* env, TIntrusiveConstPtr<TKeyCellDefaults> keyDefaults,
+        TIntrusiveConstPtr<TFrames> small, TIntrusiveConstPtr<TFrames> large, ui64 rowCountResolution,
+        ui64 dataSizeResolution, NStats::TPageTracker* pageTracker = nullptr)
         : Part(std::move(partView.Part))
         , KeyDefaults(std::move(keyDefaults))
         , Groups(::Reserve(Part->GroupsCount))
@@ -57,10 +57,9 @@ public:
                     groupDataSizeResolution = dataSizeResolution;
                 }
 
-                (historic ? HistoricGroups : Groups).push_back(
-                    CreateStatsPartGroupIterator(Part.Get(), env, TGroupId(groupIndex, historic), 
-                        groupRowCountResolution, groupDataSizeResolution, 
-                        historic || groupRowCountResolution == 0 ? TVector<TRowId>() : splitPoints));
+                (historic ? HistoricGroups : Groups).push_back(CreateStatsPartGroupIterator(Part.Get(), env,
+                    TGroupId(groupIndex, historic), groupRowCountResolution, groupDataSizeResolution,
+                    historic || groupRowCountResolution == 0 ? TVector<TRowId>() : splitPoints, pageTracker));
             }
         }
     }

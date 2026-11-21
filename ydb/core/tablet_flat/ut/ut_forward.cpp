@@ -1,3 +1,4 @@
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include "flat_fwd_cache.h"
 #include "flat_fwd_env.h"
 #include "flat_page_conf.h"
@@ -23,23 +24,28 @@ namespace {
     using namespace NTest;
 
     // Loads a page of the main group requested by a forward cache, which queues both index and data pages
-    const TSharedData* LoadQueuedPage(TTestEnv& env, const TPart* part, const NPage::TPageLocation& location) {
-        return NPage::IsIndexPage(location.Type)
-            ? env.TryGetIndexPage(part, location, { })
-            : env.TryGetPage(part, location, { });
+    TCachePageRef LoadQueuedPage(TTestEnv& env, const TPart* part, const NPage::TPageLocation& location) {
+        return env.LoadPage(part, location, {});
     }
 
     // Minimal IPageCollection mock for blobs forward cache tests.
     // Uses TFrames::Relation to provide page size, returns CRC32=0.
     struct TBlobPageCollection : public NPageCollection::IPageCollection {
         TIntrusiveConstPtr<NPage::TFrames> Frames;
+        const TLogoBlobID Id;
 
         TBlobPageCollection(TIntrusiveConstPtr<NPage::TFrames> frames)
-            : Frames(std::move(frames)) {}
+            : Frames(std::move(frames))
+            , Id(reinterpret_cast<ui64>(Frames.Get()), 0, 0, 0, 0, 0)
+        {}
 
         const TLogoBlobID& Label() const noexcept override {
-            static TLogoBlobID dummy(0, 0, 0, 0, 0, 0);
-            return dummy;
+            return Id;
+        }
+
+        bool IsCompatible(const NPageCollection::IPageCollection& other) const noexcept override {
+            const auto* collection = dynamic_cast<const TBlobPageCollection*>(&other);
+            return collection && Frames == collection->Frames;
         }
 
         ui32 Total() const noexcept override { return 0; }
@@ -49,6 +55,8 @@ namespace {
         NPageCollection::TGlobId Glob(ui32) const override { Y_TABLET_ERROR("Not implemented"); }
         bool Verify(ui32, TArrayRef<const char>) const override { return true; }
         bool Verify(const TPageLocation&, TArrayRef<const char>) const override { return true; }
+        size_t BackingSize() const noexcept override { return 0; }
+
         i64 GetMetadataMemoryUsage() const noexcept override {
             return sizeof(TBlobPageCollection);
         }
@@ -57,14 +65,23 @@ namespace {
             return nullptr;
         }
 
-        size_t BackingSize() const noexcept override { return 0; }
-
         NTable::NPage::TPageLocation GetLocation(ui32 pageId) const override {
             return NTable::NPage::TPageLocation::FromPageIndex(
                 pageId, Frames->Relation(pageId).Size,
                 NTable::NPage::EPage::Opaque, 0);
         }
     };
+
+    bool IsPagePinned(NSharedCache::TPageCacheItem item) {
+        auto operation = TCache::Get().BeginOperation();
+        const auto& space = operation.SpaceOperation();
+        if (!space.Contains(item.CacheItem())) {
+            return false;
+        }
+        const auto state =
+            NSharedCache::THandleState::FromRaw(space.Handles()[item.Index()].State.load(std::memory_order_acquire));
+        return item.Matches(state) && state.Refs() != 0;
+    }
 
     struct TBlobsWrap : public NTest::TSteps<TBlobsWrap>, protected NFwd::IPageLoadingQueue {
         using TFrames = NPage::TFrames;
@@ -140,7 +157,7 @@ namespace {
         {
             Forward();
 
-            TVector<NPageCollection::TLoadedPage> load;
+            TVector<TCachePageRef> load;
 
             for (auto& qp : std::exchange(Pages, TDeque<TQueuedPage>{})) {
                 if (qp.Size >= Edge) {
@@ -160,9 +177,10 @@ namespace {
                     UNIT_ASSERT(false);
                 }
 
-                load.emplace_back(
-                    NTable::NPage::TPageLocation(qp.Offset, qp.Size, EPage::Opaque),
-                    TSharedData::Copy(TString(qp.Size, 'x')));
+                const TPageLocation location(qp.Offset, qp.Size, EPage::Opaque);
+                auto ref = NTable::NTest::AdmitPage(
+                    TCache::Get(), BlobsPageCollection, location, TSharedData::Copy(TString(qp.Size, 'x')));
+                load.emplace_back(std::move(ref));
             }
 
             if (load.size() < least || load.size() >= most) {
@@ -177,7 +195,7 @@ namespace {
             Shuffle(load.begin(), load.end(), Rnd);
 
             for (auto &page : load) {
-                Cache->Fill(page, {}, EPage::Opaque);
+                Cache->Fill(std::move(page), EPage::Opaque);
             }
 
             UNIT_ASSERT(Cache->Stat.Saved == Cache->Stat.Fetch);
@@ -206,13 +224,21 @@ namespace {
     struct TTestPageCollection : public NPageCollection::IPageCollection {
         TIntrusiveConstPtr<NTest::TStore> Store;
         ui32 Room;
+        const TLogoBlobID Id;
 
         TTestPageCollection(TIntrusiveConstPtr<NTest::TStore> store, ui32 room)
-            : Store(std::move(store)), Room(room) {}
+            : Store(std::move(store))
+            , Room(room)
+            , Id(reinterpret_cast<ui64>(Store.Get()), 1, 0, 0, 0, room)
+        {}
 
         const TLogoBlobID& Label() const noexcept override {
-            static TLogoBlobID dummy(0, 0, 0, 0, 0, 0);
-            return dummy;
+            return Id;
+        }
+
+        bool IsCompatible(const NPageCollection::IPageCollection& other) const noexcept override {
+            const auto* collection = dynamic_cast<const TTestPageCollection*>(&other);
+            return collection && Store == collection->Store && Room == collection->Room;
         }
 
         ui32 Total() const noexcept override {
@@ -244,16 +270,16 @@ namespace {
             return data.size() == location.Size;
         }
 
+        size_t BackingSize() const noexcept override {
+            return Store->PageCollectionBytes(Room);
+        }
+
         i64 GetMetadataMemoryUsage() const noexcept override {
             return sizeof(TTestPageCollection);
         }
 
         const TSharedData* GetMetadataBuffer() const noexcept override {
             return nullptr;
-        }
-
-        size_t BackingSize() const noexcept override {
-            return Store->PageCollectionBytes(Room);
         }
 
         NTable::NPage::TPageLocation GetLocation(ui32 pageId) const override {
@@ -312,18 +338,18 @@ namespace {
 
             UNIT_ASSERT_VALUES_EQUAL_C(Queue.size(), pageIds.size(), CurrentStepStr());
 
-            TVector<NPageCollection::TLoadedPage> load;
+            TVector<TCachePageRef> load;
             NTest::TTestEnv testEnv;
             size_t i = 0;
             for (auto& loc : std::exchange(Queue, TDeque<TPageLocation>{})) {
                 UNIT_ASSERT_VALUES_EQUAL_C(loc.Offset, Part->GetPageLocation(pageIds[i++], { }).Offset, CurrentStepStr());
-                load.emplace_back(loc, *LoadQueuedPage(testEnv, Part.Get(), loc));
+                load.emplace_back(LoadQueuedPage(testEnv, Part.Get(), loc));
             }
 
             Shuffle(load.begin(), load.end(), Rnd);
 
             for (auto &page : load) {
-                Cache->Fill(page, {}, page.Location.Type);
+                Cache->Fill(std::move(page), page.GetType());
             }
 
             UNIT_ASSERT_VALUES_EQUAL_C(Cache->Stat, stat, CurrentStepStr());
@@ -350,7 +376,7 @@ namespace {
 
         TCacheWrap& Apply(const TVector<TPageId>& pageIds, NFwd::TStat stat)
         {
-            TVector<NPageCollection::TLoadedPage> load;
+            TVector<TCachePageRef> load;
             NTest::TTestEnv testEnv;
             for (auto pageId : pageIds) {
                 NFwd::TPageOffset offset = Part->GetPageLocation(pageId, { }).Offset;
@@ -365,13 +391,13 @@ namespace {
                     }
                 }
                 UNIT_ASSERT_C(found, CurrentStepStr());
-                load.emplace_back(location, *LoadQueuedPage(testEnv, Part.Get(), location));
+                load.emplace_back(LoadQueuedPage(testEnv, Part.Get(), location));
             }
 
             Shuffle(load.begin(), load.end(), Rnd);
 
             for (auto &page : load) {
-                Cache->Fill(page, {}, page.Location.Type);
+                Cache->Fill(std::move(page), page.GetType());
             }
 
             UNIT_ASSERT_VALUES_EQUAL_C(Cache->Stat, stat, CurrentStepStr());
@@ -414,7 +440,7 @@ namespace {
     };
 }
 
-Y_UNIT_TEST_SUITE(NFwd_TBlobs) {
+Y_UNIT_TEST_SUITE_F(NFwd_TBlobs, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NFwd;
     using namespace NTest;
 
@@ -645,21 +671,23 @@ Y_UNIT_TEST_SUITE(NFwd_TBlobs) {
 
         // Enter through a historical frame, then read earlier shared references.
         wrap.Get(2, false, false, true).Fill(1, 2, {1}).Get(2, true, false, true);
-        const TSharedData previousValue = *wrap.Get(2).Page;
+        const auto previousValue = wrap.Get(2).Page->CacheItem();
         wrap.Get(1, false, false, false).Get(1, false, false, false);
         wrap.Get(0, false, false, true).Get(0, false, false, true).Fill(1, 2, {0});
-        const TSharedData shared = *wrap.Get(0).Page;
-        UNIT_ASSERT_VALUES_EQUAL(shared.size(), 10u);
+        const auto* sharedPage = wrap.Get(0).Page;
+        UNIT_ASSERT(sharedPage);
+        const auto shared = sharedPage->CacheItem();
+        UNIT_ASSERT_VALUES_EQUAL(sharedPage->size(), 10u);
 
         wrap.Get(3, false, false, true).Fill(1, 2, {1}).Get(3, true, false, true);
-        UNIT_ASSERT(shared.IsShared());
-        UNIT_ASSERT(previousValue.IsShared());
+        UNIT_ASSERT(IsPagePinned(shared));
+        UNIT_ASSERT(IsPagePinned(previousValue));
         wrap.Get(0, true, false, true).Get(2, true, false, true).Fill(0, 1, {});
 
         // Moving to the next logical row releases every version together.
         wrap.Get(4, false, false, false);
-        UNIT_ASSERT(shared.IsPrivate());
-        UNIT_ASSERT(previousValue.IsPrivate());
+        UNIT_ASSERT(!IsPagePinned(shared));
+        UNIT_ASSERT(!IsPagePinned(previousValue));
         const auto trace = wrap.Trace();
         UNIT_ASSERT_VALUES_EQUAL(trace.size(), 2u);
         UNIT_ASSERT(trace[0] == TScreen::THole(1, 2));
@@ -696,19 +724,21 @@ Y_UNIT_TEST_SUITE(NFwd_TBlobs) {
         const TIntrusiveConstPtr<NPage::TFrames> frames = new NPage::TFrames(writer.Make());
         TBlobsWrap wrap(frames, Max<ui32>(), 0, 0);
 
-        TVector<TSharedData> payloads;
+        TVector<NSharedCache::TPageCacheItem> pages;
         for (ui16 tag = 0; tag < columns; ++tag) {
             wrap.Get(tag, false, false, true).Fill(1, 2, {tag});
-            payloads.push_back(*wrap.Get(tag).Page);
+            const auto* page = wrap.Get(tag).Page;
+            UNIT_ASSERT(page);
+            pages.push_back(page->CacheItem());
         }
         for (ui16 tag = 0; tag < columns; ++tag) {
-            UNIT_ASSERT(payloads[tag].IsShared());
+            UNIT_ASSERT(IsPagePinned(pages[tag]));
             UNIT_ASSERT(wrap.Get(tag).Page);
         }
         wrap.Fill(0, 1, {});
         wrap.EndRow();
-        for (const auto& payload : payloads) {
-            UNIT_ASSERT(payload.IsPrivate());
+        for (const auto& page : pages) {
+            UNIT_ASSERT(!IsPagePinned(page));
         }
     }
 
@@ -800,16 +830,23 @@ Y_UNIT_TEST_SUITE(NFwd_TBlobs) {
     }
 }
 
-Y_UNIT_TEST_SUITE(NFwd_TLoadedPagesCircularBuffer){
+Y_UNIT_TEST_SUITE_F(NFwd_TLoadedPagesCircularBuffer, ::NKikimr::NTable::NTest::TTableCacheTest){
     Y_UNIT_TEST(Basics) {
         auto buffer = NFwd::TLoadedPagesCircularBuffer<5>();
+        NPage::TFrameWriter writer(1);
+        for (ui32 pageId = 0; pageId < 42; ++pageId) {
+            writer.Put(pageId, 0, pageId * 10 + 1);
+        }
+        auto collection = MakeIntrusiveConst<TBlobPageCollection>(new NPage::TFrames(writer.Make()));
 
         for (ui32 pageId = 0; pageId < 42; pageId++) {
             // doesn't have current
             UNIT_ASSERT_VALUES_EQUAL(buffer.Get(TPageOffset::FromPageIndex(pageId)), nullptr);
 
             auto page = NFwd::TPage(TPageOffset::FromPageIndex(pageId * 1), pageId * 10 + 1, pageId * 100, pageId * 1000);
-            page.Data =  TSharedData::Copy(TString(page.Size, 'x'));
+            const TPageLocation location(page.Offset, page.Size, EPage::Opaque);
+            page.SharedPageRef = NTable::NTest::AdmitPage(
+                TCache::Get(), collection, location, TSharedData::Copy(TString(page.Size, 'x')));
 
             auto result = buffer.Emplace(page);
             UNIT_ASSERT_VALUES_EQUAL(result, pageId >= 5 ? (pageId - 5) * 10 + 1 : 0);
@@ -830,7 +867,7 @@ Y_UNIT_TEST_SUITE(NFwd_TLoadedPagesCircularBuffer){
     }
 }
 
-Y_UNIT_TEST_SUITE(NFwd_TFlatIndexCache) {
+Y_UNIT_TEST_SUITE_F(NFwd_TFlatIndexCache, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NFwd;
 
     // 20 pages, 50 bytes each
@@ -1172,7 +1209,7 @@ Y_UNIT_TEST_SUITE(NFwd_TFlatIndexCache) {
     }
 }
 
-Y_UNIT_TEST_SUITE(NFwd_TBTreeIndexCache) {
+Y_UNIT_TEST_SUITE_F(NFwd_TBTreeIndexCache, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NFwd;
 
     /**
@@ -1874,18 +1911,18 @@ struct TCacheWrapV2 : public NTest::TSteps<TCacheWrapV2>, protected NFwd::IPageL
 
         UNIT_ASSERT_VALUES_EQUAL_C(Queue.size(), offsets.size(), CurrentStepStr());
 
-        TVector<NPageCollection::TLoadedPage> load;
+        TVector<TCachePageRef> load;
         NTest::TTestEnv testEnv;
         size_t i = 0;
         for (auto& loc : std::exchange(Queue, TDeque<NPage::TPageLocation>{})) {
             UNIT_ASSERT_VALUES_EQUAL_C(loc.Offset, offsets[i++], CurrentStepStr());
-            load.emplace_back(loc, *LoadQueuedPage(testEnv, Part.Get(), loc));
+            load.emplace_back(LoadQueuedPage(testEnv, Part.Get(), loc));
         }
 
         Shuffle(load.begin(), load.end(), Rnd);
 
         for (auto &page : load) {
-            Cache->Fill(page, {}, page.Location.Type);
+            Cache->Fill(std::move(page), page.GetType());
         }
 
         return *this;
@@ -1907,7 +1944,7 @@ struct TCacheWrapV2 : public NTest::TSteps<TCacheWrapV2>, protected NFwd::IPageL
 
     TCacheWrapV2& Apply(const TVector<NFwd::TPageOffset>& offsets)
     {
-        TVector<NPageCollection::TLoadedPage> load;
+        TVector<TCachePageRef> load;
         NTest::TTestEnv testEnv;
         for (auto offset : offsets) {
             NPage::TPageLocation location;
@@ -1921,13 +1958,13 @@ struct TCacheWrapV2 : public NTest::TSteps<TCacheWrapV2>, protected NFwd::IPageL
                 }
             }
             UNIT_ASSERT_C(found, CurrentStepStr());
-            load.emplace_back(location, *LoadQueuedPage(testEnv, Part.Get(), location));
+            load.emplace_back(LoadQueuedPage(testEnv, Part.Get(), location));
         }
 
         Shuffle(load.begin(), load.end(), Rnd);
 
         for (auto &page : load) {
-            Cache->Fill(page, {}, page.Location.Type);
+            Cache->Fill(std::move(page), page.GetType());
         }
 
         return *this;
@@ -1995,7 +2032,7 @@ static TPartEggs CookPartV2() {
     return cook.Finish();
 }
 
-Y_UNIT_TEST_SUITE(NFwd_TBTreeIndexCacheV2) {
+Y_UNIT_TEST_SUITE_F(NFwd_TBTreeIndexCacheV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NFwd;
     using namespace NTest;
 

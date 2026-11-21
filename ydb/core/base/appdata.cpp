@@ -16,6 +16,7 @@
 #include <ydb/core/control/lib/immediate_control_board_impl.h>
 #include <ydb/core/grpc_services/grpc_helper.h>
 #include <ydb/core/jaeger_tracing/sampling_throttling_configurator.h>
+#include <ydb/core/tablet_flat/cache.h>
 #include <ydb/core/tablet_flat/shared_cache_pages.h>
 #include <ydb/core/protos/auth.pb.h>
 #include <ydb/core/protos/blobstorage.pb.h>
@@ -61,6 +62,7 @@ struct TAppData::TImpl {
     NKikimrProto::TKeyConfig KeyConfig;
     NKikimrProto::TKeyConfig PDiskKeyConfig;
     TFeatureFlags FeatureFlags;
+    bool UseLockFreePageCache = FeatureFlags.GetEnableLockFreePageCache();
     NKikimrConfig::THiveConfig HiveConfig;
     NKikimrConfig::TDataShardConfig DataShardConfig;
     NKikimrConfig::TColumnShardConfig ColumnShardConfig;
@@ -121,7 +123,7 @@ TAppData::TAppData(
     , Icb(new TControlBoard())
     , Dcb(new TDynamicControlBoard())
     , InFlightLimiterRegistry(new NGRpcService::TInFlightLimiterRegistry())
-    , SharedCachePages(new NSharedCache::TSharedCachePages())
+    , LegacySharedCachePages(Impl->UseLockFreePageCache ? nullptr : new NSharedCache::TSharedCachePages)
     , BuildIndexScanAdmission(std::make_shared<TScanAdmissionControl>())
     , StreamingConfig(Impl->StreamingConfig)
     , PQConfig(Impl->PQConfig)
@@ -176,10 +178,20 @@ TAppData::~TAppData()
 
 void TAppData::InitFeatureFlags(const NKikimrConfig::TFeatureFlags& flags) {
     Impl->FeatureFlags = flags;
+    Impl->UseLockFreePageCache = flags.GetEnableLockFreePageCache();
+    if (Impl->UseLockFreePageCache) {
+        LegacySharedCachePages.Reset();
+    } else if (!LegacySharedCachePages) {
+        LegacySharedCachePages = MakeIntrusive<NSharedCache::TSharedCachePages>();
+    }
 }
 
 void TAppData::UpdateRuntimeFlags(const NKikimrConfig::TFeatureFlags& flags) {
     Impl->FeatureFlags.CopyRuntimeFrom(flags);
+}
+
+bool TAppData::UseLockFreePageCache() const noexcept {
+    return Impl->UseLockFreePageCache;
 }
 
 TIntrusivePtr<IRandomProvider> TAppData::RandomProvider = CreateDefaultRandomProvider();

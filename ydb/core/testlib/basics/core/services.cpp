@@ -10,6 +10,7 @@
 #include <ydb/core/tablet/tablet_monitoring_proxy.h>
 #include <ydb/core/node_whiteboard/node_whiteboard.h>
 #include <ydb/core/tablet_flat/shared_sausagecache.h>
+#include <ydb/core/tablet_flat/cache_thread_test.h>
 #include <ydb/core/tx/scheme_board/replica.h>
 #include <util/generic/xrange.h>
 #include <util/string/printf.h>
@@ -93,14 +94,17 @@ namespace NKikimr {
                            TMailboxType::Revolving, 0), nodeIndex);
     }
 
-    void SetupSharedPageCache(TTestActorRuntime& runtime, ui32 nodeIndex, const NSharedCache::TSharedCacheConfig& config)
+    void SetupSharedPageCache(TTestActorRuntime& runtime, ui32 nodeIndex,
+        const NSharedCache::TSharedCacheConfig& config, bool useLockFreePageCache, ui64 expectedPageSize)
     {
-        runtime.AddLocalService(NSharedCache::MakeSharedPageCacheId(0),
-            TActorSetupCmd(
-                NSharedCache::CreateSharedPageCache(config, runtime.GetDynamicCounters(nodeIndex)),
-                TMailboxType::ReadAsFilled,
-                0),
-            nodeIndex);
+        if (useLockFreePageCache) {
+            NSharedCache::TCacheThreadTestAccess::Setup(runtime);
+        }
+        auto counters = runtime.GetDynamicCounters(nodeIndex);
+        auto* actor = useLockFreePageCache ? NSharedCache::CreateSharedPageCache(config, counters, expectedPageSize)
+                                           : NSharedCache::NLegacy::CreateSharedPageCache(config, counters);
+        runtime.AddLocalService(
+            NSharedCache::MakeSharedPageCacheId(0), TActorSetupCmd(actor, TMailboxType::ReadAsFilled, 0), nodeIndex);
     }
 
     template<size_t N>

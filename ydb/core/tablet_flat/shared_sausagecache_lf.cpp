@@ -2096,18 +2096,7 @@ class TSharedPageCache : public TActorBootstrapped<TSharedPageCache>, private IC
         const auto& record = ev->Get()->Record;
 
         {
-            auto* appData = AppData(ctx);
-            NKikimrSharedCache::TSharedCacheConfig config;
-            if (record.GetConfig().HasBootstrapConfig() && record.GetConfig().GetBootstrapConfig().HasSharedCacheConfig()) {
-                config.MergeFrom(record.GetConfig().GetBootstrapConfig().GetSharedCacheConfig());
-            } else if (appData->BootstrapConfig.HasSharedCacheConfig()) {
-                config.MergeFrom(appData->BootstrapConfig.GetSharedCacheConfig());
-            }
-            if (record.GetConfig().HasSharedCacheConfig()) {
-                config.MergeFrom(record.GetConfig().GetSharedCacheConfig());
-            } else {
-                config.MergeFrom(appData->SharedCacheConfig);
-            }
+            auto config = ResolveSharedCacheConfig(record.GetConfig(), AppData(ctx));
             Y_ENSURE(!config.HasMemoryLimit() || config.GetMemoryLimit() > 0,
                 "Shared-cache MemoryLimit must be positive");
             LOG_NOTICE_S(ctx, NKikimrServices::TABLET_SAUSAGECACHE, "Update config " << config.ShortDebugString());

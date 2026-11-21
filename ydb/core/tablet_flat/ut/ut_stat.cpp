@@ -1,8 +1,10 @@
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include "flat_part_charge_range.h"
 #include "flat_stat_table.h"
 #include "flat_stat_table_mixed_index.h"
 #include "flat_stat_table_btree_index.h"
 #include "flat_stat_part.h"
+#include "flat_stat_page.h"
 #include <test/libs/table/wrap_iter.h>
 #include <test/libs/table/wrap_part.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
@@ -13,6 +15,8 @@
 #include <ydb/core/tablet_flat/test/libs/table/test_writer.h>
 
 #include <library/cpp/testing/unittest/registar.h>
+#include <util/generic/scope.h>
+#include <type_traits>
 
 namespace NKikimr::NTable {
 
@@ -29,8 +33,8 @@ namespace {
             return Touch(part, location, groupId, type, NTest::TTestEnv::TryGetPage(part, location, groupId));
         }
 
-        const TSharedData* TryGetIndexPage(const TPart *part, const TPageLocation& location, TGroupId groupId) override
-        {
+        const TSharedData* TryGetIndexPage(
+            const TPart* part, const TPageLocation& location, TGroupId groupId) override {
             auto type = location.Type;
             if (type == EPage::Undef && location.Offset.IsPageIndex()) {
                 type = part->GetIndexPageType(location.Offset.AsPageIndex(), groupId);
@@ -39,7 +43,8 @@ namespace {
             return Touch(part, location, TGroupId(part->IndexSlot(groupId)), type, NTest::TTestEnv::TryGetIndexPage(part, location, groupId));
         }
 
-        const TSharedData* Touch(const TPart *part, const TPageLocation& location, TGroupId groupId, EPage type, const TSharedData* page)
+        const TSharedData* Touch(
+            const TPart* part, const TPageLocation& location, TGroupId groupId, EPage type, const TSharedData* page)
         {
             bool newTouch = Touched[{part, groupId}].insert(location.Offset).second;
 
@@ -58,9 +63,10 @@ namespace {
                 }
             }
 
-            return newTouch && Faulty
-                ? nullptr
-                : page;
+            if (newTouch && Faulty) {
+                return {};
+            }
+            return page;
         }
 
         TMap<std::pair<const TPart*, TGroupId>, TSet<TPageOffset>> Touched;
@@ -142,9 +148,258 @@ namespace {
         UNIT_ASSERT_VALUES_EQUAL(stats.DataSize.Size, expectedData);
         UNIT_ASSERT_VALUES_EQUAL(stats.IndexSize.Size, expectedIndex);
     }
+} // namespace
+
+Y_UNIT_TEST_SUITE_F(BuildStatsPageLifetime, ::NKikimr::NTable::NTest::TTableCacheTest) {
+    using namespace NTest;
+
+    static_assert(std::is_nothrow_copy_constructible_v<NStats::TKeyView>);
+    static_assert(std::is_nothrow_copy_assignable_v<NStats::TKeyView>);
+    static_assert(std::is_nothrow_move_constructible_v<NStats::TKeyView>);
+    static_assert(std::is_nothrow_move_assignable_v<NStats::TKeyView>);
+
+    struct TStopTraversal {};
+
+    class TStatsPageEnv : public TTestEnv {
+    public:
+        explicit TStatsPageEnv(NStats::TPageTracker& tracker)
+            : Tracker(tracker)
+        {}
+
+        const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+            if (StopAfterPages && Touched.size() >= StopAfterPages) {
+                throw TStopTraversal{};
+            }
+            auto page = LoadPage(part, location, groupId);
+            UNIT_ASSERT_C(page, "The statistics frontier exceeded its configured page budget");
+            if (Touched.insert(location.Offset).second) {
+                ReadBytes += page.size() + TSharedData::OverheadSize;
+            }
+            return Tracker.ProvidePage(std::move(page));
+        }
+
+        NStats::TPageTracker& Tracker;
+        THashSet<TPageOffset> Touched;
+        ui64 ReadBytes = 0;
+        size_t StopAfterPages = 0;
+    };
+
+    void CheckReleasedPages(bool v2, bool mixed) {
+        TLayoutCook layout;
+        layout.Col(0, 0, NScheme::NTypeIds::String)
+            .Col(0, 1, NScheme::NTypeIds::Uint32, TCell::Make(ui32(777)))
+            .Col(0, 2, NScheme::NTypeIds::Uint64)
+            .Key({ 0, 1 });
+        NPage::TConf conf(true, 1024);
+        conf.Group(0).BTreeIndexNodeTargetSize = 512;
+        conf.Group(0).BTreeIndexNodeKeysMin = 2;
+        conf.Group(0).BTreeIndexNodeKeysMax = 3;
+        conf.CutIndexKeys = false;
+        conf.WriteFlatIndex = false;
+        conf.WriteBTreeIndexV1 = !v2;
+        conf.WriteBTreeIndexV2 = v2;
+        constexpr ui32 rows = 4096;
+        auto makeKey = [](ui32 row) -> TString {
+            return TStringBuilder() << TString(40, 'k') << (100000 + row);
+        };
+        TPartCook cook(layout, conf);
+        for (ui32 row = 0; row < rows; ++row) {
+            cook.AddN(makeKey(row), row, ui64(row));
+        }
+        auto eggs = cook.Finish();
+        auto part = eggs.Lone();
+        UNIT_ASSERT_GT(part->IndexPages.GetBTree({}).LevelCount(), 1);
+        TSubset subset(TEpoch::Zero(), eggs.Scheme);
+        subset.Flatten.push_back(eggs.ToPartView());
+        if (!mixed) {
+            const auto first = makeKey(11);
+            const auto last = makeKey(rows - 19);
+            const TCell firstCells[] = { TCell(first.data(), first.size()), TCell() };
+            const TCell lastCells[] = { TCell(last.data(), last.size()), TCell() };
+            subset.Flatten.front().Slices = new TSlices(TVector<TSlice>{
+                TSlice(TSerializedCellVec(firstCells), TSerializedCellVec(lastCells), 11, rows - 19, true, false) });
+        }
+        NStats::TPageTracker tracker;
+        auto build = [&](TStats& stats, IPages* env, TBuildStatsYieldHandler yield) {
+            return mixed ? BuildStatsMixedIndex(subset, stats, 32, 4096, env, yield, &tracker)
+                         : BuildStatsBTreeIndex(subset, stats, 256, env, yield, {}, &tracker);
+        };
+        TStats expected;
+        TTestEnv referenceEnv;
+        UNIT_ASSERT(build(expected, &referenceEnv, [] {
+        }));
+        if (!mixed) {
+            auto slices = MakeIntrusive<TSlices>(
+                TVector<TSlice>(subset.Flatten.front().Slices->begin(), subset.Flatten.front().Slices->end()));
+            // Prefix bounds must keep NULL suffixes, even with a non-NULL schema default.
+            for (auto* key : { &slices->front().FirstKey, &slices->front().LastKey }) {
+                *key = TSerializedCellVec(key->GetCells().Slice(0, 1));
+            }
+            subset.Flatten.front().Slices = std::move(slices);
+        }
+        ui64 pageBudget = 0;
+        ui64 indexBytes = 0;
+        auto* collection = part->GetPageCollection(0);
+        for (ui32 page = 0; page < collection->Total(); ++page) {
+            const auto info = collection->Page(page);
+            if (info.Type == ui32(EPage::BTreeIndex) || info.Type == ui32(EPage::BTreeIndexV2)) {
+                pageBudget = Max(pageBudget, info.Size + TSharedData::OverheadSize);
+                indexBytes += info.Size;
+            }
+        }
+        UNIT_ASSERT_GT(indexBytes, 8 * pageBudget);
+        auto& cache = NSharedCache::TCache::Get();
+        const ui64 savedLimit = cache.CurrentLimit();
+        Y_DEFER {
+            cache.UpdateCurrentLimit(savedLimit);
+            cache.UpdateSoftLimitOverride(Max<ui64>());
+        };
+        UNIT_ASSERT(cache.UpdateSoftLimitOverride(0));
+        const ui64 frontierBudget = mixed ? indexBytes + collection->Total() * TSharedData::OverheadSize
+                                          : (4 * part->IndexPages.GetBTree({}).LevelCount() + 4) * pageBudget;
+        UNIT_ASSERT(cache.UpdateCurrentLimit(frontierBudget));
+        {
+            while (cache.EnforceCurrentLimit()) {
+            }
+        }
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
+        {
+            const auto root = GetBTreeRootLocation(part->IndexPages.GetBTree({}), collection, collection);
+            auto page = referenceEnv.LoadPage(part.Get(), root, {});
+            UNIT_ASSERT(page);
+            const char* pageData = page.data();
+            const size_t pageSize = page.size();
+            NStats::TKeyView view;
+            NStats::TIndexPage* indexPage = nullptr;
+            {
+                auto pageOwner = MakeIntrusive<NStats::TIndexPage>(std::move(page), v2, &tracker);
+                UNIT_ASSERT_VALUES_EQUAL(pageOwner->RefCount(), 1);
+                {
+                    auto duplicateOwner =
+                        MakeIntrusive<NStats::TIndexPage>(pageOwner->GetPageRef().Acquire(), v2, &tracker);
+                    const auto workingSet = tracker.WorkingSet();
+                    UNIT_ASSERT_VALUES_EQUAL(workingSet.Pages, 1);
+                    UNIT_ASSERT_VALUES_EQUAL(workingSet.Bytes, pageSize + TSharedData::OverheadSize);
+                    UNIT_ASSERT_VALUES_EQUAL(workingSet.TotalBytes, workingSet.Bytes);
+                }
+                NSharedCache::TCacheCollectionRef collectionRef;
+                UNIT_ASSERT(cache.Find(collection->Label(), collectionRef) == NSharedCache::ECacheResultStatus::Hit);
+                UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collectionRef.CacheItem(), NPage::ECacheMode::Sticky));
+                auto stickyPage = referenceEnv.LoadPage(part.Get(), root, {});
+                UNIT_ASSERT(stickyPage.IsSticky());
+                stickyPage.Drop();
+                UNIT_ASSERT_VALUES_EQUAL(tracker.WorkingSet().Bytes, 0);
+                UNIT_ASSERT_VALUES_EQUAL(tracker.WorkingSet().TotalBytes, pageSize + TSharedData::OverheadSize);
+                UNIT_ASSERT(cache.SetCollectionPagesCacheMode(collectionRef.CacheItem(), NPage::ECacheMode::Regular));
+                UNIT_ASSERT_VALUES_EQUAL(tracker.WorkingSet().Bytes, pageSize + TSharedData::OverheadSize);
+                indexPage = pageOwner.Get();
+                view = NStats::TKeyView(
+                    pageOwner->Node.GetKeyCellsIterable(0, part->Scheme->GetLayout({}).ColsKeyData), pageOwner);
+                UNIT_ASSERT_VALUES_EQUAL(pageOwner->RefCount(), 2);
+            }
+            const auto key = view.Iter().Next();
+            UNIT_ASSERT_GE(key.Data(), pageData);
+            UNIT_ASSERT_LE(key.Data() + key.Size(), pageData + pageSize);
+            UNIT_ASSERT_VALUES_EQUAL(indexPage->RefCount(), 1);
+            auto copiedView = view;
+            NStats::TKeyView assignedView;
+            assignedView = copiedView;
+            UNIT_ASSERT_VALUES_EQUAL(indexPage->RefCount(), 3);
+            UNIT_ASSERT_VALUES_EQUAL(tracker.WorkingSet().Pages, 1);
+            view = {};
+            assignedView = {};
+            UNIT_ASSERT_VALUES_EQUAL(indexPage->RefCount(), 1);
+            UNIT_ASSERT_GT(cache.PayloadUsage(), 0);
+            UNIT_ASSERT_VALUES_EQUAL(copiedView.Iter().Next().Data(), key.Data());
+            copiedView = {};
+            UNIT_ASSERT(tracker.Empty());
+            {
+                while (cache.EnforceCurrentLimit()) {
+                }
+            }
+            UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
+        }
+        TStatsPageEnv env(tracker);
+        TStats actual;
+        bool sawPinnedFrontier = false;
+        UNIT_ASSERT(build(actual, &env, [&] {
+            const auto workingSet = tracker.WorkingSet();
+            sawPinnedFrontier |= workingSet.Pages > 0;
+            UNIT_ASSERT_LE(workingSet.TotalBytes, cache.PayloadUsage());
+        }));
+        UNIT_ASSERT(sawPinnedFrontier);
+        UNIT_ASSERT(tracker.Empty());
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
+        UNIT_ASSERT_GT(env.Touched.size(), 8);
+        if (!mixed) {
+            UNIT_ASSERT_C(env.ReadBytes > frontierBudget,
+                "Distinct page charges " << env.ReadBytes << " must exceed the frontier budget " << frontierBudget);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(actual.RowCount, expected.RowCount);
+        UNIT_ASSERT_VALUES_EQUAL(actual.DataSize.Size, expected.DataSize.Size);
+        UNIT_ASSERT_VALUES_EQUAL(actual.IndexSize.Size, expected.IndexSize.Size);
+        auto checkHistogram = [](const THistogram& actual, const THistogram& expected) {
+            UNIT_ASSERT_VALUES_EQUAL(actual.size(), expected.size());
+            for (size_t bucket = 0; bucket < actual.size(); ++bucket) {
+                UNIT_ASSERT_VALUES_EQUAL(actual[bucket].EndKey, expected[bucket].EndKey);
+                UNIT_ASSERT_VALUES_EQUAL(actual[bucket].Value, expected[bucket].Value);
+            }
+        };
+        checkHistogram(actual.RowCountHistogram, expected.RowCountHistogram);
+        checkHistogram(actual.DataSizeHistogram, expected.DataSizeHistogram);
+        TStatsPageEnv pressureEnv(tracker);
+        pressureEnv.StopAfterPages = 8;
+        TStats abandoned;
+        UNIT_ASSERT_EXCEPTION(build(abandoned, &pressureEnv, [] {
+        }), TStopTraversal);
+        UNIT_ASSERT(tracker.Empty());
+        UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR11FlatIndexesTrackLivePages) {
+        auto subset = TMake(Mass3, PageConf(Mass3.Model->Scheme->Families.size(), false)).Mixed(0, 4, TMixerRnd(4));
+        NStats::TPageTracker tracker;
+
+        struct TEnv : TTestEnv {
+            explicit TEnv(NStats::TPageTracker& tracker)
+                : Tracker(tracker)
+            {}
+
+            const TSharedData* TryGetIndexPage(const TPart* part, const TPageLocation& location, TGroupId groupId) override {
+                const auto workingSet = Tracker.WorkingSet();
+                SawRetainedIndex |= workingSet.Pages != 0;
+                return Tracker.ProvidePage(LoadPage(part, location, groupId));
+            }
+
+            NStats::TPageTracker& Tracker;
+            bool SawRetainedIndex = false;
+        } env(tracker);
+
+        TStats stats;
+        UNIT_ASSERT(BuildStatsMixedIndex(*subset, stats, 32, 4096, &env, [] {
+        }, &tracker));
+        UNIT_ASSERT(env.SawRetainedIndex);
+        UNIT_ASSERT(tracker.Empty());
+    }
+
+    Y_UNIT_TEST(ReviewR11HistogramV1ReleasesPages) {
+        CheckReleasedPages(false, false);
+    }
+
+    Y_UNIT_TEST(ReviewR11HistogramV2ReleasesPages) {
+        CheckReleasedPages(true, false);
+    }
+
+    Y_UNIT_TEST(ReviewR11MixedV1RetainsKeyPages) {
+        CheckReleasedPages(false, true);
+    }
+
+    Y_UNIT_TEST(ReviewR11MixedV2RetainsKeyPages) {
+        CheckReleasedPages(true, true);
+    }
 }
 
-Y_UNIT_TEST_SUITE(BuildStatsFlatIndex) {
+Y_UNIT_TEST_SUITE_F(BuildStatsFlatIndex, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
     const bool WriteBTreeIndex = false;
 
@@ -240,7 +495,7 @@ Y_UNIT_TEST_SUITE(BuildStatsFlatIndex) {
     }
 }
 
-Y_UNIT_TEST_SUITE(BuildStatsMixedIndex) {
+Y_UNIT_TEST_SUITE_F(BuildStatsMixedIndex, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
     const bool WriteBTreeIndex = true;
 
@@ -375,7 +630,7 @@ Y_UNIT_TEST_SUITE(BuildStatsMixedIndex) {
     }
 }
 
-Y_UNIT_TEST_SUITE(BuildStatsBTreeIndex) {
+Y_UNIT_TEST_SUITE_F(BuildStatsBTreeIndex, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
     const bool WriteBTreeIndex = true;
 
@@ -450,7 +705,7 @@ Y_UNIT_TEST_SUITE(BuildStatsBTreeIndex) {
     }
 }
 
-Y_UNIT_TEST_SUITE(BuildStatsHistogram) {
+Y_UNIT_TEST_SUITE_F(BuildStatsHistogram, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     enum TMode {
@@ -1175,7 +1430,7 @@ Y_UNIT_TEST_SUITE(BuildStatsHistogram) {
 // Section 3.4: V2 twin stats tests
 // ========================================================================
 
-Y_UNIT_TEST_SUITE(BuildStatsBTreeIndexV2) {
+Y_UNIT_TEST_SUITE_F(BuildStatsBTreeIndexV2, ::NKikimr::NTable::NTest::TTableCacheTest) {
     using namespace NTest;
 
     // Shared twin-conf builder: V1 and V2 differ only in WriteBTreeIndexV2 and

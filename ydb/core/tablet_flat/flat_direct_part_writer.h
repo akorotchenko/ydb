@@ -8,6 +8,7 @@
 #include "flat_part_laid.h"
 #include "flat_part_screen.h"
 #include "flat_part_store.h"
+#include "flat_sausagecache_lf.h"
 #include "flat_sausage_chop.h"
 #include "flat_transaction_pages.h"
 #include "shared_sausagecache.h"
@@ -350,12 +351,12 @@ namespace NTabletFlatExecutor {
         TDirectWriteCfg Cfg;
         TIntrusiveConstPtr<TScheme> Scheme;
         TMessageRelevanceOwner RelevanceTracker = std::make_shared<TMessageRelevanceTracker>();
+        TWrittenPageCache PageCache;
 
         TAutoPtr<TBundle> Bundle;
         TAutoPtr<TPartWriter> Writer;
         NTable::TWriteStats WriteStats;
         TVector<TBundle::TResult> Results;
-        TWrittenPageCache PageCache;
 
         TOwnedCellVec PrevKey;
         bool HavePrevKey = false;

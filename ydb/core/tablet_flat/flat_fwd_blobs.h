@@ -14,14 +14,19 @@ namespace NFwd {
 
     using TPageOffset = NPage::TPageOffset;
 
-    class TBlobs : public IPageLoadingLogic {
+    template <class TPageRef>
+    class TBlobsImpl : public IPageLoadingLogicImpl<TPageRef> {
+        using TBase = IPageLoadingLogicImpl<TPageRef>;
         using THoles = TScreen::TCook;
+        using TPage = TPageImpl<TPageRef>;
 
     public:
         using TEdges = TVector<ui32>;
+        using TBase::Stat;
+        using typename TBase::TResult;
 
-        TBlobs(TIntrusiveConstPtr<NPage::TFrames> frames, TIntrusiveConstPtr<TSlices> slices, TEdges edge, bool trace,
-                TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection)
+        TBlobsImpl(TIntrusiveConstPtr<NPage::TFrames> frames, TIntrusiveConstPtr<TSlices> slices, TEdges edge,
+            bool trace, TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection)
             : Edge(std::move(edge))
             , Frames(std::move(frames))
             , PageCollection(std::move(pageCollection))
@@ -33,7 +38,7 @@ namespace NFwd {
             Y_ENSURE(Edge.size() == Tags.size(), "Invalid edges vector");
         }
 
-        ~TBlobs()
+        ~TBlobsImpl()
         {
         }
 
@@ -77,20 +82,21 @@ namespace NFwd {
             }
         }
 
-        void Fill(NPageCollection::TLoadedPage& page, NSharedCache::TSharedPageRef sharedPageRef, EPage) override
-        {
-            if (!Pages || page.Location.Offset < Pages.front().Offset) {
+        void Fill(TPageRef&& page, EPage) override {
+            const auto location = page.GetLocation();
+            const ui64 loadedSize = location.Size;
+            if (!Pages || location.Offset < Pages.front().Offset) {
                 Y_TABLET_ERROR("Blobs fwd cache got page below queue");
-            } else if (page.Location.Offset > Pages.back().Offset) {
+            } else if (location.Offset > Pages.back().Offset) {
                 Y_TABLET_ERROR("Blobs fwd cache got page above queue");
-            } else if (page.Data.size() > OnFetch) {
+            } else if (loadedSize > OnFetch) {
                 Y_TABLET_ERROR("Blobs fwd cache ahead counters is out of sync");
             }
 
-            Stat.Saved += page.Data.size();
-            OnFetch -= page.Data.size();
+            Stat.Saved += loadedSize;
+            OnFetch -= loadedSize;
             // blob pages are always page-index-addressed
-            OnHold += Lookup(page.Location.Offset.AsPageIndex()).Settle(page, std::move(sharedPageRef));
+            OnHold += Lookup(location.Offset.AsPageIndex()).Settle(std::move(page));
 
             Shrink(false /* do not drop loading pages */);
         }
@@ -148,7 +154,7 @@ namespace NFwd {
             return rel.Tag;
         }
 
-        TBlobs& Preload(IPageLoadingQueue *head, ui64 upper)
+        TBlobsImpl& Preload(IPageLoadingQueue* head, ui64 upper)
         {
             auto until = [this, upper]() { return OnHold + OnFetch < upper; };
 
@@ -205,7 +211,7 @@ namespace NFwd {
             }
         }
 
-        TBlobs& Rewind(TPageId until)
+        TBlobsImpl& Rewind(TPageId until)
         {
             for (; Position < Pages.size(); Position++) {
                 auto &page = Pages.at(Position);
@@ -214,7 +220,7 @@ namespace NFwd {
                     break;
                 } else if (page.Size == 0) {
                     Y_TABLET_ERROR("Dropping page that hasn't been propagated");
-                } else if (auto size = page.Release().size()) {
+                } else if (auto size = page.Release()) {
                     OnHold -= size;
 
                     if (page.Usage == EUsage::None)
@@ -225,7 +231,7 @@ namespace NFwd {
             return *this;
         }
 
-        TBlobs& Shrink(bool force = false)
+        TBlobsImpl& Shrink(bool force = false)
         {
             for (; Position && (Pages[0].Ready() || force); Position--) {
 
@@ -267,6 +273,7 @@ namespace NFwd {
         TDeque<TPage> Pages;
     };
 
+    using TBlobs = TBlobsImpl<TCachePageRef>;
 }
 }
 }

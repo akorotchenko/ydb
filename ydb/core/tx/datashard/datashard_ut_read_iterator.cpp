@@ -1,4 +1,5 @@
 #include <ydb/core/tx/datashard/ut_common/datashard_ut_common.h>
+#include <ydb/core/base/memory_controller_iface.h>
 #include "datashard_ut_common_kqp.h"
 #include "datashard_active_transaction.h"
 #include "datashard_failpoints.h"
@@ -18,6 +19,7 @@
 #include <ydb/core/kqp/runtime/scheduler/kqp_compute_scheduler_service.h>
 #include <ydb/core/kqp/runtime/scheduler/tree/dynamic.h>
 #include <ydb/core/memory_controller/consumer_collection.h>
+#include <ydb/core/tablet_flat/shared_cache_events_lf.h>
 #include <ydb/core/tablet_flat/shared_cache_events.h>
 #include <ydb/core/tx/tx_proxy/proxy.h>
 #include <ydb/core/tx/tx_proxy/read_table.h>
@@ -4351,7 +4353,7 @@ Y_UNIT_TEST_SUITE(DataShardReadIteratorPageFaults) {
         bool replied = false;
         auto observer = runtime.AddObserver<TEvDataShard::TEvReadResult>(
             [&](TEvDataShard::TEvReadResult::TPtr&) { replied = true; });
-        TBlockEvents<NSharedCache::TEvRequest> pages(runtime);
+        TBlockEvents<NSharedCache::NLegacy::TEvRequest> pages(runtime);
         bool retried = false;
         auto retryObserver = runtime.AddObserver<TEvDataShard::TEvReadContinue>(
             [&](TEvDataShard::TEvReadContinue::TPtr& ev) {
@@ -4402,12 +4404,20 @@ Y_UNIT_TEST_SUITE(DataShardReadIteratorPageFaults) {
     Y_UNIT_TEST(CancelPageFaultedReadThenDropTable) {
         TPortManager pm;
         TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetEnableLockFreePageCache(true);
         serverSettings.SetDomainName("Root")
             .SetUseRealThreads(false);
-        serverSettings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(0);
+        serverSettings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(32_MB);
         TServer::TPtr server = new TServer(serverSettings);
 
         auto& runtime = *server->GetRuntime();
+        auto cacheAllocation = runtime.AddObserver<NMemory::TEvConsumerLimit>([](const auto& ev) {
+            if (ev->Get()->MaxLimitBytes) {
+                ev->Get()->LimitBytes = 0;
+            }
+        });
+        runtime.Send(new IEventHandle(
+            NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 32_MB)));
         auto sender = runtime.AllocateEdgeActor();
 
         runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
@@ -4490,12 +4500,20 @@ Y_UNIT_TEST_SUITE(DataShardReadIteratorPageFaults) {
     Y_UNIT_TEST(LocksNotLostOnPageFault) {
         TPortManager pm;
         TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetEnableLockFreePageCache(true);
         serverSettings.SetDomainName("Root")
             .SetUseRealThreads(false);
-        serverSettings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(0);
+        serverSettings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(32_MB);
         TServer::TPtr server = new TServer(serverSettings);
 
         auto& runtime = *server->GetRuntime();
+        auto cacheAllocation = runtime.AddObserver<NMemory::TEvConsumerLimit>([](const auto& ev) {
+            if (ev->Get()->MaxLimitBytes) {
+                ev->Get()->LimitBytes = 0;
+            }
+        });
+        runtime.Send(new IEventHandle(
+            NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 32_MB)));
         auto sender = runtime.AllocateEdgeActor();
 
         runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);

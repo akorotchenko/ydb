@@ -413,14 +413,21 @@ namespace NTest {
     class TStorePageCollection : public NPageCollection::IPageCollection {
         TIntrusiveConstPtr<TStore> Store;
         ui32 Room;
+        const TLogoBlobID Id;
+
     public:
         TStorePageCollection(TIntrusiveConstPtr<TStore> store, ui32 room)
             : Store(std::move(store)), Room(room)
+            , Id(reinterpret_cast<ui64>(Store.Get()), 0, 0, 0, 0, room)
         {}
 
         const TLogoBlobID& Label() const noexcept override {
-            static TLogoBlobID dummy(0, 0, 0, 0, 0, 0);
-            return dummy;
+            return Id;
+        }
+
+        bool IsCompatible(const NPageCollection::IPageCollection& other) const noexcept override {
+            const auto* collection = dynamic_cast<const TStorePageCollection*>(&other);
+            return collection && Store == collection->Store && Room == collection->Room;
         }
 
         ui32 Total() const noexcept override {
@@ -428,7 +435,7 @@ namespace NTest {
         }
 
         NPageCollection::TInfo Page(ui32 page) const override {
-            return {Store->GetPageSize(Room, page), 0};
+            return {Store->GetPageSize(Room, page), static_cast<ui32>(Store->GetPageType(Room, page)) };
         }
 
         NPageCollection::TBorder Bounds(ui32 page) const override {
@@ -459,6 +466,10 @@ namespace NTest {
             return data.size() == location.Size;
         }
 
+        size_t BackingSize() const noexcept override {
+            return Store->PageCollectionBytes(Room);
+        }
+
         i64 GetMetadataMemoryUsage() const noexcept override {
             // The backing fixture store is outside this descriptor's modeled footprint
             return sizeof(TStorePageCollection);
@@ -466,10 +477,6 @@ namespace NTest {
 
         const TSharedData* GetMetadataBuffer() const noexcept override {
             return nullptr;
-        }
-
-        size_t BackingSize() const noexcept override {
-            return Store->PageCollectionBytes(Room);
         }
 
         NTable::NPage::TPageLocation GetLocation(ui32 pageId) const override {

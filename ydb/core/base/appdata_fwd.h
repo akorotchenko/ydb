@@ -30,6 +30,10 @@ namespace NKikimr {
     }
     namespace NSharedCache {
         class TSharedCachePages;
+        struct TProdTraits;
+        template <class TTraits>
+        class TCacheImpl;
+        using TCache = TCacheImpl<TProdTraits>;
     }
     namespace NJaegerTracing {
         class TSamplingThrottlingConfigurator;
@@ -268,7 +272,8 @@ struct TAppData {
     TIntrusivePtr<NKikimr::TControlBoard> Icb;
     TIntrusivePtr<NKikimr::TDynamicControlBoard> Dcb;
     TIntrusivePtr<NGRpcService::TInFlightLimiterRegistry> InFlightLimiterRegistry;
-    TIntrusivePtr<NSharedCache::TSharedCachePages> SharedCachePages;
+    TIntrusivePtr<NSharedCache::TCache> SharedCache;
+    TIntrusivePtr<NSharedCache::TSharedCachePages> LegacySharedCachePages;
     std::shared_ptr<TScanAdmissionControl> BuildIndexScanAdmission;
 
     TIntrusivePtr<NInterconnect::TPollerThreads> PollerThreads;
@@ -391,6 +396,7 @@ struct TAppData {
 
     void InitFeatureFlags(const NKikimrConfig::TFeatureFlags& flags);
     void UpdateRuntimeFlags(const NKikimrConfig::TFeatureFlags& flags);
+    bool UseLockFreePageCache() const noexcept;
 
     // Test failure injection methods
     void InjectFailure(ui64 failureType) {

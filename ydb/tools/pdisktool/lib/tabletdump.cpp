@@ -1,4 +1,5 @@
 #include "tabletdump.h"
+#include "tabletdb.h"
 
 #include <ydb/core/scheme/scheme_tablecell.h>
 #include <ydb/core/scheme/scheme_type_info.h>
@@ -245,6 +246,7 @@ bool DumpTablet(NTable::TDatabase& db, NTable::IPages& env, const TDumpOptions& 
                 const auto mode = options.IncludeErased ? NTable::ENext::All : NTable::ENext::Data;
 
                 for (;;) {
+                    ReleaseRowBuffers(env);
                     if (dump.Rows + dump.Erased >= MaxRowsPerTable) {
                         dump.Complete = false;
                         break;
@@ -277,8 +279,10 @@ bool DumpTablet(NTable::TDatabase& db, NTable::IPages& env, const TDumpOptions& 
                     erased ? ++dump.Erased : ++dump.Rows;
                 }
 
+                ReleaseRowBuffers(env);
                 file.Finish();
             } catch (...) {
+                ReleaseRowBuffers(env);
                 // A row that cannot be rendered, or a part that turns out to be damaged deeper than the
                 // loader could see, costs the rest of this table and nothing else.
                 dump.Complete = false;
@@ -288,9 +292,9 @@ bool DumpTablet(NTable::TDatabase& db, NTable::IPages& env, const TDumpOptions& 
 
             if (!dump.Complete) {
                 ++stats.Incomplete;
-                issues.Warning("tablet-dump", TStringBuilder() << "Table " << id << " " << info.Name
-                    << " is truncated after " << dump.Rows << " row(s) because the data that follows"
-                    << " is not in the input");
+                issues.Warning("tablet-dump", TStringBuilder()
+                                                  << "Table " << id << " " << info.Name << " is truncated after "
+                                                  << dump.Rows << " row(s) because the scan could not continue");
             }
 
             stats.Rows += dump.Rows;

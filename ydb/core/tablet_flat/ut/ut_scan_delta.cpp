@@ -1,6 +1,7 @@
 #include <ydb/core/tablet_flat/test/libs/table/test_part.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_writer.h>
 #include <ydb/core/tablet_flat/test/libs/table/test_envs.h>
+#include <ydb/core/tablet_flat/test/libs/table/cache_fixture.h>
 #include <ydb/core/tablet_flat/test/libs/rows/cook.h>
 #include <ydb/core/tablet_flat/test/libs/rows/layout.h>
 
@@ -167,7 +168,7 @@ namespace {
 
 } // anonymous
 
-Y_UNIT_TEST_SUITE(TDeltaScanTest) {
+Y_UNIT_TEST_SUITE_F(TDeltaScanTest, NTest::TTableCacheTest) {
 
     Y_UNIT_TEST(ChangedKeysOnly) {
         auto lay = MakeLayout();

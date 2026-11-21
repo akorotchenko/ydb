@@ -16,6 +16,7 @@
 #include <ydb/core/base/counters.h>
 #include <ydb/core/util/pb.h>
 #include <ydb/library/actors/core/monotonic_provider.h>
+#include <ydb/library/actors/core/actorsystem.h>
 
 
 namespace NKikimr {
@@ -30,8 +31,8 @@ NBoot::TLoadBlobs::TLoadBlobs(IStep *owner, NPageCollection::TLargeGlobId largeG
     Logic->LoadEntry(this);
 }
 
-TExecutorBootLogic::TExecutorBootLogic(IOps *ops, IExecutorPageCache& pageCache, const TActorId &self,
-    ui64 bootAttempt, TTabletStorageInfo *info, ui64 maxBytesInFly)
+TExecutorBootLogic::TExecutorBootLogic(IOps* ops, IExecutorPageCache& pageCache, const TActorId& self, ui64 bootAttempt,
+    TTabletStorageInfo* info, ui64 maxBytesInFly)
     : Ops(ops)
     , PageCache(pageCache)
     , SelfId(self)
@@ -46,12 +47,12 @@ TExecutorBootLogic::TExecutorBootLogic(IOps *ops, IExecutorPageCache& pageCache,
 
 TExecutorBootLogic::~TExecutorBootLogic()
 {
-    PageCacheWaiter.Drop();
     CancelMetadataLoads();
     LoadBlobQueue.Clear();
 
     Loads.clear();
     EntriesToLoad.clear();
+    PageCacheWaiter.Drop();
 
     Steps->Execute(); /* should flush all jobs in internal queue */
 
@@ -175,12 +176,12 @@ void TExecutorBootLogic::PrepareEnv(bool follower, ui32 gen, TExecutorCaches cac
 }
 
 void TExecutorBootLogic::WaitForPageCache(NBoot::TStages* step) {
+    if (Cancelled) {
+        return;
+    }
     auto request = PageCache.Protocol().MakeReadyRequest();
     if (!request) {
         step->HandlePageCacheReady();
-        return;
-    }
-    if (MetadataCancelled) {
         return;
     }
     Y_ENSURE(!PageCacheWaiter, "Page-cache readiness is already pending");
@@ -209,9 +210,8 @@ void TExecutorBootLogic::LoadEntry(TIntrusivePtr<NBoot::TLoadBlobs> entry) {
 }
 
 bool TExecutorBootLogic::LoadMetadata(NBoot::IStep* step, ui32 slot, const NPageCollection::TLargeGlobId& descriptor,
-    const void* request, THolder<NActors::IEventBase> event)
-{
-    if (MetadataCancelled) {
+    const void* request, THolder<NActors::IEventBase> event) {
+    if (Cancelled) {
         return false;
     }
     Y_ENSURE(MetadataLoads.emplace(request, TMetadataLoad{ TIntrusivePtr<NBoot::IStep>(step), slot }).second);
@@ -224,13 +224,12 @@ bool TExecutorBootLogic::LoadMetadata(NBoot::IStep* step, ui32 slot, const NPage
     return true;
 }
 
-void TExecutorBootLogic::UpdateMetadata(THolder<NActors::IEventBase> event)
-{
+void TExecutorBootLogic::UpdateMetadata(THolder<NActors::IEventBase> event) {
     Ops->Send(NSharedCache::MakeSharedPageCacheId(), event.Release());
 }
 
 void TExecutorBootLogic::CancelMetadataLoads() noexcept {
-    MetadataCancelled = true;
+    Cancelled = true;
     decltype(MetadataLoads) loads;
     loads.swap(MetadataLoads);
     for (const auto& [_, load] : loads) {
@@ -239,17 +238,16 @@ void TExecutorBootLogic::CancelMetadataLoads() noexcept {
 }
 
 NBoot::TSpawned TExecutorBootLogic::LoadPages(
-    NBoot::IStep *step, NTable::TLoader& loader, NTable::TLoader::TFetch&& fetch) {
+    NBoot::IStep* step, NTable::TLoader& loader, NTable::TLoader::TFetch&& fetch) {
     auto success = Loads.insert(std::make_pair(fetch.PageCollection.Get(), step)).second;
 
     Y_ENSURE(success, "IPageCollection queued twice for loading");
 
     SeenBlob(fetch.PageCollection->Label());
 
-    Ops->Send(
-        NSharedCache::MakeSharedPageCacheId(),
-        loader.MakeRequest(NBlockIO::EPriority::Fast, std::move(fetch), BootAttempt).Release(),
-        0, (ui64)ERequestTypeCookie::BootLogic);
+    Ops->Send(NSharedCache::MakeSharedPageCacheId(),
+        loader.MakeRequest(NBlockIO::EPriority::Fast, std::move(fetch), BootAttempt).Release(), 0,
+        ui64(ERequestTypeCookie::BootLogic));
 
     return NBoot::TSpawned(true);
 }
@@ -332,32 +330,35 @@ void TExecutorBootLogic::SeenBlob(const TLogoBlobID& id) {
 
 TExecutorBootLogic::EOpResult TExecutorBootLogic::Receive(::NActors::IEventHandle &ev)
 {
-    if (PageCache.Protocol().EventKind(ev.GetTypeRewrite()) == EPageCacheEvent::Ready) {
-        if (MetadataCancelled || ev.Cookie != BootAttempt || !PageCacheWaiter) {
+    const auto& protocol = PageCache.Protocol();
+    const auto eventKind = protocol.EventKind(ev.GetTypeRewrite());
+    if (eventKind == EPageCacheEvent::Ready) {
+        if (Cancelled || !ev.HasEvent() || ev.Cookie != BootAttempt || !PageCacheWaiter) {
             return OpResultUnhandled;
         }
         PageCacheWaiter.Get()->HandlePageCacheReady();
         PageCacheWaiter.Drop();
         Steps->Execute();
-    } else if (auto *msg = ev.CastAsLocal<TEvBlobStorage::TEvGetResult>()) {
-        if (!LoadBlobQueue.ProcessResult(msg))
+    } else if (auto* msg = ev.CastAsLocal<TEvBlobStorage::TEvGetResult>()) {
+        if (!LoadBlobQueue.ProcessResult(msg)) {
             return OpResultBroken;
+        }
 
-    } else if (TPageCacheMetadataResult metadata; PageCache.Protocol().ReadMetadataResult(ev, metadata)) {
-        if (MetadataCancelled || ev.Cookie != BootAttempt) {
+    } else if (TPageCacheMetadataResult metadata; ev.HasEvent() && protocol.ReadMetadataResult(ev, metadata)) {
+        if (Cancelled || ev.Cookie != BootAttempt) {
             return OpResultUnhandled;
         }
-        const auto it = MetadataLoads.find(metadata.Request);
+        auto it = MetadataLoads.find(metadata.Request);
         if (it == MetadataLoads.end()) {
             return OpResultUnhandled;
         }
         auto load = std::move(it->second);
         MetadataLoads.erase(it);
+        if (metadata.Status == NKikimrProto::NODATA) {
+            GetServiceCounters(AppData()->Counters, "tablets")->GetCounter("alerts_boot_nodata", true)->Inc();
+        }
         try {
             if (load.Step->HandleMetadata(load.Slot, metadata, *ev.GetBase()) == NTable::EMetadataLoadResult::Error) {
-                if (metadata.Status == NKikimrProto::NODATA) {
-                    GetServiceCounters(AppData()->Counters, "tablets")->GetCounter("alerts_boot_nodata", true)->Inc();
-                }
                 load.Step->CancelMetadata();
                 CancelMetadataLoads();
                 return OpResultBroken;
@@ -369,14 +370,16 @@ TExecutorBootLogic::EOpResult TExecutorBootLogic::Receive(::NActors::IEventHandl
         }
         load.Step.Drop();
         Steps->Execute();
-    } else if (PageCache.Protocol().EventKind(ev.GetTypeRewrite()) == EPageCacheEvent::Result) {
-        if (ERequestTypeCookie(ev.Cookie) != ERequestTypeCookie::BootLogic)
+    } else if (eventKind == EPageCacheEvent::Result && ev.HasEvent()) {
+        if (ERequestTypeCookie(ev.Cookie) != ERequestTypeCookie::BootLogic) {
             return OpResultUnhandled;
+        }
 
         auto& event = *ev.GetBase();
-        const auto msg = PageCache.Protocol().ReadResult(event);
-        if (msg.Cookie != BootAttempt)
+        const auto msg = protocol.ReadResult(event);
+        if (msg.Cookie != BootAttempt) {
             return OpResultUnhandled;
+        }
 
         auto it = Loads.find(msg.PageCollection);
         if (it == Loads.end()) // could receive outdated results
@@ -390,8 +393,9 @@ TExecutorBootLogic::EOpResult TExecutorBootLogic::Receive(::NActors::IEventHandl
             GetServiceCounters(AppData()->Counters, "tablets")->GetCounter("alerts_boot_nodata", true)->Inc();
         }
 
-        if (!step->HandleBio(msg, event))
+        if (!step->HandleBio(msg, event)) {
             return OpResultBroken;
+        }
 
         step.Drop();
         Steps->Execute();

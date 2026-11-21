@@ -254,7 +254,7 @@ void TExecutorBorrowLogic::BorrowBundle(
 
 void TExecutorBorrowLogic::LoanBundle(
     const TLogoBlobID &bundleId,
-    TPageCollectionTxEnv::TLoanBundle &loaned,
+    TTransactionEnv::TLoanBundle &loaned,
     TLogCommit *commit)
 {
     auto storedInfoItPair = BorrowedInfo.insert(std::make_pair(bundleId, TBorrowedPartInfo()));
@@ -273,7 +273,7 @@ void TExecutorBorrowLogic::LoanBundle(
 
 void TExecutorBorrowLogic::LoanTxStatus(
     const TLogoBlobID &bundleId,
-    TPageCollectionTxEnv::TLoanTxStatus &loaned,
+    TTransactionEnv::TLoanTxStatus &loaned,
     TLogCommit *commit)
 {
     auto storedInfoItPair = BorrowedInfo.insert(std::make_pair(bundleId, TBorrowedPartInfo()));
@@ -358,7 +358,7 @@ bool TExecutorBorrowLogic::SetGcBarrier(ui32 step) {
 
 void TExecutorBorrowLogic::UpdateBorrow(
     const TLogoBlobID &metaInfoId,
-    TPageCollectionTxEnv::TBorrowUpdate &borrowUpdate,
+    TTransactionEnv::TBorrowUpdate &borrowUpdate,
     TLogCommit *commit)
 {
     auto storedInfoIt = BorrowedInfo.find(metaInfoId);

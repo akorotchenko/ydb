@@ -894,12 +894,15 @@ Y_UNIT_TEST_SUITE(TObjectStorageListingTest) {
         ui16 port = pm.GetPort(2134);
         TServerSettings settings = MakeObjectStorageServerSettings(port);
         settings.NodeCount = 1;
+        settings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(32_MB);
+        settings.SetEnableLockFreePageCache(true);
+        settings.SharedCacheExpectedPageSize = 300;
         TServer cleverServer = TServer(settings);
         GRPC_PORT = pm.GetPort(2135);
         cleverServer.EnableGRpc(GRPC_PORT);
 
-        // Disable shared cache to trigger restarts
-        cleverServer.GetRuntime()->Send(NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0));
+        // Disable shared-cache retention to trigger restarts, while keeping demand capacity.
+        cleverServer.GetRuntime()->Send(NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 32_MB));
 
         TFlatMsgBusClient annoyingClient(port);
 
@@ -958,6 +961,9 @@ Y_UNIT_TEST_SUITE(TObjectStorageListingTest) {
         TPortManager pm;
         ui16 port = pm.GetPort(2134);
         TServerSettings serverSettings = MakeObjectStorageServerSettings(port);
+        serverSettings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(32_MB);
+        serverSettings.SetEnableLockFreePageCache(true);
+        serverSettings.SharedCacheExpectedPageSize = 300;
 
         TStringStream ss;
         serverSettings.SetLogBackend(new TStreamWithContextLogBackend(&ss));
@@ -966,8 +972,8 @@ Y_UNIT_TEST_SUITE(TObjectStorageListingTest) {
         GRPC_PORT = pm.GetPort(2135);
         cleverServer.EnableGRpc(GRPC_PORT);
 
-        // Disable shared cache to trigger restarts
-        cleverServer.GetRuntime()->Send(NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0));
+        // Disable shared-cache retention to trigger restarts, while keeping demand capacity.
+        cleverServer.GetRuntime()->Send(NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 32_MB));
 
         TFlatMsgBusClient annoyingClient(port);
         PrepareS3Data(cleverServer.GetRuntime(), annoyingClient);

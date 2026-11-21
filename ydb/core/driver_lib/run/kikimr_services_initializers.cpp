@@ -172,6 +172,8 @@
 #include <ydb/core/tablet/tablet_list_renderer.h>
 #include <ydb/core/tablet/tablet_monitoring_proxy.h>
 #include <ydb/core/tablet_flat/tablet_flat_executed.h>
+#include <ydb/core/tablet_flat/cache_thread.h>
+#include <ydb/core/tablet_flat/shared_sausagecache.h>
 
 #include <ydb/core/tracing/tablet_info.h>
 
@@ -1514,9 +1516,14 @@ TSharedCacheInitializer::TSharedCacheInitializer(const TKikimrRunConfig& runConf
 void TSharedCacheInitializer::InitializeServices(
         NActors::TActorSystemSetup* setup,
         const NKikimr::TAppData* appData) {
+    const bool useLockFreePageCache = appData->UseLockFreePageCache();
+    if (useLockFreePageCache) {
+        setup->RegisterSubSystem(std::make_unique<NSharedCache::TCacheThreadSubSystem>());
+    }
     const auto config = NSharedCache::ResolveSharedCacheConfig(Config);
 
-    auto* actor = NSharedCache::CreateSharedPageCache(config, appData->Counters);
+    auto* actor = useLockFreePageCache ? NSharedCache::CreateSharedPageCache(config, appData->Counters)
+                                       : NSharedCache::NLegacy::CreateSharedPageCache(config, appData->Counters);
     setup->LocalServices.emplace_back(NSharedCache::MakeSharedPageCacheId(0),
         TActorSetupCmd(actor, TMailboxType::ReadAsFilled, appData->UserPoolId));
 }

@@ -1,10 +1,12 @@
 #include <ydb/core/tx/datashard/read_iterator_sampling.h>
 #include <ydb/core/tx/datashard/datashard_ut_common_kqp.h>
 #include <ydb/core/base/blobstorage.h>
+#include <ydb/core/base/memory_controller_iface.h>
 #include <ydb/core/tx/datashard/ut_common/datashard_ut_common.h>
 
 #include <ydb/core/tablet_flat/flat_page_iface.h>
-#include <ydb/core/tablet_flat/shared_cache_events.h>
+#include <ydb/core/tablet_flat/shared_cache_events_lf.h>
+#include <ydb/core/tablet_flat/shared_sausagecache.h>
 #include <ydb/core/testlib/actors/block_events.h>
 
 #include <library/cpp/testing/unittest/registar.h>
@@ -42,6 +44,7 @@ struct TSamplingOptions {
 
 struct TSamplingTestHelper {
     Tests::TServer::TPtr Server;
+    TTestActorRuntime::TEventObserverHolder CacheAllocation;
     TActorId Sender;
     TTableId TableId;
     TVector<ui64> TabletIds;
@@ -55,10 +58,21 @@ struct TSamplingTestHelper {
         TServerSettings serverSettings(pm.GetPort(2134));
         serverSettings.SetDomainName("Root").SetUseRealThreads(false);
         if (options.ColdCache) {
-            serverSettings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(0);
+            serverSettings.SetEnableLockFreePageCache(true);
+            serverSettings.AppConfig->MutableSharedCacheConfig()->SetMemoryLimit(32_MB);
         }
         Server = new TServer(serverSettings);
         auto& runtime = *Server->GetRuntime();
+        if (options.ColdCache) {
+            // Disable retention while keeping capacity for pages in use
+            CacheAllocation = runtime.AddObserver<NMemory::TEvConsumerLimit>([](const auto& ev) {
+                if (ev->Get()->MaxLimitBytes) {
+                    ev->Get()->LimitBytes = 0;
+                }
+            });
+            runtime.Send(new IEventHandle(
+                NSharedCache::MakeSharedPageCacheId(), TActorId{}, new NMemory::TEvConsumerLimit(0, 32_MB)));
+        }
         Sender = runtime.AllocateEdgeActor();
         runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_ERROR);
         runtime.GetAppData().FeatureFlags.SetEnableLocalDBBtreeIndex(options.BTreeIndex);
