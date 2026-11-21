@@ -1,6 +1,7 @@
 LIBRARY()
 
 SRCS(
+    cache_thread.cpp
     cache_accounting.cpp
     defs.cpp
     defs.h
@@ -103,6 +104,20 @@ SRCS(
     tablet_flat_executed.h
     tablet_flat_executed.cpp
 )
+
+IF (OS_LINUX OR OS_FREEBSD)
+    SRCS(
+        cache_mapping_memfd.cpp
+    )
+ELSEIF (OS_WINDOWS)
+    SRCS(
+        cache_mapping_win.cpp
+    )
+ELSE()
+    SRCS(
+        cache_mapping_reserved.cpp
+    )
+ENDIF()
 
 GENERATE_ENUM_SERIALIZATION(flat_comp_gen.h)
 GENERATE_ENUM_SERIALIZATION(flat_executor_compaction_logic.h)
