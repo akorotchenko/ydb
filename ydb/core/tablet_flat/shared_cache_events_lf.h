@@ -1,0 +1,469 @@
+#pragma once
+
+#include "defs.h"
+#include "flat_bio_events.h"
+#include "flat_transaction_pages.h"
+#include "cache.h"
+#include "cache_item.h"
+#include "shared_cache_event_format.h"
+#include <ydb/core/protos/shared_cache.pb.h>
+
+#include <util/generic/ptr.h>
+#include <util/generic/map.h>
+#include <util/generic/set.h>
+#include <util/generic/hash.h>
+#include <util/generic/hash_set.h>
+
+namespace NKikimr::NSharedCache {
+    using EPriority = NTabletFlatExecutor::NBlockIO::EPriority;
+    using TPageId = NTable::NPage::TPageId;
+    using TPageOffset = NTable::NPage::TPageOffset;
+    using TPageLocation = NTable::NPage::TPageLocation;
+    using EPage = NTable::NPage::EPage;
+
+    enum class EWakeupTag {
+        DoGCScheduled = 1,
+        DoGCManual = 2,
+        DoLimitMaintenance = 3,
+        ContinueBTreeWalk = 4,
+    };
+
+    enum EEv {
+        EvBegin = EventSpaceBegin(TKikimrEvents::ES_FLAT_EXECUTOR),
+
+        EvTouch = EvBegin + 512,
+        EvUnregister,
+        EvDetach,
+        EvAttach,
+        EvAttached,
+        EvSaveCompactedPages,
+        EvRequest,
+        EvResult,
+        EvInFlightReleased,
+        EvRequestAnswered,
+        EvKeepPageEvicted,
+        EvResourcesAvailable,
+        EvCollectionReleased,
+        EvCollectionBytesChanged,
+        EvCacheReadyRequest,
+        EvCacheReady,
+        EvCollectionReady,
+        EvCollectionRawReady,
+        EvCollectionParse,
+        EvCollectionData,
+        EvCollectionRequest,
+        EvCollectionRequestUpdate,
+        EvCollectionResult,
+
+        EvEnd
+
+        /* +1024 range is reserved for scan events */
+    };
+
+    using ERequestTypeCookie = NTabletFlatExecutor::ERequestTypeCookie;
+
+    static_assert(EvEnd < EventSpaceEnd(TKikimrEvents::ES_FLAT_EXECUTOR), "");
+
+    struct TEvUnregister : public TEventLocal<TEvUnregister, EvUnregister> {};
+
+    struct TEvCacheReadyRequest : public TEventLocal<TEvCacheReadyRequest, EvCacheReadyRequest> {};
+
+    struct TEvCacheReady : public TEventLocal<TEvCacheReady, EvCacheReady> {};
+
+    struct TEvDetach : public TEventLocal<TEvDetach, EvDetach> {
+        const TLogoBlobID PageCollectionId;
+
+        TEvDetach(const TLogoBlobID& pageCollectionId)
+            : PageCollectionId(pageCollectionId)
+        {}
+    };
+
+    // notifies Shared Cache about Private Cache owned shared bodies
+    // so it can send back dropped pages
+    struct TEvSync : public TEventLocal<TEvSync, EvTouch> {
+        THashMap<TLogoBlobID, THashSet<TPageOffset>> Pages;
+
+        TEvSync(THashMap<TLogoBlobID, THashSet<TPageOffset>>&& pages)
+            : Pages(std::move(pages))
+        {}
+    };
+
+    struct TEvAttach : public TEventLocal<TEvAttach, EvAttach> {
+        using TBtreeSeed = NPageCollection::TBtreeSeed;
+
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
+        ECacheMode CacheMode;
+        TIntrusivePtr<TCollectionOwnerStats> OwnerStats;
+        // Authoritative for the sender: an empty vector withdraws that owner's walks.
+        TVector<TBtreeSeed> BtreeSeeds;
+        // Revisit unchanged sticky seeds after the owner's private cache is recreated.
+        bool ReplayStickyWalk = false;
+
+        // A nonzero event cookie requests TEvAttached; ordinary executor registration needs no reply.
+
+        // The cache walks the seeded B-trees itself.
+        TEvAttach(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, ECacheMode cacheMode,
+            TVector<TBtreeSeed> btreeSeeds, bool replayStickyWalk = false)
+            : PageCollection(std::move(pageCollection))
+            , CacheMode(cacheMode)
+            , BtreeSeeds(std::move(btreeSeeds))
+            , ReplayStickyWalk(replayStickyWalk)
+        {}
+
+        TEvAttach(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, ECacheMode cacheMode)
+            : PageCollection(std::move(pageCollection))
+            , CacheMode(cacheMode)
+        {}
+    };
+
+    struct TEvAttached : public TEventLocal<TEvAttached, EvAttached> {
+        TLogoBlobID PageCollectionId;
+        TCollectionCacheItem CacheItem;
+
+        TEvAttached(const TLogoBlobID& pageCollectionId, TCollectionCacheItem cacheItem)
+            : PageCollectionId(pageCollectionId)
+            , CacheItem(cacheItem)
+        {}
+    };
+
+    // Note: compacted pages do not have an owner yet
+    // at first they should be accepted by an executor
+    // and it will send TEvAttach itself when it have happened
+    struct TEvSaveCompactedPages : public TEventLocal<TEvSaveCompactedPages, EvSaveCompactedPages> {
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
+        TVector<TPageLocation> Pages;
+        TCollectionCacheItem CacheItem;
+
+        TCachePageRef AddPage(
+            TCacheOperationView<TProdTraits>& cacheOp, NPageCollection::TPageData&& page, bool sticky);
+
+        Y_FORCE_INLINE TCachePageRef AddWrittenPage(
+            TCacheOperationView<TProdTraits>& cacheOp, NPageCollection::TPageData&& page, bool sticky) {
+            Pages.push_back(page.Location);
+            return cacheOp.AdmitWrittenPage(CacheItem, page.Location, std::move(page.Data), sticky);
+        }
+
+        // Prepare the collection before starting its page batch
+        void AddWrittenBatch(TCache::TOpBatch& batch, TArrayRef<NPageCollection::TPageData> pages, bool sticky);
+
+        void PrepareCollection(TCache& cache) {
+            EnsureCollection(cache);
+        }
+
+        const TCacheCollectionRef& Collection() const noexcept {
+            return Collection_;
+        }
+
+        TEvSaveCompactedPages(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection)
+            : PageCollection(std::move(pageCollection))
+        {}
+
+        explicit TEvSaveCompactedPages(TCacheCollectionRef collection)
+            : PageCollection(collection->PageCollection())
+            , CacheItem(collection.CacheItem())
+            , Collection_(std::move(collection))
+        {}
+
+    private:
+        TCacheCollectionRef Collection_;
+
+        void EnsureCollection(TCache& cache);
+    };
+
+    struct TEvRequest : public TEventLocal<TEvRequest, EvRequest> {
+        TEvRequest(EPriority priority, TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection,
+            TVector<TPageLocation> pages, ui64 cookie = 0)
+            : Priority(priority)
+            , PageCollection(std::move(pageCollection))
+            , Pages(std::move(pages))
+            , Cookie(cookie)
+        {}
+
+        const EPriority Priority;
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
+        TVector<TPageLocation> Pages;
+        TVector<bool> Sticky; // Optional per-page admission hints supplied by the requester.
+        bool ReadAhead = false;
+        TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad;
+        NWilson::TTraceId TraceId;
+        const ui64 Cookie;
+    };
+
+    struct TEvResult : public TEventLocal<TEvResult, EvResult> {
+        using EStatus = NKikimrProto::EReplyStatus;
+
+        TEvResult(TIntrusiveConstPtr<NPageCollection::IPageCollection> pageCollection, EStatus status, ui64 cookie,
+            ui64 executorGeneration = 0, ui64 requestId = 0, bool coreRoute = false)
+            : Status(status)
+            , PageCollection(std::move(pageCollection))
+            , Cookie(cookie)
+            , ExecutorGeneration(executorGeneration)
+            , RequestId(requestId)
+            , CoreRoute(coreRoute)
+        {}
+
+        void Describe(IOutputStream& out) const {
+            out << "TEvResult{" << Pages.size() << " pages"
+                << " " << PageCollection->Label() << " " << (Status == NKikimrProto::OK ? "ok" : "fail") << " "
+                << NKikimrProto::EReplyStatus_Name(Status) << "}";
+        }
+
+        ui64 Bytes() const;
+
+        struct TLoaded {
+            TLoaded(NTable::NPage::TPageOffset offset, size_t size, TCachePageRef page)
+                : Offset(offset)
+                , Size(size)
+                , Page(std::move(page))
+            {}
+
+            NTable::NPage::TPageOffset Offset;
+            size_t Size;
+            TCachePageRef Page;
+        };
+
+        bool ResourcePressure = false;
+        bool ResourcesReady = false;
+        bool WorkingSetTooLarge = false;
+
+        const EStatus Status;
+        const TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
+        TVector<TLoaded> Pages;
+        TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad;
+        const ui64 Cookie;
+        const ui64 ExecutorGeneration;
+        const ui64 RequestId;
+        const bool CoreRoute;
+    };
+
+    struct TRequestCompletionParams {
+        NActors::TActorSystem* ActorSystem = nullptr;
+        TActorId ReplyTo;
+        ui64 EventCookie = 0;
+        ui64 ExecutorGeneration = 0;
+        ui64 RequestId = 0;
+        TCacheCollectionRef Collection;
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection;
+        NKikimrProto::EReplyStatus Status = NKikimrProto::OK;
+        TVector<TPageLocation> Pages;
+        TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad;
+        ui64 Cookie = 0;
+        NActors::TActorId Notify;
+        bool CoreRoute = false;
+        ui64 CompletionId = 0;
+    };
+
+    class TRequestCompletion final : public TThrRefBase {
+    public:
+        enum class EReplyMode {
+            AfterPages,
+            Now,
+        };
+
+        // Exposed for generated enum serialization; transitions remain private
+        enum class EAction {
+            Finish,
+            Fail,
+            Cancel,
+            Postpone,
+        };
+
+        explicit TRequestCompletion(TRequestCompletionParams&& params) noexcept;
+        ~TRequestCompletion() override;
+
+        // Cache actor only; bind once before publishing any page waiter
+        bool BindCollection(TCacheCollectionRef collection) noexcept;
+        void Complete(ui32 index, TCachePageRef page, EPageFetchCompletion completion) noexcept;
+        void Fail() noexcept;
+        void Cancel(EReplyMode replyMode = EReplyMode::AfterPages) noexcept;
+        void PostponeForResources() noexcept;
+        void NotifyResourcesReady() noexcept;
+        void NotifyWorkingSetTooLarge() noexcept;
+
+        bool IsActive() const noexcept {
+            const ui64 control = Control_.load(std::memory_order_acquire);
+            return Status(control) == NKikimrProto::OK && !(control & ReplyClaimedMask);
+        }
+
+        bool IsCancelled() const noexcept {
+            return Status(Control_.load(std::memory_order_acquire)) == NKikimrProto::RACE;
+        }
+
+        bool HasFailed() const noexcept {
+            return Status(Control_.load(std::memory_order_acquire)) == NKikimrProto::ERROR;
+        }
+
+        const TIntrusivePtr<NPageCollection::TPagesWaitPad>& WaitPad() const noexcept {
+            return WaitPad_;
+        }
+
+        const TVector<TPageLocation>& Locations() const noexcept {
+            return Locations_;
+        }
+
+        ui64 CompletionId() const noexcept {
+            return CompletionId_;
+        }
+
+        const TIntrusiveConstPtr<NPageCollection::IPageCollection>& PageCollection() const noexcept {
+            return PageCollection_;
+        }
+
+        const TCacheCollectionRef& Collection() const noexcept {
+            return Collection_;
+        }
+
+    private:
+        friend struct TRequestCompletionTestAccess;
+
+        struct TAction {
+            ui64 Reply = 0;
+            bool ReleasePages = false;
+        };
+
+        // Low 32 bits hold status; the first stop or successful reply fixes status and pressure
+        static constexpr ui64 StatusMask = Max<ui32>();
+        static constexpr ui64 ResourcePressureMask = ui64{ 1 } << 32;
+        static constexpr ui64 ReplyClaimedMask = ui64{ 1 } << 33;
+        // Index zero cannot own a page; zero itself remains the unpublished slot value
+        static constexpr ui64 ClosedPageSlot = TCacheItem::Make(1, 0).Raw();
+        static_assert(sizeof(TCachePageRef) == sizeof(std::atomic<ui64>));
+
+        static TEvResult::EStatus Status(ui64 control) noexcept {
+            return static_cast<TEvResult::EStatus>(control & StatusMask);
+        }
+
+        bool PublishPage(ui32 index, TCachePageRef& page) noexcept;
+        TAction Update(EAction action, EReplyMode replyMode) noexcept;
+        TAction FinishPage(TAction action) noexcept;
+        void Apply(TAction action) noexcept;
+        void ReleasePages() noexcept;
+        THolder<TEvResult> TakeResult(ui64 reply) noexcept;
+        void SendResult(THolder<TEvResult> result) noexcept;
+
+    private:
+        NActors::TActorSystem* const ActorSystem_;
+        const TActorId ReplyTo_;
+        const ui64 EventCookie_;
+        const ui64 ExecutorGeneration_;
+        const ui64 RequestId_;
+        // A failure callback can reply without the cache TLS context
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> PageCollection_;
+        TCacheCollectionRef Collection_;
+        TVector<TPageLocation> Locations_;
+        // Slots own owned page words until taken or permanently closed; callbacks keep the array alive
+        TArrayHolder<std::atomic<ui64>> ReadyPages_;
+        TIntrusivePtr<NPageCollection::TPagesWaitPad> WaitPad_;
+        const ui64 Cookie_;
+        const NActors::TActorId Notify_;
+        const bool CoreRoute_;
+        const ui64 CompletionId_;
+        std::atomic<ui64> Control_;
+        std::atomic<ui32> RemainingPages_;
+    };
+
+    struct TEvResourcesAvailable : public TEventLocal<TEvResourcesAvailable, EvResourcesAvailable> {};
+
+    struct TEvCollectionReady : public TEventLocal<TEvCollectionReady, EvCollectionReady> {
+        const TLogoBlobID CollectionId;
+        const TCollectionCacheItem CacheItem;
+
+        TEvCollectionReady(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem) noexcept
+            : CollectionId(collectionId)
+            , CacheItem(cacheItem)
+        {}
+    };
+
+    struct TEvRequestAnswered : public TEventLocal<TEvRequestAnswered, EvRequestAnswered> {
+        explicit TEvRequestAnswered(ui64 status, ui64 completionId = 0) noexcept
+            : Status(status)
+            , CompletionId(completionId)
+        {}
+
+        const ui64 Status;
+        const ui64 CompletionId;
+    };
+
+    struct TEvCollectionBytesChanged : public TEventLocal<TEvCollectionBytesChanged, EvCollectionBytesChanged> {
+        TLogoBlobID CollectionId;
+        TCollectionCacheItem CacheItem;
+
+        TEvCollectionBytesChanged(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem)
+            : CollectionId(collectionId)
+            , CacheItem(cacheItem)
+        {}
+    };
+
+    // Page items drained, or the collection metadata was reclaimed; recheck this generation.
+    struct TEvCollectionReleased : public TEventLocal<TEvCollectionReleased, EvCollectionReleased> {
+        TLogoBlobID CollectionId;
+        TCollectionCacheItem CacheItem;
+
+        TEvCollectionReleased(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem)
+            : CollectionId(collectionId)
+            , CacheItem(cacheItem)
+        {}
+    };
+
+    struct TEvKeepPageEvicted : public TEventLocal<TEvKeepPageEvicted, EvKeepPageEvicted> {
+        TEvKeepPageEvicted(const TLogoBlobID& collectionId, TCollectionCacheItem cacheItem, ui64 generation,
+            NTable::NPage::TPageLocation location)
+            : CollectionId(collectionId)
+            , CacheItem(cacheItem)
+            , Generation(generation)
+            , Location(std::move(location))
+        {}
+
+        const TLogoBlobID CollectionId;
+        const TCollectionCacheItem CacheItem;
+        const ui64 Generation;
+        const NTable::NPage::TPageLocation Location;
+    };
+
+    struct TEvInFlightReleased : public TEventLocal<TEvInFlightReleased, EvInFlightReleased> {
+        TEvInFlightReleased(ui64 cookie, ui64 bytes, ui32 pages) noexcept
+            : Cookie(cookie)
+            , Bytes(bytes)
+            , Pages(pages)
+        {}
+
+        const ui64 Cookie; // queue type
+        const ui64 Bytes; // fetch cookie, the requested size
+        const ui32 Pages;
+    };
+
+    class TRequestPageWaiter final : public TPageFetchWaiter {
+    public:
+        Y_FORCE_INLINE TRequestPageWaiter(TIntrusivePtr<TRequestCompletion> completion, ui32 index) noexcept
+            : Completion_(std::move(completion))
+            , Index_(index)
+        {
+            Y_DEBUG_ABORT_UNLESS(Completion_);
+        }
+
+        Y_FORCE_INLINE bool IsActive() const noexcept override {
+            return Completion_->IsActive();
+        }
+
+        const TRequestCompletion& GetCompletion() const noexcept {
+            return *Completion_;
+        }
+
+        void Complete(TSpaceOperation* spaceOp, TPageCacheItem page, EPageFetchCompletion completion) noexcept override;
+
+    private:
+        TIntrusivePtr<TRequestCompletion> Completion_;
+        const ui32 Index_;
+    };
+
+    // Inline implementations
+
+    inline ui64 TEvResult::Bytes() const {
+        return std::accumulate(Pages.begin(), Pages.end(), ui64(0),
+            [](ui64 bytes, const TLoaded& loaded)
+            {
+                return bytes + loaded.Size;
+            });
+    }
+
+} // namespace NKikimr::NSharedCache
