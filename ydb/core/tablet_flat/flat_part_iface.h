@@ -10,6 +10,7 @@
 
 #include <util/generic/string.h>
 #include <util/system/types.h>
+#include <new>
 
 namespace NKikimr {
 namespace NTable {
@@ -56,6 +57,38 @@ namespace NTable {
 
         virtual ~IPages() = default;
 
+        class TReadScope {
+        public:
+            TReadScope(const TReadScope&) = delete;
+            TReadScope& operator=(const TReadScope&) = delete;
+
+            ~TReadScope() {
+                if (Env_) {
+                    Env_->DoEndOpBatch();
+                }
+            }
+
+        private:
+            friend struct IPages;
+
+            explicit TReadScope(IPages* env) noexcept
+                : Env_(env)
+            {}
+
+            IPages* Env_;
+        };
+
+        // Lexical scopes reuse the outer read operation and end before waiting for pages
+        [[nodiscard]] TReadScope BeginOpBatch() noexcept {
+            return TReadScope(DoBeginOpBatch() ? this : nullptr);
+        }
+
+        // Restart an active batch while its RAII scope keeps ownership of cleanup
+        void RestartOpBatch() noexcept {
+            DoEndOpBatch();
+            DoBeginOpBatch();
+        }
+
         struct TResult {
             explicit operator bool() const noexcept
             {
@@ -78,12 +111,12 @@ namespace NTable {
         virtual void ReleaseRowHistory() {}
 
         /**
-         * Returns a data page of the column group, or nullptr if it is not loaded yet
+         * Returns a data page of the column group, or an empty reference if it is not loaded yet
          */
         virtual const TSharedData* TryGetPage(const TPart* part, const TPageLocation& location, TGroupId groupId) = 0;
 
         /**
-         * Returns an index page (flat or b-tree) of the column group, or nullptr if it is not loaded yet
+         * Returns an index page (flat or b-tree) of the column group, or an empty reference if it is not loaded yet
          *
          * Index pages may be stored in another page collection than data pages of the same group,
          * so the page collection is chosen by the part (TPart::IndexSlot) rather than the caller
@@ -96,6 +129,13 @@ namespace NTable {
         virtual void OnRollbackChanges() {
             // nothing by default
         }
+
+    protected:
+        virtual bool DoBeginOpBatch() noexcept {
+            return false;
+        }
+
+        virtual void DoEndOpBatch() noexcept {}
     };
 
 }

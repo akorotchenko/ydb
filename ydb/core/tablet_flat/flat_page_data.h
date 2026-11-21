@@ -241,11 +241,16 @@ namespace NPage {
 
         TDataPage& Set(const TSharedData *raw = nullptr)
         {
+            return Parse(raw ? *raw : TSharedData());
+        }
+
+    private:
+        TDataPage& Parse(TSharedData raw) {
             Page = { };
 
             if (raw) {
-                const void* base = raw->data();
-                auto data = NPage::TLabelWrapper().Read(*raw, EPage::DataPage);
+                const void* base = raw.data();
+                auto data = NPage::TLabelWrapper().Read(raw, EPage::DataPage);
 
                 Y_ENSURE(data.Version == 1, "Unknown EPage::DataPage version");
 
@@ -268,7 +273,7 @@ namespace NPage {
                     base = Decoded.begin();
                     data.Page = { Decoded.begin() + labelSize, Decoded.end() };
                 } else {
-                    Decoded = *raw;
+                    Decoded = std::move(raw);
                 }
 
                 auto *recordsHeader = TDeref<TRecordsHeader>::At(data.Page.data(), 0);
@@ -287,6 +292,7 @@ namespace NPage {
             return *this;
         }
 
+    public:
         const TSharedData& GetData() const noexcept {
             return Decoded;
         }

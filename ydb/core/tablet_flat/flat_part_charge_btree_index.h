@@ -45,7 +45,7 @@ class TChargeBTreeIndex : public ICharge {
     struct TNodeState : TChildState, TBtreeIndexNode {
         TNodeState(TSharedData data, TChildState child, bool v2Format)
             : TChildState(std::move(child))
-            , TBtreeIndexNode(data, v2Format)
+            , TBtreeIndexNode(std::move(data), v2Format)
         {
         }
     };
@@ -71,6 +71,7 @@ public:
 public:
     TResult Do(TCells key1, TCells key2, TRowId beginRowId, TRowId endRowId,
             const TKeyCellDefaults &keyDefaults, ui64 itemsLimit, ui64 bytesLimit) const override {
+        auto readScope = Env->BeginOpBatch();
         endRowId++; // current interface accepts inclusive row2 bound
 
         bool ready = true, overshot = true, hasValidRowsRange = Groups || IncludeHistory;
@@ -173,9 +174,9 @@ public:
 
             if (hasValidRowsRange && (child.Ref == key1Ref || child.Ref == key2Ref)) {
                 auto location = NTable::ResolvePageLocation(Part, child.Ref, groupId);
-                const auto page = TryGetDataPage(location, groupId);
+                auto page = TryGetDataPage(location, groupId);
                 if (page) {
-                    auto data = NPage::TDataPage(page);
+                    auto data = NPage::TDataPage(std::move(page));
                     if (child.Ref == key1Ref) {
                         TRowId key1RowId = data.BaseRow() + data.LookupKey(key1, Scheme.Groups[0], ESeek::Lower, &keyDefaults).Off();
                         beginRowId = Max(beginRowId, key1RowId);
@@ -242,6 +243,7 @@ public:
 
     TResult DoReverse(TCells key1, TCells key2, TRowId endRowId, TRowId beginRowId,
             const TKeyCellDefaults &keyDefaults, ui64 itemsLimit, ui64 bytesLimit) const override {
+        auto readScope = Env->BeginOpBatch();
         endRowId++; // current interface accepts inclusive row1 bound
 
         bool ready = true, overshot = true, hasValidRowsRange = Groups || IncludeHistory;
@@ -344,9 +346,9 @@ public:
 
             if (hasValidRowsRange && (child.Ref == key1Ref || child.Ref == key2Ref)) {
                 auto location = NTable::ResolvePageLocation(Part, child.Ref, groupId);
-                const auto page = TryGetDataPage(location, groupId);
+                auto page = TryGetDataPage(location, groupId);
                 if (page) {
-                    auto data = NPage::TDataPage(page);
+                    auto data = NPage::TDataPage(std::move(page));
                     if (child.Ref == key1Ref) {
                         auto iter = data.LookupKeyReverse(key1, Scheme.Groups[0], ESeek::Lower, &keyDefaults);
                         if (iter) {
@@ -695,9 +697,9 @@ private:
         const auto tryHandleDataPage = [&](const TChildState& child, bool /*isDataBelow*/ = false) -> bool {
             if (Groups && (child.Ref == key1Ref || child.Ref == key2Ref)) {
                 auto location = NTable::ResolvePageLocation(Part, child.Ref, groupId);
-                const auto page = TryGetDataPage(location, groupId);
+                auto page = TryGetDataPage(location, groupId);
                 if (page) {
-                    auto data = NPage::TDataPage(page);
+                    auto data = NPage::TDataPage(std::move(page));
                     if (child.Ref == key1Ref) {
                         TRowId key1RowId = data.BaseRow() + data.LookupKey(key1, scheme, ESeek::Lower, keyDefaults).Off();
                         beginRowId = Max(beginRowId, key1RowId);

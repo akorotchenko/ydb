@@ -1,0 +1,14 @@
+#pragma once
+
+#include "flat_page_iface.h"
+#include "flat_sausage_gut.h"
+#include "shared_cache_events_lf.h"
+#include "cache.h"
+
+namespace NKikimr::NTabletFlatExecutor {
+
+using namespace NSharedCache;
+
+using NSharedCache::TPageCollectionStats;
+
+} // namespace NKikimr::NTabletFlatExecutor

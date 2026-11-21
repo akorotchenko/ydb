@@ -46,6 +46,7 @@ namespace NTable {
         TResult Do(const TCells key1, const TCells key2, TRowId row1, TRowId row2,
                 const TKeyCellDefaults &keyDefaults, ui64 itemsLimit, ui64 bytesLimit) const override
         {
+            auto readScope = Env->BeginOpBatch();
             auto index = Index.TryLoadRaw();
             if (!index) {
                 return {
@@ -132,6 +133,7 @@ namespace NTable {
         TResult DoReverse(const TCells key1, const TCells key2, TRowId row1, TRowId row2,
                 const TKeyCellDefaults &keyDefaults, ui64 itemsLimit, ui64 bytesLimit) const override
         {
+            auto readScope = Env->BeginOpBatch();
             auto index = Index.TryLoadRaw();
             if (!index) {
                 return {
@@ -260,13 +262,18 @@ namespace NTable {
                         bytes += location.Size;
                     }
                     ready &= bool(page);
+                    TDataPage decoded;
+                    if (page && needExactBounds &&
+                        ((key1Page && key1Page == current) || (key2Page && key2Page == current))) {
+                        decoded.Set(std::move(page));
+                    }
 
                     auto prechargeCurrentFirstRowId = Max(currentFirstRowId, startRowId);
                     auto prechargeCurrentLastRowId = Min(currentLastRowId, endRowId);
 
                     if (key1Page && key1Page == current) {
-                        if (needExactBounds && page) {
-                            auto key1RowId = LookupRowId(key1, page, Scheme.Groups[0], ESeek::Lower, keyDefaults);
+                        if (needExactBounds && decoded) {
+                            auto key1RowId = LookupRowId(key1, decoded, Scheme.Groups[0], ESeek::Lower, keyDefaults);
                             prechargeCurrentFirstRowId = Max(prechargeCurrentFirstRowId, key1RowId);
                         } else {
                             prechargeCurrentFirstRowId = Max<TRowId>(); // no precharge
@@ -283,8 +290,8 @@ namespace NTable {
                     }
                     if (key2Page && key2Page <= current) {
                         if (key2Page == current) {
-                            if (needExactBounds && page) {
-                                auto key2RowId = LookupRowId(key2, page, Scheme.Groups[0], ESeek::Upper, keyDefaults);
+                            if (needExactBounds && decoded) {
+                                auto key2RowId = LookupRowId(key2, decoded, Scheme.Groups[0], ESeek::Upper, keyDefaults);
                                 if (key2RowId) {
                                     prechargeCurrentLastRowId = Min(prechargeCurrentLastRowId, key2RowId - 1);
                                 } else {
@@ -363,13 +370,18 @@ namespace NTable {
                         bytes += location.Size;
                     }
                     ready &= bool(page);
+                    TDataPage decoded;
+                    if (page && needExactBounds &&
+                        ((key1Page && key1Page == current) || (key2Page && key2Page == current))) {
+                        decoded.Set(std::move(page));
+                    }
 
                     auto prechargeCurrentFirstRowId = Min(currentFirstRowId, startRowId);
                     auto prechargeCurrentLastRowId = Max(currentLastRowId, endRowId);
 
                     if (key1Page && key1Page == current) {
-                        if (needExactBounds && page) {
-                            auto key1RowId = LookupRowIdReverse(key1, page, Scheme.Groups[0], ESeek::Lower, keyDefaults);
+                        if (needExactBounds && decoded) {
+                            auto key1RowId = LookupRowIdReverse(key1, decoded, Scheme.Groups[0], ESeek::Lower, keyDefaults);
                             if (key1RowId != Max<TRowId>()) { // Max<TRowId>() means that lower bound is before current page, so doesn't charge current page
                                 prechargeCurrentFirstRowId = Min(prechargeCurrentFirstRowId, key1RowId);
                             } else {
@@ -390,8 +402,8 @@ namespace NTable {
                     }
                     if (key2Page && key2Page >= current) {
                         if (key2Page == current) {
-                            if (needExactBounds && page) {
-                                auto key2RowId = LookupRowIdReverse(key2, page, Scheme.Groups[0], ESeek::Upper, keyDefaults);
+                            if (needExactBounds && decoded) {
+                                auto key2RowId = LookupRowIdReverse(key2, decoded, Scheme.Groups[0], ESeek::Upper, keyDefaults);
                                 if (key2RowId != Max<TRowId>()) { // Max<TRowId>() means that upper bound is before current page, so doesn't limit current page
                                     prechargeCurrentLastRowId = Max(prechargeCurrentLastRowId, key2RowId + 1);
                                 }
@@ -492,21 +504,25 @@ namespace NTable {
                     continue;
                 }
 
+                TDataPage decoded;
+                if (page && (first == current || last == current)) {
+                    decoded.Set(std::move(page));
+                }
                 auto currentExt = current + 1;
                 auto prechargeCurrentFirstRowId = current->GetRowId();
                 auto prechargeCurrentLastRowId = currentExt ? (currentExt->GetRowId() - 1) : Max<TRowId>();
 
                 if (first == current) {
-                    if (page) {
-                        auto startKeyRowId = LookupRowId(startKey, page, scheme, ESeek::Lower, *keyDefaults);
+                    if (decoded) {
+                        auto startKeyRowId = LookupRowId(startKey, decoded, scheme, ESeek::Lower, *keyDefaults);
                         prechargeCurrentFirstRowId = Max(prechargeCurrentFirstRowId, startKeyRowId);
                     } else {
                         prechargeCurrentFirstRowId = Max<TRowId>(); // no precharge
                     }
                 }
                 if (last == current) {
-                    if (page) {
-                        auto endKeyRowId = LookupRowId(endKey, page, scheme, ESeek::Upper, *keyDefaults);
+                    if (decoded) {
+                        auto endKeyRowId = LookupRowId(endKey, decoded, scheme, ESeek::Upper, *keyDefaults);
                         if (endKeyRowId) {
                             prechargeCurrentLastRowId = Min(prechargeCurrentLastRowId, endKeyRowId - 1);
                         } else {
@@ -550,7 +566,7 @@ namespace NTable {
             const NPage::TGroupId GroupId;
 
             TGroupState(TPartGroupFlatIndexIter&& groupIndex, NPage::TGroupId groupId)
-                : GroupIndex(groupIndex)
+                : GroupIndex(std::move(groupIndex))
                 , GroupId(groupId)
             { }
         };
@@ -655,18 +671,16 @@ namespace NTable {
         }
 
     private:
-        TRowId LookupRowId(const TCells key, const TSharedData* page, const TPartScheme::TGroupInfo &group, ESeek seek, const TKeyCellDefaults &keyDefaults) const
+        TRowId LookupRowId(const TCells key, const TDataPage& data, const TPartScheme::TGroupInfo &group, ESeek seek, const TKeyCellDefaults &keyDefaults) const
         {
-            auto data = TDataPage(page);
             auto lookup = data.LookupKey(key, group, seek, &keyDefaults);
             auto rowId = data.BaseRow() + lookup.Off();
             return rowId;
         }
 
     private:
-        TRowId LookupRowIdReverse(const TCells key, const TSharedData* page, const TPartScheme::TGroupInfo &group, ESeek seek, const TKeyCellDefaults &keyDefaults) const
+        TRowId LookupRowIdReverse(const TCells key, const TDataPage& data, const TPartScheme::TGroupInfo &group, ESeek seek, const TKeyCellDefaults &keyDefaults) const
         {
-            auto data = TDataPage(page);
             auto lookup = data.LookupKeyReverse(key, group, seek, &keyDefaults);
             auto rowId = lookup
                 ? data.BaseRow() + lookup.Off()

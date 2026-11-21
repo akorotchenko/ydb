@@ -79,6 +79,10 @@ namespace NPage {
             EndRowId = LastKey ? LastKey->GetRowId() + 1 : Max<TRowId>();
         }
 
+        const TSharedData& GetData() const noexcept {
+            return Raw;
+        }
+
         const TBlock* operator->() const noexcept
         {
             return &Page;
