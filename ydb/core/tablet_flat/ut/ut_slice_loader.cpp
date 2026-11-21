@@ -126,6 +126,14 @@ namespace {
             return data.size() == location.Size;
         }
 
+        i64 GetMetadataMemoryUsage() const noexcept override {
+            return sizeof(TTestPartPageCollection);
+        }
+
+        const TSharedData* GetMetadataBuffer() const noexcept override {
+            return nullptr;
+        }
+
         size_t BackingSize() const noexcept override
         {
             return Part->Store->PageCollectionBytes(Room);

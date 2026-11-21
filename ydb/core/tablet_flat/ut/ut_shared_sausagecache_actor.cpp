@@ -85,6 +85,14 @@ struct TPageCollectionMock : public IPageCollection {
         return data.size() == location.Size;
     }
 
+    i64 GetMetadataMemoryUsage() const noexcept override {
+        return sizeof(TPageCollectionMock);
+    }
+
+    const TSharedData* GetMetadataBuffer() const noexcept override {
+        return nullptr;
+    }
+
     size_t BackingSize() const noexcept override {
         return 10 * TotalPages;
     }

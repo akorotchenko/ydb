@@ -1,6 +1,7 @@
 LIBRARY()
 
 SRCS(
+    cache_accounting.cpp
     defs.cpp
     defs.h
     flat_backup.cpp

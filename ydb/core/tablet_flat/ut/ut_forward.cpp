@@ -49,6 +49,14 @@ namespace {
         NPageCollection::TGlobId Glob(ui32) const override { Y_TABLET_ERROR("Not implemented"); }
         bool Verify(ui32, TArrayRef<const char>) const override { return true; }
         bool Verify(const TPageLocation&, TArrayRef<const char>) const override { return true; }
+        i64 GetMetadataMemoryUsage() const noexcept override {
+            return sizeof(TBlobPageCollection);
+        }
+
+        const TSharedData* GetMetadataBuffer() const noexcept override {
+            return nullptr;
+        }
+
         size_t BackingSize() const noexcept override { return 0; }
 
         NTable::NPage::TPageLocation GetLocation(ui32 pageId) const override {
@@ -234,6 +242,14 @@ namespace {
 
         bool Verify(const TPageLocation& location, TArrayRef<const char> data) const override {
             return data.size() == location.Size;
+        }
+
+        i64 GetMetadataMemoryUsage() const noexcept override {
+            return sizeof(TTestPageCollection);
+        }
+
+        const TSharedData* GetMetadataBuffer() const noexcept override {
+            return nullptr;
         }
 
         size_t BackingSize() const noexcept override {

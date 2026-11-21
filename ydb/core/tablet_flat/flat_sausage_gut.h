@@ -5,6 +5,13 @@
 
 #include <util/generic/vector.h>
 
+#include <atomic>
+
+namespace NKikimr::NSharedCache {
+class TMetadataRecord;
+class TCacheAccounting;
+} // namespace NKikimr::NSharedCache
+
 namespace NKikimr {
 namespace NPageCollection {
 
@@ -23,10 +30,15 @@ namespace NPageCollection {
 
     class IPageCollection : public TAtomicRefCount<IPageCollection> {
     public:
-        virtual ~IPageCollection() = default;
+        virtual ~IPageCollection();
 
         virtual const TLogoBlobID& Label() const noexcept = 0;
         virtual ui32 Total() const noexcept = 0;
+
+        // Separate instances may be substituted only when their I/O descriptors are interchangeable
+        virtual bool IsCompatible(const IPageCollection& other) const noexcept {
+            return this == &other;
+        }
         /* Number of structural pages addressable by TPageId */
         virtual ui32 MetaPages() const noexcept { return Total(); }
         virtual TInfo Page(ui32 page) const = 0;
@@ -38,10 +50,18 @@ namespace NPageCollection {
         /// Verifies page data using the location's size and checksum
         virtual bool Verify(const TPageLocation&, TArrayRef<const char>) const = 0;
         virtual size_t BackingSize() const noexcept = 0;
+        virtual i64 GetMetadataMemoryUsage() const noexcept = 0;
+        // Shared allocation, if any; used to exclude overlap with cached page bodies
+        virtual const TSharedData* GetMetadataBuffer() const noexcept = 0;
         virtual NTable::NPage::TPageLocation GetLocation(ui32 pageId) const = 0;
         /// Returns true when the collection carries both BTreeIndex and BTreeIndexV2 pages
         virtual bool SkipBTreeIndexV1Shadow() const noexcept { return false; }
         virtual void SetSkipBTreeIndexV1Shadow(bool) const noexcept { }
+
+    private:
+        friend class NSharedCache::TCacheAccounting;
+
+        mutable std::atomic<NSharedCache::TMetadataRecord*> MetadataAccounts_{ nullptr };
     };
 
     /// A page that must not be loaded: an excluded page, or a dead V1 shadow index.
