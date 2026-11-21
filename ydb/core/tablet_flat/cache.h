@@ -1,0 +1,1523 @@
+#pragma once
+
+#include "cache_collection.h"
+#include "cache_collections.h"
+#include "cache_eviction.h"
+#include "cache_fetches.h"
+#include "cache_items.h"
+#include "cache_memory.h"
+#include "cache_ref.h"
+#include "cache_capacity.h"
+#include "cache_table.h"
+
+#include <ydb/core/base/appdata_fwd.h>
+
+#include <util/generic/function_ref.h>
+#include <util/generic/size_literals.h>
+
+#include <new>
+#include <optional>
+#include <type_traits>
+#include <utility>
+
+namespace NKikimr::NSharedCache {
+
+inline constexpr ui32 CacheOperationBatchSize = 1024;
+
+struct TCacheHandleRequirement {
+    TLogoBlobID CollectionId;
+    TArrayRef<const NTable::NPage::TPageLocation> Pages;
+};
+
+// Diagnostic snapshot of retained and requested identities, not a minimal retry footprint
+struct TCacheWorkingSetStats {
+    ui64 RetainedCollections = 0; // Valid distinct retained handles
+    ui64 CollectionHandles = 0;
+    ui64 PageHandles = 0;
+    ui64 PageBytes = 0; // Full charges for distinct requested pages, including Sticky
+    ui64 HandleLimit = 0;
+    ui64 ByteLimit = 0;
+    bool LimitsUnchanged = false;
+};
+
+template <class TTraits = TProdTraits>
+struct TCachePageRequestImpl {
+    NTable::NPage::TPageLocation Location;
+    TIntrusivePtr<TPageFetchWaiter> Waiter;
+    bool Sticky = false;
+
+    TCachePageRequestImpl(
+        NTable::NPage::TPageLocation location, TIntrusivePtr<TPageFetchWaiter> waiter, bool sticky = false) noexcept
+        : Location(std::move(location))
+        , Waiter(std::move(waiter))
+        , Sticky(sticky)
+    {
+        new (&Storage_.Page) TCachePageRefImpl<TTraits>();
+    }
+
+    TCachePageRequestImpl(TCachePageRequestImpl&& other) noexcept
+        : TCachePageRequestImpl(std::move(other.Location), std::move(other.Waiter), other.Sticky)
+    {
+        MoveResult(other);
+    }
+
+    TCachePageRequestImpl& operator=(TCachePageRequestImpl&& other) noexcept;
+
+    ~TCachePageRequestImpl() {
+        Destroy();
+    }
+
+    ECacheResultStatus Status() const noexcept {
+        return Status_;
+    }
+
+    TCachePageRefImpl<TTraits>& Page() noexcept {
+        Y_DEBUG_ABORT_UNLESS(Status_ == ECacheResultStatus::Hit);
+        return Storage_.Page;
+    }
+
+    const TCachePageRefImpl<TTraits>& Page() const noexcept {
+        Y_DEBUG_ABORT_UNLESS(Status_ == ECacheResultStatus::Hit);
+        return Storage_.Page;
+    }
+
+    TPageFetchImpl<TTraits>& Fetch() noexcept {
+        Y_DEBUG_ABORT_UNLESS(Status_ == ECacheResultStatus::Inserted);
+        return Storage_.Fetch;
+    }
+
+    void SetHit(TCachePageRefImpl<TTraits>&& page) noexcept {
+        Destroy();
+        new (&Storage_.Page) TCachePageRefImpl<TTraits>(std::move(page));
+        Status_ = ECacheResultStatus::Hit;
+    }
+
+    void SetInserted(TPageFetchImpl<TTraits>&& fetch) noexcept {
+        Destroy();
+        new (&Storage_.Fetch) TPageFetchImpl<TTraits>(std::move(fetch));
+        Status_ = ECacheResultStatus::Inserted;
+    }
+
+    void SetPending() noexcept {
+        Reset();
+        Status_ = ECacheResultStatus::Pending;
+    }
+
+    void SetNoResource() noexcept {
+        Reset();
+        Status_ = ECacheResultStatus::NoResource;
+    }
+
+    void Reset() noexcept {
+        Destroy();
+        new (&Storage_.Page) TCachePageRefImpl<TTraits>();
+        Status_ = ECacheResultStatus::Miss;
+    }
+
+private:
+    void Destroy() noexcept;
+
+    void MoveResult(TCachePageRequestImpl& other) noexcept;
+
+    // Fetch is active only for Inserted; Page is active for every other status.
+    ECacheResultStatus Status_ = ECacheResultStatus::Miss;
+
+    union TStorage {
+        TStorage() noexcept {}
+
+        ~TStorage() {}
+
+        TCachePageRefImpl<TTraits> Page;
+        TPageFetchImpl<TTraits> Fetch;
+    } Storage_;
+};
+
+class TCacheTestAccess;
+class TRequestPageWaiter;
+class TCompactedPageWaiter;
+
+template <class TTraits = TProdTraits>
+class TCacheImpl : public TThrRefBase, private TTraits {
+public:
+    static constexpr ui64 ExpectedPageSize = 7_KB;
+    // Null handle, resize marker and collection metadata
+    static constexpr ui64 RequestHandleOverhead = 3;
+
+    static TIntrusivePtr<TCacheImpl> Create(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits = {});
+
+    ~TCacheImpl() override;
+
+    TCacheImpl(const TCacheImpl&) = delete;
+    TCacheImpl& operator=(const TCacheImpl&) = delete;
+
+    using TOperation = TCacheOperation<TTraits>;
+    using TOpBatch = TCacheOpBatch<TTraits>;
+
+    Y_FORCE_INLINE TOperation BeginOperation() noexcept;
+    Y_FORCE_INLINE TOpBatch BeginOpBatch() noexcept;
+
+    static TCacheImpl& Get() noexcept {
+        TCacheImpl* cache = TryGet();
+        Y_DEBUG_ABORT_UNLESS(cache);
+        return *cache;
+    }
+
+    THolder<TCollection> PrepareCollection(
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, ECacheMode mode = ECacheMode::Sticky);
+
+    TCacheAccounting ShareMemoryAccounting() const noexcept {
+        return Accounting_.Share();
+    }
+
+    TCachePendingBuffers TrackPendingBuffers() const noexcept {
+        return Accounting_.TrackPendingBuffers();
+    }
+
+    void AccountMetadata(const NPageCollection::IPageCollection& collection) const {
+        Accounting_.AccountMetadata(collection);
+    }
+
+    void AccountBuffer(const TSharedData& buffer) const {
+        Accounting_.AccountBuffer(buffer);
+    }
+
+    void AccountMetadataBuffer(const TSharedData& buffer) const {
+        Accounting_.AccountMetadataBuffer(buffer);
+    }
+
+    static TCacheImpl* TryGet() noexcept {
+        return static_cast<TCacheImpl*>(TTraits::TryGetCache());
+    }
+
+    Y_FORCE_INLINE bool MakeReady(TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept {
+        return MakeReady(Collections_.Registry(), collection, std::move(value));
+    }
+
+    bool MakeReady(TCollectionCacheItem collection, THolder<TCollection>&& value,
+        TCacheCollectionRefImpl<TTraits>& ready) noexcept;
+
+    // The cleanup lookup must be the sole remaining handle reference
+    bool TryDetachReleasedCollection(const TCacheCollectionRefImpl<TTraits>& collection) noexcept;
+
+    Y_FORCE_INLINE bool DetachCollection(TCollectionCacheItem collection) noexcept {
+        return DetachCollection(Collections_.Registry(), collection);
+    }
+
+    Y_FORCE_INLINE bool EraseCollection(TCollectionCacheItem collection) noexcept {
+        return EraseCollection(nullptr, collection);
+    }
+
+    bool SetCollectionPagesCacheMode(TCollectionCacheItem collection, ECacheMode mode) noexcept;
+    bool SetCollectionSkipBTreeIndexV1Shadow(TCollectionCacheItem collection, bool skip) noexcept;
+
+    Y_FORCE_INLINE bool AcknowledgeCollectionBytes(TCollectionCacheItem collection) noexcept {
+        auto cacheOp = BeginOperation();
+        TOperationItemRef<TTraits> ref(cacheOp, cacheOp.TryAcquireStructural(collection.CacheItem()));
+        if (auto* owner = ref ? cacheOp.Collections().PageCollection(collection) : nullptr) {
+            Collections_.AcknowledgeBytes(*owner);
+            return true;
+        }
+        return false;
+    }
+
+    Y_FORCE_INLINE ECacheResultStatus Find(
+        TCollectionCacheItem collection, ui64 offset, TCachePageRefImpl<TTraits>& page) noexcept;
+
+    Y_FORCE_INLINE ECacheResultStatus Find(
+        const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept;
+
+    // Finds and attaches a Ready collection without inserting on a miss
+    Y_FORCE_INLINE ECacheCollectionLookupStatus FindCollection(
+        const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept {
+        return FindCollection(Collections_.Registry(), id, collection);
+    }
+
+    // The callback may detach the current collection. Registry mutations remain serialized by its owner.
+    Y_FORCE_INLINE void ForEachCollection(TFunctionRef<void(TCollection&)> callback) noexcept {
+        auto cacheOp = BeginOperation();
+        cacheOp.Collections().ForEach(callback);
+    }
+
+    Y_FORCE_INLINE bool FindOrInsertBatch(TCollectionCacheItem collection,
+        TArrayRef<TCachePageRequestImpl<TTraits>> requests, bool recordStats = true,
+        bool waitForMemory = false) noexcept {
+        return FindOrInsertBatch(collection, requests, recordStats, waitForMemory, EPageAdmission::Bounded);
+    }
+
+    // Optional admission reclaims only Regular pages
+    Y_FORCE_INLINE bool FindOrInsertPreloadBatch(
+        TCollectionCacheItem collection, TArrayRef<TCachePageRequestImpl<TTraits>> requests) noexcept {
+        return FindOrInsertBatch(collection, requests, false, false, EPageAdmission::Preload);
+    }
+
+    // Forward readers retain their own working set, as writers retain already produced pages
+    Y_FORCE_INLINE bool FindOrInsertReadAheadBatch(TCollectionCacheItem collection,
+        TArrayRef<TCachePageRequestImpl<TTraits>> requests, bool recordStats = true) noexcept {
+        return FindOrInsertBatch(collection, requests, recordStats, false, EPageAdmission::ReadAhead);
+    }
+
+    Y_FORCE_INLINE ui64 AvailableHandleCount() noexcept {
+        return BeginOperation().SpaceOperation().AvailableHandleCount();
+    }
+
+    Y_FORCE_INLINE ECacheResultStatus FindOrInsert(const TCollectionLocation& collection,
+        TCollectionCacheItem& inserted, TCacheCollectionRefImpl<TTraits>& hit) noexcept {
+        return FindOrInsert(Collections_.Registry(), collection, inserted, hit);
+    }
+
+    // Prepares a Regular holder only on a miss, before publishing the pending entry
+    ECacheResultStatus FindOrInsert(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
+        THolder<TCollection>& value, TCollectionCacheItem& inserted, TCacheCollectionRefImpl<TTraits>& hit);
+
+    Y_FORCE_INLINE bool ReclaimCold() noexcept {
+        auto cacheOp = BeginOperation();
+        return cacheOp.Eviction().ReclaimCold() || cacheOp.Eviction().ReclaimCold(ECacheTier::Keep);
+    }
+
+    bool ReclaimSpareHandle() noexcept;
+    bool ReclaimForAdmission(ui64 bytes) noexcept;
+
+    Y_FORCE_INLINE bool UpdateCurrentLimit(ui64 limit) noexcept {
+        if (limit == 0 || limit > HardLimit()) {
+            return false;
+        }
+
+        Memory_.SetCurrentLimit(limit);
+        RefreshSoftLimit();
+        NotifyResourcesAvailable();
+        return true;
+    }
+
+    // Max<ui64>() restores the calculated default; zero is an explicit target.
+    Y_FORCE_INLINE bool UpdateSoftLimitOverride(ui64 limit) noexcept {
+        Memory_.SetSoftLimitOverride(limit);
+        RefreshSoftLimit();
+        return true;
+    }
+
+    bool UpdateHardLimit(ui64 limit) noexcept;
+
+    ui64 AdmissionGeneration() const noexcept {
+        return Memory_.AdmissionGeneration();
+    }
+
+    Y_FORCE_INLINE void ArmResourceWait() noexcept {
+        Memory_.ArmResourceWait();
+    }
+
+    Y_FORCE_INLINE bool TryReserveFetchBatch(TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept {
+        auto cacheOp = BeginOperation();
+        return cacheOp.Fetches().TryReserveBatch(pages);
+    }
+
+    Y_FORCE_INLINE void ReserveReadAheadBatch(TArrayRef<TPageFetchImpl<TTraits>> pages) noexcept {
+        auto cacheOp = BeginOperation();
+        cacheOp.Fetches().TryReserveBatch(pages, true);
+    }
+
+    // Advisory read-only snapshots; actual admission must still acquire its resources
+    Y_FORCE_INLINE bool CanReserve(ui64 bytes) const noexcept {
+        const ui64 limit = CurrentLimit();
+        return bytes == 0 || (bytes <= limit && Memory_.PayloadUsage() <= limit - bytes);
+    }
+
+    bool CanAllocateHandles(TArrayRef<const TCacheHandleRequirement> requirements) noexcept;
+    // Pressure-only check of request-held collection handles and distinct requested pages.
+    bool WorkingSetExceedsCapacity(TArrayRef<const TCollectionCacheItem> retainedCollections,
+        TArrayRef<const TCacheHandleRequirement> requirements, TCacheWorkingSetStats& stats) noexcept;
+
+    void DisarmResourceWait() noexcept {
+        Memory_.DisarmResourceWait();
+    }
+
+    Y_FORCE_INLINE bool EnforceCurrentLimit() noexcept {
+        auto cacheOp = BeginOperation();
+        return cacheOp.Eviction().EnforceCurrentLimit(0);
+    }
+
+    bool RunMaintenance() noexcept;
+
+    ui64 CurrentLimit() const noexcept {
+        return Memory_.CurrentLimit();
+    }
+
+    ui64 SoftLimit() const noexcept {
+        return Memory_.SoftLimit();
+    }
+
+    ui64 HardLimit() const noexcept {
+        return Memory_.HardLimit();
+    }
+
+    // Serialized controller access, like UpdateHardLimit and RunMaintenance.
+    bool NeedsCapacityMaintenance() const noexcept {
+        return Capacity_.NeedsMaintenance();
+    }
+
+    ui64 TargetHandleCount() const noexcept {
+        return Capacity_.TargetHandleCount();
+    }
+
+    // Serialized controller access; workers use their active space view.
+    ui64 PhysicalHandleCount() const noexcept {
+        return Space_->CurrentConfiguration().HandleCount();
+    }
+
+    ui64 ReservationLimit() const noexcept {
+        return Memory_.ReservationLimit();
+    }
+
+    ui64 ResidentBytes() const noexcept {
+        return Memory_.ResidentBytes();
+    }
+
+    ui64 HotBytes() const noexcept {
+        return Memory_.Hot(ECacheTier::Regular).Bytes() + Memory_.Hot(ECacheTier::Keep).Bytes();
+    }
+
+    ui64 HotPages() const noexcept {
+        return Memory_.Hot(ECacheTier::Regular).Pages() + Memory_.Hot(ECacheTier::Keep).Pages();
+    }
+
+    ui64 ColdPages() const noexcept {
+        return Memory_.Cold(ECacheTier::Regular).Pages() + Memory_.Cold(ECacheTier::Keep).Pages() +
+               Memory_.Retired().Pages();
+    }
+
+    ui64 ColdRingEntries() const noexcept {
+        return Space_->ColdRingEntries(ECacheTier::Regular);
+    }
+
+    ui64 StickyPages() const noexcept {
+        return Memory_.Sticky().Pages();
+    }
+
+    ui64 KeepColdPages() const noexcept {
+        return Memory_.Cold(ECacheTier::Keep).Pages();
+    }
+
+    ui64 Collections() const noexcept {
+        return Memory_.Collections();
+    }
+
+    ui64 ColdBytes() const noexcept {
+        return Memory_.Cold(ECacheTier::Regular).Bytes() + Memory_.Cold(ECacheTier::Keep).Bytes() +
+               Memory_.Retired().Bytes();
+    }
+
+    ui64 ColdReclaimableBytes() const noexcept {
+        return Memory_.ColdReclaimableBytes();
+    }
+
+    ui64 ColdReclaimableItems() const noexcept {
+        return Memory_.ColdReclaimableItems();
+    }
+
+    ui64 StickyBytes() const noexcept {
+        return Memory_.Sticky().Bytes();
+    }
+
+    ui64 KeepColdBytes() const noexcept {
+        return Memory_.Cold(ECacheTier::Keep).Bytes();
+    }
+
+    ui64 KeepResidentPageBytes() const noexcept {
+        return Memory_.KeepResidentPageBytes();
+    }
+
+    ui64 KeepReadyPageBytes() const noexcept {
+        return Memory_.KeepReadyPageBytes();
+    }
+
+    ui64 CollectionBytes() const noexcept {
+        return Memory_.CollectionBytes();
+    }
+
+    ui64 BufferBytes() const noexcept {
+        return Accounting_.BufferBytes();
+    }
+
+    ui64 MetadataBytes() const noexcept {
+        return Accounting_.MetadataBytes();
+    }
+
+    ui64 StorageBytes() const noexcept {
+        return Accounting_.GetMemoryUsage();
+    }
+
+    ui64 OverallUsage() const noexcept {
+        return Memory_.StaticBytes() + Memory_.StaticDeltaBytes() + StorageBytes();
+    }
+
+    // Allocated fetch buffers are prepaid pages, not extra storage outside the page ledger
+    ui64 RetentionLimit() const noexcept {
+        const ui64 actual = Accounting_.GetMemoryUsage();
+        const ui64 pending = Accounting_.PendingBufferBytes();
+        const ui64 gap = actual - Min(actual, pending + Memory_.ResidentBytes());
+        const ui64 limit = SoftLimit();
+        return limit - Min(limit, gap);
+    }
+
+    ui64 PayloadUsage() const noexcept {
+        return Memory_.PayloadUsage();
+    }
+
+    ui64 RetainedBytes() const noexcept {
+        return Memory_.RetainedBytes();
+    }
+
+    ui64 ReservedBytes() const noexcept {
+        return Memory_.ReservedBytes();
+    }
+
+    // Admitted pages whose payload has not arrived yet, i.e. the pages currently being loaded. The actor publishes
+    // them as the LoadInFlyPages/LoadInFlyBytes counters.
+    ui64 ReservedPages() const noexcept {
+        return Memory_.ReservedPages();
+    }
+
+    Y_FORCE_INLINE bool UpdateKeepLimit(ui64 limit) noexcept {
+        return Eviction_.UpdateKeepLimit(limit);
+    }
+
+    ui64 EvictableByteBudget() const noexcept {
+        return Eviction_.EvictableByteBudget();
+    }
+
+    ui64 KeepLimit() const noexcept {
+        return Eviction_.KeepLimit();
+    }
+
+    ui64 KeepOwnedBytes() const noexcept {
+        return Memory_.KeepOwnedBytes();
+    }
+
+    struct TKeepLoadRoom {
+        ui64 Bytes = 0;
+        ui64 Pages = 0;
+    };
+
+    ui64 KeepOwnedPages() const noexcept {
+        return Memory_.KeepOwnedPages();
+    }
+
+    ui64 RetiredBytes() const noexcept {
+        return Memory_.Retired().Bytes();
+    }
+
+    ui64 KeepPendingBytes() const noexcept {
+        return Memory_.Tier(ECacheTier::Keep).Pending.Bytes();
+    }
+
+    ui64 StickyOwnedBytes() const noexcept {
+        return Memory_.StickyOwnedBytes();
+    }
+
+    ui64 StaticBytes() const noexcept {
+        return Memory_.StaticBytes();
+    }
+
+    ui64 StaticDeltaBytes() const noexcept {
+        return Memory_.StaticDeltaBytes();
+    }
+
+    using TStats = TCacheMemory::TStats;
+
+    TStats Stats() const noexcept {
+        return Memory_.Stats();
+    }
+
+private:
+    using TOperationView = TCacheOperationView<TTraits>;
+
+    Y_FORCE_INLINE TOperationView BindOperation(TSpaceOperation& spaceOp) noexcept;
+
+    friend class TCacheTestAccess;
+    friend class TCacheThreadTestAccess;
+    friend class TCollection;
+    friend class TCacheItemRefImpl<TTraits>;
+    friend class TCacheTableImpl<TTraits>;
+    friend class TCacheItems<TTraits>;
+    friend class TCachePageRefImpl<TTraits>;
+    friend class TCachePageConstRefImpl<TTraits>;
+    friend class TPageFetchImpl<TTraits>;
+    friend class TCacheCollectionRefImpl<TTraits>;
+    friend class TCacheFetches<TTraits>;
+    friend class TCacheCollections<TTraits>;
+    friend class TCacheEviction<TTraits>;
+    friend class TCacheHotPolicy<TTraits>;
+    friend class TCacheColdPolicy<TTraits>;
+    friend class TCacheCapacity<TTraits>;
+    friend class TCacheOperation<TTraits>;
+    friend class TCacheOperationView<TTraits>;
+    friend class TCacheItemsOperation<TTraits>;
+    friend class TCacheCollectionsOperation<TTraits>;
+    friend class TCacheEvictionOperation<TTraits>;
+    friend class TCacheFetchesOperation<TTraits>;
+    friend class TRequestPageWaiter;
+    friend class TCompactedPageWaiter;
+    friend struct TEvSaveCompactedPages;
+
+    TCacheItemRefImpl<TTraits> AcquirePageItem(TSpaceOperation& spaceOp, TPageCacheItem page) noexcept;
+
+    Y_FORCE_INLINE void InvokeHook(ECacheHookPoint point, TCacheItem cacheItem) const noexcept {
+        TTraits::Invoke(point, cacheItem);
+    }
+
+    Y_FORCE_INLINE void InvokeHook(ECacheHookPoint point, TColdCacheItem coldItem) const noexcept {
+        // Scheduling hooks transport raw token bits; the production APIs keep their distinct types.
+        TTraits::Invoke(point, TCacheItem::FromRaw(coldItem.Raw()));
+    }
+
+    void SetHooks(TTraits hooks) noexcept {
+        static_cast<TTraits&>(*this) = std::move(hooks);
+    }
+
+    explicit TCacheImpl(THolder<TCacheSpace> space, ui64 hardLimit, TTraits traits);
+
+    using EAcquireStatus = typename TCacheItems<TTraits>::EAcquireStatus;
+
+    enum class EPageAdmission {
+        Bounded,
+        Preload,
+        Written,
+        ReadAhead,
+    };
+
+    struct TPageInsertCandidate {
+        static constexpr bool IsPageKind() noexcept {
+            return true;
+        }
+
+        TKeepReservation KeepReservation;
+        TCacheKey Key;
+        ui64 Size = 0;
+        NTable::NPage::EPage Type = NTable::NPage::EPage::Undef;
+        ui32 Crc32 = 0;
+        EStickyState Sticky = EStickyState::None;
+        TCacheItem CacheItem;
+        bool CollectionOwnerHeld = false; // a batch owns the collection through candidate retries
+        bool Prepare = false; // the page is absent from the table and needs an allocated pending item
+        bool WaitForMemory = false;
+        EPageAdmission Admission = EPageAdmission::Bounded;
+    };
+
+    struct TCollectionInsertCandidate {
+        static constexpr bool IsPageKind() noexcept {
+            return false;
+        }
+
+        TCacheKey Key;
+        ui64 Bytes = 0;
+        TCacheItem CacheItem;
+    };
+
+    struct TCollectionValueCandidate : TCollectionInsertCandidate {
+        TCollectionValueCandidate(
+            const TIntrusiveConstPtr<NPageCollection::IPageCollection>& collection, THolder<TCollection>& value)
+            : TCollectionInsertCandidate{ .Key = TCacheKey::Collection(collection->Label()) }
+            , PageCollection(collection)
+            , Value(value)
+        {}
+
+        const TIntrusiveConstPtr<NPageCollection::IPageCollection>& PageCollection;
+        THolder<TCollection>& Value;
+    };
+
+    template <bool IsPage>
+    struct TCacheKeyedItem {
+        static constexpr bool IsPageKind() noexcept {
+            return IsPage;
+        }
+
+        TCacheKey Key;
+        TCacheItem CacheItem;
+    };
+
+    TPageCacheItem AllocatePage(TCollectionCacheItem collection, ui64 offset, ui64 size, NTable::NPage::EPage type,
+        ui32 crc32, EStickyState sticky) noexcept;
+
+    TCollectionCacheItem AllocateCollection(const TLogoBlobID& id, ui64 bytes) noexcept;
+
+    Y_FORCE_INLINE bool MakeReady(
+        TCollectionRegistry& registry, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept {
+        return MakeReady(&registry, collection, std::move(value));
+    }
+
+    Y_FORCE_INLINE bool MakeReady(
+        TCollectionRegistry* registry, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept {
+        auto cacheOp = BeginOperation();
+        return cacheOp.MakeReady(registry, collection.CacheItem(), std::move(value));
+    }
+
+    bool MakeReady(TSpaceOperation& spaceOp, TCollectionRegistry* registry, TCacheItem cacheItem,
+        THolder<TCollection>&& value) noexcept;
+
+    void MakeReadyState(TSpaceOperation& spaceOp, TCacheItem cacheItem, EHandleState readyState = EHandleState::Hot,
+        TCollection* pageOwner = nullptr, TKeepReservation* keepReservation = nullptr,
+        TCachePendingBuffers* pendingBuffers = nullptr) noexcept;
+
+    template <class TLookup>
+    Y_FORCE_INLINE ECacheResultStatus Find(
+        TOperationView& cacheOp, TLookup&& lookup, TCacheItemRefImpl<TTraits>& ref, bool preload = false) noexcept;
+
+    ECacheCollectionLookupStatus FindCollection(
+        TCollectionRegistry& registry, const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept;
+    bool AttachCollection(
+        TSpaceOperation& spaceOp, TCollectionRegistry& registry, const TCacheItemRefImpl<TTraits>& ref) noexcept;
+
+    Y_FORCE_INLINE ECacheResultStatus FindOrInsert(
+        TSpaceOperation& spaceOp, TPageCacheItem candidate, TCacheItemRefImpl<TTraits>& ref) noexcept {
+        return FindOrInsertItem(spaceOp, candidate, ref);
+    }
+
+    Y_FORCE_INLINE ECacheResultStatus FindOrInsert(
+        TSpaceOperation& spaceOp, TCollectionCacheItem candidate, TCacheItemRefImpl<TTraits>& ref) noexcept {
+        return FindOrInsertItem(spaceOp, candidate, ref);
+    }
+
+    template <class TItem>
+    Y_FORCE_INLINE ECacheResultStatus FindOrInsertItem(
+        TSpaceOperation& spaceOp, TItem candidate, TCacheItemRefImpl<TTraits>& ref) noexcept {
+        constexpr bool isPage = std::is_same_v<TItem, TPageCacheItem>;
+        static_assert(isPage || std::is_same_v<TItem, TCollectionCacheItem>);
+        auto cacheOp = BindOperation(spaceOp);
+        const THandle& handle = spaceOp.Handles()[candidate.Index()];
+        Y_DEBUG_ABORT_UNLESS(
+            THandleState::FromRaw(handle.State.load(std::memory_order_relaxed)).IsPageKind() == isPage);
+        TCacheKeyedItem<isPage> keyedCandidate{
+            .Key = LoadCacheKey(handle, isPage ? EItemKind::Page : EItemKind::Collection),
+            .CacheItem = candidate.CacheItem(),
+        };
+        return cacheOp.FindOrInsert(keyedCandidate, ref);
+    }
+
+    static TPageInsertCandidate BuildPageInsertCandidate(
+        TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page, EStickyState sticky) noexcept;
+
+    ECacheResultStatus FindOrInsert(TCollectionCacheItem collection, const NTable::NPage::TPageLocation& page,
+        EStickyState sticky, TPageCacheItem& inserted, TCachePageRefImpl<TTraits>& hit) noexcept;
+
+    Y_FORCE_INLINE ECacheResultStatus FindOrInsert(TCollectionCacheItem collection,
+        const NTable::NPage::TPageLocation& page, EStickyState sticky, TIntrusivePtr<TPageFetchWaiter> waiter,
+        TCachePageRefImpl<TTraits>& hit, TPageFetchImpl<TTraits>& fetch) noexcept {
+        Y_DEBUG_ABORT_UNLESS(page && page.Type != NTable::NPage::EPage::Undef && waiter);
+        Y_DEBUG_ABORT_UNLESS(sticky == EStickyState::None || sticky == EStickyState::Sticky);
+        auto cacheOp = BeginOperation();
+        TPageInsertCandidate candidate = BuildPageInsertCandidate(collection, page, sticky);
+        const ECacheResultStatus status = cacheOp.FindOrInsertPage(candidate, std::move(waiter), hit, fetch);
+        TStats stats;
+        stats.AddAdmission(status, page.Size);
+        Memory_.AddStats(stats);
+        return status;
+    }
+
+    Y_FORCE_INLINE ECacheResultStatus FindOrInsert(TCollectionRegistry& registry, const TCollectionLocation& collection,
+        TCollectionCacheItem& inserted, TCacheCollectionRefImpl<TTraits>& hit) noexcept {
+        inserted = {};
+        hit.Drop();
+        auto cacheOp = BeginOperation();
+        return cacheOp.FindOrInsertCollection(&registry, collection, inserted, hit);
+    }
+
+    Y_FORCE_INLINE ECacheResultStatus FindOrInsertUnregistered(const TCollectionLocation& collection,
+        TCollectionCacheItem& inserted, TCacheCollectionRefImpl<TTraits>& hit) noexcept {
+        inserted = {};
+        hit.Drop();
+        auto cacheOp = BeginOperation();
+        return cacheOp.FindOrInsertCollection(nullptr, collection, inserted, hit);
+    }
+
+    ECacheResultStatus FindOrInsertPage(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate,
+        TIntrusivePtr<TPageFetchWaiter> waiter, TCachePageRefImpl<TTraits>& hit,
+        TPageFetchImpl<TTraits>& fetch) noexcept;
+    bool PreparePageBatch(TSpaceOperation& spaceOp, TCollection& collection,
+        TArrayRef<TCachePageRequestImpl<TTraits>> requests, TVector<TPageInsertCandidate>& candidates,
+        ui64& reservedBytes) noexcept;
+    bool AllocatePageBatch(TSpaceOperation& spaceOp, TCollection& collection, TVector<TPageInsertCandidate>& candidates,
+        ui64 reservedBytes, bool waitForMemory, EPageAdmission admission) noexcept;
+
+    bool FindOrInsertBatch(TCollectionCacheItem collection, TArrayRef<TCachePageRequestImpl<TTraits>> requests,
+        bool recordStats, bool waitForMemory, EPageAdmission admission) noexcept;
+    bool FindOrInsertBatch(TSpaceOperation& spaceOp, TCollectionCacheItem collection,
+        TArrayRef<TCachePageRequestImpl<TTraits>> requests, bool recordStats, bool waitForMemory,
+        EPageAdmission admission) noexcept;
+    ECacheResultStatus FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
+        const TCollectionLocation& collection, TCollectionCacheItem& inserted,
+        TCacheCollectionRefImpl<TTraits>& hit) noexcept;
+
+    [[nodiscard]] ECacheResultStatus AdmitCollection(TSpaceOperation& spaceOp,
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, TCacheCollectionRefImpl<TTraits>& ready);
+    TCachePageRefImpl<TTraits> AdmitPage(TSpaceOperation& spaceOp, TCollectionCacheItem collection,
+        NTable::NPage::TPageLocation location, NActors::TSharedData&& data, bool sticky, EPageAdmission admission)
+        requires std::is_same_v<TTraits, TProdTraits>;
+
+    template <class TCandidate>
+    ECacheResultStatus FindOrInsertCollection(TSpaceOperation& spaceOp, TCollectionRegistry* registry,
+        TCandidate& candidate, TCollectionCacheItem& inserted,
+        TCacheCollectionRefImpl<TTraits>& hit) noexcept(noexcept(PrepareCandidate(spaceOp, candidate)));
+
+    template <class TKeyedCandidate>
+    ECacheResultStatus FindOrInsert(TSpaceOperation& spaceOp, TKeyedCandidate& candidate,
+        TCacheItemRefImpl<TTraits>& ref) noexcept(noexcept(PrepareCandidate(spaceOp, candidate)));
+
+    bool PrepareCandidate(TSpaceOperation& spaceOp, TPageInsertCandidate& candidate) noexcept;
+    bool PrepareCandidate(TSpaceOperation& spaceOp, TCollectionInsertCandidate& candidate) noexcept;
+    bool PrepareCandidate(TSpaceOperation& spaceOp, TCollectionValueCandidate& candidate);
+
+    template <bool IsPage>
+    bool PrepareCandidate(TSpaceOperation&, TCacheKeyedItem<IsPage>& candidate) noexcept {
+        return !candidate.CacheItem.IsNull();
+    }
+
+    bool TryReserve(TSpaceOperation& spaceOp, ui64 bytes, ui64 pages = 0, bool preload = false) noexcept;
+
+    Y_FORCE_INLINE void NotifyResourcesAvailable() noexcept {
+        if (Memory_.NotifyResourcesAvailable()) {
+            TTraits::NotifyResourcesAvailable();
+        }
+    }
+
+    Y_FORCE_INLINE void ReleaseReservation(ui64 bytes, ui64 pages = 0) noexcept {
+        if (bytes == 0 && pages == 0) {
+            return;
+        }
+        Memory_.ReleaseReservation(bytes, pages);
+        NotifyResourcesAvailable();
+    }
+
+    Y_FORCE_INLINE void DiscardCandidate(TPageCacheItem page) noexcept {
+        DiscardCandidate(page.CacheItem(), EItemKind::Page);
+    }
+
+    Y_FORCE_INLINE void DiscardCandidate(TCollectionCacheItem collection) noexcept {
+        DiscardCandidate(collection.CacheItem(), EItemKind::Collection);
+    }
+
+    Y_FORCE_INLINE void DiscardCandidate(TCacheItem cacheItem, EItemKind kind) noexcept {
+        auto cacheOp = BeginOperation();
+        const THandle& handle = cacheOp.Handles()[cacheItem.Index()];
+        const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+        const ui64 reservedBytes =
+            state.IsPending() && !state.IsWaitingForMemory()
+                                       ? TCacheItems<TTraits>::PendingPayloadBytes(handle, kind)
+                                       : 0;
+        cacheOp.DiscardCandidate(cacheItem, kind, reservedBytes);
+    }
+
+    Y_FORCE_INLINE bool DetachCollection(TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept {
+        auto cacheOp = BeginOperation();
+        TOperationItemRef<TTraits> collectionRef(cacheOp, cacheOp.TryAcquireStructural(collection.CacheItem()));
+        if (!collectionRef) {
+            return false;
+        }
+        return cacheOp.Collections().Detach(registry, collection.CacheItem());
+    }
+
+    Y_FORCE_INLINE bool EraseCollection(TCollectionRegistry* registry, TCollectionCacheItem collection) noexcept {
+        auto cacheOp = BeginOperation();
+        TOperationItemRef<TTraits> collectionRef(cacheOp, cacheOp.TryAcquireStructural(collection.CacheItem()));
+        if (!collectionRef) {
+            return false;
+        }
+        TCollection* value = cacheOp.Collections().PageCollection(collection);
+        if (!value || !cacheOp.Collections().SetPagesCacheMode(*value, ECacheMode::Regular)) {
+            return false;
+        }
+        return cacheOp.Collections().Erase(registry, collection.CacheItem());
+    }
+
+    bool IsPageSticky(TPageCacheItem page) const noexcept;
+
+    bool ReclaimSpareHandle(TSpaceOperation& spaceOp) noexcept;
+    TKeepLoadRoom KeepLoadRoom(TSpaceOperation& spaceOp) noexcept;
+
+    // May finalize or reclaim an item while its mappings are protected
+    void ReleaseCleanup(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept {
+        auto cacheOp = BindOperation(spaceOp);
+        TCollection* owner = cacheOp.ReleaseItem(cacheItem);
+        if (owner) {
+            cacheOp.Collections().DropPageReference(*owner);
+        }
+    }
+
+    void ReleaseReplacing(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
+
+    void ReleaseReplaced(TSpaceOperation& spaceOp, TCacheItem cacheItem) noexcept;
+
+    static Y_FORCE_INLINE void DeleteReplacedPage(THandle& handle) noexcept {
+        Y_DEBUG_ABORT_UNLESS(handle.Payload.Page.data());
+        handle.Payload.Page.~TSharedData();
+    }
+
+    bool MatchesCandidateMetadata(
+        const TSpaceOperation& spaceOp, TCacheItem candidate, TCacheItem existing) const noexcept;
+
+    Y_FORCE_INLINE bool MatchesCandidateMetadata(
+        const TSpaceOperation& spaceOp, const TPageInsertCandidate& candidate, TCacheItem existing) const noexcept {
+        const THandle& handle = spaceOp.Handles()[existing.Index()];
+        const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
+        Y_DEBUG_ABORT_UNLESS(existing.Matches(state) && state.IsPageKind());
+        const ui64 size = handle.Payload.LoadPageSize();
+        return size == candidate.Size &&
+               handle.Metadata.Page.Type == candidate.Type && handle.Metadata.Page.Crc32 == candidate.Crc32;
+    }
+
+    Y_FORCE_INLINE bool MatchesCandidateMetadata(const TSpaceOperation& spaceOp,
+        const TCollectionInsertCandidate& candidate, TCacheItem existing) const noexcept {
+        const THandle& handle = spaceOp.Handles()[existing.Index()];
+        const THandleState state = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
+        Y_DEBUG_ABORT_UNLESS(existing.Matches(state) && state.IsCollectionKind());
+        return handle.Metadata.PayloadBytes == candidate.Bytes;
+    }
+
+    template <bool IsPage>
+    bool MatchesCandidateMetadata(
+        const TSpaceOperation& spaceOp, const TCacheKeyedItem<IsPage>& candidate, TCacheItem existing) const noexcept {
+        return MatchesCandidateMetadata(spaceOp, candidate.CacheItem, existing);
+    }
+
+    Y_FORCE_INLINE void UpdateColdReclaimable(ui64 payloadBytes, THandleState before, THandleState after) noexcept {
+        if (Memory_.UpdateColdReclaimable(payloadBytes, before, after)) {
+            NotifyResourcesAvailable();
+        }
+    }
+
+    static ui32 AdvanceColdMembership(THandle& handle) noexcept;
+
+    bool DrainHotResize() noexcept;
+
+    Y_FORCE_INLINE void RefreshSoftLimit() noexcept {
+        const ui64 softLimit = Memory_.RefreshSoftLimit(Policy_.CurrentLimitGap, Policy_.MinCurrentLimitGap);
+        Eviction_.RefreshKeepLimits();
+        if (RetainedBytes() >= softLimit) {
+            Eviction_.MarkSoftLimitPressure();
+        }
+    }
+
+    TCacheItemRefImpl<TTraits> TryAcquirePageForRelocation(TSpaceOperation& spaceOp, ui32 index) noexcept;
+    TCacheItem PreparePageReplacement(TSpaceOperation& spaceOp, TCacheItem source) noexcept;
+    void DiscardPageReplacement(TSpaceOperation& spaceOp, TCacheItem replacement) noexcept;
+    bool PublishPageReplacement(
+        TSpaceOperation& spaceOp, TCacheItem source, TCacheItem replacement, EHandleState& oldState) noexcept;
+    void CompletePageReplacement(TSpaceOperation& spaceOp, TCacheItem source) noexcept;
+    bool RelocatePage(TSpaceOperation& spaceOp, ui32 index) noexcept;
+    bool DemoteUnlinkedStickyPage(TSpaceOperation& spaceOp, ui32 index) noexcept;
+    EShrinkCutStatus ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui32 index) noexcept;
+
+private:
+    THolder<TCacheSpace> Space_;
+    TCacheTableImpl<TTraits> Table_;
+    TCacheMemory Memory_;
+    TCacheAccounting Accounting_;
+    TCacheItems<TTraits> Items_;
+    TCacheCollections<TTraits> Collections_;
+    TCacheEviction<TTraits> Eviction_;
+    TCacheCapacity<TTraits> Capacity_;
+    TCacheFetches<TTraits> Fetches_;
+    THotResize HotResize_;
+
+    inline static constexpr TCachePolicy Policy_ = CachePolicyFor<TTraits>;
+};
+
+template <class TTraits>
+class TCacheOperationView {
+    using EPageAdmission = typename TCacheImpl<TTraits>::EPageAdmission;
+    using TPageInsertCandidate = typename TCacheImpl<TTraits>::TPageInsertCandidate;
+    using TCollectionInsertCandidate = typename TCacheImpl<TTraits>::TCollectionInsertCandidate;
+public: // Cache table operations
+    using TInsertPosition = typename TCacheTableImpl<TTraits>::TInsertPosition;
+    using EResizeStep = typename TCacheTableImpl<TTraits>::EResizeStep;
+    using EAcquireStatus = typename TCacheImpl<TTraits>::EAcquireStatus;
+
+    Y_FORCE_INLINE TSpaceOperation& SpaceOperation() const noexcept {
+        return SpaceOp_;
+    }
+
+    Y_FORCE_INLINE ECacheResultStatus FindPage(
+        TCollectionCacheItem collection, ui64 offset, NDetail::TFoundItem& found) noexcept {
+        return Cache_.Table_.FindPage(SpaceOp_, collection, offset, found);
+    }
+
+    Y_FORCE_INLINE ECacheResultStatus FindPage(
+        TCollectionCacheItem collection, ui64 offset, TCacheItemRefImpl<TTraits>& ref, bool preload = false) noexcept {
+        struct TLookup {
+            TCacheOperationView& CacheOp;
+            TCollectionCacheItem Collection;
+            ui64 Offset;
+
+            Y_FORCE_INLINE ECacheResultStatus operator()(NDetail::TFoundItem& found) const noexcept {
+                return CacheOp.FindPage(Collection, Offset, found);
+            }
+        };
+
+        return Cache_.Find(*this, TLookup{ *this, collection, offset }, ref, preload);
+    }
+
+    // An owning presence probe for optional loads, using free Keep credit without reheating
+    Y_FORCE_INLINE ECacheResultStatus FindForPreload(
+        TCollectionCacheItem collection, ui64 offset, TCacheItemRefImpl<TTraits>& ref) noexcept {
+        return FindPage(collection, offset, ref, true);
+    }
+
+    Y_FORCE_INLINE ECacheResultStatus FindCollection(const TLogoBlobID& id, NDetail::TFoundItem& found) noexcept {
+        return Cache_.Table_.FindCollection(SpaceOp_, id, found);
+    }
+
+    Y_FORCE_INLINE ECacheResultStatus FindCollection(const TLogoBlobID& id, TCacheItemRefImpl<TTraits>& ref) noexcept {
+        struct TLookup {
+            TCacheOperationView& CacheOp;
+            const TLogoBlobID& Id;
+
+            Y_FORCE_INLINE ECacheResultStatus operator()(NDetail::TFoundItem& found) const noexcept {
+                return CacheOp.FindCollection(Id, found);
+            }
+        };
+
+        return Cache_.Find(*this, TLookup{ *this, id }, ref);
+    }
+
+    template <class TKeyedCandidate>
+    Y_FORCE_INLINE ECacheResultStatus FindForInsert(const TKeyedCandidate& candidate, TInsertPosition& found) noexcept {
+        if constexpr (TKeyedCandidate::IsPageKind()) {
+            return Cache_.Table_.FindPageForInsert(SpaceOp_, candidate.Key, found);
+        } else {
+            return Cache_.Table_.FindCollectionForInsert(SpaceOp_, candidate.Key, found);
+        }
+    }
+
+    Y_FORCE_INLINE bool InsertAt(TInsertPosition& position, TCacheItem candidate) noexcept {
+        return Cache_.Table_.InsertAt(SpaceOp_, position, candidate);
+    }
+
+    Y_FORCE_INLINE void DropInsertOwner(TInsertPosition& position) noexcept {
+        position.DropOwner(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE bool TryBeginErase(
+        TCacheItem item, THandleState& expected, TCacheItemRefImpl<TTraits>& owner) noexcept {
+        return Cache_.Table_.TryBeginErase(SpaceOp_, item, expected, owner);
+    }
+
+    Y_FORCE_INLINE bool TryBeginErase(TCacheItemRefImpl<TTraits>& owner, THandleState& expected) noexcept {
+        return Cache_.Table_.TryBeginErase(SpaceOp_, owner, expected);
+    }
+
+    Y_FORCE_INLINE void FinishErase(TCacheItem item, const TCacheKey& key) noexcept {
+        Cache_.Table_.FinishErase(SpaceOp_, item, key);
+    }
+
+public: // Cache helpers
+    // Returns Hit/Inserted or NoResource; ready is replaced only on success
+    [[nodiscard]] Y_FORCE_INLINE ECacheResultStatus AdmitCollection(
+        TIntrusiveConstPtr<NPageCollection::IPageCollection> collection, TCacheCollectionRefImpl<TTraits>& ready) {
+        return Cache_.AdmitCollection(SpaceOp_, std::move(collection), ready);
+    }
+
+    Y_FORCE_INLINE TCachePageRefImpl<TTraits> AdmitPage(TCollectionCacheItem collection,
+        NTable::NPage::TPageLocation location, NActors::TSharedData&& data, bool sticky = false)
+        requires std::is_same_v<TTraits, TProdTraits>
+    {
+        return Cache_.AdmitPage(SpaceOp_, collection, location, std::move(data), sticky, EPageAdmission::Bounded);
+    }
+
+    Y_FORCE_INLINE TCachePageRefImpl<TTraits> AdmitWrittenPage(TCollectionCacheItem collection,
+        NTable::NPage::TPageLocation location, NActors::TSharedData&& data, bool sticky = false)
+        requires std::is_same_v<TTraits, TProdTraits>
+    {
+        return Cache_.AdmitPage(SpaceOp_, collection, location, std::move(data), sticky, EPageAdmission::Written);
+    }
+
+    Y_FORCE_INLINE ui64 AvailableHandleCount() const noexcept {
+        return SpaceOp_.AvailableHandleCount();
+    }
+
+    Y_FORCE_INLINE bool ReclaimSpareHandle() noexcept {
+        return Cache_.ReclaimSpareHandle(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE typename TCacheImpl<TTraits>::TKeepLoadRoom KeepLoadRoom() noexcept {
+        return Cache_.KeepLoadRoom(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE EAcquireStatus TryAcquire(const NDetail::TFoundItem& found, bool allowPending,
+        TCacheItemRefImpl<TTraits>& ref, bool preload = false) noexcept {
+        return Items().TryAcquire(found, allowPending, ref, preload);
+    }
+
+    Y_FORCE_INLINE TCacheItemRefImpl<TTraits> TryAcquireStructural(TCacheItem item) noexcept {
+        return Items().TryAcquireStructural(item);
+    }
+
+    Y_FORCE_INLINE void ReleaseCleanup(TCacheItem item) noexcept {
+        Cache_.ReleaseCleanup(SpaceOp_, item);
+    }
+
+    Y_FORCE_INLINE typename TCacheFetches<TTraits>::TOperation Fetches() noexcept {
+        return { Cache_, SpaceOp_ };
+    }
+
+    Y_FORCE_INLINE TCacheItem Allocate() noexcept {
+        return Items().Allocate();
+    }
+
+    Y_FORCE_INLINE TCacheItem TryAllocateReservedItem(ui64 bytes, ui64 pages = 0) noexcept {
+        return Items().TryAllocateReservedItem(bytes, pages);
+    }
+
+    Y_FORCE_INLINE ui32 TryAllocateHandle() noexcept {
+        return Items().TryAllocateHandle();
+    }
+
+    Y_FORCE_INLINE void RefillSpareItem() noexcept {
+        Items().RefillSpareItem();
+    }
+
+    Y_FORCE_INLINE void RecycleCandidate(TCacheItem cacheItem) noexcept {
+        Items().RecycleCandidate(cacheItem);
+    }
+
+    Y_FORCE_INLINE bool MakeReady(
+        TCollectionRegistry* registry, TCacheItem cacheItem, THolder<TCollection>&& value) noexcept {
+        return Cache_.MakeReady(SpaceOp_, registry, cacheItem, std::move(value));
+    }
+
+    Y_FORCE_INLINE void MakeReadyState(
+        TCacheItem cacheItem, EHandleState readyState = EHandleState::Hot, TCollection* pageOwner = nullptr) noexcept {
+        Cache_.MakeReadyState(SpaceOp_, cacheItem, readyState, pageOwner);
+    }
+
+    Y_FORCE_INLINE ECacheResultStatus FindOrInsertPage(TPageInsertCandidate& candidate,
+        TIntrusivePtr<TPageFetchWaiter> waiter, TCachePageRefImpl<TTraits>& hit,
+        TPageFetchImpl<TTraits>& fetch) noexcept {
+        return Cache_.FindOrInsertPage(SpaceOp_, candidate, std::move(waiter), hit, fetch);
+    }
+
+    Y_FORCE_INLINE bool FindOrInsertBatch(TCollectionCacheItem collection,
+        TArrayRef<TCachePageRequestImpl<TTraits>> requests, bool recordStats = true,
+        bool waitForMemory = false) noexcept {
+        return Cache_.FindOrInsertBatch(
+            SpaceOp_, collection, requests, recordStats, waitForMemory, EPageAdmission::Bounded);
+    }
+
+    Y_FORCE_INLINE bool FindOrInsertWrittenBatch(
+        TCollectionCacheItem collection, TArrayRef<TCachePageRequestImpl<TTraits>> requests) noexcept {
+        return Cache_.FindOrInsertBatch(SpaceOp_, collection, requests, false, false, EPageAdmission::Written);
+    }
+
+    Y_FORCE_INLINE bool PreparePageBatch(TCollection& collection, TArrayRef<TCachePageRequestImpl<TTraits>> requests,
+        TVector<TPageInsertCandidate>& candidates, ui64& reservedBytes) noexcept {
+        return Cache_.PreparePageBatch(SpaceOp_, collection, requests, candidates, reservedBytes);
+    }
+
+    Y_FORCE_INLINE bool AllocatePageBatch(TCollection& collection, TVector<TPageInsertCandidate>& candidates,
+        ui64 reservedBytes, bool waitForMemory, EPageAdmission admission) noexcept {
+        return Cache_.AllocatePageBatch(SpaceOp_, collection, candidates, reservedBytes, waitForMemory, admission);
+    }
+
+    Y_FORCE_INLINE ECacheResultStatus FindOrInsertCollection(TCollectionRegistry* registry,
+        const TCollectionLocation& collection, TCollectionCacheItem& inserted,
+        TCacheCollectionRefImpl<TTraits>& hit) noexcept {
+        return Cache_.FindOrInsertCollection(SpaceOp_, registry, collection, inserted, hit);
+    }
+
+    Y_FORCE_INLINE bool AttachCollection(
+        TCollectionRegistry& registry, const TCacheItemRefImpl<TTraits>& ref) noexcept {
+        return Cache_.AttachCollection(SpaceOp_, registry, ref);
+    }
+
+    template <class TKeyedCandidate>
+    Y_FORCE_INLINE ECacheResultStatus FindOrInsert(TKeyedCandidate& candidate,
+        TCacheItemRefImpl<TTraits>& ref) noexcept(noexcept(Cache_.FindOrInsert(SpaceOp_, candidate, ref))) {
+        return Cache_.FindOrInsert(SpaceOp_, candidate, ref);
+    }
+
+    Y_FORCE_INLINE bool PrepareCandidate(TPageInsertCandidate& candidate) noexcept {
+        return Cache_.PrepareCandidate(SpaceOp_, candidate);
+    }
+
+    Y_FORCE_INLINE bool PrepareCandidate(TCollectionInsertCandidate& candidate) noexcept {
+        return Cache_.PrepareCandidate(SpaceOp_, candidate);
+    }
+
+    template <class TKeyedCandidate>
+    Y_FORCE_INLINE bool PrepareCandidate(TKeyedCandidate& candidate) noexcept(
+        noexcept(Cache_.PrepareCandidate(SpaceOp_, candidate))) {
+        return Cache_.PrepareCandidate(SpaceOp_, candidate);
+    }
+
+    Y_FORCE_INLINE bool TryReserve(ui64 bytes, ui64 pages = 0) noexcept {
+        return Cache_.TryReserve(SpaceOp_, bytes, pages);
+    }
+
+    Y_FORCE_INLINE bool TryReservePreload(ui64 bytes, ui64 pages = 0) noexcept {
+        return Cache_.TryReserve(SpaceOp_, bytes, pages, true);
+    }
+
+    Y_FORCE_INLINE void DiscardCandidate(TCacheItem cacheItem, EItemKind kind, ui64 reservedBytes = 0) noexcept {
+        Items().DiscardCandidate(cacheItem, kind, reservedBytes);
+    }
+
+    Y_FORCE_INLINE void InitializePage(TCacheItem cacheItem, TCollectionCacheItem collection, ui64 offset, ui64 size,
+        NTable::NPage::EPage type, ui32 crc32, EStickyState sticky, bool reserved = true,
+        bool collectionOwnerHeld = false) noexcept {
+        Items().InitializePage(cacheItem, collection, offset, size, type, crc32, sticky, reserved, collectionOwnerHeld);
+    }
+
+    Y_FORCE_INLINE TCachePageRefImpl<TTraits> BuildPageRef(TCacheItemRefImpl<TTraits>&& ref) const noexcept {
+        Y_DEBUG_ABORT_UNLESS(&TCacheImpl<TTraits>::Get() == &Cache_);
+        return Items().BuildPageRef(std::move(ref));
+    }
+
+    Y_FORCE_INLINE bool AcquirePage(TPageCacheItem page, TCachePageRefImpl<TTraits>& result) noexcept;
+
+    Y_FORCE_INLINE TCacheCollectionRefImpl<TTraits> BuildCollectionRef(
+        TCacheItemRefImpl<TTraits>&& ref) const noexcept {
+        Y_DEBUG_ABORT_UNLESS(&TCacheImpl<TTraits>::Get() == &Cache_);
+        return Items().BuildCollectionRef(std::move(ref));
+    }
+
+    Y_FORCE_INLINE TCollection* ReleaseItem(TCacheItem cacheItem) noexcept {
+        return Items().ReleaseItem(cacheItem);
+    }
+
+    Y_FORCE_INLINE void ReleaseReplacing(TCacheItem cacheItem) noexcept {
+        Cache_.ReleaseReplacing(SpaceOp_, cacheItem);
+    }
+
+    Y_FORCE_INLINE void ReleaseReplaced(TCacheItem cacheItem) noexcept {
+        Cache_.ReleaseReplaced(SpaceOp_, cacheItem);
+    }
+
+    Y_FORCE_INLINE bool MatchesCandidateMetadata(TCacheItem candidate, TCacheItem existing) const noexcept {
+        return Cache_.MatchesCandidateMetadata(SpaceOp_, candidate, existing);
+    }
+
+    Y_FORCE_INLINE bool MatchesCandidateMetadata(
+        const TPageInsertCandidate& candidate, TCacheItem existing) const noexcept {
+        return Cache_.MatchesCandidateMetadata(SpaceOp_, candidate, existing);
+    }
+
+    Y_FORCE_INLINE bool MatchesCandidateMetadata(
+        const TCollectionInsertCandidate& candidate, TCacheItem existing) const noexcept {
+        return Cache_.MatchesCandidateMetadata(SpaceOp_, candidate, existing);
+    }
+
+    template <class TKeyedCandidate>
+    Y_FORCE_INLINE bool MatchesCandidateMetadata(const TKeyedCandidate& candidate, TCacheItem existing) const noexcept {
+        return Cache_.MatchesCandidateMetadata(SpaceOp_, candidate, existing);
+    }
+
+    Y_FORCE_INLINE typename TCacheCollections<TTraits>::TOperation Collections() noexcept {
+        return { Cache_, SpaceOp_ };
+    }
+
+    Y_FORCE_INLINE typename TCacheEviction<TTraits>::TOperation Eviction() noexcept {
+        return { Cache_, SpaceOp_ };
+    }
+
+    Y_FORCE_INLINE typename TCacheItems<TTraits>::TOperation Items() const noexcept {
+        return { Cache_, SpaceOp_ };
+    }
+
+    Y_FORCE_INLINE TCacheItemRefImpl<TTraits> TryAcquirePageForRelocation(ui32 index) noexcept {
+        return Cache_.TryAcquirePageForRelocation(SpaceOp_, index);
+    }
+
+    Y_FORCE_INLINE TCacheItem PreparePageReplacement(TCacheItem source) noexcept {
+        return Cache_.PreparePageReplacement(SpaceOp_, source);
+    }
+
+    Y_FORCE_INLINE void DiscardPageReplacement(TCacheItem replacement) noexcept {
+        Cache_.DiscardPageReplacement(SpaceOp_, replacement);
+    }
+
+    Y_FORCE_INLINE bool PublishPageReplacement(
+        TCacheItem source, TCacheItem replacement, EHandleState& oldState) noexcept {
+        return Cache_.PublishPageReplacement(SpaceOp_, source, replacement, oldState);
+    }
+
+    Y_FORCE_INLINE void CompletePageReplacement(TCacheItem source) noexcept {
+        Cache_.CompletePageReplacement(SpaceOp_, source);
+    }
+
+    Y_FORCE_INLINE bool RelocatePage(ui32 index) noexcept {
+        return Cache_.RelocatePage(SpaceOp_, index);
+    }
+
+    Y_FORCE_INLINE bool DemoteUnlinkedStickyPage(ui32 index) noexcept {
+        return Cache_.DemoteUnlinkedStickyPage(SpaceOp_, index);
+    }
+
+    Y_FORCE_INLINE EShrinkCutStatus ReclaimShrinkHandle(ui32 index) noexcept {
+        return Cache_.ReclaimShrinkHandle(SpaceOp_, index);
+    }
+
+public: // Resizing
+    Y_FORCE_INLINE EResizeStep PrepareBucketSplit() noexcept {
+        return Cache_.Table_.PrepareBucketSplit(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE EResizeStep ActivateBucketSplitOrMerge() noexcept {
+        return Cache_.Table_.ActivateBucketSplitOrMerge(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE EResizeStep PublishBucketSplit() noexcept {
+        return Cache_.Table_.PublishBucketSplit(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE EResizeStep CloseBucketSplit() noexcept {
+        return Cache_.Table_.CloseBucketSplit(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE EResizeStep RemoveBucketSplit() noexcept {
+        return Cache_.Table_.RemoveBucketSplit(SpaceOp_);
+    }
+
+    Y_FORCE_INLINE void PublishPageReplacement(
+        TCacheItem source, TCacheItem replacement, const TCacheKey& key) noexcept {
+        Cache_.Table_.PublishPageReplacement(source, replacement, key, SpaceOp_);
+    }
+
+private:
+    friend class TCacheImpl<TTraits>;
+    friend class TCacheOperation<TTraits>;
+
+    Y_FORCE_INLINE TCacheOperationView(TCacheImpl<TTraits>& cache, TSpaceOperation& spaceOp) noexcept
+        : Cache_(cache)
+        , SpaceOp_(spaceOp)
+    {}
+
+protected: // Data members
+    TCacheImpl<TTraits>& Cache_;
+    TSpaceOperation& SpaceOp_;
+};
+
+// Leave operations implicitly instantiated so their constructors can inline
+template <class TTraits>
+class TCacheOperation final : public TSpaceOperation, public TCacheOperationView<TTraits> {
+    using TOperationView = TCacheOperationView<TTraits>;
+
+public:
+    using TOperationView::AvailableHandleCount;
+    using TOperationView::ReclaimSpareHandle;
+    using TOperationView::TryAllocateHandle;
+
+    TCacheOperation(const TCacheOperation&) = delete;
+    TCacheOperation& operator=(const TCacheOperation&) = delete;
+    TCacheOperation& operator=(TCacheOperation&&) = delete;
+
+    Y_FORCE_INLINE TCacheOperation(TCacheOperation&& other) noexcept
+        : TSpaceOperation(std::move(other))
+        , TOperationView(other.Cache_, *this)
+    {}
+
+private:
+    friend class TCacheImpl<TTraits>;
+
+    Y_FORCE_INLINE TCacheOperation(TCacheImpl<TTraits>& cache, TSpaceOperation&& spaceOp) noexcept
+        : TSpaceOperation(std::move(spaceOp))
+        , TOperationView(cache, *this)
+    {}
+};
+
+template <class TTraits>
+class TCacheOpBatch final {
+public:
+    using TOperation = TCacheOperation<TTraits>;
+
+    TCacheOpBatch(const TCacheOpBatch&) = delete;
+    TCacheOpBatch& operator=(const TCacheOpBatch&) = delete;
+    TCacheOpBatch& operator=(TCacheOpBatch&&) = delete;
+    Y_FORCE_INLINE TCacheOpBatch(TCacheOpBatch&& other) noexcept;
+
+    // Actions must not restart or reenter this batch, or retain operation-bound references
+    // Return independent owners or values
+    template <class TAction>
+    Y_FORCE_INLINE auto ProcessPage(TAction&& action);
+
+    Y_FORCE_INLINE void Restart() noexcept;
+
+private:
+    friend class TCacheImpl<TTraits>;
+
+    Y_FORCE_INLINE explicit TCacheOpBatch(TCacheImpl<TTraits>& cache) noexcept;
+    Y_FORCE_INLINE void FinishPage() noexcept;
+
+    TCacheImpl<TTraits>& Cache_;
+    std::optional<TOperation> Operation_;
+    ui32 OpPageCount_ = 0;
+};
+
+template <class TTraits>
+Y_FORCE_INLINE TCacheOpBatch<TTraits>::TCacheOpBatch(TCacheOpBatch&& other) noexcept
+    : Cache_(other.Cache_)
+    , Operation_(std::move(other.Operation_))
+    , OpPageCount_(other.OpPageCount_)
+{}
+
+template <class TTraits>
+Y_FORCE_INLINE TCacheOpBatch<TTraits>::TCacheOpBatch(TCacheImpl<TTraits>& cache) noexcept
+    : Cache_(cache)
+    , Operation_(cache.BeginOperation())
+{}
+
+template <class TTraits>
+template <class TAction>
+Y_FORCE_INLINE auto TCacheOpBatch<TTraits>::ProcessPage(TAction&& action) {
+    using TResult = std::invoke_result_t<TAction, TOperation&>;
+    static_assert(!std::is_reference_v<TResult>, "A page action must return an independent owner or value");
+    if constexpr (std::is_void_v<TResult>) {
+        std::forward<TAction>(action)(*Operation_);
+        FinishPage();
+    } else {
+        auto result = std::forward<TAction>(action)(*Operation_);
+        FinishPage();
+        return result;
+    }
+}
+
+template <class TTraits>
+Y_FORCE_INLINE void TCacheOpBatch<TTraits>::Restart() noexcept {
+    Operation_.reset();
+    OpPageCount_ = 0;
+    Operation_.emplace(Cache_.BeginOperation());
+}
+
+template <class TTraits>
+Y_FORCE_INLINE void TCacheOpBatch<TTraits>::FinishPage() noexcept {
+    // Bound the active view lifetime
+    if (++OpPageCount_ == CacheOperationBatchSize) {
+        Restart();
+    }
+}
+
+template <class TTraits>
+Y_FORCE_INLINE typename TCacheImpl<TTraits>::TOperationView TCacheImpl<TTraits>::BindOperation(
+    TSpaceOperation& spaceOp) noexcept {
+    return TOperationView(*this, spaceOp);
+}
+
+template <class TTraits>
+Y_FORCE_INLINE typename TCacheImpl<TTraits>::TOperation TCacheImpl<TTraits>::BeginOperation() noexcept {
+    return TOperation(*this, Space_->BeginOperation());
+}
+
+template <class TTraits>
+Y_FORCE_INLINE typename TCacheImpl<TTraits>::TOpBatch TCacheImpl<TTraits>::BeginOpBatch() noexcept {
+    return TOpBatch(*this);
+}
+
+using TPageFetch = TPageFetchImpl<>;
+using TCachePageRequest = TCachePageRequestImpl<>;
+using TCache = TCacheImpl<>;
+
+// Inline implementations
+
+template <class TTraits>
+Y_FORCE_INLINE bool TCacheOperationView<TTraits>::AcquirePage(
+    TPageCacheItem page, TCachePageRefImpl<TTraits>& result) noexcept {
+    result.Drop();
+    auto ref = Cache_.AcquirePageItem(SpaceOp_, page);
+    if (!ref) {
+        return false;
+    }
+    result = BuildPageRef(std::move(ref));
+    return true;
+}
+
+Y_FORCE_INLINE void* TProdTraits::TryGetCache() noexcept {
+    NActors::TActorSystem* actorSystem =
+        NActors::TlsActivationContext ? NActors::TActivationContext::ActorSystem() : nullptr;
+    if (HasAppData(actorSystem)) {
+        const TIntrusivePtr<TCache>& owner = AppData(actorSystem)->SharedCache;
+        return owner.Get();
+    }
+    return nullptr;
+}
+
+template <class TTraits>
+Y_FORCE_INLINE ECacheResultStatus TCacheImpl<TTraits>::Find(
+    TCollectionCacheItem collection, ui64 offset, TCachePageRefImpl<TTraits>& page) noexcept {
+    page.Drop();
+    auto cacheOp = BeginOperation();
+    TOperationItemRef<TTraits> ref(cacheOp);
+    const ECacheResultStatus status = cacheOp.FindPage(collection, offset, ref.Get());
+    if (status == ECacheResultStatus::Hit) {
+        page = cacheOp.BuildPageRef(ref.Take());
+    }
+    return status;
+}
+
+template <class TTraits>
+Y_FORCE_INLINE ECacheResultStatus TCacheImpl<TTraits>::Find(
+    const TLogoBlobID& id, TCacheCollectionRefImpl<TTraits>& collection) noexcept {
+    collection.Drop();
+    auto cacheOp = BeginOperation();
+    TOperationItemRef<TTraits> ref(cacheOp);
+    const ECacheResultStatus status = cacheOp.FindCollection(id, ref.Get());
+    if (status == ECacheResultStatus::Hit) {
+        collection = cacheOp.BuildCollectionRef(ref.Take());
+    }
+    return status;
+}
+
+template <class TTraits>
+template <class TLookup>
+Y_FORCE_INLINE ECacheResultStatus TCacheImpl<TTraits>::Find(
+    TOperationView& cacheOp, TLookup&& lookup, TCacheItemRefImpl<TTraits>& ref, bool preload) noexcept {
+    for (;;) {
+        NDetail::TFoundItem found;
+        const ECacheResultStatus status = lookup(found);
+        if (status == ECacheResultStatus::Miss) {
+            return ECacheResultStatus::Miss;
+        }
+        Y_DEBUG_ABORT_UNLESS(status == ECacheResultStatus::Hit);
+        InvokeHook(ECacheHookPoint::BeforeLookupItemAcquire, found.Item);
+        TOperationItemRef<TTraits> acquired(cacheOp.SpaceOperation());
+        switch (cacheOp.TryAcquire(found, false, acquired.Get(), preload)) {
+            case EAcquireStatus::Stale:
+                continue;
+            case EAcquireStatus::Pending:
+                return ECacheResultStatus::Pending;
+            case EAcquireStatus::Ready:
+                ref = acquired.Take();
+                return ECacheResultStatus::Hit;
+        }
+        Y_UNREACHABLE();
+    }
+}
+
+template <class TTraits>
+inline TCachePageRequestImpl<TTraits>& TCachePageRequestImpl<TTraits>::operator=(
+    TCachePageRequestImpl&& other) noexcept {
+    if (this != &other) {
+        Location = std::move(other.Location);
+        Waiter = std::move(other.Waiter);
+        Sticky = other.Sticky;
+        MoveResult(other);
+    }
+    return *this;
+}
+
+template <class TTraits>
+inline void TCachePageRequestImpl<TTraits>::Destroy() noexcept {
+    if (Status_ == ECacheResultStatus::Inserted) {
+        Storage_.Fetch.~TPageFetchImpl<TTraits>();
+    } else {
+        Storage_.Page.~TCachePageRefImpl<TTraits>();
+    }
+}
+
+template <class TTraits>
+inline void TCachePageRequestImpl<TTraits>::MoveResult(TCachePageRequestImpl& other) noexcept {
+    Destroy();
+    if (other.Status_ == ECacheResultStatus::Inserted) {
+        new (&Storage_.Fetch) TPageFetchImpl<TTraits>(std::move(other.Storage_.Fetch));
+    } else {
+        new (&Storage_.Page) TCachePageRefImpl<TTraits>(std::move(other.Storage_.Page));
+    }
+    Status_ = other.Status_;
+}
+
+} // namespace NKikimr::NSharedCache
