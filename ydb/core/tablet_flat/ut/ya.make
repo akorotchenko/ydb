@@ -11,6 +11,7 @@ ELSE()
 ENDIF()
 
 SRCS(
+    cache_item_ut.cpp
     cache_cyclic_buffer_ut.cpp
     cache_accounting_ut.cpp
     flat_cxx_database_ut.cpp

@@ -1,6 +1,7 @@
 LIBRARY()
 
 SRCS(
+    cache_memory.cpp
     cache_thread.cpp
     cache_accounting.cpp
     defs.cpp

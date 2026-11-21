@@ -1,0 +1,305 @@
+#include "cache_item.h"
+
+#include <library/cpp/testing/unittest/registar.h>
+
+#include <type_traits>
+
+namespace NKikimr::NSharedCache {
+
+Y_UNIT_TEST_SUITE(TCacheItemTest) {
+    Y_UNIT_TEST(CacheItemFields) {
+        constexpr auto cacheItem = TCacheItem::Make(MaxItemVersion, Max<ui32>(), true);
+
+        static_assert(cacheItem.Version() == MaxItemVersion);
+        static_assert(cacheItem.Index() == Max<ui32>());
+        static_assert(cacheItem.IsFrozen());
+        static_assert(!cacheItem.IsNull());
+        static_assert(cacheItem.WithoutFrozen().WithFrozen() == cacheItem);
+
+        UNIT_ASSERT_VALUES_EQUAL(cacheItem.Raw(), Max<ui64>());
+        UNIT_ASSERT_VALUES_EQUAL(TCacheItem{}.Raw(), 0);
+        UNIT_ASSERT(TCacheItem{}.IsNull());
+    }
+
+    Y_UNIT_TEST(HandleStateFields) {
+        constexpr auto state = THandleState::Make(
+            MaxItemVersion, EHandleState::Tombstone, EItemKind::Collection, 3, EStickyState::Transition, MaxHandleRefs);
+
+        static_assert(state.Version() == MaxItemVersion);
+        static_assert(state.State() == EHandleState::Tombstone);
+        static_assert(state.Kind() == EItemKind::Collection);
+        static_assert(state.Frequency() == 3);
+        static_assert(state.Sticky() == EStickyState::Transition);
+        static_assert(state.Refs() == MaxHandleRefs);
+
+        constexpr ui64 expected =
+            THandleState::VersionMask | (ui64(EHandleState::Tombstone) << THandleState::StateShift) |
+            THandleState::KindMask | THandleState::FrequencyMask |
+            (ui64(EStickyState::Transition) << THandleState::StickyShift) | THandleState::RefsMask;
+        UNIT_ASSERT_VALUES_EQUAL(state.Raw(), expected);
+    }
+
+    Y_UNIT_TEST(HandleStateFieldIsolation) {
+        constexpr auto state =
+            THandleState::Make(123456, EHandleState::Hot, EItemKind::Page, 2, EStickyState::Sticky, 42);
+
+        constexpr auto updated = state.WithVersion(765432)
+                                     .WithState(EHandleState::Cold)
+                                     .WithKind(EItemKind::Collection)
+                                     .WithFrequency(1)
+                                     .WithSticky(EStickyState::Transition)
+                                     .WithRefs(24);
+
+        static_assert(updated.Version() == 765432);
+        static_assert(updated.State() == EHandleState::Cold);
+        static_assert(updated.Kind() == EItemKind::Collection);
+        static_assert(updated.Frequency() == 1);
+        static_assert(updated.Sticky() == EStickyState::Transition);
+        static_assert(updated.Refs() == 24);
+
+        UNIT_ASSERT_VALUES_EQUAL(state.Version(), 123456);
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 42);
+    }
+
+    Y_UNIT_TEST(CollectionPageAttachmentUsesOnlyRetainedMetadataBits) {
+        constexpr auto sticky =
+            THandleState::Make(13, EHandleState::Sticky, EItemKind::Collection, 0, EStickyState::None, 2)
+                .WithPageAttachment(true)
+                .WithShrinkWaiter(true);
+        static_assert(
+            sticky.HasPageAttachment() && sticky.HasShrinkWaiter() && sticky.Refs() == 2 && sticky.Version() == 13);
+        constexpr auto retired = sticky.WithState(EHandleState::Tombstone)
+                                     .WithFrequency(0)
+                                     .WithPageAttachment(sticky.HasPageAttachment())
+                                     .WithShrinkWaiter(sticky.HasShrinkWaiter());
+        static_assert(retired.HasPageAttachment() && retired.HasShrinkWaiter() && retired.Refs() == 2);
+        static_assert(!retired.WithPageAttachment(false).HasPageAttachment());
+        constexpr auto hot = THandleState::Make(13, EHandleState::Hot, EItemKind::Collection, 1, EStickyState::None, 1);
+        static_assert(!hot.HasPageAttachment() && !hot.HasShrinkWaiter() && hot.Frequency() == 1);
+        constexpr auto attached =
+            hot.WithState(EHandleState::Sticky).WithFrequency(0).WithPageAttachment(hot.HasPageAttachment());
+        static_assert(!attached.HasPageAttachment());
+        constexpr auto page = THandleState::Make(13, EHandleState::Sticky, EItemKind::Page, 1, EStickyState::Sticky, 2);
+        static_assert(!page.HasPageAttachment());
+    }
+
+    Y_UNIT_TEST(ShrinkWaiterEncodingsPreserveReferencesAndPolicy) {
+        static_assert(MaxHandleRefs == (ui32{ 1 } << 24) - 1);
+        static_assert(THandleState::CollectionShrinkWaiterMask == (ui64{ 1 } << 27));
+        constexpr auto base = THandleState::Make(
+            MaxItemVersion, EHandleState::KeepHot, EItemKind::Page, 3, EStickyState::None, MaxHandleRefs);
+        constexpr auto waiting = base.WithShrinkWaiter(true);
+        static_assert(!base.HasShrinkWaiter() && waiting.HasShrinkWaiter());
+        static_assert(waiting.Sticky() == EStickyState::ShrinkWaiter && waiting.IsStickyNoneField());
+        static_assert(!waiting.IsStickyField() && !waiting.IsTransitionField());
+        static_assert(waiting.Refs() == MaxHandleRefs && waiting.Frequency() == 3);
+        static_assert(waiting.Raw() == (base.Raw() | THandleState::StickyMask));
+        static_assert(waiting.DecrementRefs().IncrementRefs() == waiting);
+        static_assert(waiting.WithRefs(0).HasShrinkWaiter());
+        static_assert(waiting.WithCold(ECacheTier::Regular).HasShrinkWaiter());
+        static_assert(waiting.WithState(EHandleState::Replacing).HasShrinkWaiter());
+        static_assert(waiting.WithState(EHandleState::Replaced).HasShrinkWaiter());
+        static_assert(waiting.WithState(EHandleState::Tombstone).HasShrinkWaiter());
+        static_assert(waiting.WithShrinkWaiter(false) == base);
+        for (auto sticky : { EStickyState::Sticky, EStickyState::Transition }) {
+            const auto realMode = base.WithSticky(sticky);
+            UNIT_ASSERT(!realMode.HasShrinkWaiter() && !realMode.IsStickyNoneField());
+            UNIT_ASSERT(realMode.WithShrinkWaiter(false) == realMode);
+        }
+    }
+
+    Y_UNIT_TEST(CollectionShrinkWaiterSurvivesOverlayTransitionsWithoutInventingHeat) {
+        constexpr auto hot = THandleState::Make(7, EHandleState::Hot, EItemKind::Collection, 3, EStickyState::None, 1);
+        static_assert(!hot.HasShrinkWaiter());
+        constexpr auto attached = hot.WithState(EHandleState::Sticky)
+                                      .WithSticky(EStickyState::Sticky)
+                                      .WithFrequency(0)
+                                      .WithPageAttachment(hot.HasPageAttachment())
+                                      .WithShrinkWaiter(hot.HasShrinkWaiter());
+        static_assert(!attached.HasShrinkWaiter() && !attached.HasPageAttachment());
+        constexpr auto waiting = hot.WithShrinkWaiter(true);
+        constexpr auto retained = waiting.WithState(EHandleState::Sticky)
+                                      .WithSticky(EStickyState::Sticky)
+                                      .WithFrequency(0)
+                                      .WithPageAttachment(true)
+                                      .WithShrinkWaiter(waiting.HasShrinkWaiter());
+        static_assert(retained.IsStickyField() && retained.HasPageAttachment() && retained.HasShrinkWaiter());
+        static_assert((retained.Raw() & THandleState::CollectionShrinkWaiterMask) != 0);
+        static_assert(retained.WithShrinkWaiter(false).IsStickyField());
+        static_assert(retained.WithShrinkWaiter(false).HasPageAttachment());
+        constexpr auto retired = waiting.WithState(EHandleState::Tombstone)
+                                     .WithFrequency(0)
+                                     .WithPageAttachment(false)
+                                     .WithShrinkWaiter(waiting.HasShrinkWaiter());
+        static_assert(retired.IsStickyNoneField() && retired.Sticky() == EStickyState::None);
+        static_assert(retired.HasShrinkWaiter() && !retired.HasPageAttachment());
+        constexpr auto hotAgain = retained.WithState(EHandleState::Hot)
+                                      .WithSticky(EStickyState::None)
+                                      .WithFrequency(0)
+                                      .WithShrinkWaiter(retained.HasShrinkWaiter());
+        static_assert(hotAgain.HasShrinkWaiter() && hotAgain.IsStickyNoneField() && hotAgain.Frequency() == 0);
+    }
+
+    Y_UNIT_TEST(ReferenceBoundaryPreservesTheWaiterAndOtherFields) {
+        constexpr auto belowOldLimit =
+            THandleState::Make(17, EHandleState::Hot, EItemKind::Page, 2, EStickyState::None, (ui32{ 1 } << 23) - 1);
+        constexpr auto aboveOldLimit = belowOldLimit.IncrementRefs();
+        static_assert(aboveOldLimit.Refs() == (ui32{ 1 } << 23));
+        static_assert(!aboveOldLimit.HasShrinkWaiter() && aboveOldLimit.Sticky() == EStickyState::None);
+        constexpr auto beforeMax = belowOldLimit.WithRefs(MaxHandleRefs - 1).WithShrinkWaiter(true);
+        constexpr auto atMax = beforeMax.IncrementRefs();
+        static_assert(atMax.Refs() == MaxHandleRefs && atMax.HasShrinkWaiter());
+        static_assert(atMax.DecrementRefs() == beforeMax);
+        static_assert(atMax.Version() == 17 && atMax.Frequency() == 2);
+    }
+
+    Y_UNIT_TEST(TierReadyTagsPreservePackedFields) {
+        static_assert(sizeof(THandleState) == sizeof(ui64));
+        static_assert(ui8(EHandleState::Hot) == 7);
+        static_assert(ui8(EHandleState::KeepCold) == 8);
+        static_assert(ui8(EHandleState::Cold) == 9);
+        static_assert(ui8(EHandleState::WaitingForMemory) == 14);
+        static_assert(ui8(EHandleState::KeepHot) == 15);
+        for (ui32 version : { ui32{ 0 }, MaxItemVersion }) {
+            for (auto kind : { EItemKind::Page, EItemKind::Collection }) {
+                for (ui8 frequency = 0; frequency < 4; ++frequency) {
+                    for (auto sticky : { EStickyState::None, EStickyState::Sticky, EStickyState::Transition,
+                             EStickyState::ShrinkWaiter }) {
+                        for (ui32 refs : { ui32{ 0 }, ui32{ 1 }, MaxHandleRefs }) {
+                            const auto base =
+                                THandleState::Make(version, EHandleState::Cold, kind, frequency, sticky, refs);
+                            for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+                                const auto hot = base.WithHot(tier);
+                                const auto cold = hot.WithCold(tier);
+                                const auto other = tier == ECacheTier::Regular ? ECacheTier::Keep : ECacheTier::Regular;
+                                UNIT_ASSERT(hot.IsHotInTier(tier) && !hot.IsHotInTier(other));
+                                UNIT_ASSERT(cold.IsColdInTier(tier) && !cold.IsColdInTier(other));
+                                UNIT_ASSERT(hot.IsReady() && cold.IsReady());
+                                UNIT_ASSERT(!hot.IsPending() && !cold.IsPending());
+                                UNIT_ASSERT(hot.Tier() == tier && cold.Tier() == tier);
+                                UNIT_ASSERT_VALUES_EQUAL((hot.Raw() ^ base.Raw()) & ~THandleState::StateMask, 0);
+                                UNIT_ASSERT_VALUES_EQUAL((cold.Raw() ^ base.Raw()) & ~THandleState::StateMask, 0);
+                                UNIT_ASSERT(cold.WithHot(tier) == hot);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Y_UNIT_TEST(TierReadyPredicatesCoverBothTiers) {
+        constexpr auto base = THandleState::Make(
+            MaxItemVersion, EHandleState::Cold, EItemKind::Page, 2, EStickyState::None, MaxHandleRefs);
+        constexpr auto regularHot = base.WithHot(ECacheTier::Regular);
+        constexpr auto keepHot = base.WithHot(ECacheTier::Keep);
+        constexpr auto regularCold = base.WithCold(ECacheTier::Regular);
+        constexpr auto keepCold = base.WithCold(ECacheTier::Keep);
+        static_assert(regularHot.IsHot() && keepHot.IsHot());
+        static_assert(regularCold.IsCold() && keepCold.IsCold());
+        static_assert(keepCold.IsKeepCold());
+        static_assert(keepHot.IsHotInTier(ECacheTier::Keep));
+        static_assert(keepCold.IsColdInTier(ECacheTier::Keep));
+        static_assert(keepHot.Tier() == ECacheTier::Keep);
+        static_assert(keepCold.Tier() == ECacheTier::Keep);
+        static_assert(regularHot.Tier() == ECacheTier::Regular);
+        static_assert(regularCold.Tier() == ECacheTier::Regular);
+        static_assert(TCacheItem::Make(MaxItemVersion, 2).Matches(keepHot));
+    }
+
+    Y_UNIT_TEST(HandleStateRefs) {
+        const auto base = THandleState::Make(7, EHandleState::Hot, EItemKind::Page, 2, EStickyState::None, 1);
+
+        const THandleState incremented = base.IncrementRefs();
+        UNIT_ASSERT_VALUES_EQUAL(incremented.Refs(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(incremented.Version(), base.Version());
+        UNIT_ASSERT_VALUES_EQUAL(incremented.Frequency(), base.Frequency());
+
+        const THandleState decremented = incremented.DecrementRefs();
+        UNIT_ASSERT_VALUES_EQUAL(decremented.Raw(), base.Raw());
+
+        UNIT_ASSERT_VALUES_EQUAL(base.WithRefs(MaxHandleRefs).Refs(), MaxHandleRefs);
+        UNIT_ASSERT_VALUES_EQUAL(base.WithRefs(0).Refs(), 0);
+    }
+
+    Y_UNIT_TEST(HandleStateClassification) {
+        constexpr TCacheItem cacheItem = TCacheItem::Make(7, 42);
+        constexpr auto make = [](EHandleState state, EStickyState sticky = EStickyState::None) {
+            return THandleState::Make(7, state, EItemKind::Page, 0, sticky, 1);
+        };
+        constexpr THandleState ready = make(EHandleState::Hot);
+        constexpr THandleState pending = make(EHandleState::Queued);
+
+        static_assert(cacheItem.Matches(ready));
+        static_assert(!TCacheItem::Make(8, 42).Matches(ready));
+        static_assert(ready.IsPageKind());
+        static_assert(!ready.IsCollectionKind());
+        static_assert(ready.IsReady());
+        static_assert(!ready.IsPending());
+        static_assert(!pending.IsReady());
+        static_assert(pending.IsPending());
+        static_assert(make(EHandleState::Free).IsFree());
+        static_assert(make(EHandleState::Begin).IsBegin());
+        static_assert(make(EHandleState::Queued).IsQueued());
+        static_assert(make(EHandleState::Requested).IsRequested());
+        static_assert(make(EHandleState::QueuedRequested).IsQueuedRequested());
+        static_assert(make(EHandleState::Completing).IsCompleting());
+        static_assert(make(EHandleState::Hot).IsHot());
+        static_assert(make(EHandleState::Cold).IsCold());
+        static_assert(make(EHandleState::Sticky).IsSticky());
+        static_assert(make(EHandleState::Replacing).IsReplacing());
+        static_assert(make(EHandleState::Replaced).IsReplaced());
+        static_assert(make(EHandleState::BucketSplit).IsBucketSplit());
+        static_assert(make(EHandleState::Tombstone).IsTombstone());
+        static_assert(make(EHandleState::Begin).IsStickyNoneField());
+        static_assert(make(EHandleState::Begin, EStickyState::Sticky).IsStickyField());
+        static_assert(make(EHandleState::Begin, EStickyState::Transition).IsTransitionField());
+    }
+
+    Y_UNIT_TEST(VersionWrap) {
+        UNIT_ASSERT_VALUES_EQUAL(AdvanceItemVersion(MaxItemVersion), 0);
+        UNIT_ASSERT_VALUES_EQUAL(AdvanceColdVersion(MaxItemVersion), 0);
+        UNIT_ASSERT_VALUES_EQUAL(AdvanceItemVersion(0), 1);
+        UNIT_ASSERT_VALUES_EQUAL(AdvanceColdVersion(0), 1);
+    }
+
+    Y_UNIT_TEST(TypedCacheItems) {
+        static_assert(!std::is_convertible_v<TPageCacheItem, TCollectionCacheItem>);
+        static_assert(!std::is_convertible_v<TCollectionCacheItem, TPageCacheItem>);
+        static_assert(!std::is_constructible_v<TPageCacheItem, TCacheItem>);
+        static_assert(!std::is_constructible_v<TCollectionCacheItem, TCacheItem>);
+
+        constexpr auto first = TCollectionCacheItem::FromValidated(TCacheItem::Make(11, 42));
+        constexpr auto second = TCollectionCacheItem::FromValidated(TCacheItem::Make(12, 42));
+
+        static_assert(first.CacheItem() == TCacheItem::Make(11, 42));
+        static_assert(first != second);
+        constexpr auto page = TPageCacheItem::FromValidated(first.CacheItem());
+        constexpr auto collectionState =
+            THandleState::Make(11, EHandleState::Hot, EItemKind::Collection, 0, EStickyState::None, 1);
+        constexpr auto pageState = collectionState.WithKind(EItemKind::Page);
+        static_assert(first.Matches(collectionState));
+        static_assert(!first.Matches(pageState));
+        static_assert(!first.Matches(collectionState.WithVersion(12)));
+        static_assert(page.Matches(pageState));
+        static_assert(!page.Matches(collectionState));
+        static_assert(!page.Matches(pageState.WithVersion(12)));
+        static_assert(first.CacheItem().Matches(pageState));
+        static_assert(first.CacheItem().Matches(collectionState));
+        UNIT_ASSERT_VALUES_UNEQUAL(first.Raw(), second.Raw());
+    }
+
+    Y_UNIT_TEST(ItemInitialization) {
+        THandle handle;
+
+        UNIT_ASSERT_VALUES_EQUAL(handle.State.load(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(handle.Next.load(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(handle.Key0.load(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(handle.Key1.load(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(handle.Metadata.PayloadBytes, 0);
+        UNIT_ASSERT_VALUES_EQUAL(handle.ColdVersion.load(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(handle.NextInOwner.load(), 0);
+    }
+}
+
+} // namespace NKikimr::NSharedCache
