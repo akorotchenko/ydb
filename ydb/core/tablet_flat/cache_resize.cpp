@@ -1,0 +1,347 @@
+#include "cache.h"
+
+namespace NKikimr::NSharedCache {
+
+#define CACHE_TEMPLATE template <class TTraits>
+#define TCache TCacheImpl<TTraits>
+#define TCacheItemRef TCacheItemRefImpl<TTraits>
+#define TOperationItemRef TOperationItemRef<TTraits>
+
+CACHE_TEMPLATE
+TCacheItemRef TCache::TryAcquirePageForRelocation(TSpaceOperation& spaceOp, ui32 index) noexcept {
+    THandle& source = spaceOp.Handles()[index];
+    ui64 expectedRaw = source.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        const bool ordinary =
+            (expected.IsHot() || expected.IsCold()) && expected.IsStickyNoneField() && expected.Refs() != 0;
+        const bool unsticky = expected.IsSticky() && expected.IsTransitionField();
+        if (!expected.IsPageKind() || (!ordinary && !unsticky))
+        {
+            return {};
+        }
+        const THandleState desired = expected.IncrementRefs();
+        if (source.State.compare_exchange_weak(
+                expectedRaw, desired.Raw(), std::memory_order_acquire, std::memory_order_relaxed))
+        {
+            return TCacheItemRef(TCacheItem::Make(expected.Version(), index));
+        }
+    }
+}
+
+CACHE_TEMPLATE
+TCacheItem TCache::PreparePageReplacement(TSpaceOperation& spaceOp, TCacheItem sourceItem) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
+    THandle& source = spaceOp.Handles()[sourceItem.Index()];
+    const THandleState sourceState = THandleState::FromRaw(source.State.load(std::memory_order_acquire));
+    const bool restoreSticky = sourceState.IsSticky() && sourceState.IsTransitionField();
+    if (!restoreSticky && (!(sourceState.IsHot() || sourceState.IsCold()) || !sourceState.IsStickyNoneField())) {
+        return {};
+    }
+    // The owner protects this indexed source from eviction while preparing its replacement
+    // Explicit invalidation can still win before the Replacing claim
+    const TCacheItem replacementItem = cacheOp.Allocate();
+    if (replacementItem.IsNull()) {
+        return {};
+    }
+
+    const TCollectionCacheItem collection =
+        TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(source.Key0.load(std::memory_order_relaxed)));
+    const ui64 offset = source.Key1.load(std::memory_order_relaxed);
+    const ui64 size = source.Payload.Page.size();
+    const NTable::NPage::EPage type = source.Metadata.Page.Type;
+    const ui32 crc32 = source.Metadata.Page.Crc32;
+    NActors::TSharedData data = source.Payload.Page;
+
+    // Relocation transfers the source's sticky charge; claiming a second budget slot would double count it.
+    cacheOp.InitializePage(replacementItem, collection, offset, size, type, crc32, EStickyState::None, true, true);
+    THandle& replacement = spaceOp.Handles()[replacementItem.Index()];
+    TCacheFetches<TTraits>::DeletePendingFetch(replacement);
+    replacement.Payload.InitializePage(std::move(data));
+    const THandleState initialized = THandleState::FromRaw(replacement.State.load(std::memory_order_relaxed));
+    Y_DEBUG_ABORT_UNLESS(replacementItem.Matches(initialized) && initialized.IsBegin() && initialized.Refs() == 0);
+    const EHandleState replacementState = restoreSticky ? EHandleState::Sticky : sourceState.State();
+    replacement.State.store(initialized.WithState(replacementState)
+                                .WithSticky(restoreSticky ? EStickyState::Sticky : EStickyState::None)
+                                .WithRefs(1)
+                                .Raw(), std::memory_order_release);
+    if (restoreSticky) {
+        Y_DEBUG_ABORT_UNLESS(source.NextInOwner.load(std::memory_order_acquire) == 0);
+        TOperationItemRef collectionRef(spaceOp);
+        if (!cacheOp.Collections().LinkStickyPage(replacementItem, collectionRef.Get())) {
+            cacheOp.DiscardPageReplacement(replacementItem);
+            return {};
+        }
+    }
+    return replacementItem;
+}
+
+CACHE_TEMPLATE
+void TCache::DiscardPageReplacement(TSpaceOperation& spaceOp, TCacheItem replacementItem) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
+    THandle& replacement = spaceOp.Handles()[replacementItem.Index()];
+    const THandleState state = THandleState::FromRaw(replacement.State.load(std::memory_order_relaxed));
+    Y_DEBUG_ABORT_UNLESS(replacementItem.Matches(state) && state.IsPageKind() &&
+                         (state.IsSticky() || state.IsHot() || state.IsCold()) && state.Refs() == 1 &&
+                         replacement.NextInOwner.load(std::memory_order_relaxed) == 0);
+    cacheOp.Collections().DropPageItemRef(replacement);
+    replacement.Payload.Page.~TSharedData();
+    replacement.Payload.ResetPending();
+    replacement.State.store(
+        state.WithState(EHandleState::Begin).WithShrinkWaiter(false).WithSticky(EStickyState::None).WithRefs(0).Raw(),
+        std::memory_order_relaxed);
+    cacheOp.DiscardCandidate(replacementItem, EItemKind::Page);
+}
+
+CACHE_TEMPLATE
+bool TCache::PublishPageReplacement(
+    TSpaceOperation& spaceOp, TCacheItem sourceItem, TCacheItem replacementItem, EHandleState& oldState) noexcept {
+    THandle& source = spaceOp.Handles()[sourceItem.Index()];
+    THandle& replacement = spaceOp.Handles()[replacementItem.Index()];
+
+    ui64 expectedRaw = source.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        const bool ordinary = (expected.IsHot() || expected.IsCold()) && expected.IsStickyNoneField();
+        const bool unsticky = expected.IsSticky() && expected.IsTransitionField();
+        Y_DEBUG_ABORT_UNLESS(sourceItem.Matches(expected) && expected.IsPageKind() && expected.Refs() > 0);
+        if (!ordinary && !unsticky) {
+            return false;
+        }
+        const THandleState desired = expected.WithState(EHandleState::Replacing).WithFrequency(0);
+        if (source.State.compare_exchange_weak(
+                expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            oldState = expected.State();
+            break;
+        }
+    }
+
+    // A held Cold page may have been promoted while the replacement was prepared.
+    // A Sticky replacement may already have been drained to Hot by its collection.
+    if (oldState != EHandleState::Sticky) {
+        const THandleState prepared = THandleState::FromRaw(replacement.State.load(std::memory_order_relaxed));
+        replacement.State.store(prepared.WithState(oldState).Raw(), std::memory_order_release);
+    }
+
+    // Replacing with an unfrozen Next makes readers retry. Freeze only the forwarder:
+    // freezing the old successor would make readers mistake it for the replacement.
+    ui64 successorRaw = source.Next.load(std::memory_order_acquire);
+    for (;;) {
+        const TCacheItem successor = TCacheItem::FromRaw(successorRaw);
+        Y_DEBUG_ABORT_UNLESS(!successor.IsFrozen());
+        const TCacheItem next = successor.IsNull() ? TCacheItem::Make(replacementItem.Version(), 0) : successor;
+        replacement.Next.store(next.Raw(), std::memory_order_release);
+        InvokeHook(ECacheHookPoint::BeforePageReplacementLinkCas, sourceItem);
+        if (source.Next.compare_exchange_weak(successorRaw, replacementItem.WithFrozen().Raw(),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            break;
+        }
+        // An insertion that already owned this link may have changed the successor.
+    }
+    InvokeHook(ECacheHookPoint::AfterReplacingPublished, sourceItem);
+    const TCacheKey key = LoadCacheKey(source, EItemKind::Page);
+    auto cacheOp = BindOperation(spaceOp);
+    cacheOp.PublishPageReplacement(sourceItem, replacementItem, key);
+    return true;
+}
+
+CACHE_TEMPLATE
+void TCache::CompletePageReplacement(TSpaceOperation& spaceOp, TCacheItem sourceItem) noexcept {
+    THandle& source = spaceOp.Handles()[sourceItem.Index()];
+    ui64 expectedRaw = source.State.load(std::memory_order_relaxed);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        Y_ABORT_UNLESS(
+            sourceItem.Matches(expected) && expected.IsPageKind() && expected.IsReplacing() && expected.Refs() > 0);
+        const THandleState desired = expected.WithState(EHandleState::Replaced);
+        if (source.State.compare_exchange_weak(
+                expectedRaw, desired.Raw(), std::memory_order_release, std::memory_order_relaxed))
+        {
+            InvokeHook(ECacheHookPoint::AfterReplacedPublished, sourceItem);
+            return;
+        }
+    }
+}
+
+CACHE_TEMPLATE
+bool TCache::RelocatePage(TSpaceOperation& spaceOp, ui32 index) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
+    TOperationItemRef sourceRef(spaceOp, cacheOp.TryAcquirePageForRelocation(index));
+    if (!sourceRef) {
+        return false;
+    }
+    const TCacheItem sourceItem = sourceRef.CacheItem();
+    const TCacheItem replacementItem = cacheOp.PreparePageReplacement(sourceItem);
+    if (replacementItem.IsNull()) {
+        return false;
+    }
+
+    THandle& source = spaceOp.Handles()[sourceItem.Index()];
+    EHandleState oldState;
+    if (!cacheOp.PublishPageReplacement(sourceItem, replacementItem, oldState)) {
+        cacheOp.DiscardPageReplacement(replacementItem);
+        return false;
+    }
+    if (oldState == EHandleState::Cold || oldState == EHandleState::KeepCold) {
+        AdvanceColdMembership(source);
+    }
+    if (oldState == EHandleState::Hot || oldState == EHandleState::KeepHot) {
+        cacheOp.Eviction().RouteHot(EHotLevel::L1, replacementItem);
+    }
+    cacheOp.CompletePageReplacement(sourceItem);
+    return true;
+}
+
+CACHE_TEMPLATE
+bool TCache::DemoteUnlinkedStickyPage(TSpaceOperation& spaceOp, ui32 index) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
+    TOperationItemRef pageRef(spaceOp, cacheOp.TryAcquirePageForRelocation(index));
+    if (!pageRef) {
+        return false;
+    }
+    const TCacheItem pageItem = pageRef.CacheItem();
+    THandle& page = spaceOp.Handles()[index];
+    ui64 expectedRaw = page.State.load(std::memory_order_acquire);
+    for (;;) {
+        const THandleState expected = THandleState::FromRaw(expectedRaw);
+        const bool unlinkedCutPage =
+            pageItem.Matches(expected) && expected.IsPageKind() && expected.IsSticky() && expected.IsTransitionField();
+        if (!unlinkedCutPage) {
+            return false;
+        }
+        Y_ABORT_UNLESS(page.NextInOwner.load(std::memory_order_acquire) == 0);
+
+        if (TCollection* owner = cacheOp.Collections().PageCollection(page)) {
+            const THandleState ownerState = THandleState::FromRaw(
+                spaceOp.Handles()[owner->CacheItem.Index()].State.load(std::memory_order_acquire));
+            if (ownerState.IsTransitionField()) {
+                return false; // Wait for attachment or detachment to finish.
+            }
+            if (ownerState.IsStickyField() &&
+                owner->CacheMode_.load(std::memory_order_acquire) != ECacheMode::TryKeepInMemory) {
+                return false;
+            }
+        }
+
+        const THandleState desired =
+            expected.WithState(EHandleState::Hot).WithSticky(EStickyState::None).WithFrequency(0);
+        if (page.State.compare_exchange_weak(
+                expectedRaw, desired.Raw(), std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            const ui64 bytes = TCacheItems<TTraits>::PageBytes(page);
+            Memory_.Sticky().TransferBytesTo(Memory_.Hot(), bytes);
+            Memory_.Sticky().TransferPageTo(Memory_.Hot(), EItemKind::Page);
+            Memory_.ReleaseStickyOwnedBytes(EItemKind::Page, bytes);
+            cacheOp.Eviction().RouteHot(EHotLevel::L1, pageItem);
+            return true;
+        }
+    }
+}
+
+CACHE_TEMPLATE
+EShrinkCutStatus TCache::ReclaimShrinkHandle(TSpaceOperation& spaceOp, ui32 index) noexcept {
+    auto cacheOp = BindOperation(spaceOp);
+    const THandleState state = THandleState::FromRaw(spaceOp.Handles()[index].State.load(std::memory_order_acquire));
+    if (state.IsFree()) {
+        Y_DEBUG_ABORT_UNLESS(state.Refs() == 0);
+        return EShrinkCutStatus::Complete;
+    }
+    if (state.IsHot()) {
+        if (state.Refs() != 0 && cacheOp.RelocatePage(index)) {
+            return EShrinkCutStatus::Progress;
+        }
+        if (cacheOp.Eviction().EvictFromHot(index)) {
+            return EShrinkCutStatus::Progress;
+        }
+    }
+    if (state.IsCold()) {
+        if (state.Refs() != 0 && cacheOp.RelocatePage(index)) {
+            return EShrinkCutStatus::Progress;
+        }
+        if (state.Refs() == 0) {
+            const ui32 coldVersion = spaceOp.Handles()[index].ColdVersion.load(std::memory_order_acquire);
+            if (cacheOp.Eviction().EraseCold(TColdCacheItem::Make(coldVersion & MaxItemVersion, index), state.Tier())) {
+                return EShrinkCutStatus::Progress;
+            }
+        }
+    }
+    if (state.IsPageKind() && state.IsSticky()) {
+        if (state.IsStickyField()) {
+            return cacheOp.Collections().UnstickyCutPages(
+                       TCacheItem::Make(state.Version(), index), spaceOp.AllocationLimit())
+                       ? EShrinkCutStatus::Progress
+                       : EShrinkCutStatus::Blocked;
+        }
+        if (state.IsTransitionField()) {
+            if (cacheOp.RelocatePage(index) || cacheOp.DemoteUnlinkedStickyPage(index)) {
+                return EShrinkCutStatus::Progress;
+            }
+        }
+    }
+    // Re-read after the probes: retiering or a final release may have removed the sampled blocker
+    const auto blocked = THandleState::FromRaw(spaceOp.Handles()[index].State.load(std::memory_order_acquire));
+    if (blocked != state) {
+        return EShrinkCutStatus::Progress;
+    }
+    // Ordinary Hot handles use Sticky=3; Sticky/Tombstone collections use overlay bit 27.
+    // Hot Sticky/Transition states have an active publisher that will notify on completion;
+    // overwriting their real mode with 3 would corrupt that operation.
+    if ((blocked.IsHot() && blocked.IsStickyNoneField()) ||
+        (blocked.IsCollectionKind() && (blocked.IsSticky() || blocked.IsTombstone()))) {
+        if (blocked.Refs() != 0) {
+            const TCacheItem item = TCacheItem::Make(blocked.Version(), index);
+            if (blocked.IsCollectionKind()) {
+                InvokeHook(ECacheHookPoint::BeforeCollectionShrinkWait, item);
+            }
+            return cacheOp.Items().TryRegisterShrinkWait(item, blocked) ? EShrinkCutStatus::Blocked
+                                                                        : EShrinkCutStatus::Progress;
+        }
+        if (blocked.IsHot() && blocked.IsStickyNoneField()) {
+            return EShrinkCutStatus::Progress;
+        }
+    }
+    if (state.IsCollectionKind() &&
+        ((state.IsSticky() && (state.IsStickyNoneField() || state.HasPageAttachment())) || state.IsTombstone()) &&
+        state.Refs() == 0) {
+        // Cached low pages can keep detached metadata above the shrink boundary alive
+        if (Eviction_.SweepModes() || DrainHotResize() || cacheOp.Eviction().ReclaimCold() ||
+            cacheOp.Eviction().ProcessHotAtMinimum()) {
+            return EShrinkCutStatus::Progress;
+        }
+        // Empty bounded batches must continue while settled Regular Hot pages remain
+        if (Memory_.Hot(ECacheTier::Regular).Pages() != 0) {
+            return EShrinkCutStatus::Progress;
+        }
+    }
+    return EShrinkCutStatus::Blocked;
+}
+
+#undef TOperationItemRef
+#undef TCacheItemRef
+#undef TCache
+#undef CACHE_TEMPLATE
+
+// Relocation and shrink kernels are instantiated here for both trait variants
+
+template TCacheItemRefImpl<TProdTraits> TCacheImpl<TProdTraits>::TryAcquirePageForRelocation(
+    TSpaceOperation&, ui32) noexcept;
+template TCacheItem TCacheImpl<TProdTraits>::PreparePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
+template void TCacheImpl<TProdTraits>::DiscardPageReplacement(TSpaceOperation&, TCacheItem) noexcept;
+template bool TCacheImpl<TProdTraits>::PublishPageReplacement(
+    TSpaceOperation&, TCacheItem, TCacheItem, EHandleState&) noexcept;
+template void TCacheImpl<TProdTraits>::CompletePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
+template bool TCacheImpl<TProdTraits>::RelocatePage(TSpaceOperation&, ui32) noexcept;
+template bool TCacheImpl<TProdTraits>::DemoteUnlinkedStickyPage(TSpaceOperation&, ui32) noexcept;
+template EShrinkCutStatus TCacheImpl<TProdTraits>::ReclaimShrinkHandle(TSpaceOperation&, ui32) noexcept;
+
+template TCacheItemRefImpl<TTestTraits> TCacheImpl<TTestTraits>::TryAcquirePageForRelocation(
+    TSpaceOperation&, ui32) noexcept;
+template TCacheItem TCacheImpl<TTestTraits>::PreparePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
+template void TCacheImpl<TTestTraits>::DiscardPageReplacement(TSpaceOperation&, TCacheItem) noexcept;
+template bool TCacheImpl<TTestTraits>::PublishPageReplacement(
+    TSpaceOperation&, TCacheItem, TCacheItem, EHandleState&) noexcept;
+template void TCacheImpl<TTestTraits>::CompletePageReplacement(TSpaceOperation&, TCacheItem) noexcept;
+template bool TCacheImpl<TTestTraits>::RelocatePage(TSpaceOperation&, ui32) noexcept;
+template bool TCacheImpl<TTestTraits>::DemoteUnlinkedStickyPage(TSpaceOperation&, ui32) noexcept;
+template EShrinkCutStatus TCacheImpl<TTestTraits>::ReclaimShrinkHandle(TSpaceOperation&, ui32) noexcept;
+
+} // namespace NKikimr::NSharedCache
