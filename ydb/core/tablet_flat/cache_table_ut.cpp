@@ -1,0 +1,3591 @@
+#include <ydb/core/tablet_flat/cache_thread_test.h>
+#include "cache.h"
+#include "cache_mapping_test.h"
+#include "cache_traits.h"
+
+#include <ydb/core/testlib/actor_helpers.h>
+
+#include <library/cpp/testing/unittest/registar.h>
+#include <util/datetime/base.h>
+#include <util/generic/algorithm.h>
+#include <util/generic/vector.h>
+
+#include <array>
+#include <atomic>
+#include <optional>
+#include <thread>
+#include <type_traits>
+#include <utility>
+
+namespace NKikimr::NSharedCache {
+
+using TTestCache = TCacheImpl<TTestTraits>;
+using EResizeStep = TCacheTableImpl<TTestTraits>::EResizeStep;
+using TTestCacheItemRef = TCacheItemRefImpl<TTestTraits>;
+using TTestCachePageRef = TCachePageRefImpl<TTestTraits>;
+using TTestCachePageConstRef = TCachePageConstRefImpl<TTestTraits>;
+using TTestCacheCollectionRef = TCacheCollectionRefImpl<TTestTraits>;
+using TTestPageFetch = TPageFetchImpl<TTestTraits>;
+using TTestCachePageRequest = TCachePageRequestImpl<TTestTraits>;
+
+static_assert(sizeof(TTestCacheItemRef) == sizeof(TCacheItem));
+static_assert(sizeof(TTestCachePageRef) == 8);
+static_assert(sizeof(TTestCachePageConstRef) == 8);
+static_assert(sizeof(TCachePageConstRef) == 8);
+static_assert(std::is_trivially_copyable_v<TTestCachePageConstRef>);
+static_assert(std::is_trivially_destructible_v<TTestCachePageConstRef>);
+static_assert(!std::is_copy_constructible_v<TTestCachePageRef>);
+static_assert(!std::is_constructible_v<TTestCachePageConstRef, TCacheItem>);
+static_assert(!std::is_convertible_v<TTestCachePageRef&, TTestCachePageConstRef>);
+
+template <class T>
+concept CCanBorrowPage = requires(T&& page) { std::forward<T>(page).Borrow(); };
+
+static_assert(CCanBorrowPage<TTestCachePageRef&>);
+static_assert(CCanBorrowPage<const TTestCachePageRef&>);
+static_assert(!CCanBorrowPage<TTestCachePageRef>);
+static_assert(!CCanBorrowPage<const TTestCachePageRef>);
+
+static_assert(sizeof(TTestCacheCollectionRef) == sizeof(TCacheItem));
+static_assert(!std::is_move_constructible_v<TTransition>);
+static_assert(!std::is_move_assignable_v<TTransition>);
+
+struct TSeparatePageRequest {
+    NTable::NPage::TPageLocation Location;
+    TIntrusivePtr<TPageFetchWaiter> Waiter;
+    ECacheResultStatus Status;
+    TTestCachePageRef Page;
+    TTestPageFetch Fetch;
+};
+
+static_assert(sizeof(TTestCachePageRequest) < sizeof(TSeparatePageRequest));
+
+template <class TRef>
+struct TTestResult {
+    ECacheResultStatus Status = ECacheResultStatus::Miss;
+    TRef Ref;
+};
+
+using TPageResult = TTestResult<TTestCachePageRef>;
+using TCollectionResult = TTestResult<TTestCacheCollectionRef>;
+using TItemResult = TTestResult<TTestCacheItemRef>;
+
+class TCacheTestAccess {
+public:
+    template <class TTraits>
+    static typename TCacheItems<TTraits>::EAcquireStatus TryAcquire(TCacheOperationView<TTraits>& operation,
+        TCacheItem item, bool allowPending, TCacheItemRefImpl<TTraits>& ref, bool preload = false) noexcept {
+        using EAcquireStatus = typename TCacheItems<TTraits>::EAcquireStatus;
+        auto& spaceOp = operation.SpaceOperation();
+        if (!spaceOp.Contains(item)) {
+            return EAcquireStatus::Stale;
+        }
+        NDetail::TFoundItem found;
+        found.Item = item;
+        found.State = THandleState::FromRaw(spaceOp.Handles()[item.Index()].State.load(std::memory_order_relaxed));
+        return found.IsValid() ? operation.TryAcquire(found, allowPending, ref, preload) : EAcquireStatus::Stale;
+    }
+
+    static bool RegisterShrinkWait(TTestCache& cache, TCacheItem item) noexcept {
+        auto cacheOp = cache.BeginOperation();
+        const auto expected = THandleState::FromRaw(
+            cacheOp.SpaceOperation().Handles()[item.Index()].State.load(std::memory_order_acquire));
+        return cacheOp.Items().TryRegisterShrinkWait(item, expected);
+    }
+
+    static bool FindOrInsertWrittenBatch(
+        TTestCache& cache, TCollectionCacheItem collection, TArrayRef<TTestCachePageRequest> requests) noexcept {
+        auto cacheOp = cache.BeginOperation();
+        return cacheOp.FindOrInsertWrittenBatch(collection, requests);
+    }
+
+    static bool MakeReady(TTestCache& cache, TCollectionRegistry& registry, TCollectionCacheItem collection,
+        THolder<TCollection>&& value) noexcept {
+        return cache.MakeReady(registry, collection, std::move(value));
+    }
+
+    static bool DetachCollection(
+        TTestCache& cache, TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept {
+        return cache.DetachCollection(registry, collection);
+    }
+
+    static bool UnlinkCollectionRegistry(
+        TTestCache& cache, TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept {
+        auto cacheOp = cache.BeginOperation();
+        return cacheOp.Collections().Unlink(registry, collection.CacheItem());
+    }
+
+    static bool EraseCollection(
+        TTestCache& cache, TCollectionRegistry& registry, TCollectionCacheItem collection) noexcept {
+        return cache.EraseCollection(&registry, collection);
+    }
+
+    static ECacheResultStatus FindOrInsert(TTestCache& cache, TCollectionRegistry& registry,
+        const TCollectionLocation& collection, TCollectionCacheItem& inserted, TTestCacheCollectionRef& hit) noexcept {
+        return cache.FindOrInsert(registry, collection, inserted, hit);
+    }
+
+    static ECacheCollectionLookupStatus FindCollection(TTestCache& cache, TCollectionRegistry& registry,
+        const TLogoBlobID& id, TTestCacheCollectionRef& collection) noexcept {
+        return cache.FindCollection(registry, id, collection);
+    }
+
+    static bool MakeReadyUnregistered(
+        TTestCache& cache, TCollectionCacheItem collection, THolder<TCollection>&& value) noexcept {
+        return cache.MakeReady(nullptr, collection, std::move(value));
+    }
+
+    static TTestCacheItemRef AcquireStructural(TTestCache& cache, TCacheItem item) noexcept {
+        auto operation = cache.BeginOperation();
+        return operation.TryAcquireStructural(item);
+    }
+
+    static bool MakePendingPageSticky(TTestCache& cache, TPageCacheItem page) noexcept {
+        auto spaceOp = cache.BeginOperation();
+        TOperationItemRef<TTestTraits> ref(spaceOp, spaceOp.TryAcquireStructural(page.CacheItem()));
+        return ref && spaceOp.Collections().MakePageSticky(page.CacheItem());
+    }
+
+    static bool MakePageSticky(TTestCache& cache, TPageCacheItem page) noexcept {
+        TTestCachePageRef held;
+        if (!AcquirePage(cache, page, held)) {
+            return false;
+        }
+        auto spaceOp = cache.BeginOperation();
+        return spaceOp.Collections().MakePageSticky(page.CacheItem());
+    }
+
+    static TPageCacheItem AllocatePage(TTestCache& cache, TCollectionCacheItem collection, ui64 offset, ui64 size,
+        NTable::NPage::EPage type, ui32 crc32, EStickyState sticky) noexcept {
+        return cache.AllocatePage(collection, offset, size, type, crc32, sticky);
+    }
+
+    static TCollectionCacheItem AllocateCollection(TTestCache& cache, const TLogoBlobID& id, ui64 bytes) noexcept {
+        return cache.AllocateCollection(id, bytes);
+    }
+
+    template <class TTraits>
+    static ECacheResultStatus FindOrInsert(TCacheImpl<TTraits>& cache, TCollectionCacheItem collection,
+        const NTable::NPage::TPageLocation& page, EStickyState sticky, TPageCacheItem& inserted,
+        TCachePageRefImpl<TTraits>& hit) noexcept {
+        return cache.FindOrInsert(collection, page, sticky, inserted, hit);
+    }
+
+    template <class TTraits>
+    static ECacheResultStatus FindOrInsert(TCacheImpl<TTraits>& cache, TCollectionCacheItem collection,
+        const NTable::NPage::TPageLocation& page, EStickyState sticky, TIntrusivePtr<TPageFetchWaiter> waiter,
+        TCachePageRefImpl<TTraits>& hit, TPageFetchImpl<TTraits>& fetch) noexcept {
+        return cache.FindOrInsert(collection, page, sticky, std::move(waiter), hit, fetch);
+    }
+
+    static ECacheResultStatus FindOrInsertUnregistered(TTestCache& cache, const TCollectionLocation& collection,
+        TCollectionCacheItem& inserted, TTestCacheCollectionRef& hit) noexcept {
+        return cache.FindOrInsertUnregistered(collection, inserted, hit);
+    }
+
+    static bool AcquirePage(TTestCache& cache, TPageCacheItem page, TTestCachePageRef& result) noexcept {
+        result.Drop();
+        auto cacheOp = cache.BeginOperation();
+        return cacheOp.AcquirePage(page, result);
+    }
+
+    static ECacheResultStatus FindForPreload(
+        TTestCache& cache, TCollectionCacheItem collection, ui64 offset, TTestCachePageRef& page) noexcept {
+        page.Drop();
+        auto cacheOp = cache.BeginOperation();
+        TOperationItemRef<TTestTraits> ref(cacheOp);
+        const auto status = cacheOp.FindForPreload(collection, offset, ref.Get());
+        if (status == ECacheResultStatus::Hit) {
+            page = cacheOp.BuildPageRef(ref.Take());
+        }
+        return status;
+    }
+
+    template <class TTraits>
+    static TIntrusivePtr<TPageFetchState> AcquireFetch(
+        TCacheOperation<TTraits>& cacheOp, TPageCacheItem page, TOperationItemRef<TTraits>& owner) noexcept {
+        if (TryAcquire(cacheOp, page.CacheItem(), true, owner.Get(), true) !=
+            TCacheImpl<TTraits>::EAcquireStatus::Pending) {
+            return {};
+        }
+        TIntrusivePtr<TPageFetchState> fetch = cacheOp.Handles()[page.Index()].Payload.PendingPage.Fetch.load();
+        Y_DEBUG_ABORT_UNLESS(fetch);
+        return fetch;
+    }
+
+    template <class TTraits>
+    static bool MakeReadyPage(TCacheImpl<TTraits>& cache, TPageCacheItem page, NActors::TSharedData&& data) noexcept {
+        auto cacheOp = cache.BeginOperation();
+        TOperationItemRef<TTraits> owner(cacheOp);
+        auto fetch = AcquireFetch(cacheOp, page, owner);
+        return fetch && cacheOp.Fetches().Complete(owner, *fetch, std::move(data), {});
+    }
+
+    static bool FailReadyPage(TTestCache& cache, TPageCacheItem page) noexcept {
+        auto cacheOp = cache.BeginOperation();
+        TOperationItemRef<TTestTraits> owner(cacheOp);
+        auto fetch = AcquireFetch(cacheOp, page, owner);
+        return fetch && cacheOp.Fetches().Fail(owner, *fetch);
+    }
+
+    static void DiscardCandidate(TTestCache& cache, TPageCacheItem page) noexcept {
+        cache.DiscardCandidate(page);
+    }
+
+    static void DiscardCandidate(TTestCache& cache, TCollectionCacheItem collection) noexcept {
+        cache.DiscardCandidate(collection);
+    }
+
+    static bool AdvanceBucketResize(TTestCache& cache) noexcept {
+        return cache.Capacity_.AdvanceBucketResize();
+    }
+
+    static bool TryReserve(TTestCache& cache, ui64 bytes, ui64 pages = 0) noexcept {
+        auto spaceOp = cache.BeginOperation();
+        return cache.TryReserve(spaceOp, bytes, pages);
+    }
+
+    static TKeepReservation ReserveKeepCandidate(TTestCache& cache, ui64 bytes) noexcept {
+        return cache.Memory_.TryReserveKeep(bytes, cache.KeepLimit());
+    }
+
+    static void ReleaseReservation(TTestCache& cache, ui64 bytes, ui64 pages = 0) noexcept {
+        cache.ReleaseReservation(bytes, pages);
+    }
+
+    static TCacheMapping& BucketsMapping(TTestCache& cache) noexcept {
+        return cache.Space_->BucketsMapping_;
+    }
+
+    static void SetCapacityTarget(TTestCache& cache, const TCacheCapacityConfig& target) noexcept {
+        cache.Capacity_.SetTarget(target);
+    }
+
+    static TTransition& CapacityTransition(TTestCache& cache) noexcept {
+        return cache.Capacity_.Transition_;
+    }
+
+    static EPrepareResult PrepareTransition(
+        TTestCache& cache, const TCacheCapacityConfig& target, TTransition& transition) noexcept {
+        return cache.Capacity_.PrepareTransition(target, transition);
+    }
+
+    static bool PrepareReceiver(TTestCache& cache, TTransition& transition) noexcept {
+        return cache.Capacity_.PrepareReceiver(transition);
+    }
+
+    template <class TCallback>
+    static bool PrepareReceiver(TTestCache& cache, TTransition& transition, TCallback& callback) noexcept {
+        auto guard = cache.HotResize_.TryLock();
+        if (!guard || !cache.HotResize_.OwnsCapacityTransition(transition)) {
+            return false;
+        }
+        return cache.Space_->PrepareReceiverWithHook(
+            transition, {
+                            .Context = &callback,
+                            .Function = [](void* context, ESpaceMap mapping) noexcept {
+                                return (*static_cast<TCallback*>(context))(mapping);
+                            },
+                        });
+    }
+
+    static TCacheMapping& RingMapping(TTestCache& cache, ESpaceMap mapping) noexcept {
+        return cache.Space_->RingMapping(mapping);
+    }
+
+    static bool PublishMigrationView(TTestCache& cache, TTransition& transition) noexcept {
+        return cache.Capacity_.PublishMigrationView(transition);
+    }
+
+    static bool TryDrainTransition(TTestCache& cache, TTransition& transition) noexcept {
+        return cache.Capacity_.TryDrainTransition(transition);
+    }
+
+    static bool PublishFinalView(TTestCache& cache, TTransition& transition) noexcept {
+        return cache.Capacity_.PublishFinalView(transition);
+    }
+
+    static bool AppendFreeHandles(TTestCache& cache, TTransition& transition) noexcept {
+        return cache.Capacity_.AppendFreeHandles(transition);
+    }
+
+    static bool FinalDrain(TTestCache& cache, TTransition& transition) noexcept {
+        do {
+            if (!cache.Capacity_.FinalDrain(transition)) {
+                return false;
+            }
+        } while (transition.Phase() == ETransitionPhase::FinalDrain);
+        return true;
+    }
+
+    static bool TryReleaseTransition(TTestCache& cache, TTransition& transition) noexcept {
+        return cache.Capacity_.TryReleaseTransition(transition);
+    }
+
+    static bool CommitTransition(TTestCache& cache, TTransition& transition) noexcept {
+        return cache.Capacity_.CommitTransition(transition);
+    }
+
+    static bool AbandonTransition(TTestCache& cache, TTransition& transition) noexcept {
+        return cache.Capacity_.AbandonTransition(transition);
+    }
+
+    template <class TCallback>
+    static decltype(auto) WithSpace(TTestCache& cache, TCallback&& callback) {
+        auto spaceOp = cache.BeginOperation();
+        return std::forward<TCallback>(callback)(spaceOp);
+    }
+
+    static auto BindOperation(TTestCache& cache, TSpaceOperation& spaceOp) noexcept {
+        return cache.BindOperation(spaceOp);
+    }
+
+    template <class TCallback>
+    static decltype(auto) WithHandle(TTestCache& cache, ui32 index, TCallback&& callback) {
+        return WithSpace(cache, [&](TSpaceOperation& spaceOp) -> decltype(auto) {
+            return std::forward<TCallback>(callback)(spaceOp.Handles()[index]);
+        });
+    }
+
+    static THandleState HandleState(
+        TTestCache& cache, ui32 index, std::memory_order order = std::memory_order_acquire) noexcept {
+        return WithHandle(cache, index, [&](THandle& handle) {
+            return THandleState::FromRaw(handle.State.load(order));
+        });
+    }
+
+    static ui32 ColdVersion(TTestCache& cache, ui32 index) noexcept {
+        return WithHandle(cache, index, [](THandle& handle) {
+            return handle.ColdVersion.load(std::memory_order_acquire) & MaxItemVersion;
+        });
+    }
+
+    static ui64 HandleNext(TTestCache& cache, ui32 index) noexcept {
+        return WithHandle(cache, index, [](THandle& handle) {
+            return handle.Next.load(std::memory_order_acquire);
+        });
+    }
+
+    static ui32 NextInOwner(TTestCache& cache, ui32 index) noexcept {
+        return WithHandle(cache, index, [](THandle& handle) {
+            return handle.NextInOwner.load(std::memory_order_acquire);
+        });
+    }
+
+    static NTable::NPage::EPage PageType(TTestCache& cache, ui32 index) noexcept {
+        return WithHandle(cache, index, [](THandle& handle) {
+            return handle.Metadata.Page.Type;
+        });
+    }
+
+    static ui32 PageCrc32(TTestCache& cache, ui32 index) noexcept {
+        return WithHandle(cache, index, [](THandle& handle) {
+            return handle.Metadata.Page.Crc32;
+        });
+    }
+
+    static void HoldPageInKeepColdForTest(TTestCache& cache, TPageCacheItem page, ui32 coldVersion) noexcept {
+        WithHandle(cache, page.Index(), [&](THandle& handle) {
+            const auto before = THandleState::FromRaw(handle.State.load(std::memory_order_relaxed));
+            Y_ABORT_UNLESS(before.IsHot() && before.Refs() == 1);
+            const ui64 bytes = TCacheItems<TTestTraits>::PageBytes(handle);
+            TKeepReservation incoming;
+            if (before.Tier() != ECacheTier::Keep) {
+                incoming = cache.Memory_.TryReserveKeep(bytes, cache.KeepLimit());
+                Y_ABORT_UNLESS(incoming);
+            }
+            handle.State.store(before.WithState(EHandleState::KeepCold).Raw(), std::memory_order_relaxed);
+            handle.ColdVersion.store(coldVersion, std::memory_order_relaxed);
+            cache.Memory_.Hot(before.Tier()).TransferBytesTo(cache.Memory_.Cold(ECacheTier::Keep), bytes);
+            cache.Memory_.Hot(before.Tier()).TransferPageTo(cache.Memory_.Cold(ECacheTier::Keep), EItemKind::Page);
+            cache.Memory_.ReleaseRetainedBytes(bytes);
+            incoming.Commit();
+        });
+    }
+
+    static ui32 QueueKeepColdPageForTest(TTestCache& cache, TPageCacheItem page) noexcept {
+        return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
+            THandle& handle = spaceOp.Handles()[page.Index()];
+            const ui32 version = cache.AdvanceColdMembership(handle);
+            handle.ColdVersion.fetch_or(ColdTicketOwnedMask, std::memory_order_release);
+            auto& tier = spaceOp.View().Tiers[ECacheTier::Keep];
+            tier.Rings->AddColdEntry();
+            const auto displaced =
+                TColdCacheItem::FromRaw(tier.Cold().PutAndPop(TColdCacheItem::Make(version, page.Index()).Raw()));
+            if (!displaced.IsNull()) {
+                tier.Rings->RemoveColdEntry();
+            }
+            return version;
+        });
+    }
+
+    static TCollection* CollectionValue(TTestCache& cache, ui32 index) noexcept {
+        return WithHandle(cache, index, [](THandle& handle) {
+            return handle.Payload.Collection.Value.load();
+        });
+    }
+
+    static ui32 StickyPageListHead(TTestCache& cache, TCollectionCacheItem collection) noexcept {
+        TCollection* value = CollectionValue(cache, collection.Index());
+        Y_ABORT_UNLESS(value);
+        return value->StickyPageListHead.load(std::memory_order_acquire);
+    }
+
+    static ui32 CollectionListHead(const TCollectionRegistry& registry) noexcept {
+        return registry.CollectionListHead.load(std::memory_order_acquire);
+    }
+
+    static TCacheItem BucketHead(TTestCache& cache, ui32 bucket) noexcept {
+        return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
+            return TCacheItem::FromRaw(spaceOp.Buckets()[bucket].load(std::memory_order_acquire));
+        });
+    }
+
+    static ui64 HandleCount(TTestCache& cache) noexcept {
+        return WithSpace(cache, [](TSpaceOperation& spaceOp) {
+            return spaceOp.HandleCount();
+        });
+    }
+
+    static ui32 MinimumHotSlots(TTestCache& cache) noexcept {
+        return static_cast<ui32>(Min<ui64>(cache.Eviction_.MinimumHotSlots(ECacheTier::Regular),
+            cache.Space_->CurrentConfiguration().Tiers[ECacheTier::Regular].HotSlots));
+    }
+
+    static ui64 ColdEntries(TTestCache& cache, ECacheTier tier) noexcept {
+        return cache.Space_->ColdRingEntries(tier);
+    }
+
+    static bool SweepModes(TTestCache& cache) noexcept {
+        return cache.Eviction_.SweepModes();
+    }
+
+    static std::array<ui64, 4> HotPolicy(TTestCache& cache, const TSpaceOperation& op) noexcept {
+        const ui32 effective = static_cast<ui32>(op.EffectiveHotSlots());
+        const ui32 minimum = MinimumHotSlots(cache);
+        return { effective, minimum, cache.Eviction_.ShrinkHotTarget(effective, 1, minimum),
+            cache.Eviction_.GrowHotTarget(op, ECacheTier::Regular, effective, 2) };
+    }
+
+    static bool EnforceWithOperation(
+        TTestCache& cache, TSpaceOperation& spaceOp, ui64 bytes = 0, bool forceShrinkHot = true) noexcept {
+        return cache.BindOperation(spaceOp).Eviction().EnforceCurrentLimit(bytes, forceShrinkHot);
+    }
+
+    static THotResize::TGuard LockHotResize(TTestCache& cache) noexcept {
+        return cache.HotResize_.TryLock();
+    }
+
+    static bool CanChangeTiers(TTestCache& cache) noexcept {
+        auto guard = cache.HotResize_.TryLock();
+        return guard && cache.HotResize_.CanChangeTiers();
+    }
+
+    static bool OwnsCapacityTransition(TTestCache& cache, const TTransition& transition) noexcept {
+        auto guard = cache.HotResize_.TryLock();
+        return guard && cache.HotResize_.OwnsCapacityTransition(transition);
+    }
+
+    template <class TCallback>
+    static bool TryReleaseTransitionWithHook(TTestCache& cache, TTransition& transition, TCallback& callback) noexcept {
+        return cache.Space_->TryReleaseTransitionWithHook(
+            transition, {
+                            .Context = &callback,
+                            .Function = [](void* context, ESpaceMap mapping, const void* begin, size_t size) noexcept {
+                                return (*static_cast<TCallback*>(context))(mapping, begin, size);
+                            },
+                        });
+    }
+
+    static std::pair<ui64, ui64> ColdByteWatermarks(const TTestCache& cache) noexcept {
+        const ui64 budget = cache.EvictableByteBudget();
+        return { cache.Eviction_.FractionCeil(budget, cache.Policy_.ColdMin),
+            cache.Eviction_.FractionCeil(budget, cache.Policy_.Grow) };
+    }
+
+    static void ShrinkHotToMinimum(TTestCache& cache) noexcept {
+        for (;;) {
+            const ui64 before = EffectiveHotSlots(cache);
+            WithSpace(cache, [&](TSpaceOperation& spaceOp) {
+                cache.BindOperation(spaceOp).Eviction().EnforceCurrentLimit(0, true);
+            });
+            if (EffectiveHotSlots(cache) == before) {
+                return;
+            }
+        }
+    }
+
+    static bool ShrinkKeepCold(TTestCache& cache) noexcept {
+        return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
+            return cache.BindOperation(spaceOp).Eviction().TrimKeep();
+        });
+    }
+
+    static bool ProcessHotAtMinimum(TTestCache& cache) noexcept {
+        return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
+            return cache.BindOperation(spaceOp).Eviction().ProcessHotAtMinimum();
+        });
+    }
+
+    static void ProcessHotToken(TTestCache& cache, TPageCacheItem page) noexcept {
+        WithSpace(cache, [&](TSpaceOperation& spaceOp) {
+            cache.BindOperation(spaceOp).Eviction().ProcessHot(EHotLevel::L0, page.CacheItem());
+        });
+    }
+
+    static ui64 EffectiveHotSlots(TTestCache& cache) noexcept {
+        return WithSpace(cache, [](TSpaceOperation& spaceOp) {
+            return spaceOp.EffectiveHotSlots();
+        });
+    }
+
+    static ui64 FreeCount(const TTestCache& cache) noexcept {
+        return cache.Space_->FreeRingCursor_->Count();
+    }
+
+    static const TCacheSpace& Space(const TTestCache& cache) noexcept {
+        return *cache.Space_;
+    }
+
+    static ui32 HazardCount(const TTestCache& cache) noexcept {
+        return cache.Space_->HazardCount_;
+    }
+
+    static ui64 SpareItem(const TTestCache& cache, ui32 index) noexcept {
+        return cache.Space_->Hazards_[index]->SpareItem.load(std::memory_order_relaxed);
+    }
+
+    static TSpaceState CurrentSpaceState(const TCacheSpace& space) noexcept {
+        return space.CurrentSpaceState();
+    }
+
+    static bool AdvanceSpaceGeneration(TTestCache& cache) noexcept {
+        return cache.Space_->AdvanceSpaceGeneration();
+    }
+
+    static bool TryDrainBefore(TTestCache& cache, ui32 generation) noexcept {
+        ui32 cursor = 0;
+        return cache.Space_->TryDrainBefore(generation, cursor);
+    }
+
+    static TBucketResizeState BucketResizeState(const TCacheSpace& space) noexcept {
+        return space.BucketResizeState();
+    }
+
+    static bool EvictFromHot(TTestCache& cache, TPageCacheItem page) {
+        auto operation = cache.BeginOperation();
+        return operation.Eviction().EvictFromHot(page.Index());
+    }
+
+    static bool EvictFromHot(TTestCache& cache, TCollectionCacheItem collection) {
+        auto operation = cache.BeginOperation();
+        return operation.Eviction().EvictFromHot(collection.Index());
+    }
+
+    static void TransferColdToHot(TTestCache& cache, ui64 bytes) {
+        cache.Memory_.Cold().TransferBytesTo(cache.Memory_.Hot(), bytes);
+    }
+
+    static void TransferHotToCold(TTestCache& cache, ui64 bytes) {
+        cache.Memory_.Hot().TransferBytesTo(cache.Memory_.Cold(), bytes);
+    }
+
+    static i64 ColdBytesEstimate(const TTestCache& cache) {
+        return cache.Memory_.Cold().BytesEstimate();
+    }
+
+    static i64 ColdPagesEstimate(const TTestCache& cache) {
+        return cache.Memory_.Cold().PagesEstimate();
+    }
+
+    static i64 KeepColdPagesEstimate(const TTestCache& cache) {
+        return cache.Memory_.Cold(ECacheTier::Keep).PagesEstimate();
+    }
+
+    static ETransitionPhase HardTransitionPhase(const TTestCache& cache) noexcept {
+        return cache.Capacity_.Transition_.Phase();
+    }
+
+    static ui64 HardTransitionWorkIndex(const TTestCache& cache) noexcept {
+        return cache.Capacity_.Transition_.NextWorkIndex_;
+    }
+
+    static EHotResizePhase HotResizePhase(const TTestCache& cache) noexcept {
+        return cache.HotResize_.Phase();
+    }
+
+    static bool BeginHotResize(TTestCache& cache, ui32 target) noexcept {
+        return cache.Space_->BeginHotResize(ECacheTier::Regular, target, cache.HotResize_);
+    }
+
+    static bool DrainHotResize(TTestCache& cache) noexcept {
+        return cache.DrainHotResize();
+    }
+
+    static ui64 HotSlot(TTestCache& cache, ui64 slot) noexcept {
+        return WithSpace(cache, [&](TSpaceOperation& spaceOp) {
+            Y_ABORT_UNLESS(slot < spaceOp.View().Tiers[ECacheTier::Regular].HotStorage.SlotCount);
+            return spaceOp.View().Tiers[ECacheTier::Regular].HotStorage.Slots[slot].load(std::memory_order_acquire);
+        });
+    }
+
+    static const TCacheMemory::TTierUsage& TierUsage(const TTestCache& cache, ECacheTier tier) noexcept {
+        return cache.Memory_.Tier(tier);
+    }
+
+    static ui64 CollectionReferences(TTestCache& cache, TCollectionCacheItem collection) {
+        auto operation = cache.BeginOperation();
+        const auto& handle = operation.Handles()[collection.Index()];
+        const auto state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+        // Count page owners plus the implicit registry/foundation owner
+        return handle.Payload.Collection.Value->PageReferences.load(std::memory_order_relaxed) +
+               (state.IsStickyField() || state.IsTransitionField());
+    }
+
+    static ui64 PageReferences(TTestCache& cache, TCollectionCacheItem collection) {
+        auto operation = cache.BeginOperation();
+        return operation.Handles()[collection.Index()].Payload.Collection.Value->PageReferences.load(
+            std::memory_order_acquire);
+    }
+
+    static void AddPageReference(TTestCache& cache, TCollection& collection) {
+        auto operation = cache.BeginOperation();
+        operation.Collections().AddPageReference(collection);
+    }
+
+    static void DropPageReference(TTestCache& cache, TCollection& collection) {
+        auto operation = cache.BeginOperation();
+        operation.Collections().DropPageReference(collection);
+    }
+
+    static bool EraseCold(TTestCache& cache, TColdCacheItem cacheItem) {
+        auto operation = cache.BeginOperation();
+        const bool keep =
+            operation.SpaceOperation().Contains(cacheItem) &&
+            THandleState::FromRaw(operation.Handles()[cacheItem.Index()].State.load(std::memory_order_acquire))
+                .IsKeepCold();
+        return operation.Eviction().EraseCold(cacheItem, keep ? ECacheTier::Keep : ECacheTier::Regular);
+    }
+
+    static bool ReclaimCold(TTestCache& cache, TSpaceOperation& operation) noexcept {
+        return cache.BindOperation(operation).Eviction().ReclaimCold();
+    }
+
+    static bool ReclaimKeepCold(TTestCache& cache, TSpaceOperation& operation) noexcept {
+        return cache.BindOperation(operation).Eviction().ReclaimCold(ECacheTier::Keep);
+    }
+
+    static bool RetierColdToRegular(TTestCache& cache, TColdCacheItem hint) noexcept {
+        auto op = cache.BeginOperation();
+        THandle& handle = op.Handles()[hint.Index()];
+        const auto state = THandleState::FromRaw(handle.State.load(std::memory_order_acquire));
+        TOperationItemRef<TTestTraits> ref(
+            op.SpaceOperation(), op.TryAcquireStructural(TCacheItem::Make(state.Version(), hint.Index())));
+        if (!ref) {
+            return false;
+        }
+        if (TCollection* owner = op.Collections().PageCollection(handle)) {
+            if (!cache.SetCollectionPagesCacheMode(owner->CacheItem, ECacheMode::Regular)) {
+                return false;
+            }
+        }
+        return op.Eviction().ReconcilePage(ref.Get());
+    }
+
+    static bool TrimKeep(TTestCache& cache, TSpaceOperation& operation) noexcept {
+        return cache.BindOperation(operation).Eviction().TrimKeep();
+    }
+
+    static bool RetirePageResult(TTestCache& cache, TPageCacheItem page) noexcept {
+        auto op = cache.BeginOperation();
+        TOperationItemRef<TTestTraits> ref(op.SpaceOperation(), op.TryAcquireStructural(page.CacheItem()));
+        if (!ref) {
+            return false;
+        }
+        auto state = THandleState::FromRaw(op.Handles()[page.Index()].State.load(std::memory_order_acquire));
+        if (!op.TryBeginErase(ref.Get(), state)) {
+            return false;
+        }
+        op.Eviction().FinishPageErase(page.CacheItem());
+        return true;
+    }
+
+    static void RouteOwnedPage(TTestCache& cache, TPageCacheItem page) noexcept {
+        auto op = cache.BeginOperation();
+        TOperationItemRef<TTestTraits> ref(op.SpaceOperation(), op.TryAcquireStructural(page.CacheItem()));
+        if (ref) {
+            op.Eviction().RouteOwnedHot(ref.Get(), EHotLevel::L1);
+        }
+    }
+
+    static bool UnstickyCutPages(TTestCache& cache, TPageCacheItem page, ui64 allocationLimit) {
+        auto operation = cache.BeginOperation();
+        return operation.Collections().UnstickyCutPages(page.CacheItem(), allocationLimit);
+    }
+
+    static bool RelocatePage(TTestCache& cache, TPageCacheItem page) {
+        auto operation = cache.BeginOperation();
+        return cache.RelocatePage(operation, page.Index());
+    }
+
+    static bool BeginBucketResize(TTestCache& cache, ui8 newAddressBits) {
+        return cache.Space_->BeginBucketResize(newAddressBits);
+    }
+
+    static EResizeStep PrepareBucketSplitStep(TTestCache& cache) {
+        auto spaceOp = cache.BeginOperation();
+        return cache.Table_.PrepareBucketSplit(spaceOp);
+    }
+
+    static bool PrepareBucketSplit(TTestCache& cache) {
+        return PrepareBucketSplitStep(cache) == EResizeStep::Complete;
+    }
+
+    static EResizeStep ActivateBucketSplitStep(TTestCache& cache) {
+        auto spaceOp = cache.BeginOperation();
+        return cache.Table_.ActivateBucketSplitOrMerge(spaceOp);
+    }
+
+    static bool ActivateBucketSplitOrMerge(TTestCache& cache) {
+        return ActivateBucketSplitStep(cache) == EResizeStep::Complete;
+    }
+
+    static bool PublishBucketSplit(TTestCache& cache) {
+        auto spaceOp = cache.BeginOperation();
+        return cache.Table_.PublishBucketSplit(spaceOp) == EResizeStep::Complete;
+    }
+
+    static bool CloseBucketSplit(TTestCache& cache) {
+        auto spaceOp = cache.BeginOperation();
+        return cache.Table_.CloseBucketSplit(spaceOp) == EResizeStep::Complete;
+    }
+
+    static EResizeStep RemoveBucketSplitStep(TTestCache& cache) {
+        auto operation = cache.BeginOperation();
+        return cache.Table_.RemoveBucketSplit(operation);
+    }
+
+    static bool RemoveBucketSplit(TTestCache& cache) {
+        return RemoveBucketSplitStep(cache) == EResizeStep::Complete;
+    }
+
+    static bool FinishBucketResize(TTestCache& cache) {
+        return cache.Space_->FinishBucketResize();
+    }
+
+    static EResizeStep FindSplitBoundary(TTestCache& cache, ui32 bucket, ui32 splitBit, TCacheItem& firstSuffix) {
+        auto operation = cache.BeginOperation();
+        TCacheTableImpl<TTestTraits>::TFoundItem result;
+        const auto step = cache.Table_.FindSplitBoundary(operation.SpaceOperation(), bucket, splitBit, true, result);
+        firstSuffix = result.Item;
+        return step;
+    }
+
+    static void FinishErase(TTestCache& cache, TCacheItem cacheItem, const TCacheKey& key) {
+        auto operation = cache.BeginOperation();
+        TOperationItemRef<TTestTraits> ownerRef(operation, cacheItem);
+        cache.Table_.FinishErase(operation, ownerRef.CacheItem(), key);
+    }
+
+    static void InstallHooks(TTestCache& cache, TTestTraits* hooks) noexcept {
+        cache.SetHooks(hooks ? *hooks : TTestTraits{});
+    }
+
+    static bool ValidateTerminalOwner(TTestCache& cache, TCacheItem owner, TCacheItem terminal) noexcept {
+        auto spaceOp = cache.BeginOperation();
+        TCacheTableImpl<TTestTraits>::TFoundItem orderedLink{
+            .Item = terminal,
+            .Owner = owner,
+        };
+        return cache.Table_.ValidateTerminalOwner(spaceOp, orderedLink);
+    }
+
+    static bool AcquireAfterGenerationChange(TTestCache& cache, const TCacheKey& key, bool expectPending) noexcept {
+        TTestCacheItemRef ref;
+        {
+            auto operation = cache.BeginOperation();
+            NDetail::TFoundItem found;
+            const auto collection = TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(key.Word(0)));
+            Y_ABORT_UNLESS(cache.Table_.FindPage(operation, collection, key.Word(1), found) == ECacheResultStatus::Hit);
+            UNIT_ASSERT(cache.Space_->AdvanceSpaceGeneration());
+            const auto status = operation.TryAcquire(found, false, ref);
+            Y_ABORT_UNLESS(
+                status == (expectPending ? TTestCache::EAcquireStatus::Pending : TTestCache::EAcquireStatus::Ready));
+        }
+        ref.Drop();
+        return true;
+    }
+
+    static TTestCacheItemRef AcquirePending(TTestCache& cache, const TCacheKey& key) noexcept {
+        auto operation = cache.BeginOperation();
+        NDetail::TFoundItem found;
+        const auto collection = TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(key.Word(0)));
+        Y_ABORT_UNLESS(cache.Table_.FindPage(operation, collection, key.Word(1), found) == ECacheResultStatus::Hit);
+        TTestCacheItemRef ref;
+        Y_ABORT_UNLESS(operation.TryAcquire(found, true, ref) == TTestCache::EAcquireStatus::Pending);
+        return ref;
+    }
+
+    static TTestCacheItemRef AcquireTombstoneHelper(TTestCache& cache, TCacheItem cacheItem) noexcept {
+        auto operation = cache.BeginOperation();
+        return cache.Table_.TryAcquireTombstone(operation, cacheItem);
+    }
+
+    static TItemResult FindOrInsert(TTestCache& cache, const TCacheKey& key, TPageCacheItem candidate) noexcept {
+        auto spaceOp = cache.BeginOperation();
+        Y_ABORT_UNLESS(LoadCacheKey(spaceOp.Handles()[candidate.Index()], EItemKind::Page) == key);
+        TTestCacheItemRef ref;
+        const ECacheResultStatus status = cache.FindOrInsert(spaceOp, candidate, ref);
+        if (status == ECacheResultStatus::Pending) {
+            ref.Drop();
+        }
+        return { .Status = status, .Ref = std::move(ref) };
+    }
+
+    static TItemResult FindOrInsert(TTestCache& cache, const TCacheKey& key, TCollectionCacheItem candidate) noexcept {
+        auto spaceOp = cache.BeginOperation();
+        Y_ABORT_UNLESS(LoadCacheKey(spaceOp.Handles()[candidate.Index()], EItemKind::Collection) == key);
+        TTestCacheItemRef ref;
+        const ECacheResultStatus status = cache.FindOrInsert(spaceOp, candidate, ref);
+        if (status == ECacheResultStatus::Pending) {
+            ref.Drop();
+        }
+        return { .Status = status, .Ref = std::move(ref) };
+    }
+};
+
+ui64 CurrentBucketCount(const TCacheSpace& space) noexcept {
+    const TSpaceState state = TCacheTestAccess::CurrentSpaceState(space);
+    return state.Resizing() ? CacheBucketCount(TCacheTestAccess::BucketResizeState(space).OldAddressBits())
+                            : state.BucketCount();
+}
+
+ui64 ExpectedOverallUsage(const TTestCache& cache, ui64 bufferBytes, ui64 descriptorBytes = 0) noexcept {
+    return cache.StaticBytes() + cache.StaticDeltaBytes() + bufferBytes + descriptorBytes;
+}
+
+namespace {
+
+    static_assert(!std::is_copy_constructible_v<TTestCachePageRef>);
+    static_assert(!std::is_copy_assignable_v<TTestCachePageRef>);
+    static_assert(std::is_move_constructible_v<TTestCachePageRef>);
+    static_assert(std::is_move_assignable_v<TTestCachePageRef>);
+    static_assert(!std::is_copy_constructible_v<TTestCacheCollectionRef>);
+    static_assert(std::is_move_constructible_v<TTestCacheCollectionRef>);
+    static_assert(std::is_move_assignable_v<TTestCacheCollectionRef>);
+    static_assert(!std::is_copy_constructible_v<TTestCacheItemRef>);
+    static_assert(!std::is_convertible_v<TTestCachePageRef, TTestCacheCollectionRef>);
+    static_assert(!std::is_convertible_v<TTestCacheCollectionRef, TTestCachePageRef>);
+
+    class TTestPageFetchWaiter final : public TPageFetchWaiter {
+    public:
+        TTestPageFetchWaiter(
+            std::atomic<ui32>& completed, std::atomic<ui32>& ready, std::atomic<ui64>& completedItem) noexcept
+            : Completed_(completed)
+            , Ready_(ready)
+            , CompletedItem_(completedItem)
+        {}
+
+        void Complete(TSpaceOperation*, TPageCacheItem page, EPageFetchCompletion completion) noexcept override {
+            CompletedItem_.store(page.CacheItem().Raw(), std::memory_order_relaxed);
+            Ready_.fetch_add(completion == EPageFetchCompletion::Ready, std::memory_order_relaxed);
+            Completed_.fetch_add(1, std::memory_order_release);
+        }
+
+    private:
+        std::atomic<ui32>& Completed_;
+        std::atomic<ui32>& Ready_;
+        std::atomic<ui64>& CompletedItem_;
+    };
+
+    class TAcquiringPageFetchWaiter final : public TPageFetchWaiter {
+    public:
+        TAcquiringPageFetchWaiter(TTestCache& cache, TTestCachePageRef& page) noexcept
+            : Cache_(cache)
+            , Page_(page)
+        {}
+
+        void Complete(
+            TSpaceOperation* spaceOp, TPageCacheItem page, EPageFetchCompletion completion) noexcept override {
+            OperationDepth_ = spaceOp && TlsCacheHazards
+                                  ? SpaceHazardActiveCount(TlsCacheHazards[0].State.load(std::memory_order_relaxed))
+                                  : 0;
+            Ready_ = completion == EPageFetchCompletion::Ready && spaceOp &&
+                     TCacheTestAccess::BindOperation(Cache_, *spaceOp).AcquirePage(page, Page_);
+        }
+
+        bool Ready() const noexcept {
+            return Ready_;
+        }
+
+        ui32 OperationDepth() const noexcept {
+            return OperationDepth_;
+        }
+
+    private:
+        TTestCache& Cache_;
+        TTestCachePageRef& Page_;
+        bool Ready_ = false;
+        ui32 OperationDepth_ = 0;
+    };
+
+    class TTestPageCollection final : public NPageCollection::IPageCollection {
+    public:
+        TTestPageCollection(TLogoBlobID id, size_t backingSize) noexcept
+            : Id_(id)
+            , BackingSize_(backingSize)
+        {}
+
+        TTestPageCollection(TLogoBlobID id, NActors::TSharedData page, bool& pagesReleasedBeforeCollection) noexcept
+            : TTestPageCollection(id, 0)
+        {
+            DestructionProbe_ = std::move(page);
+            PagesReleasedBeforeCollection_ = &pagesReleasedBeforeCollection;
+        }
+
+        ~TTestPageCollection() override {
+            if (PagesReleasedBeforeCollection_) {
+                *PagesReleasedBeforeCollection_ = DestructionProbe_.IsPrivate();
+            }
+        }
+
+        const TLogoBlobID& Label() const noexcept override {
+            return Id_;
+        }
+
+        ui32 Total() const noexcept override {
+            return 0;
+        }
+
+        NPageCollection::TInfo Page(ui32) const override {
+            return {};
+        }
+
+        NPageCollection::TBorder Bounds(ui32) const override {
+            return {};
+        }
+
+        NPageCollection::TBorder Bounds(const NTable::NPage::TPageLocation&) const override {
+            return {};
+        }
+
+        NPageCollection::TGlobId Glob(ui32) const override {
+            return {};
+        }
+
+        bool Verify(ui32, TArrayRef<const char>) const override {
+            return false;
+        }
+
+        bool Verify(const NTable::NPage::TPageLocation&, TArrayRef<const char>) const override {
+            return false;
+        }
+
+        size_t BackingSize() const noexcept override {
+            return BackingSize_;
+        }
+
+        i64 GetMetadataMemoryUsage() const noexcept override {
+            return sizeof(TTestPageCollection);
+        }
+
+        const TSharedData* GetMetadataBuffer() const noexcept override {
+            return nullptr;
+        }
+
+        NTable::NPage::TPageLocation GetLocation(ui32) const override {
+            return {};
+        }
+
+        bool SkipBTreeIndexV1Shadow() const noexcept override {
+            return SkipShadow_.load(std::memory_order_relaxed);
+        }
+
+        void SetSkipBTreeIndexV1Shadow(bool skip) const noexcept override {
+            SkipShadow_.store(skip, std::memory_order_relaxed);
+        }
+
+    private:
+        const TLogoBlobID Id_;
+        const size_t BackingSize_;
+        mutable std::atomic<bool> SkipShadow_{ false };
+        NActors::TSharedData DestructionProbe_;
+        bool* PagesReleasedBeforeCollection_ = nullptr;
+    };
+
+    TCollectionCacheItem MakeCollectionCacheItem(ui32 version, ui32 index) {
+        return TCollectionCacheItem::FromValidated(TCacheItem::Make(version, index));
+    }
+
+    NActors::TSharedData MakePageData(ui32 index, size_t size = 4096) {
+        auto data = NActors::TSharedData::Uninitialized(size);
+        data.mutable_data()[0] = static_cast<char>(index);
+        return data;
+    }
+
+    NTable::NPage::TPageLocation MakePageLocation(
+        ui64 offset, ui64 size = 4096, NTable::NPage::EPage type = NTable::NPage::EPage::DataPage, ui32 crc32 = 0) {
+        return NTable::NPage::TPageLocation::FromByteOffset(offset, size, type, crc32);
+    }
+
+    bool DispatchFetch(TTestPageFetch& fetch) {
+        if (!fetch) {
+            return false;
+        }
+        auto cacheOp = TTestCache::Get().BeginOperation();
+        return fetch.Dispatch(cacheOp);
+    }
+
+    bool MakeFetchReady(TTestPageFetch& fetch, NActors::TSharedData&& data, TCachePendingBuffers pendingBuffers = {}) {
+        if (!fetch) {
+            return false;
+        }
+        auto cacheOp = TTestCache::Get().BeginOperation();
+        return fetch.MakeReady(cacheOp, std::move(data), std::move(pendingBuffers));
+    }
+
+    bool FailFetch(TTestPageFetch& fetch) {
+        if (!fetch) {
+            return false;
+        }
+        auto cacheOp = TTestCache::Get().BeginOperation();
+        return fetch.FailReady(cacheOp);
+    }
+
+    THolder<TCollection> MakeCollection(const TLogoBlobID& id, size_t backingSize = 0) {
+        return TTestCache::Get().PrepareCollection(
+            TIntrusiveConstPtr<NPageCollection::IPageCollection>(new TTestPageCollection(id, backingSize)));
+    }
+
+    TColdCacheItem MakeColdItem(TTestCache& cache, ui32 index) {
+        return TColdCacheItem::Make(TCacheTestAccess::ColdVersion(cache, index) & MaxItemVersion, index);
+    }
+
+    ui64 AvailableFreeHandles(const TTestCache& cache) {
+        ui64 result = TCacheTestAccess::FreeCount(cache);
+        for (ui32 index = 0; index < TCacheTestAccess::HazardCount(cache); ++index) {
+            result += TCacheTestAccess::SpareItem(cache, index) != 0;
+        }
+        return result;
+    }
+
+    TCollectionCacheItem PageCollection(const TCacheKey& key) {
+        Y_ABORT_UNLESS(key.IsPageKind());
+        return TCollectionCacheItem::FromValidated(TCacheItem::FromRaw(key.Word(0)));
+    }
+
+    struct TCacheGate {
+        struct TSlot {
+            std::atomic<ECacheHookPoint> Wanted{ ECacheHookPoint::BeforeTableLinkCas };
+            std::atomic<ui64> Target{ 0 };
+            std::atomic<bool> Arrived = false;
+            std::atomic<bool> Continue = true;
+            std::atomic<bool> Triggered = false;
+
+            void Arm(ECacheHookPoint point, TCacheItem target = {}) noexcept {
+                Target.store(target.Raw(), std::memory_order_relaxed);
+                Wanted.store(point, std::memory_order_release);
+                Arrived.store(false, std::memory_order_relaxed);
+                Continue.store(false, std::memory_order_relaxed);
+                Triggered.store(false, std::memory_order_relaxed);
+            }
+
+            void Arm(ECacheHookPoint point, TColdCacheItem target) noexcept {
+                Arm(point, TCacheItem::FromRaw(target.Raw()));
+            }
+
+            void Wait() noexcept {
+                const TInstant deadline = TInstant::Now() + TDuration::Seconds(10);
+                while (!Arrived.load(std::memory_order_acquire)) {
+                    if (TInstant::Now() >= deadline) {
+                        Y_ABORT("Shared-cache test hook was not reached");
+                    }
+                    std::this_thread::yield();
+                }
+            }
+
+            void Release() noexcept {
+                Continue.store(true, std::memory_order_release);
+            }
+
+            void TryInvoke(ECacheHookPoint point, TCacheItem cacheItem) noexcept {
+                if (point != Wanted.load(std::memory_order_acquire)) {
+                    return;
+                }
+                // Wanted is read first so its acquire publishes Arm's relaxed Target store.
+                const TCacheItem target = TCacheItem::FromRaw(Target.load(std::memory_order_acquire));
+                if (!target.IsNull() && target != cacheItem) {
+                    return;
+                }
+                Block();
+            }
+
+            void Block() noexcept {
+                if (Triggered.exchange(true, std::memory_order_acq_rel)) {
+                    return;
+                }
+                Arrived.store(true, std::memory_order_release);
+                const TInstant deadline = TInstant::Now() + TDuration::Seconds(10);
+                while (!Continue.load(std::memory_order_acquire)) {
+                    if (TInstant::Now() >= deadline) {
+                        Y_ABORT("Shared-cache test hook was not released");
+                    }
+                    std::this_thread::yield();
+                }
+            }
+        } Slots[2];
+
+        TTestTraits Hooks;
+
+        TCacheGate()
+            : Hooks{ this, &Invoke }
+        {}
+
+        static void Invoke(void* context, ECacheHookPoint point, TCacheItem cacheItem) noexcept {
+            auto& gate = *static_cast<TCacheGate*>(context);
+            for (auto& slot : gate.Slots) {
+                slot.TryInvoke(point, cacheItem);
+            }
+        }
+    };
+
+    struct TCacheHookGuard {
+        TTestCache& Cache;
+
+        TCacheHookGuard(TTestCache& cache, TTestTraits& hooks) noexcept
+            : Cache(cache)
+        {
+            TCacheTestAccess::InstallHooks(Cache, &hooks);
+        }
+
+        ~TCacheHookGuard() {
+            TCacheTestAccess::InstallHooks(Cache, nullptr);
+        }
+
+        TCacheHookGuard(const TCacheHookGuard&) = delete;
+        TCacheHookGuard& operator=(const TCacheHookGuard&) = delete;
+    };
+
+    struct TGateThread {
+        TCacheGate& Gate;
+        std::thread Thread;
+
+        template <class TFunc>
+        TGateThread(TCacheGate& gate, TFunc&& func)
+            : Gate(gate)
+            , Thread(std::forward<TFunc>(func))
+        {}
+
+        ~TGateThread() {
+            if (Thread.joinable()) {
+                for (auto& slot : Gate.Slots) {
+                    slot.Release();
+                }
+                Thread.join();
+            }
+        }
+
+        void Join() {
+            if (Thread.joinable()) {
+                Thread.join();
+            }
+        }
+
+        TGateThread(const TGateThread&) = delete;
+        TGateThread& operator=(const TGateThread&) = delete;
+    };
+
+    TLogoBlobID CollectionId(const TCacheKey& key) {
+        Y_ABORT_UNLESS(key.IsCollectionKind());
+        return TLogoBlobID(key.Word(0), key.Word(1), key.Word(2));
+    }
+
+    // The fixture inserts Target first and no other key in this bucket before Successor.
+    std::array<TCacheKey, 2> MakeAdjacentKeys(const TCacheSpace& space, TCollectionCacheItem token, ui64 startOffset) {
+        TVector<TCacheKey> keys;
+        const ui32 bucket =
+            TCacheKey::Page(token, startOffset).Hash() & TCacheTestAccess::CurrentSpaceState(space).BucketMask();
+        for (ui64 offset = startOffset; keys.size() < 2; ++offset) {
+            Y_ABORT_UNLESS(offset - startOffset < (1u << 20));
+            const auto key = TCacheKey::Page(token, offset);
+            if ((key.Hash() & TCacheTestAccess::CurrentSpaceState(space).BucketMask()) == bucket) {
+                keys.push_back(key);
+            }
+        }
+        Sort(keys.begin(), keys.end(), [](const auto& left, const auto& right) {
+            return CompareCacheKeys(left, right) < 0;
+        });
+        Y_ABORT_UNLESS(CompareCacheKeys(keys[0], keys[1]) < 0);
+        return { keys[0], keys[1] };
+    }
+
+    std::array<TCacheKey, 3> MakeResizeKeys(const TCacheSpace& space, TCollectionCacheItem token, ui64 startOffset) {
+        const ui64 oldBucketCount = CurrentBucketCount(space);
+        Y_ABORT_UNLESS(oldBucketCount <= (ui64{ 1 } << 31));
+        TMaybe<TCacheKey> low;
+        TVector<TCacheKey> high;
+        for (ui64 offset = startOffset; !low || high.size() < 2; ++offset) {
+            Y_ABORT_UNLESS(offset - startOffset < (1u << 20));
+            const auto key = TCacheKey::Page(token, offset);
+            const ui32 hash = key.Hash();
+            if ((hash & (oldBucketCount - 1)) != 0) {
+                continue;
+            }
+            if (hash & oldBucketCount) {
+                high.push_back(key);
+            } else {
+                low = key;
+            }
+        }
+        Sort(high.begin(), high.end(), [](const auto& left, const auto& right) {
+            return CompareCacheKeys(left, right) < 0;
+        });
+        return { *low, high[0], high[1] };
+    }
+
+    TPageCacheItem AllocatePage(TTestCache& cache, const TCacheKey& key, ui64 size,
+        NTable::NPage::EPage type = NTable::NPage::EPage::DataPage, ui32 crc32 = 0,
+        EStickyState sticky = EStickyState::None) {
+        return TCacheTestAccess::AllocatePage(cache, PageCollection(key), key.Word(1), size, type, crc32, sticky);
+    }
+
+    TPageResult FindPage(TTestCache& cache, const TCacheKey& key) {
+        TPageResult result;
+        result.Status = cache.Find(PageCollection(key), key.Word(1), result.Ref);
+        return result;
+    }
+
+    TItemResult FindOrInsertPage(TTestCache& cache, const TCacheKey& key, TPageCacheItem candidate) {
+        return TCacheTestAccess::FindOrInsert(cache, key, candidate);
+    }
+
+    template <class TTraits>
+    ECacheResultStatus FindOrInsertPage(TCacheImpl<TTraits>& cache, TCollectionCacheItem collection,
+        const NTable::NPage::TPageLocation& page, EStickyState sticky, TPageCacheItem& inserted,
+        TCachePageRefImpl<TTraits>& hit) {
+        return TCacheTestAccess::FindOrInsert(cache, collection, page, sticky, inserted, hit);
+    }
+
+    TCollectionCacheItem AllocateCollection(TTestCache& cache, const TCacheKey& key, size_t backingSize = 0) {
+        Y_UNUSED(backingSize);
+        return TCacheTestAccess::AllocateCollection(cache, CollectionId(key), 0);
+    }
+
+    TCollectionResult FindCollection(TTestCache& cache, const TCacheKey& key) {
+        TCollectionResult result;
+        result.Status = cache.Find(CollectionId(key), result.Ref);
+        return result;
+    }
+
+    TItemResult FindOrInsertCollection(TTestCache& cache, const TCacheKey& key, TCollectionCacheItem candidate) {
+        return TCacheTestAccess::FindOrInsert(cache, key, candidate);
+    }
+
+    TPageCacheItem InsertReadyPage(TTestCache& cache, const TCacheKey& key) {
+        TPageCacheItem page;
+        TTestCachePageRef hit;
+        UNIT_ASSERT(FindOrInsertPage(cache, PageCollection(key), MakePageLocation(key.Word(1)), EStickyState::None,
+                        page, hit) == ECacheResultStatus::Inserted);
+        UNIT_ASSERT(TCacheTestAccess::MakeReadyPage(cache, page, MakePageData(page.Index())));
+        return page;
+    }
+
+    bool ConfigureKeep(TTestCache& cache, ui64 bytes) {
+        if (!cache.UpdateKeepLimit(bytes)) {
+            return false;
+        }
+        for (ui64 step = 0; step < cache.TargetHandleCount() * 4 + 4096; ++step) {
+            const bool work = cache.RunMaintenance();
+            if (!work && !cache.NeedsCapacityMaintenance()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    TPageCacheItem InsertOwnedPage(
+        TTestCache& cache, TCollectionCacheItem collection, ui64 offset, TTestCachePageRef& result) {
+        auto waiter = MakeIntrusive<TAcquiringPageFetchWaiter>(cache, result);
+        TTestCachePageRequest request(MakePageLocation(offset), waiter);
+        UNIT_ASSERT(cache.FindOrInsertBatch(collection, { &request, 1 }));
+        if (request.Status() == ECacheResultStatus::Hit) {
+            result = std::move(request.Page());
+            return result.CacheItem();
+        }
+        UNIT_ASSERT(request.Status() == ECacheResultStatus::Inserted);
+        const auto item = request.Fetch().CacheItem();
+        UNIT_ASSERT(MakeFetchReady(request.Fetch(), MakePageData(item.Index())));
+        UNIT_ASSERT(waiter->Ready());
+        return result.CacheItem();
+    }
+
+    TCollectionCacheItem CreateModeCollection(
+        TTestCache& cache, TCollectionRegistry& registry, const TLogoBlobID& id, ECacheMode mode) {
+        const auto item = AllocateCollection(cache, TCacheKey::Collection(id));
+        UNIT_ASSERT(TCacheTestAccess::MakeReady(cache, registry, item, MakeCollection(id)));
+        UNIT_ASSERT(cache.SetCollectionPagesCacheMode(item, mode));
+        return item;
+    }
+
+    TPageCacheItem InsertOwnedSizedPage(TTestCache& cache, TCollectionCacheItem collection, ui64 offset, ui32 size,
+        char value, TTestCachePageRef& result) {
+        auto waiter = MakeIntrusive<TAcquiringPageFetchWaiter>(cache, result);
+        TTestCachePageRequest request(MakePageLocation(offset, size), waiter);
+        UNIT_ASSERT(cache.FindOrInsertBatch(collection, { &request, 1 }));
+        UNIT_ASSERT(request.Status() == ECacheResultStatus::Inserted);
+        UNIT_ASSERT(MakeFetchReady(request.Fetch(), MakePageData(static_cast<ui32>(value), size)));
+        UNIT_ASSERT(waiter->Ready());
+        return result.CacheItem();
+    }
+
+    void AssertPageHit(TTestCache& cache, const TCacheKey& key, TPageCacheItem expected) {
+        auto found = FindPage(cache, key);
+        UNIT_ASSERT(found.Status == ECacheResultStatus::Hit);
+        UNIT_ASSERT(found.Ref.CacheItem() == expected);
+        found.Ref.Drop();
+    }
+
+    void AssertPageUnreferenced(TTestCache& cache, TPageCacheItem page) {
+        const THandleState state = TCacheTestAccess::HandleState(cache, page.Index());
+        UNIT_ASSERT_VALUES_EQUAL(state.Version(), page.Version());
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 0);
+    }
+
+    void AssertResizeMarker(TTestCache& cache, EHandleState expectedState) {
+        const THandleState state = TCacheTestAccess::HandleState(cache, ResizeMarkerIndex);
+        UNIT_ASSERT(state.State() == expectedState);
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 1);
+    }
+
+    void CompleteBucketResize(TTestCache& cache, TCacheSpace& space) {
+        const ui64 maxSteps = ui64(TCacheTestAccess::BucketResizeState(space).PairCount()) * 5 + 1;
+        for (ui64 step = 0; step < maxSteps; ++step) {
+            if (!TCacheTestAccess::CurrentSpaceState(space).Resizing()) {
+                return;
+            }
+            UNIT_ASSERT(TCacheTestAccess::AdvanceBucketResize(cache));
+        }
+        UNIT_ASSERT_C(!TCacheTestAccess::CurrentSpaceState(space).Resizing(),
+            "Bucket resize did not finish within its step bound");
+    }
+
+    void CommitTransition(TTestCache& cache, TTransition& transition) {
+        UNIT_ASSERT(TCacheTestAccess::PublishFinalView(cache, transition));
+        while (transition.Phase() == ETransitionPhase::AppendGrowth) {
+            UNIT_ASSERT(TCacheTestAccess::AppendFreeHandles(cache, transition));
+        }
+        UNIT_ASSERT(TCacheTestAccess::TryDrainTransition(cache, transition));
+        while (transition.Phase() == ETransitionPhase::FinalDrain) {
+            UNIT_ASSERT(TCacheTestAccess::FinalDrain(cache, transition));
+        }
+        UNIT_ASSERT(TCacheTestAccess::TryReleaseTransition(cache, transition));
+        UNIT_ASSERT(TCacheTestAccess::CommitTransition(cache, transition));
+    }
+
+} // anonymous namespace
+
+Y_UNIT_TEST_SUITE(TCacheTableKeyTest) {
+    Y_UNIT_TEST(PageKeyRoundTripIgnoresSizeWord) {
+        THandle handle;
+        const auto key = TCacheKey::Page(MakeCollectionCacheItem(5, 17), 1234);
+        StoreCacheKey(handle, key);
+        handle.Payload.InitializeCollection(98765);
+
+        UNIT_ASSERT(LoadCacheKey(handle, EItemKind::Page) == key);
+    }
+    Y_UNIT_TEST(CollectionKeyRoundTripUsesAllWords) {
+        THandle handle;
+        const auto key = TCacheKey::Collection(TLogoBlobID(11, 22, 33));
+        StoreCacheKey(handle, key);
+
+        UNIT_ASSERT(LoadCacheKey(handle, EItemKind::Collection) == key);
+        UNIT_ASSERT_VALUES_EQUAL(handle.Payload.LoadWord(0), 33);
+    }
+    Y_UNIT_TEST(HashUsesEveryTypedKeyWord) {
+        const auto token = MakeCollectionCacheItem(1, 2);
+        UNIT_ASSERT_VALUES_UNEQUAL(HashPageKey(token, 10), HashPageKey(token, 11));
+        UNIT_ASSERT_VALUES_UNEQUAL(HashPageKey(token, 10), HashPageKey(MakeCollectionCacheItem(2, 2), 10));
+
+        const auto base = HashCollectionKey(TLogoBlobID(1, 2, 3));
+        UNIT_ASSERT_VALUES_UNEQUAL(base, HashCollectionKey(TLogoBlobID(2, 2, 3)));
+        UNIT_ASSERT_VALUES_UNEQUAL(base, HashCollectionKey(TLogoBlobID(1, 3, 3)));
+        UNIT_ASSERT_VALUES_UNEQUAL(base, HashCollectionKey(TLogoBlobID(1, 2, 4)));
+    }
+    Y_UNIT_TEST(CrossKindHashTieUsesKind) {
+        const auto page = TCacheKey::Page(MakeCollectionCacheItem(1, 2), 3);
+        const auto collection = TCacheKey::Collection(TLogoBlobID(1, 2, 3));
+
+        UNIT_ASSERT(CompareCacheKeys(page, 42, collection, 42) < 0);
+        UNIT_ASSERT(CompareCacheKeys(collection, 42, page, 42) > 0);
+    }
+    Y_UNIT_TEST(TypedWordOrderBreaksHashTie) {
+        const auto first = TCacheKey::Collection(TLogoBlobID(1, 2, 3));
+        const auto second = TCacheKey::Collection(TLogoBlobID(1, 2, 4));
+
+        UNIT_ASSERT(CompareCacheKeys(first, 42, second, 42) < 0);
+        UNIT_ASSERT(CompareCacheKeys(second, 42, first, 42) > 0);
+        UNIT_ASSERT_VALUES_EQUAL(CompareCacheKeys(first, 42, first, 42), 0);
+    }
+    Y_UNIT_TEST(ComparatorDefinesTotalOrder) {
+        TVector<TCacheKey> keys = {
+            TCacheKey::Page(MakeCollectionCacheItem(1, 7), 11),
+            TCacheKey::Collection(TLogoBlobID(3, 2, 1)),
+            TCacheKey::Page(MakeCollectionCacheItem(1, 7), 10),
+            TCacheKey::Collection(TLogoBlobID(1, 2, 3)),
+            TCacheKey::Page(MakeCollectionCacheItem(2, 7), 10),
+        };
+
+        Sort(keys.begin(), keys.end(), [](const auto& left, const auto& right) {
+            return CompareCacheKeys(left, right) < 0;
+        });
+
+        for (size_t index = 1; index < keys.size(); ++index) {
+            UNIT_ASSERT(CompareCacheKeys(keys[index - 1], keys[index]) < 0);
+        }
+    }
+}
+
+Y_UNIT_TEST_SUITE(TCacheTableTest) {
+    Y_UNIT_TEST(PageFetchWaitersCloseExactlyOnce) {
+        TIntrusivePtr<TPageFetchState> fetch = new TPageFetchState;
+        for (ui32 index = 0; index < 8; ++index) {
+            UNIT_ASSERT(fetch->Subscribe(new TPageFetchWaiter));
+        }
+
+        ui32 drained = 0;
+        UNIT_ASSERT(fetch->CloseWaiters([&](TIntrusivePtr<TPageFetchWaiter> waiter) {
+            UNIT_ASSERT(waiter);
+            ++drained;
+        }));
+        UNIT_ASSERT_VALUES_EQUAL(drained, 8);
+        UNIT_ASSERT(fetch->Closed());
+        UNIT_ASSERT(!fetch->Subscribe(new TPageFetchWaiter));
+        UNIT_ASSERT(!fetch->CloseWaiters([](TIntrusivePtr<TPageFetchWaiter>) {
+        }));
+    }
+    Y_UNIT_TEST(PageFetchSubscribeRacesClose) {
+        TIntrusivePtr<TPageFetchState> fetch = new TPageFetchState;
+        std::atomic<bool> start = false;
+        std::atomic<ui32> subscribed = 0;
+        std::array<std::thread, 8> threads;
+        for (std::thread& thread : threads) {
+            thread = std::thread([&] {
+                while (!start.load(std::memory_order_acquire)) {
+                }
+                if (fetch->Subscribe(new TPageFetchWaiter)) {
+                    subscribed.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+        }
+
+        start.store(true, std::memory_order_release);
+        ui32 drained = 0;
+        fetch->CloseWaiters([&](TIntrusivePtr<TPageFetchWaiter>) {
+            ++drained;
+        });
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+        UNIT_ASSERT_VALUES_EQUAL(drained, subscribed.load(std::memory_order_relaxed));
+    }
+
+    struct TFixture {
+        TFixture(ui8 addressBits = 6, ui32 hazards = 8, ui8 reservedAddressBits = 0, ui64 hardLimit = 0) {
+            Y_ABORT_UNLESS(!TlsCacheHazards);
+            UNIT_ASSERT(TryCalculateCacheFootprint(addressBits, 4096, 0, hazards, Capacity));
+            if (reservedAddressBits == 0) {
+                reservedAddressBits = addressBits;
+            }
+            UNIT_ASSERT(TryCalculateCacheFootprint(reservedAddressBits, 4096, 0, hazards, ReservedCapacity));
+            Threads = MakeHolder<TCacheThreadSubSystem>(hazards);
+            auto space = TCacheSpace::Create(Capacity, ReservedCapacity, *Threads);
+            UNIT_ASSERT(space);
+            Space = space.Get();
+            Cache = TTestCache::Create(std::move(space), hardLimit ? hardLimit : Capacity.Limit);
+            UNIT_ASSERT(Cache);
+            TlsCacheHazards = { &TCacheThreadTestAccess::Hazard(*Cache, hazards - 1), 1 };
+        }
+
+        ~TFixture() {
+            Y_DEBUG_ABORT_UNLESS(
+                !TlsCacheHazards || !SpaceHazardIsActive(TlsCacheHazards[0].State.load(std::memory_order_relaxed)));
+            TlsCacheHazards = {};
+        }
+
+        THolder<TCacheThreadSubSystem> Threads;
+        TCacheCapacityConfig Capacity;
+        TCacheCapacityConfig ReservedCapacity;
+        TCacheSpace* Space = nullptr;
+        TCollectionRegistry Registry;
+        TIntrusivePtr<TTestCache> Cache;
+    };
+
+    Y_UNIT_TEST(OpBatchRenewsTheMappingViewAtPageBoundaries) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const ui32 firstGeneration = TCacheTestAccess::CurrentSpaceState(*fixture.Space).Generation();
+        std::optional<TTestCache::TOpBatch> batch;
+        batch.emplace(cache.BeginOpBatch());
+        UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazards[0].State.load()), 1);
+        for (ui32 step = 1; step <= 2; ++step) {
+            const ui32 nextGeneration = firstGeneration + step;
+            UNIT_ASSERT(TCacheTestAccess::AdvanceSpaceGeneration(cache));
+            UNIT_ASSERT(!TCacheTestAccess::TryDrainBefore(cache, nextGeneration));
+            for (ui32 visit = 0; visit < CacheOperationBatchSize; ++visit) {
+                batch->ProcessPage([&](auto& cacheOp) {
+                    UNIT_ASSERT_VALUES_EQUAL(cacheOp.EntryGeneration(), nextGeneration - 1);
+                    UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazards[0].State.load()), 1);
+                });
+            }
+            UNIT_ASSERT(TCacheTestAccess::TryDrainBefore(cache, nextGeneration));
+        }
+        const auto generation = batch->ProcessPage([](auto& cacheOp) {
+            return cacheOp.EntryGeneration();
+        });
+        UNIT_ASSERT_VALUES_EQUAL(generation, firstGeneration + 2);
+        batch.reset();
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazards[0].State.load()));
+    }
+
+    Y_UNIT_TEST(OpBatchReturnsOwnedPagesAndReleasesOnExceptions) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(295, 297, 6), ECacheMode::Regular);
+        const auto page = InsertReadyPage(cache, TCacheKey::Page(collection, 1));
+        TTestCachePageRef held;
+        {
+            auto batch = cache.BeginOpBatch();
+            for (ui32 visit = 0; visit < CacheOperationBatchSize - 1; ++visit) {
+                batch.ProcessPage([](auto&) {
+                });
+            }
+            held = batch.ProcessPage([&](auto& cacheOp) {
+                TOperationItemRef<TTestTraits> ref(cacheOp.SpaceOperation());
+                UNIT_ASSERT(cacheOp.FindPage(collection, 1, ref.Get()) == ECacheResultStatus::Hit);
+                return cacheOp.BuildPageRef(ref.Take());
+            });
+            UNIT_ASSERT(held && held.CacheItem() == page);
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazards[0].State.load()), 1);
+        }
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazards[0].State.load()));
+        UNIT_ASSERT(held.data() && held.size());
+        UNIT_ASSERT_EXCEPTION([&] {
+            auto batch = cache.BeginOpBatch();
+            batch.ProcessPage([](auto&) {
+                ythrow yexception() << "page action failure";
+            });
+        }(), yexception);
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazards[0].State.load()));
+    }
+
+    Y_UNIT_TEST(OperationCollectionAdmissionReturnsCanonicalReadyOwner) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const TLogoBlobID id(295, 297, 4);
+        auto source = MakeIntrusiveConst<TTestPageCollection>(id, size_t{ 0 });
+        TTestCacheCollectionRef ready;
+        {
+            auto cacheOp = cache.BeginOperation();
+            UNIT_ASSERT(cacheOp.AdmitCollection(source, ready) == ECacheResultStatus::Inserted);
+            UNIT_ASSERT(ready && ready->Id() == id);
+            const auto* canonical = ready.Get();
+            UNIT_ASSERT(cacheOp.AdmitCollection(ready->PageCollection(), ready) == ECacheResultStatus::Hit);
+            UNIT_ASSERT(ready.Get() == canonical);
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazards[0].State.load()), 1);
+        }
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazards[0].State.load()));
+        UNIT_ASSERT(ready->Id() == id);
+        UNIT_ASSERT(cache.DetachCollection(ready.CacheItem()));
+        {
+            auto cacheOp = cache.BeginOperation();
+            TTestCacheCollectionRef attached;
+            UNIT_ASSERT(cacheOp.AdmitCollection(source, attached) == ECacheResultStatus::Hit);
+            UNIT_ASSERT(attached.Get() == ready.Get());
+            UNIT_ASSERT(attached.CacheItem() == ready.CacheItem());
+        }
+    }
+
+    Y_UNIT_TEST(OperationCollectionAdmissionRetriesConcurrentPublication) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const TLogoBlobID id(295, 297, 5);
+        TCollectionCacheItem inserted;
+        TTestCacheCollectionRef pending;
+        UNIT_ASSERT(cache.FindOrInsert({ .Id = id }, inserted, pending) == ECacheResultStatus::Inserted);
+        auto source = MakeIntrusiveConst<TTestPageCollection>(id, size_t{ 0 });
+        TCacheGate gate;
+        gate.Slots[0].Arm(ECacheHookPoint::BeforeCollectionAdmissionRetry);
+        TCacheHookGuard guard(cache, gate.Hooks);
+        TTestCacheCollectionRef ready;
+        bool oneOperation = false;
+        TGateThread worker(gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazards);
+            TlsCacheHazards = { &TCacheThreadTestAccess::Hazard(cache, 0), 1 };
+            Y_DEFER {
+                TlsCacheHazards = {};
+            };
+            auto cacheOp = cache.BeginOperation();
+            UNIT_ASSERT(cacheOp.AdmitCollection(source, ready) == ECacheResultStatus::Hit);
+            oneOperation = SpaceHazardActiveCount(TlsCacheHazards[0].State.load()) == 1;
+        });
+        gate.Slots[0].Wait();
+        TTestCacheCollectionRef published;
+        UNIT_ASSERT(cache.MakeReady(inserted, cache.PrepareCollection(source), published));
+        gate.Slots[0].Release();
+        worker.Join();
+        UNIT_ASSERT(ready && ready.Get() == published.Get());
+        UNIT_ASSERT(ready.CacheItem() == inserted);
+        UNIT_ASSERT(oneOperation);
+    }
+
+    Y_UNIT_TEST(CollectionAdmissionReportsNoResourceAndPreservesOutput) {
+        TFixture fixture(5);
+        auto& cache = *fixture.Cache;
+        TVector<TTestCacheCollectionRef> held;
+        bool exhausted = false;
+        for (ui32 index = 0; index < cache.TargetHandleCount(); ++index) {
+            auto source = MakeIntrusiveConst<TTestPageCollection>(TLogoBlobID(295, 298, index + 1), size_t{ 0 });
+            TTestCacheCollectionRef ready;
+            const auto status = cache.BeginOperation().AdmitCollection(source, ready);
+            if (status == ECacheResultStatus::NoResource) {
+                UNIT_ASSERT(!ready);
+                exhausted = true;
+                break;
+            }
+            UNIT_ASSERT(status == ECacheResultStatus::Inserted);
+            held.push_back(std::move(ready));
+        }
+        UNIT_ASSERT(exhausted && held.size() > 1);
+
+        auto source = MakeIntrusiveConst<TTestPageCollection>(TLogoBlobID(295, 298, 1000), size_t{ 0 });
+        const auto* descriptor = source.Get();
+        auto ready = held.front().Acquire();
+        const auto* previous = ready.Get();
+        const auto previousItem = ready.CacheItem();
+        UNIT_ASSERT(cache.BeginOperation().AdmitCollection(source, ready) == ECacheResultStatus::NoResource);
+        UNIT_ASSERT(ready.Get() == previous && ready.CacheItem() == previousItem);
+        UNIT_ASSERT(source.Get() == descriptor);
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazards[0].State.load()));
+
+        TTestCacheCollectionRef missing;
+        UNIT_ASSERT(cache.Find(source->Label(), missing) == ECacheResultStatus::Miss);
+        TCollectionCacheItem inserted;
+        UNIT_ASSERT(cache.FindOrInsert({ .Id = source->Label() }, inserted, missing) == ECacheResultStatus::NoResource);
+        UNIT_ASSERT(!inserted && !missing);
+
+        const auto released = held.back().CacheItem();
+        UNIT_ASSERT(cache.DetachCollection(released));
+        UNIT_ASSERT(cache.EraseCollection(released));
+        held.pop_back();
+        UNIT_ASSERT(cache.BeginOperation().AdmitCollection(source, ready) == ECacheResultStatus::Inserted);
+        UNIT_ASSERT(ready->PageCollection().Get() == descriptor);
+    }
+
+    Y_UNIT_TEST(PageAdmissionReportsNoResourceInsteadOfLookupMiss) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        auto source = MakeIntrusiveConst<TTestPageCollection>(TLogoBlobID(295, 299, 1), size_t{ 0 });
+        TTestCacheCollectionRef collection;
+        UNIT_ASSERT(cache.BeginOperation().AdmitCollection(source, collection) == ECacheResultStatus::Inserted);
+        const auto location = MakePageLocation(1, cache.CurrentLimit() + 1);
+        TPageCacheItem inserted;
+        TTestCachePageRef page;
+        UNIT_ASSERT(FindOrInsertPage(cache, collection.CacheItem(), location, EStickyState::None, inserted, page) ==
+                    ECacheResultStatus::NoResource);
+        UNIT_ASSERT(!inserted && !page);
+        UNIT_ASSERT(
+            cache.Find(collection.CacheItem(), static_cast<ui64>(location.Offset), page) == ECacheResultStatus::Miss);
+        UNIT_ASSERT_VALUES_EQUAL(cache.ReservedBytes(), 0);
+    }
+
+    Y_UNIT_TEST(EmptyAdmissionBatchesDoNotRequireAThreadOperation) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        {
+            auto hazards = std::exchange(TlsCacheHazards, TArrayRef<TSpaceHazard>{});
+            Y_DEFER {
+                TlsCacheHazards = hazards;
+            };
+            UNIT_ASSERT(cache.FindOrInsertBatch({}, {}));
+            UNIT_ASSERT(cache.FindOrInsertPreloadBatch({}, {}));
+            UNIT_ASSERT(cache.FindOrInsertReadAheadBatch({}, {}));
+        }
+        auto cacheOp = cache.BeginOperation();
+        UNIT_ASSERT(cacheOp.FindOrInsertBatch({}, {}));
+        UNIT_ASSERT(cacheOp.FindOrInsertWrittenBatch({}, {}));
+        UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazards[0].State.load()), 1);
+    }
+
+    Y_UNIT_TEST(AdmissionAndCompletionShareTheCallerOperation) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(295, 297, 3), ECacheMode::Regular);
+        TTestCachePageRef page;
+        auto waiter = MakeIntrusive<TAcquiringPageFetchWaiter>(cache, page);
+        TTestCachePageRequest request(MakePageLocation(0), waiter);
+        {
+            auto cacheOp = cache.BeginOperation();
+            UNIT_ASSERT(cacheOp.FindOrInsertBatch(collection, { &request, 1 }, false));
+            UNIT_ASSERT(request.Status() == ECacheResultStatus::Inserted);
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazards[0].State.load()), 1);
+            const auto item = request.Fetch().CacheItem();
+            UNIT_ASSERT(request.Fetch().MakeReady(cacheOp, MakePageData(item.Index())));
+            UNIT_ASSERT_VALUES_EQUAL(waiter->OperationDepth(), 1);
+        }
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazards[0].State.load()));
+        UNIT_ASSERT(waiter->Ready() && page);
+        UNIT_ASSERT_VALUES_EQUAL(page.size(), 4096);
+    }
+
+    Y_UNIT_TEST(FetchBatchSharesDispatchAndCompletionOperations) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(295, 297, 1), ECacheMode::Regular);
+        std::array<TTestCachePageRef, 3> pages;
+        std::array<TIntrusivePtr<TAcquiringPageFetchWaiter>, 3> waiters;
+        TVector<TTestCachePageRequest> requests;
+        for (ui32 index = 0; index < pages.size(); ++index) {
+            waiters[index] = MakeIntrusive<TAcquiringPageFetchWaiter>(cache, pages[index]);
+            requests.emplace_back(MakePageLocation(index / 2), waiters[index]);
+        }
+        UNIT_ASSERT(cache.FindOrInsertBatch(collection, requests));
+        UNIT_ASSERT(requests[0].Status() == ECacheResultStatus::Inserted);
+        UNIT_ASSERT(requests[1].Status() == ECacheResultStatus::Pending);
+        UNIT_ASSERT(requests[2].Status() == ECacheResultStatus::Inserted);
+
+        {
+            auto cacheOp = cache.BeginOperation();
+            for (ui32 index : { 0u, 2u }) {
+                UNIT_ASSERT(requests[index].Fetch().Dispatch(cacheOp));
+            }
+            UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazards[0].State.load()), 1);
+        }
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazards[0].State.load()));
+
+        {
+            auto cacheOp = cache.BeginOperation();
+            for (ui32 index : { 0u, 2u }) {
+                auto& fetch = requests[index].Fetch();
+                const auto page = fetch.CacheItem();
+                UNIT_ASSERT(fetch.MakeReady(cacheOp, MakePageData(page.Index())));
+                UNIT_ASSERT(!fetch);
+                UNIT_ASSERT_VALUES_EQUAL(SpaceHazardActiveCount(TlsCacheHazards[0].State.load()), 1);
+            }
+        }
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazards[0].State.load()));
+        for (ui32 index = 0; index < pages.size(); ++index) {
+            UNIT_ASSERT(waiters[index]->Ready());
+            UNIT_ASSERT_VALUES_EQUAL(waiters[index]->OperationDepth(), 1);
+            UNIT_ASSERT(pages[index]);
+            UNIT_ASSERT_VALUES_EQUAL(pages[index].size(), 4096);
+        }
+        UNIT_ASSERT(pages[0].CacheItem() == pages[1].CacheItem());
+        UNIT_ASSERT(pages[0].CacheItem() != pages[2].CacheItem());
+    }
+
+    Y_UNIT_TEST(FetchBatchFailureConsumesEachOwnerOnce) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(295, 297, 2), ECacheMode::Regular);
+        std::atomic<ui32> completed = 0;
+        std::atomic<ui32> ready = 0;
+        std::atomic<ui64> completedItem = 0;
+        TVector<TTestCachePageRequest> requests;
+        for (ui32 index = 0; index < 3; ++index) {
+            requests.emplace_back(
+                MakePageLocation(index), MakeIntrusive<TTestPageFetchWaiter>(completed, ready, completedItem));
+        }
+        UNIT_ASSERT(cache.FindOrInsertBatch(collection, requests));
+        {
+            auto cacheOp = cache.BeginOperation();
+            for (auto& request : requests) {
+                auto& fetch = request.Fetch();
+                UNIT_ASSERT(fetch.Dispatch(cacheOp));
+                UNIT_ASSERT(fetch.FailReady(cacheOp));
+                UNIT_ASSERT(!fetch);
+                UNIT_ASSERT(!fetch.FailReady(cacheOp));
+            }
+            UNIT_ASSERT_VALUES_EQUAL(completed.load(), 3);
+            UNIT_ASSERT_VALUES_EQUAL(ready.load(), 0);
+        }
+        requests.clear();
+        UNIT_ASSERT_VALUES_EQUAL(completed.load(), 3);
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazards[0].State.load()));
+    }
+
+    Y_UNIT_TEST(HotPageRefReleaseSkipsHazardAndPreservesNotifications) {
+        for (bool keep : { false, true }) {
+            for (bool armed : { false, true }) {
+                for (bool registered : { false, true }) {
+                    TFixture fixture;
+                    auto& cache = *fixture.Cache;
+                    UNIT_ASSERT(cache.UpdateKeepLimit(64_KB));
+                    const auto collection = CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 160),
+                        keep ? ECacheMode::TryKeepInMemory : ECacheMode::Regular);
+                    TTestCachePageRef held;
+                    const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+                    auto other = held.Acquire();
+                    if (registered) {
+                        UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+                    }
+                    const auto before = TCacheTestAccess::HandleState(cache, page.Index());
+                    UNIT_ASSERT(before.IsHot() && before.IsStickyNoneField());
+                    UNIT_ASSERT(before.Tier() == (keep ? ECacheTier::Keep : ECacheTier::Regular));
+                    const ui64 payload = cache.PayloadUsage();
+                    const ui64 keepBytes = cache.KeepResidentPageBytes();
+                    const ui64 keepOwnedBytes = cache.KeepOwnedBytes();
+                    const ui64 keepOwnedPages = cache.KeepOwnedPages();
+                    UNIT_ASSERT_VALUES_EQUAL(keepOwnedPages, keep ? 1 : 0);
+                    const ui64 generation = cache.AdmissionGeneration();
+
+                    struct TContext {
+                        TCacheItem Item;
+                        ui32 Attempts = 0;
+                        ui32 Notifications = 0;
+                    } context{ page.CacheItem() };
+
+                    TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem item) noexcept {
+                                          auto& ctx = *static_cast<TContext*>(ptr);
+                                          if (point == ECacheHookPoint::BeforeHotPageRefRelease && item == ctx.Item) {
+                                              Y_ABORT_UNLESS(!SpaceHazardIsActive(
+                                                  TlsCacheHazards[0].State.load(std::memory_order_relaxed)));
+                                              ++ctx.Attempts;
+                                          } else if (point == ECacheHookPoint::ResourcesAvailable) {
+                                              ++ctx.Notifications;
+                                          }
+                                      } };
+                    TCacheHookGuard guard(cache, hooks);
+                    if (armed) {
+                        cache.ArmResourceWait();
+                    }
+                    other.Drop();
+                    UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation);
+                    UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 0);
+                    UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()) == before.DecrementRefs());
+                    held.Drop();
+                    UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()) ==
+                                before.WithRefs(0).WithShrinkWaiter(false));
+                    UNIT_ASSERT_VALUES_EQUAL(context.Attempts, 2);
+                    UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation + (armed && registered));
+                    UNIT_ASSERT_VALUES_EQUAL(context.Notifications, armed && registered ? 1 : 0);
+                    if (!armed) {
+                        cache.ArmResourceWait();
+                        // A release before arming is observed by the following probe
+                        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, page.Index()).Refs(), 0);
+                    }
+                    UNIT_ASSERT_VALUES_EQUAL(context.Notifications, armed && registered ? 1 : 0);
+                    cache.DisarmResourceWait();
+                    UNIT_ASSERT_VALUES_EQUAL(cache.PayloadUsage(), payload);
+                    UNIT_ASSERT_VALUES_EQUAL(cache.KeepResidentPageBytes(), keepBytes);
+                    UNIT_ASSERT_VALUES_EQUAL(cache.KeepOwnedBytes(), keepOwnedBytes);
+                    UNIT_ASSERT_VALUES_EQUAL(cache.KeepOwnedPages(), keepOwnedPages);
+                }
+            }
+        }
+    }
+
+    Y_UNIT_TEST(HotPageRefReleaseRetriesWithoutHazard) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 163), ECacheMode::Regular);
+        TTestCachePageRef held;
+        const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+        UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+        const ui64 generation = cache.AdmissionGeneration();
+
+        struct TContext {
+            TTestCache& Cache;
+            TPageCacheItem Page;
+            TTestCachePageRef Other;
+            ui32 Attempts = 0;
+        } context{ cache, page, {} };
+
+        TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem item) noexcept {
+                              auto& ctx = *static_cast<TContext*>(ptr);
+                              if (point != ECacheHookPoint::BeforeHotPageRefRelease || item != ctx.Page.CacheItem()) {
+                                  return;
+                              }
+                              Y_ABORT_UNLESS(
+                                  !SpaceHazardIsActive(TlsCacheHazards[0].State.load(std::memory_order_relaxed)));
+                              if (++ctx.Attempts == 1) {
+                                  Y_ABORT_UNLESS(TCacheTestAccess::AcquirePage(ctx.Cache, ctx.Page, ctx.Other));
+                              }
+                          } };
+        TCacheHookGuard guard(cache, hooks);
+        cache.ArmResourceWait();
+        held.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(context.Attempts, 2);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, page.Index()).Refs(), 1);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
+        UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation);
+        context.Other.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(context.Attempts, 3);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, page.Index()).Refs(), 0);
+        UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
+        UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation + 1);
+    }
+
+    Y_UNIT_TEST(ShrinkWaitRegistrationDoesNotOwnAReferenceAndIsOneShot) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 164), ECacheMode::Regular);
+        TTestCachePageRef held;
+        const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+        ui32 notifications = 0;
+        TTestTraits hooks{ &notifications, [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
+                              if (point == ECacheHookPoint::ResourcesAvailable) {
+                                  ++*static_cast<ui32*>(context);
+                              }
+                          } };
+        TCacheHookGuard guard(cache, hooks);
+        cache.ArmResourceWait();
+        const auto before = TCacheTestAccess::HandleState(cache, page.Index());
+        UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+        const auto registered = TCacheTestAccess::HandleState(cache, page.Index());
+        UNIT_ASSERT(registered == before.WithShrinkWaiter(true));
+        UNIT_ASSERT_VALUES_EQUAL(registered.Refs(), 1);
+        held.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
+
+        cache.ArmResourceWait();
+        UNIT_ASSERT(cache.Find(collection, 1, held) == ECacheResultStatus::Hit);
+        held.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+        cache.DisarmResourceWait();
+    }
+
+    Y_UNIT_TEST(ShrinkWaitRegistrationRetriesIfTheLastReferenceWasReleased) {
+        for (bool alreadyRegistered : { false, true }) {
+            TFixture fixture;
+            auto& cache = *fixture.Cache;
+            const auto collection =
+                CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 165), ECacheMode::Regular);
+            TTestCachePageRef held;
+            const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+            cache.ArmResourceWait();
+            if (alreadyRegistered) {
+                UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+            }
+
+            struct TContext {
+                TTestCachePageRef& Held;
+                TCacheItem Item;
+                ui32 Notifications = 0;
+            } context{ held, page.CacheItem() };
+
+            TTestTraits hooks{ &context,
+                [](void* ptr, ECacheHookPoint point, TCacheItem item) noexcept {
+                    auto& context = *static_cast<TContext*>(ptr);
+                    if (point == ECacheHookPoint::BeforeShrinkWaitRegistration && item == context.Item) {
+                        context.Held.Drop();
+                    } else if (point == ECacheHookPoint::ResourcesAvailable) {
+                        ++context.Notifications;
+                    }
+                } };
+            TCacheHookGuard guard(cache, hooks);
+            UNIT_ASSERT(!TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+            const auto after = TCacheTestAccess::HandleState(cache, page.Index());
+            UNIT_ASSERT_VALUES_EQUAL(after.Refs(), 0);
+            UNIT_ASSERT(!after.HasShrinkWaiter());
+            UNIT_ASSERT_VALUES_EQUAL(context.Notifications, alreadyRegistered ? 1 : 0);
+            cache.DisarmResourceWait();
+        }
+    }
+
+    Y_UNIT_TEST(ShrinkWaiterSurvivesDemotionAndRelocation) {
+        for (bool relocate : { false, true }) {
+            TFixture fixture;
+            auto& cache = *fixture.Cache;
+            const auto collection =
+                CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 166), ECacheMode::Regular);
+            TTestCachePageRef held;
+            const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+            UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+            if (relocate) {
+                UNIT_ASSERT(TCacheTestAccess::RelocatePage(cache, page));
+                TTestCachePageRef replacement;
+                UNIT_ASSERT(cache.Find(collection, 1, replacement) == ECacheResultStatus::Hit);
+                UNIT_ASSERT(replacement.CacheItem() != page);
+                UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, replacement.CacheItem().Index()).HasShrinkWaiter());
+            } else {
+                UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, page));
+            }
+            UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
+            ui32 notifications = 0;
+            TTestTraits hooks{ &notifications, [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
+                                  if (point == ECacheHookPoint::ResourcesAvailable) {
+                                      ++*static_cast<ui32*>(context);
+                                  }
+                              } };
+            TCacheHookGuard guard(cache, hooks);
+            cache.ArmResourceWait();
+            held.Drop();
+            UNIT_ASSERT_VALUES_EQUAL(notifications, 1);
+            UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
+            cache.DisarmResourceWait();
+        }
+    }
+
+    enum class EHotReleaseRace {
+        Demote,
+        Erase,
+        Relocate,
+    };
+
+    void CheckHotPageRefReleaseFallback(EHotReleaseRace race) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 161), ECacheMode::Regular);
+        TTestCachePageRef held;
+        const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+
+        struct TContext {
+            TTestCache& Cache;
+            TCacheItem Item;
+            TCacheKey Key;
+            EHotReleaseRace Race;
+            bool Entered = false;
+        } context{ cache, page.CacheItem(), TCacheKey::Page(collection, 1), race };
+
+        TTestTraits hooks{ &context,
+            [](void* ptr, ECacheHookPoint point, TCacheItem item) noexcept {
+                auto& ctx = *static_cast<TContext*>(ptr);
+                if (point != ECacheHookPoint::BeforeHotPageRefRelease || item != ctx.Item ||
+                    std::exchange(ctx.Entered, true)) {
+                    return;
+                }
+                Y_ABORT_UNLESS(!SpaceHazardIsActive(TlsCacheHazards[0].State.load(std::memory_order_relaxed)));
+                switch (ctx.Race) {
+                    case EHotReleaseRace::Demote:
+                        Y_ABORT_UNLESS(
+                            TCacheTestAccess::EvictFromHot(ctx.Cache, TPageCacheItem::FromValidated(ctx.Item)));
+                        break;
+                    case EHotReleaseRace::Erase: {
+                        auto op = ctx.Cache.BeginOperation();
+                        auto expected = THandleState::FromRaw(op.SpaceOperation().Handles()[item.Index()].State.load());
+                        TOperationItemRef<TTestTraits> owner(op);
+                        Y_ABORT_UNLESS(op.TryBeginErase(item, expected, owner.Get()));
+                        op.FinishErase(item, ctx.Key);
+                        break;
+                    }
+                    case EHotReleaseRace::Relocate:
+                        Y_ABORT_UNLESS(
+                            TCacheTestAccess::RelocatePage(ctx.Cache, TPageCacheItem::FromValidated(ctx.Item)));
+                        break;
+                }
+            } };
+        TCacheHookGuard guard(cache, hooks);
+        held.Drop();
+        UNIT_ASSERT(context.Entered);
+        const auto after = TCacheTestAccess::HandleState(cache, page.Index());
+        if (race == EHotReleaseRace::Demote) {
+            UNIT_ASSERT(after.IsCold() && after.Refs() == 0);
+            UNIT_ASSERT(TCacheTestAccess::EraseCold(cache, MakeColdItem(cache, page.Index())));
+        } else {
+            UNIT_ASSERT(after.IsFree());
+            if (race == EHotReleaseRace::Relocate) {
+                auto found = FindPage(cache, context.Key);
+                UNIT_ASSERT(found.Status == ECacheResultStatus::Hit);
+                UNIT_ASSERT(found.Ref.CacheItem().Index() != page.Index());
+                UNIT_ASSERT_VALUES_EQUAL(found.Ref.data()[0], 'p');
+            }
+        }
+        UNIT_ASSERT_VALUES_EQUAL(cache.RetiredBytes(), 0);
+        UNIT_ASSERT(!SpaceHazardIsActive(TlsCacheHazards[0].State.load(std::memory_order_relaxed)));
+    }
+
+    Y_UNIT_TEST(HotPageRefReleaseFallsBackAfterDemotion) {
+        CheckHotPageRefReleaseFallback(EHotReleaseRace::Demote);
+    }
+
+    Y_UNIT_TEST(HotPageRefReleaseFallsBackAfterErase) {
+        CheckHotPageRefReleaseFallback(EHotReleaseRace::Erase);
+    }
+
+    Y_UNIT_TEST(HotPageRefReleaseFallsBackAfterRelocation) {
+        CheckHotPageRefReleaseFallback(EHotReleaseRace::Relocate);
+    }
+
+    Y_UNIT_TEST(OwnedPageRefCloneSkipsHazardAcrossLifetimeTransitions) {
+        enum class EState {
+            Hot,
+            Cold,
+            Tombstone,
+            Replaced,
+        };
+        for (const auto state : { EState::Hot, EState::Cold, EState::Tombstone, EState::Replaced }) {
+            TFixture fixture;
+            auto& cache = *fixture.Cache;
+            const auto collection =
+                CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 167), ECacheMode::Regular);
+            TTestCachePageRef held;
+            const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+            switch (state) {
+                case EState::Hot:
+                    break;
+                case EState::Cold:
+                    UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, page));
+                    break;
+                case EState::Tombstone: {
+                    auto cacheOp = cache.BeginOperation();
+                    auto expected = TCacheTestAccess::HandleState(cache, page.Index());
+                    TOperationItemRef<TTestTraits> owner(cacheOp);
+                    UNIT_ASSERT(cacheOp.TryBeginErase(page.CacheItem(), expected, owner.Get()));
+                    cacheOp.FinishErase(page.CacheItem(), TCacheKey::Page(collection, 1));
+                    break;
+                }
+                case EState::Replaced:
+                    UNIT_ASSERT(TCacheTestAccess::RelocatePage(cache, page));
+                    break;
+            }
+            ui32 clones = 0;
+            TTestTraits hooks{ &clones, [](void* context, ECacheHookPoint point, TCacheItem) noexcept {
+                                  if (point == ECacheHookPoint::BeforePageRefClone) {
+                                      Y_ABORT_UNLESS(
+                                          !SpaceHazardIsActive(TlsCacheHazards[0].State.load(std::memory_order_relaxed)));
+                                      ++*static_cast<ui32*>(context);
+                                  }
+                              } };
+            TCacheHookGuard guard(cache, hooks);
+            const auto before = TCacheTestAccess::HandleState(cache, page.Index());
+            auto clone = held.Acquire();
+            UNIT_ASSERT(clones >= 1);
+            UNIT_ASSERT(clone.CacheItem() == page);
+            UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()) == before.IncrementRefs());
+            UNIT_ASSERT_VALUES_EQUAL(clone.size(), held.size());
+            UNIT_ASSERT(clone.data() == held.data());
+            held.Drop();
+            UNIT_ASSERT_VALUES_EQUAL(clone.data()[0], 'p');
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, page.Index()).Refs(), 1);
+        }
+    }
+
+    Y_UNIT_TEST(OwnedPageRefCloneRetriesWithoutHazardAndPreservesShrinkWaiter) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 168), ECacheMode::Regular);
+        TTestCachePageRef held;
+        const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+        UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+        cache.ArmResourceWait();
+
+        struct TContext {
+            TTestCachePageRef& Held;
+            TTestCachePageRef Other;
+            ui32 Attempts = 0;
+            ui32 Notifications = 0;
+        } context{ held, {} };
+
+        TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem) noexcept {
+                              auto& context = *static_cast<TContext*>(ptr);
+                              if (point == ECacheHookPoint::BeforePageRefClone) {
+                                  Y_ABORT_UNLESS(
+                                      !SpaceHazardIsActive(TlsCacheHazards[0].State.load(std::memory_order_relaxed)));
+                                  if (++context.Attempts == 1) {
+                                      context.Other = context.Held.Acquire();
+                                  }
+                              } else if (point == ECacheHookPoint::ResourcesAvailable) {
+                                  ++context.Notifications;
+                              }
+                          } };
+        TCacheHookGuard guard(cache, hooks);
+        auto clone = held.Acquire();
+        UNIT_ASSERT(context.Attempts >= 3);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, page.Index()).Refs(), 3);
+        held.Drop();
+        context.Other.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 0);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
+        clone.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 1);
+        UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, page.Index()).HasShrinkWaiter());
+        cache.DisarmResourceWait();
+    }
+
+    Y_UNIT_TEST(OwnedCollectionRefCloneSkipsHazardAcrossLifetimeTransitions) {
+        enum class EState {
+            Sticky,
+            Detached,
+            Hot,
+            Cold,
+            Tombstone,
+        };
+        for (const auto state : { EState::Sticky, EState::Detached, EState::Hot, EState::Cold, EState::Tombstone }) {
+            TFixture fixture;
+            auto& cache = *fixture.Cache;
+            const TLogoBlobID id(111, 112, 169);
+            TCollectionCacheItem item;
+            TTestCacheCollectionRef held;
+            UNIT_ASSERT(cache.FindOrInsert({ .Id = id }, item, held) == ECacheResultStatus::Inserted);
+            UNIT_ASSERT(cache.MakeReady(item, MakeCollection(id)));
+            UNIT_ASSERT(cache.Find(id, held) == ECacheResultStatus::Hit);
+            if (state != EState::Sticky) {
+                UNIT_ASSERT(cache.DetachCollection(item));
+            }
+            if (state == EState::Hot || state == EState::Cold) {
+                held.Drop();
+                UNIT_ASSERT(cache.Find(id, held) == ECacheResultStatus::Hit);
+            }
+            if (state == EState::Cold) {
+                auto cacheOp = cache.BeginOperation();
+                UNIT_ASSERT(cacheOp.Eviction().EvictFromHot(item.Index()));
+            } else if (state == EState::Tombstone) {
+                auto cacheOp = cache.BeginOperation();
+                auto expected = TCacheTestAccess::HandleState(cache, item.Index());
+                TOperationItemRef<TTestTraits> owner(cacheOp);
+                UNIT_ASSERT(cacheOp.TryBeginErase(item.CacheItem(), expected, owner.Get()));
+                cacheOp.FinishErase(item.CacheItem(), TCacheKey::Collection(id));
+            }
+
+            struct TContext {
+                bool Cloning = false;
+                ui32 Attempts = 0;
+            } context;
+
+            TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem) noexcept {
+                                  auto& context = *static_cast<TContext*>(ptr);
+                                  if (point == ECacheHookPoint::BeforeCollectionRefClone && context.Cloning) {
+                                      Y_ABORT_UNLESS(
+                                          !SpaceHazardIsActive(TlsCacheHazards[0].State.load(std::memory_order_relaxed)));
+                                      ++context.Attempts;
+                                  }
+                              } };
+            TCacheHookGuard guard(cache, hooks);
+            const auto before = TCacheTestAccess::HandleState(cache, item.Index());
+            const TCollection* identity = held.Get();
+            context.Cloning = true;
+            auto clone = held.Acquire();
+            context.Cloning = false;
+            UNIT_ASSERT(context.Attempts >= 1);
+            UNIT_ASSERT(clone.CacheItem() == item && clone.Get() == identity);
+            UNIT_ASSERT(TCacheTestAccess::HandleState(cache, item.Index()) == before.IncrementRefs());
+            held.Drop();
+            UNIT_ASSERT(clone->Id() == id);
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, item.Index()).Refs(), 1);
+        }
+    }
+
+    Y_UNIT_TEST(OwnedCollectionRefCloneRetriesWithoutHazardAndPreservesShrinkWaiter) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const TLogoBlobID id(111, 112, 170);
+        TCollectionCacheItem item;
+        TTestCacheCollectionRef held;
+        UNIT_ASSERT(cache.FindOrInsert({ .Id = id }, item, held) == ECacheResultStatus::Inserted);
+        UNIT_ASSERT(cache.MakeReady(item, MakeCollection(id)));
+        UNIT_ASSERT(cache.Find(id, held) == ECacheResultStatus::Hit);
+        UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, item.CacheItem()));
+        cache.ArmResourceWait();
+
+        struct TContext {
+            TTestCacheCollectionRef& Held;
+            TTestCacheCollectionRef Other;
+            bool Cloning = false;
+            ui32 Attempts = 0;
+            ui32 Notifications = 0;
+        } context{ held, {} };
+
+        TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem) noexcept {
+                              auto& context = *static_cast<TContext*>(ptr);
+                              if (point == ECacheHookPoint::BeforeCollectionRefClone && context.Cloning) {
+                                  Y_ABORT_UNLESS(
+                                      !SpaceHazardIsActive(TlsCacheHazards[0].State.load(std::memory_order_relaxed)));
+                                  if (++context.Attempts == 1) {
+                                      context.Other = context.Held.Acquire();
+                                  }
+                              } else if (point == ECacheHookPoint::ResourcesAvailable) {
+                                  ++context.Notifications;
+                              }
+                          } };
+        TCacheHookGuard guard(cache, hooks);
+        context.Cloning = true;
+        auto clone = held.Acquire();
+        context.Cloning = false;
+        UNIT_ASSERT(context.Attempts >= 3);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleState(cache, item.Index()).Refs(), 3);
+        held.Drop();
+        context.Other.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 0);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, item.Index()).HasShrinkWaiter());
+        clone.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(context.Notifications, 1);
+        UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, item.Index()).HasShrinkWaiter());
+        cache.DisarmResourceWait();
+    }
+
+    Y_UNIT_TEST(HotPageRefReleaseAllowsPhysicalShrinkInsideNotification) {
+        TFixture fixture(11, 2);
+        auto& cache = *fixture.Cache;
+        TCacheCapacityConfig target;
+        UNIT_ASSERT(TryCalculateCacheFootprint(10, 4096, 0, 2, target));
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 162), ECacheMode::Regular);
+        TVector<TCollectionCacheItem> candidates;
+        Y_DEFER {
+            for (auto item : candidates) {
+                TCacheTestAccess::DiscardCandidate(cache, item);
+            }
+        };
+        for (ui64 index = 3; index < target.HandleCount(); ++index) {
+            const auto item = AllocateCollection(cache, TCacheKey::Collection(TLogoBlobID(111, 113, index)));
+            UNIT_ASSERT_VALUES_EQUAL(item.Index(), index);
+            candidates.push_back(item);
+        }
+        TTestCachePageRef held;
+        const auto page = InsertOwnedSizedPage(cache, collection, 1, 64, 'p', held);
+        UNIT_ASSERT_VALUES_EQUAL(page.Index(), target.HandleCount());
+        UNIT_ASSERT(ui64(page.Index()) * sizeof(THandle) >= 64_KB);
+        for (auto item : candidates) {
+            TCacheTestAccess::DiscardCandidate(cache, item);
+        }
+        candidates.clear();
+
+        struct TContext {
+            TTestCache& Cache;
+            const TCacheCapacityConfig& Target;
+            bool Entered = false;
+            bool Shrunk = false;
+        } context{ cache, target };
+
+        TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem) noexcept {
+                              auto& ctx = *static_cast<TContext*>(ptr);
+                              if (point != ECacheHookPoint::ResourcesAvailable || std::exchange(ctx.Entered, true)) {
+                                  return;
+                              }
+                              Y_ABORT_UNLESS(
+                                  !SpaceHazardIsActive(TlsCacheHazards[0].State.load(std::memory_order_relaxed)));
+                              Y_ABORT_UNLESS(ctx.Cache.UpdateCurrentLimit(ctx.Target.Limit));
+                              Y_ABORT_UNLESS(ctx.Cache.UpdateHardLimit(ctx.Target.Limit));
+                              for (ui32 step = 0; step < 50000 && ctx.Cache.NeedsCapacityMaintenance(); ++step) {
+                                  ctx.Cache.RunMaintenance();
+                              }
+                              Y_ABORT_UNLESS(!ctx.Cache.NeedsCapacityMaintenance());
+                              auto op = ctx.Cache.BeginOperation();
+                              ctx.Shrunk = op.SpaceOperation().View().HandlesBytes == 64_KB;
+                          } };
+        TCacheHookGuard guard(cache, hooks);
+        cache.ArmResourceWait();
+        UNIT_ASSERT(TCacheTestAccess::RegisterShrinkWait(cache, page.CacheItem()));
+        held.Drop();
+        UNIT_ASSERT(context.Entered && context.Shrunk);
+        cache.DisarmResourceWait();
+        UNIT_ASSERT_VALUES_EQUAL(cache.StaticBytes(), target.StaticBytes);
+        UNIT_ASSERT(FindPage(cache, TCacheKey::Page(collection, 1)).Status == ECacheResultStatus::Miss);
+    }
+
+    Y_UNIT_TEST(CollectionPublicationKeepsFoundationStickyDefault) {
+        TFixture fixture;
+        const TLogoBlobID id(111, 112, 150);
+        TCollectionCacheItem collection;
+        TTestCacheCollectionRef published;
+        UNIT_ASSERT(fixture.Cache->FindOrInsert(TCollectionLocation{ .Id = id }, collection, published) ==
+                    ECacheResultStatus::Inserted);
+        auto value = MakeCollection(id);
+        UNIT_ASSERT(value->GetCacheMode() == ECacheMode::Sticky);
+        UNIT_ASSERT(fixture.Cache->MakeReady(collection, std::move(value)));
+        UNIT_ASSERT(fixture.Cache->Find(id, published) == ECacheResultStatus::Hit);
+        UNIT_ASSERT(published->GetCacheMode() == ECacheMode::Sticky);
+    }
+
+    Y_UNIT_TEST(ColdTicketCannotReviveAfterPhysicalShrinkAndRegrowth) {
+        TFixture fixture(10, 2);
+        auto& cache = *fixture.Cache;
+        TCacheCapacityConfig small;
+        UNIT_ASSERT(TryCalculateCacheFootprint(9, 4096, 0, 2, small));
+        UNIT_ASSERT(cache.UpdateSoftLimitOverride(4 * (64 + TSharedData::OverheadSize)));
+        const auto collection =
+            CreateModeCollection(cache, fixture.Registry, TLogoBlobID(111, 112, 152), ECacheMode::Regular);
+        UNIT_ASSERT_VALUES_EQUAL(collection.Index(), 2);
+        TVector<TCollectionCacheItem> candidates;
+        Y_DEFER {
+            for (auto item : candidates) {
+                TCacheTestAccess::DiscardCandidate(cache, item);
+            }
+        };
+        for (ui64 index = 3; index < small.HandleCount(); ++index) {
+            const auto item = AllocateCollection(cache, TCacheKey::Collection(TLogoBlobID(111, 113, index)));
+            UNIT_ASSERT_VALUES_EQUAL(item.Index(), index);
+            candidates.push_back(item);
+        }
+        TTestCachePageRef oldOwner;
+        const auto old = InsertOwnedSizedPage(cache, collection, 1, 64, 'a', oldOwner);
+        UNIT_ASSERT_VALUES_EQUAL(old.Index(), small.HandleCount());
+        oldOwner.Drop();
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, old));
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, old.Index()).IsCold());
+        const auto oldTicket = MakeColdItem(cache, old.Index());
+        const auto firstColdWord = [&] {
+            auto operation = cache.BeginOperation();
+            return operation.SpaceOperation().View().Tiers[ECacheTier::Regular].ColdStorage.Slots[0].load();
+        };
+        UNIT_ASSERT_VALUES_EQUAL(firstColdWord(), oldTicket.Raw());
+        const auto resize = [&](const TCacheCapacityConfig& target) {
+            if (cache.CurrentLimit() > target.Limit) {
+                UNIT_ASSERT(cache.UpdateCurrentLimit(target.Limit));
+            }
+            UNIT_ASSERT(cache.UpdateHardLimit(target.Limit));
+            for (ui32 step = 0; step < 10000 && cache.NeedsCapacityMaintenance(); ++step) {
+                cache.RunMaintenance();
+            }
+            UNIT_ASSERT(!cache.NeedsCapacityMaintenance());
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::HandleCount(cache), target.HandleCount());
+        };
+        resize(small);
+        UNIT_ASSERT_VALUES_EQUAL(cache.StaticBytes(), small.StaticBytes);
+        UNIT_ASSERT_VALUES_EQUAL(firstColdWord(), 0);
+        TCacheTestAccess::DiscardCandidate(cache, candidates.front());
+        candidates.erase(candidates.begin());
+        TTestCachePageRef olderOwner;
+        const auto older = InsertOwnedSizedPage(cache, collection, 2, 64, 'b', olderOwner);
+        UNIT_ASSERT(older.Index() < small.HandleCount());
+        olderOwner.Drop();
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, older));
+        resize(fixture.Capacity);
+        UNIT_ASSERT_VALUES_EQUAL(cache.StaticBytes(), fixture.Capacity.StaticBytes);
+        UNIT_ASSERT_VALUES_EQUAL(firstColdWord(), 0);
+        TTestCachePageRef newOwner;
+        const auto newer = InsertOwnedSizedPage(cache, collection, 3, 64, 'c', newOwner);
+        UNIT_ASSERT_VALUES_EQUAL(newer.Index(), old.Index());
+        newOwner.Drop();
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, newer));
+        UNIT_ASSERT_VALUES_EQUAL(MakeColdItem(cache, newer.Index()).ColdVersion(), oldTicket.ColdVersion());
+        UNIT_ASSERT(cache.ReclaimCold());
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, older.Index()).IsFree());
+        auto found = FindPage(cache, TCacheKey::Page(collection, 3));
+        UNIT_ASSERT(found.Status == ECacheResultStatus::Hit);
+        UNIT_ASSERT_VALUES_EQUAL(found.Ref.data()[0], 'c');
+        UNIT_ASSERT_VALUES_EQUAL(newer.Version(), old.Version());
+    }
+
+    struct TPageAttachmentFixture : TFixture {
+        TPageAttachmentFixture()
+            : TFixture(6, 3)
+        {
+            const TLogoBlobID id(111, 112, 153);
+            UNIT_ASSERT(Cache->FindOrInsert({ .Id = id }, Item, Owner) == ECacheResultStatus::Inserted);
+            UNIT_ASSERT(Cache->MakeReady(Item, MakeCollection(id), Owner));
+            UNIT_ASSERT(Cache->SetCollectionPagesCacheMode(Item, ECacheMode::Regular));
+        }
+
+        TCollectionCacheItem Item;
+        TTestCacheCollectionRef Owner;
+    };
+
+    Y_UNIT_TEST(PageSetOwnsOneCollectionAttachment) {
+        for (bool keepOwner : { false, true }) {
+            TPageAttachmentFixture fixture;
+            auto& cache = *fixture.Cache;
+            const auto check = [&](ui64 pages, bool attachment, ui32 refs) {
+                const auto state = TCacheTestAccess::HandleState(cache, fixture.Item.Index());
+                UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::PageReferences(cache, fixture.Item), pages);
+                UNIT_ASSERT_VALUES_EQUAL(state.HasPageAttachment(), attachment);
+                UNIT_ASSERT_VALUES_EQUAL(state.Refs(), refs);
+            };
+            check(0, false, 1);
+            std::array<TPageCacheItem, 2> items;
+            for (ui32 index = 0; index < items.size(); ++index) {
+                TTestCachePageRef page;
+                items[index] = InsertOwnedSizedPage(cache, fixture.Item, index, 64, 'p', page);
+                page.Drop();
+                check(index + 1, true, 1);
+            }
+            UNIT_ASSERT(cache.DetachCollection(fixture.Item));
+            UNIT_ASSERT(!cache.SetCollectionPagesCacheMode(fixture.Item, ECacheMode::Sticky));
+            UNIT_ASSERT(!cache.SetCollectionPagesCacheMode(fixture.Item, ECacheMode::TryKeepInMemory));
+            if (!keepOwner) {
+                fixture.Owner.Drop();
+            }
+            for (ui32 index = 0; index < items.size(); ++index) {
+                UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, items[index]));
+                UNIT_ASSERT(TCacheTestAccess::EraseCold(cache, MakeColdItem(cache, items[index].Index())));
+                const ui64 remaining = items.size() - index - 1;
+                check(remaining, remaining != 0, keepOwner);
+            }
+            if (keepOwner) {
+                UNIT_ASSERT(TCacheTestAccess::HandleState(cache, fixture.Item.Index()).IsSticky());
+            }
+            fixture.Owner.Drop();
+            check(0, false, 0);
+            UNIT_ASSERT(TCacheTestAccess::HandleState(cache, fixture.Item.Index()).IsHot());
+        }
+    }
+
+    Y_UNIT_TEST(RetiredPageRetainsItsVirtualCollectionAttachment) {
+        TPageAttachmentFixture fixture;
+        auto& cache = *fixture.Cache;
+        TTestCachePageRef owner;
+        const auto page = InsertOwnedSizedPage(cache, fixture.Item, 0, 64, 'p', owner);
+        UNIT_ASSERT(cache.DetachCollection(fixture.Item));
+        fixture.Owner.Drop();
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, page));
+        UNIT_ASSERT(TCacheTestAccess::RetirePageResult(cache, page));
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, page.Index()).IsTombstone());
+        const auto state = TCacheTestAccess::HandleState(cache, fixture.Item.Index());
+        UNIT_ASSERT(state.IsSticky() && state.HasPageAttachment());
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::PageReferences(cache, fixture.Item), 1);
+        UNIT_ASSERT_VALUES_EQUAL(owner.data()[0], 'p');
+        UNIT_ASSERT_VALUES_EQUAL(owner.size(), 64);
+        owner.Drop();
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::PageReferences(cache, fixture.Item), 0);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, fixture.Item.Index()).IsHot());
+    }
+
+    Y_UNIT_TEST(NewPageRestoresAttachmentDuringLastPageDestruction) {
+        TPageAttachmentFixture fixture;
+        auto& cache = *fixture.Cache;
+        TTestCachePageRef oldOwner;
+        const auto oldPage = InsertOwnedSizedPage(cache, fixture.Item, 0, 64, 'o', oldOwner);
+        oldOwner.Drop();
+
+        struct TContext {
+            TTestCache& Cache;
+            TCollectionCacheItem Item;
+            TTestCachePageRef NewOwner{};
+            bool Inserted = false;
+        } context{ cache, fixture.Item };
+
+        TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem item) noexcept {
+                              auto& ctx = *static_cast<TContext*>(ptr);
+                              if (point == ECacheHookPoint::AfterPageAttachmentWithdrawn &&
+                                  item == ctx.Item.CacheItem() && !ctx.Inserted) {
+                                  ctx.Inserted = true;
+                                  InsertOwnedSizedPage(ctx.Cache, ctx.Item, 1, 64, 'n', ctx.NewOwner);
+                              }
+                          } };
+        TCacheHookGuard guard(cache, hooks);
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(cache, oldPage));
+        UNIT_ASSERT(TCacheTestAccess::EraseCold(cache, MakeColdItem(cache, oldPage.Index())));
+        UNIT_ASSERT(context.Inserted);
+        const auto state = TCacheTestAccess::HandleState(cache, fixture.Item.Index());
+        UNIT_ASSERT(state.HasPageAttachment());
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::PageReferences(cache, fixture.Item), 1);
+        UNIT_ASSERT_VALUES_EQUAL(context.NewOwner.data()[0], 'n');
+    }
+
+    Y_UNIT_TEST(PageOnlyCollectionShrinkWakeIsOneShot) {
+        for (bool releaseBeforeArm : { false, true }) {
+            TPageAttachmentFixture fixture;
+            auto& cache = *fixture.Cache;
+            TTestCachePageRef page;
+            InsertOwnedSizedPage(cache, fixture.Item, 0, 64, 'p', page);
+
+            struct TContext {
+                TTestCacheCollectionRef& Owner;
+                bool ReleaseBeforeArm;
+                ui32 Notifications = 0;
+            } context{ fixture.Owner, releaseBeforeArm };
+
+            TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint point, TCacheItem) noexcept {
+                                  auto& ctx = *static_cast<TContext*>(ptr);
+                                  if (point == ECacheHookPoint::BeforeCollectionShrinkWait && ctx.ReleaseBeforeArm) {
+                                      ctx.Owner.Drop();
+                                  } else if (point == ECacheHookPoint::ResourcesAvailable) {
+                                      ++ctx.Notifications;
+                                  }
+                              } };
+            TCacheHookGuard guard(cache, hooks);
+            cache.ArmResourceWait();
+            Y_DEFER {
+                cache.DisarmResourceWait();
+            };
+            {
+                auto op = cache.BeginOperation();
+                UNIT_ASSERT(op.ReclaimShrinkHandle(fixture.Item.Index()) ==
+                            (releaseBeforeArm ? EShrinkCutStatus::Progress : EShrinkCutStatus::Blocked));
+            }
+            if (!releaseBeforeArm) {
+                UNIT_ASSERT(TCacheTestAccess::HandleState(cache, fixture.Item.Index()).HasShrinkWaiter());
+                fixture.Owner.Drop();
+            }
+            UNIT_ASSERT_VALUES_EQUAL(context.Notifications, releaseBeforeArm ? 0 : 1);
+            UNIT_ASSERT(!TCacheTestAccess::HandleState(cache, fixture.Item.Index()).HasShrinkWaiter());
+            const auto generation = cache.AdmissionGeneration();
+            cache.ArmResourceWait();
+            for (ui32 probe = 0; probe < 3; ++probe) {
+                auto op = cache.BeginOperation();
+                TOperationItemRef<TTestTraits> ref(op, op.TryAcquireStructural(fixture.Item.CacheItem()));
+                UNIT_ASSERT(ref);
+            }
+            UNIT_ASSERT_VALUES_EQUAL(cache.AdmissionGeneration(), generation);
+            UNIT_ASSERT_VALUES_EQUAL(context.Notifications, releaseBeforeArm ? 0 : 1);
+        }
+    }
+
+    Y_UNIT_TEST(InFlightPagesRetainMetadataAfterCollectionErase) {
+        TPageAttachmentFixture fixture;
+        auto& cache = *fixture.Cache;
+        UNIT_ASSERT(cache.DetachCollection(fixture.Item));
+        auto* collection = fixture.Owner.Get();
+        const auto id = collection->Id();
+        TCacheGate gate;
+        gate.Slots[0].Arm(ECacheHookPoint::BeforeCollectionEraseClaim, fixture.Item.CacheItem());
+        gate.Slots[1].Arm(ECacheHookPoint::BeforePageAttachmentPublished, fixture.Item.CacheItem());
+        TCacheHookGuard guard(cache, gate.Hooks);
+        bool erased = false;
+        TGateThread eraser(gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazards);
+            TlsCacheHazards = { &TCacheThreadTestAccess::Hazard(cache, 0), 1 };
+            Y_DEFER {
+                TlsCacheHazards = {};
+            };
+            erased = cache.EraseCollection(fixture.Item);
+        });
+        gate.Slots[0].Wait();
+        TGateThread adder(gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazards);
+            TlsCacheHazards = { &TCacheThreadTestAccess::Hazard(cache, 1), 1 };
+            Y_DEFER {
+                TlsCacheHazards = {};
+            };
+            // The existing owner was acquired before erasure; this is an in-flight admission
+            TCacheTestAccess::AddPageReference(cache, *collection);
+        });
+        gate.Slots[1].Wait();
+        // A nonfirst admission can finish while the first is paused before installing the hold
+        TCacheTestAccess::AddPageReference(cache, *collection);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::PageReferences(cache, fixture.Item), 2);
+        gate.Slots[0].Release();
+        eraser.Join();
+        UNIT_ASSERT(erased);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, fixture.Item.Index()).IsTombstone());
+        TTestCacheCollectionRef fresh;
+        UNIT_ASSERT(cache.Find(id, fresh) == ECacheResultStatus::Miss);
+        gate.Slots[1].Release();
+        adder.Join();
+        fixture.Owner.Drop();
+        const auto state = TCacheTestAccess::HandleState(cache, fixture.Item.Index());
+        UNIT_ASSERT(state.IsTombstone() && state.HasPageAttachment());
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(collection->Id(), id);
+        TCacheTestAccess::DropPageReference(cache, *collection);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::PageReferences(cache, fixture.Item), 1);
+        TCacheTestAccess::DropPageReference(cache, *collection);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, fixture.Item.Index()).IsFree());
+    }
+
+    Y_UNIT_TEST(CollectionLastReleaseTracksDetachEpoch) {
+        for (bool detachAndReattach : { false, true }) {
+            TFixture fixture;
+            const TLogoBlobID id(111, 112, 151);
+            TCollectionCacheItem item;
+            TTestCacheCollectionRef owner;
+            UNIT_ASSERT(fixture.Cache->FindOrInsert({ .Id = id }, item, owner) == ECacheResultStatus::Inserted);
+            UNIT_ASSERT(fixture.Cache->MakeReady(item, MakeCollection(id), owner));
+            owner->EnsureActorState();
+
+            struct TObservation {
+                TTestCache* Cache;
+                TCollection* Collection;
+                TLogoBlobID Id;
+                TCollectionCacheItem Item;
+                bool DetachAndReattach;
+                bool Changed = false;
+                bool RestoredState = false;
+                ui32 Notifications = 0;
+            } observation{ fixture.Cache.Get(), owner.Get(), id, item, detachAndReattach };
+
+            TTestTraits hooks{ &observation, [](void* context, ECacheHookPoint point, TCacheItem item) noexcept {
+                                  auto& state = *static_cast<TObservation*>(context);
+                                  if (item != state.Item.CacheItem()) {
+                                      return;
+                                  }
+                                  if (point == ECacheHookPoint::CollectionReleased) {
+                                      ++state.Notifications;
+                                  } else if (point == ECacheHookPoint::BeforeLastCollectionRefRelease &&
+                                             state.DetachAndReattach && !state.Changed) {
+                                      state.Changed = true;
+                                      const auto before = TCacheTestAccess::HandleState(*state.Cache, item.Index());
+                                      state.Collection->ResetActorState();
+                                      Y_ABORT_UNLESS(state.Cache->DetachCollection(state.Item));
+                                      TTestCacheCollectionRef joined;
+                                      Y_ABORT_UNLESS(state.Cache->FindCollection(state.Id, joined) ==
+                                                     ECacheCollectionLookupStatus::Hit);
+                                      joined.Drop();
+                                      state.RestoredState =
+                                          TCacheTestAccess::HandleState(*state.Cache, item.Index()).Raw() ==
+                                          before.Raw();
+                                  }
+                              } };
+            TCacheHookGuard guard(*fixture.Cache, hooks);
+            owner.Drop();
+            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, detachAndReattach ? 1 : 0);
+            UNIT_ASSERT_VALUES_EQUAL(observation.Changed, detachAndReattach);
+            UNIT_ASSERT_VALUES_EQUAL(observation.RestoredState, detachAndReattach);
+
+            TTestCacheCollectionRef cleanup;
+            UNIT_ASSERT(fixture.Cache->Find(id, cleanup) == ECacheResultStatus::Hit);
+            cleanup->ResetActorState();
+            UNIT_ASSERT(fixture.Cache->TryDetachReleasedCollection(cleanup));
+            cleanup.Drop();
+            UNIT_ASSERT_VALUES_EQUAL(observation.Notifications, detachAndReattach ? 1 : 0);
+        }
+    }
+
+    TCacheKey ReviewKeyForBucket(
+        TCollectionCacheItem collection, ui32 mask, ui32 bucket, ui64 startOffset, const TCacheKey* after = nullptr) {
+        for (ui64 offset = startOffset; offset - startOffset < (1u << 20); ++offset) {
+            const auto key = TCacheKey::Page(collection, offset);
+            if ((key.Hash() & mask) == bucket && (!after || CompareCacheKeys(*after, key) < 0)) {
+                return key;
+            }
+        }
+        UNIT_FAIL("Could not construct the review test's bucket key");
+        Y_UNREACHABLE();
+    }
+
+    enum class EReusedPredecessorReader {
+        Lookup,
+        Erase,
+        SplitBoundary,
+    };
+
+    void CheckReusedPredecessorSnapshot(EReusedPredecessorReader reader) {
+        TFixture fixture;
+        auto& cache = *fixture.Cache;
+        const TLogoBlobID sourceId(142, 1, 1);
+        const TLogoBlobID targetId(142, 2, 1);
+        const auto sourceCollection = CreateModeCollection(cache, fixture.Registry, sourceId, ECacheMode::Regular);
+        const auto targetCollection = CreateModeCollection(cache, fixture.Registry, targetId, ECacheMode::Regular);
+        auto sourceMetadata = TCacheTestAccess::AcquireStructural(cache, sourceCollection.CacheItem());
+        auto targetMetadata = TCacheTestAccess::AcquireStructural(cache, targetCollection.CacheItem());
+        UNIT_ASSERT(sourceMetadata && targetMetadata);
+
+        const ui32 bucketCount = static_cast<ui32>(CurrentBucketCount(*fixture.Space));
+        const ui32 mask = bucketCount - 1;
+        ui32 bucket = 0;
+        while (bucket == (HashCollectionKey(sourceId) & mask) || bucket == (HashCollectionKey(targetId) & mask)) {
+            ++bucket;
+        }
+        // A is a prefix and B a suffix, so the same pair exercises ordered lookup and split discovery
+        const auto sourceKey = ReviewKeyForBucket(sourceCollection, (bucketCount << 1) - 1, bucket, 1000);
+        const auto targetKey =
+            ReviewKeyForBucket(targetCollection, (bucketCount << 1) - 1, bucket | bucketCount, 2000, &sourceKey);
+        const auto replacementKey = ReviewKeyForBucket(sourceCollection, mask, bucket ^ 1, 3000, &targetKey);
+        const auto source = InsertReadyPage(cache, sourceKey);
+        const auto target = InsertReadyPage(cache, targetKey);
+        auto sourceOwner = TCacheTestAccess::AcquireStructural(cache, source.CacheItem());
+        auto targetOwner = TCacheTestAccess::AcquireStructural(cache, target.CacheItem());
+        UNIT_ASSERT(sourceOwner && targetOwner);
+        UNIT_ASSERT(TCacheTestAccess::BucketHead(cache, bucket) == source.CacheItem());
+
+        TVector<TPageCacheItem> candidates;
+        TPageCacheItem replacement;
+        Y_DEFER {
+            if (replacement) {
+                TCacheTestAccess::DiscardCandidate(cache, replacement);
+            }
+            for (const auto candidate : candidates) {
+                TCacheTestAccess::DiscardCandidate(cache, candidate);
+            }
+        };
+        for (ui64 offset = 10000; candidates.size() < fixture.Capacity.HandleCount(); ++offset) {
+            const auto candidate = AllocatePage(cache, TCacheKey::Page(sourceCollection, offset), 16);
+            if (!candidate) {
+                break;
+            }
+            candidates.push_back(candidate);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(cache), 0);
+
+        TCacheGate gate;
+        TCacheHookGuard hookGuard(cache, gate.Hooks);
+        gate.Slots[0].Arm(ECacheHookPoint::BeforeTableItemValidation, source.CacheItem());
+        TPageResult lookup;
+        EResizeStep boundary = EResizeStep::Complete;
+        TCacheItem firstSuffix;
+        TGateThread pausedReader(gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazards);
+            TlsCacheHazards = { &TCacheThreadTestAccess::Hazard(cache, 0), 1 };
+            Y_DEFER {
+                TlsCacheHazards = {};
+            };
+            if (reader == EReusedPredecessorReader::Lookup) {
+                lookup = FindPage(cache, targetKey);
+            } else if (reader == EReusedPredecessorReader::SplitBoundary) {
+                boundary = TCacheTestAccess::FindSplitBoundary(cache, bucket, bucketCount, firstSuffix);
+            } else {
+                auto operation = cache.BeginOperation();
+                TOperationItemRef<TTestTraits> owner(operation.SpaceOperation(), std::move(targetOwner));
+                auto state =
+                    THandleState::FromRaw(operation.Handles()[target.Index()].State.load(std::memory_order_acquire));
+                Y_ABORT_UNLESS(operation.TryBeginErase(owner.Get(), state));
+                operation.FinishErase(owner.CacheItem(), targetKey);
+                owner.Drop();
+            }
+        });
+        gate.Slots[0].Wait();
+
+        UNIT_ASSERT(TCacheTestAccess::RetirePageResult(cache, source));
+        sourceOwner.Drop();
+        UNIT_ASSERT(TCacheTestAccess::HandleState(cache, source.Index()).IsFree());
+        UNIT_ASSERT(TCacheTestAccess::BucketHead(cache, bucket) == target.CacheItem());
+        UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(cache), 1);
+        replacement = AllocatePage(cache, replacementKey, 16);
+        UNIT_ASSERT(replacement);
+        UNIT_ASSERT_VALUES_EQUAL(replacement.Index(), source.Index());
+        UNIT_ASSERT_VALUES_UNEQUAL(replacement.Version(), source.Version());
+        // The replacement stays unpublished while the reader validates its old predecessor snapshot
+        gate.Slots[0].Release();
+        pausedReader.Join();
+
+        if (reader == EReusedPredecessorReader::Erase) {
+            UNIT_ASSERT(TCacheTestAccess::HandleState(cache, target.Index()).IsFree());
+            UNIT_ASSERT(TCacheTestAccess::BucketHead(cache, bucket).IsNull());
+            UNIT_ASSERT(FindPage(cache, targetKey).Status == ECacheResultStatus::Miss);
+        } else {
+            if (reader == EReusedPredecessorReader::Lookup) {
+                UNIT_ASSERT(lookup.Status == ECacheResultStatus::Hit);
+                UNIT_ASSERT(lookup.Ref.CacheItem() == target);
+            } else {
+                UNIT_ASSERT(boundary == EResizeStep::Retry);
+                UNIT_ASSERT(TCacheTestAccess::FindSplitBoundary(cache, bucket, bucketCount, firstSuffix) ==
+                            EResizeStep::Complete);
+                UNIT_ASSERT(firstSuffix == target.CacheItem());
+            }
+            AssertPageHit(cache, targetKey, target);
+        }
+    }
+
+    Y_UNIT_TEST(ReviewR42LookupRetriesReusedPredecessorSnapshot) {
+        CheckReusedPredecessorSnapshot(EReusedPredecessorReader::Lookup);
+    }
+
+    Y_UNIT_TEST(ReviewR42EraseUnlinksTargetAfterPredecessorReuse) {
+        CheckReusedPredecessorSnapshot(EReusedPredecessorReader::Erase);
+    }
+
+    Y_UNIT_TEST(ReviewR42SplitBoundaryRejectsReusedPredecessorSnapshot) {
+        CheckReusedPredecessorSnapshot(EReusedPredecessorReader::SplitBoundary);
+    }
+
+    void InsertRetriesCompletingFetch(bool ready) {
+        TFixture fixture;
+        const TCollectionCacheItem collection = MakeCollectionCacheItem(83, 84);
+        const ui32 bucketMask = static_cast<ui32>(CurrentBucketCount(*fixture.Space) - 1);
+        const auto sourceKey = ReviewKeyForBucket(collection, bucketMask, 0, 1000);
+        const auto successorKey = ReviewKeyForBucket(collection, bucketMask, 0, sourceKey.Word(1) + 1, &sourceKey);
+        std::atomic<ui32> completed = 0;
+        std::atomic<ui32> readyCount = 0;
+        std::atomic<ui64> completedItem = 0;
+        TIntrusivePtr<TPageFetchWaiter> waiter = new TTestPageFetchWaiter(completed, readyCount, completedItem);
+        TTestCachePageRef sourceHit;
+        TTestPageFetch fetch;
+        UNIT_ASSERT(TCacheTestAccess::FindOrInsert(*fixture.Cache, collection, MakePageLocation(sourceKey.Word(1)),
+                        EStickyState::None, waiter, sourceHit, fetch) == ECacheResultStatus::Inserted);
+        const TPageCacheItem source = fetch.CacheItem();
+
+        struct TCompletionGate {
+            TCacheGate Gate;
+            TCacheItem Source;
+            std::atomic<ui32> Attempts = 0;
+            std::atomic<bool> Retried = false;
+
+            static void Invoke(void* context, ECacheHookPoint point, TCacheItem item) noexcept {
+                auto& self = *static_cast<TCompletionGate*>(context);
+                if (item != self.Source) {
+                    return;
+                }
+                if (point == ECacheHookPoint::AfterFetchCompletingClaim) {
+                    self.Gate.Slots[0].TryInvoke(point, item);
+                } else if (point == ECacheHookPoint::BeforeInsertOwnerAcquire) {
+                    if (self.Attempts.fetch_add(1, std::memory_order_relaxed) == 1) {
+                        self.Retried.store(true, std::memory_order_relaxed);
+                        self.Gate.Slots[1].Block();
+                    }
+                } else if (point == ECacheHookPoint::AfterInsertPositionFound) {
+                    self.Gate.Slots[1].Block();
+                }
+            }
+        } completionGate;
+
+        completionGate.Source = source.CacheItem();
+        auto& gate = completionGate.Gate;
+        gate.Slots[0].Arm(ECacheHookPoint::AfterFetchCompletingClaim, source.CacheItem());
+        gate.Slots[1].Arm(ECacheHookPoint::AfterInsertPositionFound, source.CacheItem());
+        TTestTraits hooks{ &completionGate, &TCompletionGate::Invoke };
+        TCacheHookGuard hookGuard(*fixture.Cache, hooks);
+        auto cache = fixture.Cache;
+        bool finished = false;
+        TGateThread finisher(gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazards);
+            TlsCacheHazards = { &TCacheThreadTestAccess::Hazard(*cache, 0), 1 };
+            Y_DEFER {
+                TlsCacheHazards = {};
+            };
+            finished = ready ? MakeFetchReady(fetch, MakePageData(source.Index())) : FailFetch(fetch);
+        });
+        gate.Slots[0].Wait();
+
+        ECacheResultStatus insertStatus = ECacheResultStatus::Miss;
+        TPageCacheItem successor;
+        TTestCachePageRef successorHit;
+        TGateThread inserter(gate, [&] {
+            Y_ABORT_UNLESS(!TlsCacheHazards);
+            TlsCacheHazards = { &TCacheThreadTestAccess::Hazard(*cache, 1), 1 };
+            Y_DEFER {
+                TlsCacheHazards = {};
+            };
+            insertStatus = FindOrInsertPage(*cache, collection, MakePageLocation(successorKey.Word(1)),
+                EStickyState::None, successor, successorHit);
+        });
+        gate.Slots[1].Wait();
+
+        // A completing predecessor must be retried without taking another structural reference
+        UNIT_ASSERT(completionGate.Retried.load(std::memory_order_relaxed));
+        const THandleState completing = TCacheTestAccess::HandleState(*cache, source.Index());
+        UNIT_ASSERT(completing.IsCompleting());
+        UNIT_ASSERT_VALUES_EQUAL(completing.Refs(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(completed.load(std::memory_order_acquire), 0);
+
+        gate.Slots[0].Release();
+        finisher.Join();
+        UNIT_ASSERT(finished);
+        UNIT_ASSERT_VALUES_EQUAL(completed.load(std::memory_order_acquire), 1);
+        UNIT_ASSERT_VALUES_EQUAL(readyCount.load(std::memory_order_relaxed), ready ? 1 : 0);
+        UNIT_ASSERT_VALUES_EQUAL(completedItem.load(std::memory_order_relaxed), source.CacheItem().Raw());
+
+        gate.Slots[1].Release();
+        inserter.Join();
+        UNIT_ASSERT(insertStatus == ECacheResultStatus::Inserted);
+        UNIT_ASSERT(successor);
+        UNIT_ASSERT(!successorHit);
+        UNIT_ASSERT(TCacheTestAccess::MakeReadyPage(*cache, successor, MakePageData(successor.Index())));
+        AssertPageHit(*cache, successorKey, successor);
+        if (ready) {
+            AssertPageHit(*cache, sourceKey, source);
+        } else {
+            UNIT_ASSERT(FindPage(*cache, sourceKey).Status == ECacheResultStatus::Miss);
+        }
+        UNIT_ASSERT_VALUES_EQUAL(cache->ReservedBytes(), 0);
+    }
+
+    TVector<TTestCachePageRef> HoldReviewFillers(TFixture & fixture, ui32 excludedMask, ui32 excludedBucket) {
+        TVector<TTestCachePageRef> held;
+        const auto collection = MakeCollectionCacheItem(100, 50000);
+        for (ui64 offset = 0; AvailableFreeHandles(*fixture.Cache) != 0; ++offset) {
+            UNIT_ASSERT(offset < (1u << 20));
+            const auto key = TCacheKey::Page(collection, offset);
+            if ((key.Hash() & excludedMask) == excludedBucket) {
+                continue;
+            }
+            InsertReadyPage(*fixture.Cache, key);
+            auto found = FindPage(*fixture.Cache, key);
+            UNIT_ASSERT(found.Status == ECacheResultStatus::Hit);
+            held.push_back(std::move(found.Ref));
+        }
+        return held;
+    }
+
+    void AssertReviewTerminal(TTestCache & cache, TCacheItem owner, const char* finding) {
+        const auto terminal = TCacheItem::FromRaw(TCacheTestAccess::HandleNext(cache, owner.Index()));
+        UNIT_ASSERT(terminal.IsNull());
+        // Check before Find: the broken terminal would make a miss lookup retry forever.
+        UNIT_ASSERT_C(TCacheTestAccess::ValidateTerminalOwner(cache, owner, terminal),
+            TStringBuilder() << finding << ": terminal version " << terminal.Version() << " differs from owner version "
+                             << owner.Version());
+    }
+
+    void ReviewEmptyMarkerAfterReuse(bool grow) {
+        TFixture fixture(6, 8, grow ? 7 : 6);
+        TTransition growth;
+        if (grow) {
+            UNIT_ASSERT(TCacheTestAccess::PrepareTransition(*fixture.Cache, fixture.ReservedCapacity, growth) ==
+                        EPrepareResult::Prepared);
+            UNIT_ASSERT(TCacheTestAccess::PublishMigrationView(*fixture.Cache, growth));
+            UNIT_ASSERT(TCacheTestAccess::TryDrainTransition(*fixture.Cache, growth));
+        }
+        UNIT_ASSERT(TCacheTestAccess::BeginBucketResize(*fixture.Cache, grow ? 7 : 5));
+        UNIT_ASSERT(TCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+        UNIT_ASSERT(TCacheTestAccess::PublishBucketSplit(*fixture.Cache));
+        if (!grow) {
+            UNIT_ASSERT(TCacheTestAccess::CloseBucketSplit(*fixture.Cache));
+        }
+        UNIT_ASSERT(TCacheTestAccess::RemoveBucketSplit(*fixture.Cache));
+        const auto reused = TCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex);
+        UNIT_ASSERT(reused.IsFree());
+        UNIT_ASSERT(reused.Version() != 0);
+        UNIT_ASSERT(TCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+        const auto markerState = TCacheTestAccess::HandleState(*fixture.Cache, ResizeMarkerIndex);
+        const auto marker = TCacheItem::Make(markerState.Version(), ResizeMarkerIndex);
+        AssertReviewTerminal(*fixture.Cache, marker, "R1");
+        const auto resize = TCacheTestAccess::BucketResizeState(*fixture.Space);
+        const auto missing = ReviewKeyForBucket(MakeCollectionCacheItem(101, 50001), (resize.SplitBit() << 1) - 1,
+            resize.Cursor() | resize.SplitBit(), 10000);
+        UNIT_ASSERT(FindPage(*fixture.Cache, missing).Status == ECacheResultStatus::Miss);
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+        if (grow) {
+            CommitTransition(*fixture.Cache, growth);
+        }
+    }
+
+    Y_UNIT_TEST(ReviewR1GrowthEmptyMarkerTerminal) {
+        ReviewEmptyMarkerAfterReuse(true);
+    }
+
+    Y_UNIT_TEST(ReviewR1ShrinkEmptyMarkerTerminal) {
+        ReviewEmptyMarkerAfterReuse(false);
+    }
+
+    Y_UNIT_TEST(ReviewR2MergePreservesRecycledTailTerminal) {
+        TFixture fixture;
+        const auto token = MakeCollectionCacheItem(102, 50002);
+        const auto key = ReviewKeyForBucket(token, 63, 0, 20000);
+        const auto original = InsertReadyPage(*fixture.Cache, key);
+        auto originalHold = FindPage(*fixture.Cache, key);
+        auto fillers = HoldReviewFillers(fixture, 31, 0);
+        originalHold.Ref.Drop();
+        if (TCacheTestAccess::HandleState(*fixture.Cache, original.Index()).IsHot()) {
+            UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, original));
+        }
+        UNIT_ASSERT(TCacheTestAccess::EraseCold(*fixture.Cache, MakeColdItem(*fixture.Cache, original.Index())));
+        const auto tail = InsertReadyPage(*fixture.Cache, key);
+        UNIT_ASSERT_VALUES_EQUAL(tail.Index(), original.Index());
+        UNIT_ASSERT(tail.Version() != original.Version());
+        UNIT_ASSERT(tail.Version() != 0);
+        UNIT_ASSERT(TCacheTestAccess::BeginBucketResize(*fixture.Cache, 5));
+        UNIT_ASSERT(TCacheTestAccess::PrepareBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TCacheTestAccess::ActivateBucketSplitOrMerge(*fixture.Cache));
+        UNIT_ASSERT(TCacheTestAccess::PublishBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TCacheTestAccess::CloseBucketSplit(*fixture.Cache));
+        UNIT_ASSERT(TCacheTestAccess::RemoveBucketSplit(*fixture.Cache));
+        AssertReviewTerminal(*fixture.Cache, tail.CacheItem(), "R2");
+        const auto missing = ReviewKeyForBucket(token, 31, 0, 30000, &key);
+        UNIT_ASSERT(FindPage(*fixture.Cache, missing).Status == ECacheResultStatus::Miss);
+        CompleteBucketResize(*fixture.Cache, *fixture.Space);
+    }
+
+    Y_UNIT_TEST(ReviewR3RelocatedTailUsesReplacementVersion) {
+        TFixture fixture;
+        const auto token = MakeCollectionCacheItem(103, 50003);
+        const auto sourceKey = ReviewKeyForBucket(token, 63, 0, 40000);
+        const auto spareKey = ReviewKeyForBucket(token, 63, 1, 50000);
+        const auto spare = InsertReadyPage(*fixture.Cache, spareKey);
+        auto spareHold = FindPage(*fixture.Cache, spareKey);
+        const auto source = InsertReadyPage(*fixture.Cache, sourceKey);
+        auto sourceHold = FindPage(*fixture.Cache, sourceKey);
+        auto fillers = HoldReviewFillers(fixture, 63, 0);
+        spareHold.Ref.Drop();
+        if (TCacheTestAccess::HandleState(*fixture.Cache, spare.Index()).IsHot()) {
+            UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, spare));
+        }
+        UNIT_ASSERT(TCacheTestAccess::EraseCold(*fixture.Cache, MakeColdItem(*fixture.Cache, spare.Index())));
+        UNIT_ASSERT(TCacheTestAccess::RelocatePage(*fixture.Cache, source));
+        const auto replacement =
+            TCacheItem::FromRaw(TCacheTestAccess::HandleNext(*fixture.Cache, source.Index())).WithoutFrozen();
+        UNIT_ASSERT_VALUES_EQUAL(replacement.Index(), spare.Index());
+        UNIT_ASSERT(replacement.Version() != source.Version());
+        AssertReviewTerminal(*fixture.Cache, replacement, "R3");
+        const auto missing = ReviewKeyForBucket(token, 63, 0, 60000, &sourceKey);
+        UNIT_ASSERT(FindPage(*fixture.Cache, missing).Status == ECacheResultStatus::Miss);
+    }
+
+    void ReviewRelocationLosesToDeletion(bool reclaimDuringAllocation) {
+        TFixture fixture;
+        const TLogoBlobID id(151, 152, 153);
+        const auto collection = AllocateCollection(*fixture.Cache, TCacheKey::Collection(id));
+        UNIT_ASSERT(TCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        const auto sourceKey = TCacheKey::Page(collection, 1);
+        const auto source = InsertReadyPage(*fixture.Cache, sourceKey);
+        auto sourceHold = FindPage(*fixture.Cache, sourceKey);
+        TPageCacheItem spare;
+        TPageResult spareHold;
+        TVector<TTestCachePageRef> fillers;
+        if (reclaimDuringAllocation) {
+            const auto spareKey = TCacheKey::Page(collection, 2);
+            spare = InsertReadyPage(*fixture.Cache, spareKey);
+            spareHold = FindPage(*fixture.Cache, spareKey);
+            fillers = HoldReviewFillers(fixture, 63, sourceKey.Hash() & 63);
+        }
+        sourceHold.Ref.Drop();
+        if (TCacheTestAccess::HandleState(*fixture.Cache, source.Index()).IsHot()) {
+            UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, source));
+        }
+        auto structural = TCacheTestAccess::AcquireStructural(*fixture.Cache, source.CacheItem());
+        UNIT_ASSERT(structural);
+        if (reclaimDuringAllocation) {
+            spareHold.Ref.Drop();
+            if (TCacheTestAccess::HandleState(*fixture.Cache, spare.Index()).IsHot()) {
+                UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, spare));
+            }
+            UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), 0);
+        }
+        const ui64 freeBefore = AvailableFreeHandles(*fixture.Cache);
+        const ui64 residentBefore = fixture.Cache->ResidentBytes();
+        const ui32 ownersBefore = TCacheTestAccess::CollectionReferences(*fixture.Cache, collection);
+
+        struct TContext {
+            TTestCache& Cache;
+            TCollectionCacheItem Collection;
+            TPageCacheItem Source;
+            bool ReclaimDuringAllocation;
+            bool Visited = false;
+            bool Deleted = false;
+        } context{ *fixture.Cache, collection, source, reclaimDuringAllocation };
+
+        TTestTraits hooks{ &context,
+            [](void* ptr, ECacheHookPoint at, TCacheItem item) noexcept {
+                auto& ctx = *static_cast<TContext*>(ptr);
+                if (ctx.ReclaimDuringAllocation) {
+                    if (at == ECacheHookPoint::BeforeReferencedColdTicketReset && item == ctx.Source.CacheItem() &&
+                        !ctx.Visited) {
+                        ctx.Visited = true;
+                        ctx.Deleted = TCacheTestAccess::RetirePageResult(ctx.Cache, ctx.Source);
+                    }
+                } else if (at == ECacheHookPoint::AfterPageCollectionStateChecked &&
+                           item == ctx.Collection.CacheItem() && !ctx.Visited) {
+                    ctx.Visited = true;
+                    ctx.Deleted = TCacheTestAccess::RetirePageResult(ctx.Cache, ctx.Source);
+                }
+            } };
+        TCacheHookGuard guard(*fixture.Cache, hooks);
+        UNIT_ASSERT(!TCacheTestAccess::RelocatePage(*fixture.Cache, source));
+        UNIT_ASSERT(context.Deleted);
+        const auto state = TCacheTestAccess::HandleState(*fixture.Cache, source.Index());
+        UNIT_ASSERT(state.IsTombstone());
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), 1);
+        UNIT_ASSERT(FindPage(*fixture.Cache, sourceKey).Status == ECacheResultStatus::Miss);
+        const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT_VALUES_EQUAL(
+            fixture.Cache->ResidentBytes(), residentBefore - (reclaimDuringAllocation ? bytes : 0));
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionReferences(*fixture.Cache, collection),
+            ownersBefore - (reclaimDuringAllocation ? 1 : 0));
+        UNIT_ASSERT_VALUES_EQUAL(AvailableFreeHandles(*fixture.Cache), freeBefore + (reclaimDuringAllocation ? 1 : 0));
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+        structural.Drop();
+        UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, source.Index()).IsFree());
+        UNIT_ASSERT_VALUES_EQUAL(
+            fixture.Cache->ResidentBytes(), residentBefore - (reclaimDuringAllocation ? 2 * bytes : bytes));
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionReferences(*fixture.Cache, collection),
+            ownersBefore - (reclaimDuringAllocation ? 2 : 1));
+    }
+
+    Y_UNIT_TEST(ReviewR10DeletionDuringReplacementPreparation) {
+        ReviewRelocationLosesToDeletion(false);
+    }
+
+    Y_UNIT_TEST(ReviewR10ExplicitDeletionDuringReplacementAllocation) {
+        ReviewRelocationLosesToDeletion(true);
+    }
+
+    Y_UNIT_TEST(ReviewR10RelocationPreservesConcurrentSuccessorInsertion) {
+        TFixture fixture;
+        const auto collection = MakeCollectionCacheItem(151, 50051);
+        const auto keys = MakeAdjacentKeys(*fixture.Space, collection, 100000);
+        const auto source = InsertReadyPage(*fixture.Cache, keys[0]);
+        auto sourceHold = FindPage(*fixture.Cache, keys[0]);
+        TCacheGate gate;
+        gate.Slots[0].Arm(ECacheHookPoint::BeforeTableLinkCas, source.CacheItem());
+        gate.Slots[1].Arm(ECacheHookPoint::BeforePageReplacementLinkCas, source.CacheItem());
+        TCacheHookGuard guard(*fixture.Cache, gate.Hooks);
+        TPageCacheItem inserted;
+        TGateThread insertion(gate, [&] {
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazards);
+            NSharedCache::TlsCacheHazards = { &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 0), 1 };
+            Y_DEFER {
+                NSharedCache::TlsCacheHazards = {};
+            };
+            inserted = InsertReadyPage(*fixture.Cache, keys[1]);
+        });
+        gate.Slots[0].Wait();
+        bool relocated = false;
+        TGateThread relocation(gate, [&] {
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazards);
+            NSharedCache::TlsCacheHazards = { &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 1), 1 };
+            Y_DEFER {
+                NSharedCache::TlsCacheHazards = {};
+            };
+            relocated = TCacheTestAccess::RelocatePage(*fixture.Cache, source);
+        });
+        gate.Slots[1].Wait();
+        UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, source.Index()).IsReplacing());
+        UNIT_ASSERT(!TCacheItem::FromRaw(TCacheTestAccess::HandleNext(*fixture.Cache, source.Index())).IsFrozen());
+        gate.Slots[0].Release();
+        insertion.Join();
+        UNIT_ASSERT(
+            TCacheItem::FromRaw(TCacheTestAccess::HandleNext(*fixture.Cache, source.Index())) == inserted.CacheItem());
+        gate.Slots[1].Release();
+        relocation.Join();
+        UNIT_ASSERT(relocated);
+        auto replacement = FindPage(*fixture.Cache, keys[0]);
+        UNIT_ASSERT(replacement.Status == ECacheResultStatus::Hit);
+        UNIT_ASSERT(replacement.Ref.CacheItem() != source);
+        UNIT_ASSERT_VALUES_EQUAL(replacement.Ref.data(), sourceHold.Ref.data());
+        AssertPageHit(*fixture.Cache, keys[1], inserted);
+        AssertReviewTerminal(*fixture.Cache, inserted.CacheItem(), "R10");
+    }
+
+    void ReviewHeldPageWaitsForForwarder(bool querySticky) {
+        TFixture fixture;
+        const TLogoBlobID id(151, 152, 154);
+        const auto collection = AllocateCollection(*fixture.Cache, TCacheKey::Collection(id));
+        UNIT_ASSERT(TCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        const auto key = TCacheKey::Page(collection, 1);
+        const auto source = InsertReadyPage(*fixture.Cache, key);
+        auto sourceHold = FindPage(*fixture.Cache, key);
+        if (querySticky) {
+            UNIT_ASSERT(TCacheTestAccess::MakePageSticky(*fixture.Cache, source));
+            UNIT_ASSERT(TCacheTestAccess::UnstickyCutPages(*fixture.Cache, source, source.Index()));
+        }
+        TCacheGate gate;
+        gate.Slots[0].Arm(ECacheHookPoint::BeforePageReplacementLinkCas, source.CacheItem());
+        gate.Slots[1].Arm(ECacheHookPoint::BeforePageReplacementRetry, source.CacheItem());
+        TCacheHookGuard guard(*fixture.Cache, gate.Hooks);
+        bool relocated = false;
+        TGateThread relocation(gate, [&] {
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazards);
+            NSharedCache::TlsCacheHazards = { &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 0), 1 };
+            Y_DEFER {
+                NSharedCache::TlsCacheHazards = {};
+            };
+            relocated = TCacheTestAccess::RelocatePage(*fixture.Cache, source);
+        });
+        gate.Slots[0].Wait();
+        bool acquired = false;
+        TTestCachePageRef page;
+        TGateThread reader(gate, [&] {
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazards);
+            NSharedCache::TlsCacheHazards = { &NSharedCache::TCacheThreadTestAccess::Hazard(*fixture.Cache, 1), 1 };
+            Y_DEFER {
+                NSharedCache::TlsCacheHazards = {};
+            };
+            acquired =
+                querySticky ? sourceHold.Ref.IsSticky() : TCacheTestAccess::AcquirePage(*fixture.Cache, source, page);
+        });
+        gate.Slots[1].Wait();
+        gate.Slots[0].Release();
+        relocation.Join();
+        gate.Slots[1].Release();
+        reader.Join();
+        UNIT_ASSERT(relocated);
+        UNIT_ASSERT(acquired);
+        if (!querySticky) {
+            UNIT_ASSERT(page.CacheItem() != source);
+            UNIT_ASSERT_VALUES_EQUAL(page.data(), sourceHold.Ref.data());
+        }
+    }
+
+    Y_UNIT_TEST(ReviewR10AcquirePageWaitsForForwarder) {
+        ReviewHeldPageWaitsForForwarder(false);
+    }
+
+    Y_UNIT_TEST(ReviewR10StickyQueryWaitsForForwarder) {
+        ReviewHeldPageWaitsForForwarder(true);
+    }
+
+    void ReviewBatchDetach(ECacheHookPoint point) {
+        TFixture fixture;
+        const TLogoBlobID id(111, 112, 113);
+        const auto collection = AllocateCollection(*fixture.Cache, TCacheKey::Collection(id));
+        UNIT_ASSERT(TCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+
+        struct TContext {
+            TFixture& Fixture;
+            TCollectionCacheItem Collection;
+            ECacheHookPoint Point;
+            bool Detached = false;
+        } context{ fixture, collection, point };
+
+        TTestTraits hooks{ &context, [](void* ptr, ECacheHookPoint at, TCacheItem item) noexcept {
+                              auto& ctx = *static_cast<TContext*>(ptr);
+                              if (at == ctx.Point && item == ctx.Collection.CacheItem() && !ctx.Detached) {
+                                  Y_ABORT_UNLESS(TCacheTestAccess::CollectionReferences(
+                                                     *ctx.Fixture.Cache, ctx.Collection) == 2);
+                                  ctx.Detached = true;
+                                  Y_ABORT_UNLESS(TCacheTestAccess::DetachCollection(
+                                      *ctx.Fixture.Cache, ctx.Fixture.Registry, ctx.Collection));
+                              }
+                          } };
+        TCacheHookGuard hookGuard(*fixture.Cache, hooks);
+        TTestCachePageRequest request(MakePageLocation(1), MakeIntrusive<TPageFetchWaiter>());
+        const bool admitted = fixture.Cache->FindOrInsertBatch(collection, { &request, 1 });
+        UNIT_ASSERT(context.Detached);
+        UNIT_ASSERT(admitted);
+        UNIT_ASSERT(request.Status() == ECacheResultStatus::Inserted);
+        UNIT_ASSERT(MakeFetchReady(request.Fetch(), MakePageData(request.Fetch().CacheItem().Index())));
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionReferences(*fixture.Cache, collection), 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR4BatchSurvivesDetachAfterPreparation) {
+        ReviewBatchDetach(ECacheHookPoint::AfterPageBatchPrepared);
+    }
+
+    Y_UNIT_TEST(ReviewR4BatchSurvivesDetachBeforeOwnerIncrement) {
+        ReviewBatchDetach(ECacheHookPoint::AfterPageCollectionStateChecked);
+    }
+
+    Y_UNIT_TEST(ReviewR4BatchRejectsDetachedCollection) {
+        TFixture fixture;
+        const TLogoBlobID id(111, 112, 114);
+        const auto collection = AllocateCollection(*fixture.Cache, TCacheKey::Collection(id));
+        UNIT_ASSERT(TCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(TCacheTestAccess::DetachCollection(*fixture.Cache, fixture.Registry, collection));
+        TTestCachePageRequest request(MakePageLocation(1), MakeIntrusive<TPageFetchWaiter>());
+        UNIT_ASSERT(!fixture.Cache->FindOrInsertBatch(collection, { &request, 1 }));
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionReferences(*fixture.Cache, collection), 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR4RejectedBatchReleasesCollectionOwner) {
+        TFixture fixture;
+        const TLogoBlobID id(111, 112, 115);
+        const auto collection = AllocateCollection(*fixture.Cache, TCacheKey::Collection(id));
+        UNIT_ASSERT(TCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        TTestCachePageRequest request(
+            MakePageLocation(1, fixture.Cache->HardLimit()), MakeIntrusive<TPageFetchWaiter>());
+        UNIT_ASSERT(!fixture.Cache->FindOrInsertBatch(collection, { &request, 1 }));
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionReferences(*fixture.Cache, collection), 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ReservedBytes(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR5CapTrimErasesOrdinaryKeepCold) {
+        TFixture fixture;
+        const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+        ConfigureKeep(*fixture.Cache, 2 * bytes);
+        const auto collection = CreateModeCollection(
+            *fixture.Cache, fixture.Registry, TLogoBlobID(121, 122, 125), ECacheMode::TryKeepInMemory);
+        const auto page = InsertReadyPage(*fixture.Cache, TCacheKey::Page(collection, 1));
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsKeepCold());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->RetainedBytes(), 0);
+        UNIT_ASSERT(fixture.Cache->UpdateKeepLimit(0));
+        for (ui32 step = 0; step < 512 && fixture.Cache->KeepOwnedBytes(); ++step) {
+            fixture.Cache->RunMaintenance();
+        }
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepOwnedBytes(), 0);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsFree());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->PayloadUsage(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(
+            TCacheTestAccess::CollectionValue(*fixture.Cache, collection.Index())->ReadyPageBytes(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR5DemotionKeepsOriginalPageUntilAccounting) {
+        TFixture fixture;
+        const TLogoBlobID aId(121, 122, 123);
+        const TLogoBlobID bId(124, 125, 126);
+        const auto a = AllocateCollection(*fixture.Cache, TCacheKey::Collection(aId));
+        UNIT_ASSERT(TCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, a, MakeCollection(aId)));
+        const auto b = AllocateCollection(*fixture.Cache, TCacheKey::Collection(bId));
+        UNIT_ASSERT(TCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, b, MakeCollection(bId)));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(a, ECacheMode::TryKeepInMemory));
+        const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(fixture.Cache->UpdateKeepLimit(2 * bytes));
+        const auto sourceKey = TCacheKey::Page(a, 1);
+        const auto source = InsertReadyPage(*fixture.Cache, sourceKey);
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, source));
+        UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, source.Index()).IsKeepCold());
+        auto fillers = HoldReviewFillers(fixture, 63, sourceKey.Hash() & 63);
+        const auto token = MakeColdItem(*fixture.Cache, source.Index());
+        TCacheGate gate;
+        gate.Slots[0].Arm(ECacheHookPoint::BeforeColdEraseClaim, token);
+        gate.Slots[1].Arm(ECacheHookPoint::AfterPageRetierClaim, source.CacheItem());
+        TCacheHookGuard hookGuard(*fixture.Cache, gate.Hooks);
+        auto cache = fixture.Cache;
+        bool reclaimed = false;
+        TGateThread consumer(gate, [&] {
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazards);
+            NSharedCache::TlsCacheHazards = { &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 0), 1 };
+            Y_DEFER {
+                NSharedCache::TlsCacheHazards = {};
+            };
+            reclaimed = TCacheTestAccess::WithSpace(*cache, [&](TSpaceOperation& op) {
+                return TCacheTestAccess::ReclaimKeepCold(*cache, op);
+            });
+        });
+        gate.Slots[0].Wait();
+        bool demoted = false;
+        TGateThread demoter(gate, [&] {
+            Y_ABORT_UNLESS(!NSharedCache::TlsCacheHazards);
+            NSharedCache::TlsCacheHazards = { &NSharedCache::TCacheThreadTestAccess::Hazard(*cache, 1), 1 };
+            Y_DEFER {
+                NSharedCache::TlsCacheHazards = {};
+            };
+            demoted = TCacheTestAccess::RetierColdToRegular(*cache, token);
+        });
+        gate.Slots[1].Wait();
+        gate.Slots[0].Release();
+        consumer.Join();
+        UNIT_ASSERT(!reclaimed);
+        UNIT_ASSERT(TCacheTestAccess::HandleState(*cache, source.Index()).IsCold());
+        UNIT_ASSERT(TCacheTestAccess::RetirePageResult(*cache, source));
+        const auto state = TCacheTestAccess::HandleState(*cache, source.Index());
+        const bool reusedEarly = state.IsFree();
+        TPageCacheItem replacement;
+        TTestCachePageRef replacementHold;
+        ui32 replacementMembership = 0;
+        const auto replacementKey = TCacheKey::Page(b, 1);
+        if (reusedEarly) {
+            replacement = InsertReadyPage(*cache, replacementKey);
+            UNIT_ASSERT_VALUES_EQUAL(replacement.Index(), source.Index());
+            UNIT_ASSERT(replacement.Version() != source.Version());
+            auto found = FindPage(*cache, replacementKey);
+            replacementHold = std::move(found.Ref);
+            replacementMembership = TCacheTestAccess::ColdVersion(*cache, replacement.Index());
+        } else {
+            UNIT_ASSERT(state.IsTombstone() && state.Refs() != 0);
+        }
+        gate.Slots[1].Release();
+        demoter.Join();
+        UNIT_ASSERT(demoted);
+        if (!reusedEarly) {
+            replacement = InsertReadyPage(*cache, replacementKey);
+            UNIT_ASSERT_VALUES_EQUAL(replacement.Index(), source.Index());
+            auto found = FindPage(*cache, replacementKey);
+            replacementHold = std::move(found.Ref);
+            replacementMembership = TCacheTestAccess::ColdVersion(*cache, replacement.Index());
+        }
+        UNIT_ASSERT_C(TCacheTestAccess::ColdVersion(*cache, replacement.Index()) == replacementMembership,
+            "R5: demotion changed the replacement page's membership generation");
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::CollectionValue(*cache, a.Index())->ReadyPageBytes(), 0);
+    }
+
+    Y_UNIT_TEST(ReviewR7LastColdPublicationDoesNotTouchReusedHandle) {
+        for (auto tier : { ECacheTier::Regular, ECacheTier::Keep }) {
+            TFixture fixture;
+            const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+            ConfigureKeep(*fixture.Cache, 4 * bytes);
+            const auto a = CreateModeCollection(*fixture.Cache, fixture.Registry, TLogoBlobID(121, 122, 134),
+                tier == ECacheTier::Keep ? ECacheMode::TryKeepInMemory : ECacheMode::Regular);
+            const auto b = CreateModeCollection(*fixture.Cache, fixture.Registry, TLogoBlobID(121, 122, 135),
+                tier == ECacheTier::Keep ? ECacheMode::Regular : ECacheMode::TryKeepInMemory);
+            const auto sourceKey = TCacheKey::Page(a, 1);
+            const auto source = InsertReadyPage(*fixture.Cache, sourceKey);
+            UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, source));
+            auto held = TCacheTestAccess::AcquireStructural(*fixture.Cache, source.CacheItem());
+            UNIT_ASSERT(held);
+            auto fillers = HoldReviewFillers(fixture, 63, sourceKey.Hash() & 63);
+
+            struct TContext {
+                TTestCache& Cache;
+                TPageCacheItem Source;
+                TCollectionCacheItem ReplacementCollection;
+                ECacheTier Tier;
+                bool Visited = false;
+                TPageCacheItem Replacement = {};
+                ui32 ReplacementMembership = 0;
+            } context{ *fixture.Cache, source, b, tier };
+
+            TTestTraits hooks{ &context,
+                [](void* ptr, ECacheHookPoint at, TCacheItem item) noexcept {
+                    auto& ctx = *static_cast<TContext*>(ptr);
+                    if (at == ECacheHookPoint::AfterLastColdRefReleased && item == ctx.Source.CacheItem() &&
+                        !ctx.Visited) {
+                        ctx.Visited = true;
+                        Y_ABORT_UNLESS(TCacheTestAccess::WithSpace(ctx.Cache, [&](TSpaceOperation& op) {
+                            return TCacheTestAccess::BindOperation(ctx.Cache, op)
+                                .Eviction()
+                                .EraseCold(MakeColdItem(ctx.Cache, ctx.Source.Index()), ctx.Tier);
+                        }));
+                        ctx.Replacement = InsertReadyPage(ctx.Cache, TCacheKey::Page(ctx.ReplacementCollection, 1));
+                        Y_ABORT_UNLESS(ctx.Replacement.Index() == ctx.Source.Index());
+                        Y_ABORT_UNLESS(TCacheTestAccess::EvictFromHot(ctx.Cache, ctx.Replacement));
+                        ctx.ReplacementMembership = TCacheTestAccess::ColdVersion(ctx.Cache, ctx.Replacement.Index());
+                    }
+                } };
+            TCacheHookGuard guard(*fixture.Cache, hooks);
+            held.Drop();
+            UNIT_ASSERT(context.Visited);
+            UNIT_ASSERT(context.Replacement.Version() != source.Version());
+            const auto state = TCacheTestAccess::HandleState(*fixture.Cache, context.Replacement.Index());
+            UNIT_ASSERT(state.IsColdInTier(tier == ECacheTier::Keep ? ECacheTier::Regular : ECacheTier::Keep));
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::ColdVersion(*fixture.Cache, context.Replacement.Index()),
+                context.ReplacementMembership);
+            UNIT_ASSERT_VALUES_EQUAL(
+                TCacheTestAccess::CollectionValue(*fixture.Cache, b.Index())->ReadyPageBytes(), bytes);
+        }
+    }
+
+    void ReviewColdPromotion(bool reheat) {
+        TFixture fixture;
+        UNIT_ASSERT(fixture.Cache->UpdateSoftLimitOverride(fixture.Cache->HardLimit()));
+        const TLogoBlobID id(141, 142, 143);
+        const auto collection = AllocateCollection(*fixture.Cache, TCacheKey::Collection(id));
+        UNIT_ASSERT(TCacheTestAccess::MakeReady(*fixture.Cache, fixture.Registry, collection, MakeCollection(id)));
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::Regular));
+        const ui64 bytes = 4096 + NActors::TSharedData::OverheadSize;
+        UNIT_ASSERT(fixture.Cache->UpdateKeepLimit(2 * bytes));
+        const auto page = InsertReadyPage(*fixture.Cache, TCacheKey::Page(collection, 1));
+        UNIT_ASSERT(TCacheTestAccess::EvictFromHot(*fixture.Cache, page));
+        UNIT_ASSERT(TCacheTestAccess::HandleState(*fixture.Cache, page.Index()).IsCold());
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 1);
+        const auto coldItem = MakeColdItem(*fixture.Cache, page.Index());
+        auto held = TCacheTestAccess::AcquireStructural(*fixture.Cache, page.CacheItem());
+        UNIT_ASSERT(held);
+        UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::ColdVersion(*fixture.Cache, page.Index()), coldItem.ColdVersion());
+        UNIT_ASSERT(fixture.Cache->SetCollectionPagesCacheMode(collection, ECacheMode::TryKeepInMemory));
+
+        struct TContext {
+            TTestCache& Cache;
+            TCollectionCacheItem Collection;
+            TPageCacheItem Page;
+            bool Reheat;
+            bool Visited = false;
+            bool Reclaimed = false;
+            ui32 RefsDuringPromotion = 0;
+            TTestCachePageRef Reader = {};
+        } context{ *fixture.Cache, collection, page, reheat };
+
+        TTestTraits hooks{ &context,
+            [](void* ptr, ECacheHookPoint at, TCacheItem item) noexcept {
+                auto& ctx = *static_cast<TContext*>(ptr);
+                if (at == ECacheHookPoint::AfterPageRetierClaim && item == ctx.Page.CacheItem() && !ctx.Visited) {
+                    ctx.Visited = true;
+                    ctx.RefsDuringPromotion = TCacheTestAccess::HandleState(ctx.Cache, item.Index()).Refs();
+                    if (ctx.Reheat) {
+                        Y_ABORT_UNLESS(ctx.Cache.Find(ctx.Collection, 1, ctx.Reader) == ECacheResultStatus::Hit);
+                    }
+                    ctx.Reclaimed = TCacheTestAccess::WithSpace(ctx.Cache, [&](TSpaceOperation& op) {
+                        return TCacheTestAccess::ReclaimCold(ctx.Cache, op);
+                    });
+                }
+            } };
+        TCacheHookGuard guard(*fixture.Cache, hooks);
+        held.Drop();
+        UNIT_ASSERT(context.Visited);
+        UNIT_ASSERT_VALUES_EQUAL(context.RefsDuringPromotion, 1);
+        UNIT_ASSERT(!context.Reclaimed);
+        const auto state = TCacheTestAccess::HandleState(*fixture.Cache, page.Index());
+        UNIT_ASSERT_VALUES_EQUAL(state.Version(), page.Version());
+        UNIT_ASSERT_VALUES_EQUAL(state.Refs(), reheat ? 1 : 0);
+        UNIT_ASSERT(reheat ? state.IsHot() : state.IsKeepCold());
+        const ui64 keepBytes = reheat ? 0 : bytes;
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepOwnedBytes(), bytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdBytes(), keepBytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->KeepColdPages(), reheat ? 0 : 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->HotBytes(), reheat ? bytes : 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->HotPages(), reheat ? 1 : 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->RetainedBytes(), reheat ? bytes : 0);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdBytes(), keepBytes);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdPages(), reheat ? 0 : 1);
+        UNIT_ASSERT_VALUES_EQUAL(fixture.Cache->ColdRingEntries(), 0);
+        UNIT_ASSERT_VALUES_EQUAL(
+            TCacheTestAccess::CollectionValue(*fixture.Cache, collection.Index())->ReadyPageBytes(), bytes);
+        if (!reheat) {
+            UNIT_ASSERT_VALUES_EQUAL(TCacheTestAccess::ColdEntries(*fixture.Cache, ECacheTier::Keep), 1);
+        }
+    }
+
+    Y_UNIT_TEST(ReviewR8PromotionPinsPageAgainstOldColdToken) {
+        ReviewColdPromotion(false);
+    }
+
+    Y_UNIT_TEST(ReviewR8ReheatOvertakesPromotionAccounting) {
+        ReviewColdPromotion(true);
+    }
+
+}
+
+} // namespace NKikimr::NSharedCache
