@@ -11,6 +11,8 @@ ENDIF()
 
 SRCS(
     b_part.cpp
+    b_cache.cpp
+    b_transaction.cpp
 )
 
 PEERDIR(
