@@ -28,6 +28,20 @@ TPageCacheCounters::TPageCacheCounters(const TIntrusivePtr<::NMonitoring::TDynam
     , EvictedBytes(counters->GetCounter("EvictedBytes", true))
 {}
 
+TCacheCounters::TCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters)
+    : TPageCacheCounters(counters)
+    // page collection counters:
+    , PageCollections(counters->GetCounter("PageCollections"))
+    , BufferBytes(counters->GetCounter("BufferBytes"))
+    , MetadataBytes(counters->GetCounter("MetadataBytes"))
+    , Owners(counters->GetCounter("Owners"))
+    , PageCollectionOwners(counters->GetCounter("PageCollectionOwners"))
+    // request counters:
+    , PendingRequests(counters->GetCounter("PendingRequests"))
+    , SucceedRequests(counters->GetCounter("SucceedRequests", true))
+    , FailedRequests(counters->GetCounter("FailedRequests", true))
+{}
+
 TSharedPageCacheCounters::TSharedPageCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters)
     : TPageCacheCounters(counters)
     , S3FIFOEvictOps(counters->GetCounter("S3FIFOEvictOps", true))

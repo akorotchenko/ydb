@@ -37,6 +37,22 @@ protected:
     explicit TPageCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters);
 };
 
+struct TCacheCounters final : public TAtomicRefCount<TCacheCounters>, public TPageCacheCounters {
+    // page collection counters:
+    const TCounterPtr PageCollections;
+    const TCounterPtr BufferBytes;
+    const TCounterPtr MetadataBytes;
+    const TCounterPtr Owners;
+    const TCounterPtr PageCollectionOwners;
+
+    // request counters:
+    const TCounterPtr PendingRequests;
+    const TCounterPtr SucceedRequests;
+    const TCounterPtr FailedRequests;
+
+    explicit TCacheCounters(const TIntrusivePtr<::NMonitoring::TDynamicCounters>& counters);
+};
+
 struct TSharedPageCacheCounters final : public TAtomicRefCount<TSharedPageCacheCounters>, public TPageCacheCounters {
     using TReplacementPolicy = NKikimrSharedCache::TReplacementPolicy;
 
