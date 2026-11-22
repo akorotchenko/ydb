@@ -332,7 +332,7 @@ void TExecutorBootLogic::SeenBlob(const TLogoBlobID& id) {
 
 TExecutorBootLogic::EOpResult TExecutorBootLogic::Receive(::NActors::IEventHandle &ev)
 {
-    if (PageCache.EventKind(ev.GetTypeRewrite()) == EPageCacheEvent::Ready) {
+    if (PageCache.Protocol().EventKind(ev.GetTypeRewrite()) == EPageCacheEvent::Ready) {
         if (MetadataCancelled || ev.Cookie != BootAttempt || !PageCacheWaiter) {
             return OpResultUnhandled;
         }
@@ -369,12 +369,12 @@ TExecutorBootLogic::EOpResult TExecutorBootLogic::Receive(::NActors::IEventHandl
         }
         load.Step.Drop();
         Steps->Execute();
-    } else if (PageCache.EventKind(ev.GetTypeRewrite()) == EPageCacheEvent::Result) {
+    } else if (PageCache.Protocol().EventKind(ev.GetTypeRewrite()) == EPageCacheEvent::Result) {
         if (ERequestTypeCookie(ev.Cookie) != ERequestTypeCookie::BootLogic)
             return OpResultUnhandled;
 
         auto& event = *ev.GetBase();
-        const auto msg = PageCache.ReadResult(event);
+        const auto msg = PageCache.Protocol().ReadResult(event);
         if (msg.Cookie != BootAttempt)
             return OpResultUnhandled;
 

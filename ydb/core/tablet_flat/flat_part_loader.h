@@ -7,6 +7,7 @@
 #include "util_fmt_abort.h"
 #include <ydb/core/tablet_flat/protos/flat_table_part.pb.h>
 #include <ydb/core/util/pb.h>
+#include <util/generic/bitmap.h>
 #include <util/generic/hash.h>
 #include <util/generic/hash_set.h>
 #include <util/stream/mem.h>
@@ -567,7 +568,7 @@ namespace NTable {
         TRowVersion MinRowVersion;
         TRowVersion MaxRowVersion;
         TPartLayout PartLayout;
-        TVector<NPage::TGroupId> StrippedV1Shadows; // groups with a stripped V1 shadow of the V2 b-tree index
+        TDynBitMap StrippedV1ShadowSlots;
         NProto::TRoot Root;
         TPartView PartView;
         THolder<IEnv> LoaderEnv;

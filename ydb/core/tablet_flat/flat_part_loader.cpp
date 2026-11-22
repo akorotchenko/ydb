@@ -68,11 +68,7 @@ void TLoader::ApplyIndexSelection()
         if (!LoaderEnv->HasCollection(slot)) {
             continue;
         }
-        bool skip = false;
-        for (auto groupId : StrippedV1Shadows) {
-            skip |= slots.IndexSlot(groupId) == slot;
-        }
-        LoaderEnv->SetSkipBTreeIndexV1Shadow(slot, skip);
+        LoaderEnv->SetSkipBTreeIndexV1Shadow(slot, StrippedV1ShadowSlots.Get(slot));
     }
 }
 
@@ -81,6 +77,8 @@ void TLoader::PrepareRoot()
     if (Stage != EStage::Root) {
         return;
     }
+
+    StrippedV1ShadowSlots.Clear();
 
     if (LoaderEnv->GetCollectionCount() < Components.PageCollectionComponents.size()) {
         LoaderEnv->ResizeCollections(Components.PageCollectionComponents.size());
@@ -210,11 +208,15 @@ void TLoader::PrepareRoot()
             } else {
                 // For dual-root (V2+V1) parts, strip V1 tree and mark the index
                 // page collection so the shared cache skips dead V1 BTreeIndex pages.
+                const auto slots = GetSlots();
                 forEachIndexMeta([&](auto& meta, NPage::TGroupId groupId) {
                     if (meta.HasRootV2() && meta.HasRootV1()) {
                         meta.RootV1 = Max<TPageId>();
                         meta.LevelCountV1 = Max<ui32>();
-                        StrippedV1Shadows.push_back(groupId);
+                        const ui32 slot = slots.IndexSlot(groupId);
+                        if (slot < slots.SlotsCount()) {
+                            StrippedV1ShadowSlots.Set(slot);
+                        }
                     }
                 });
             }

@@ -243,25 +243,6 @@ public:
         NTable::TLoader& loader, const NTable::TMetadataLoadContext& context, bool frontStep) const;
     virtual const IPageCacheProtocol& Protocol() const noexcept = 0;
 
-    EPageCacheEvent EventKind(ui32 eventType) const noexcept {
-        return Protocol().EventKind(eventType);
-    }
-
-    TPageCacheResult ReadResult(NActors::IEventBase& event) const {
-        return Protocol().ReadResult(event);
-    }
-
-    THolder<NActors::IEventBase> MakePageRequest(NBlockIO::EPriority priority,
-        TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
-        TVector<NTable::NPage::TPageLocation> locations, ui64 cookie = 0) const {
-        return Protocol().MakePageRequest(priority, std::move(collection), std::move(locations), cookie);
-    }
-
-    THolder<NActors::IEventBase> MakeCollectionUpdate(TIntrusiveConstPtr<NPageCollection::IPageCollection> collection,
-        NTable::NPage::ECacheMode mode, TVector<NPageCollection::TBtreeSeed> btreeSeeds = {}) const {
-        return Protocol().MakeCollectionUpdate(std::move(collection), mode, std::move(btreeSeeds));
-    }
-
     THolder<NActors::IEventBase> MakeUnregisterRequest() const {
         return Protocol().MakeUnregisterRequest();
     }
