@@ -7,6 +7,8 @@
 #include <util/generic/ptr.h>
 #include <util/generic/vector.h>
 
+#include <type_traits>
+
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::FLAT_TX_SCHEMESHARD
 
 namespace NKikimr {
@@ -31,6 +33,16 @@ protected:
     void Send(const TActorId& recipient, THolder<TEvent> ev, ui32 flags = 0, ui64 cookie = 0) {
         return Send(recipient, static_cast<IEventBase*>(ev.Release()), flags, cookie);
     }
+
+    void StopImportChecksum(ui64 operationId) {
+        if (auto event = Self->ImportChecksum.StopOperation(operationId, Self->SelfId())) {
+            SendOnComplete.emplace_back(std::move(event));
+        }
+    }
+
+    void CancelImportChecksumItem(NIceDb::TNiceDb& db, TImportInfo& info, ui32 itemIdx, TStringBuf issue = {});
+    void StopImportChecksums(NIceDb::TNiceDb& db, TImportInfo& info);
+    void TryFinishImportCancellation(NIceDb::TNiceDb& db, const TImportInfo::TPtr& info);
 
     TPathId DomainPathId(const TString& dbName) const {
         const TPath domainPath = TPath::Resolve(dbName, Self);
@@ -57,6 +69,11 @@ protected:
 
     template <typename TInfoPtr>
     void SendNotificationsIfFinished(TInfoPtr info, bool force = false) {
+        if constexpr (std::is_same_v<TInfoPtr, TImportInfo::TPtr>) {
+            if (info->IsFinished()) {
+                StopImportChecksum(info->Id);
+            }
+        }
         if (!info->IsFinished() && !force) {
             return;
         }

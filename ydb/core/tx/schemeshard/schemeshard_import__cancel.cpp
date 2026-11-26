@@ -7,6 +7,7 @@
 #include <ydb/public/api/protos/ydb_issue_message.pb.h>
 #include <ydb/public/api/protos/ydb_status_codes.pb.h>
 
+#include <util/generic/algorithm.h>
 #include <util/generic/ptr.h>
 #include <util/generic/xrange.h>
 
@@ -14,6 +15,46 @@ namespace NKikimr {
 namespace NSchemeShard {
 
 using namespace NTabletFlatExecutor;
+
+void TSchemeShard::TXxport::TTxBase::CancelImportChecksumItem(
+    NIceDb::TNiceDb& db, TImportInfo& info, ui32 itemIdx, TStringBuf issue)
+{
+    auto& item = info.Items.at(itemIdx);
+    item.ChecksumState = TImportInfo::TItem::EChecksumState::None;
+    item.State = TImportInfo::EState::Cancelled;
+    item.WaitTxId = InvalidTxId;
+    if (issue) {
+        item.Issue = issue;
+    }
+    Self->PersistImportItemState(db, info, itemIdx);
+}
+
+void TSchemeShard::TXxport::TTxBase::StopImportChecksums(NIceDb::TNiceDb& db, TImportInfo& info) {
+    for (ui32 i : xrange(info.Items.size())) {
+        if (info.Items[i].ChecksumState != TImportInfo::TItem::EChecksumState::None) {
+            CancelImportChecksumItem(db, info, i);
+        }
+    }
+    StopImportChecksum(info.Id);
+}
+
+void TSchemeShard::TXxport::TTxBase::TryFinishImportCancellation(NIceDb::TNiceDb& db, const TImportInfo::TPtr& info) {
+    using EState = TImportInfo::EState;
+    using ESubState = TImportInfo::TItem::ESubState;
+    if (info->State != EState::Cancellation || AnyOf(info->Items, [](const auto& item) {
+            return (item.State == EState::Transferring || item.State == EState::BuildIndexes) &&
+                   (item.WaitTxId != InvalidTxId || item.SubState == ESubState::Proposed);
+        })) {
+        return;
+    }
+
+    info->State = EState::Cancelled;
+    info->EndTime = TAppData::TimeProvider->Now();
+    Self->PersistImportState(db, *info);
+    Self->EraseEncryptionKey(db, *info);
+    SendNotificationsIfFinished(info);
+    AuditLogImportEnd(*info.Get(), Self);
+}
 
 struct TSchemeShard::TImport::TTxCancel: public TSchemeShard::TXxport::TTxBase {
     TEvImport::TEvCancelImportRequest::TPtr Request;
@@ -57,7 +98,8 @@ struct TSchemeShard::TImport::TTxCancel: public TSchemeShard::TXxport::TTxBase {
                 Send(schemaMappingGetter, new TEvents::TEvPoisonPill());
                 Self->RunningImportSchemeGetters.erase(schemaMappingGetter);
             }
-            for (auto& item : importInfo->Items) {
+            for (ui32 idx = 0; idx < importInfo->Items.size(); ++idx) {
+                auto& item = importInfo->Items[idx];
                 if (auto schemeGetter = std::exchange(item.SchemeGetter, {})) {
                     Send(schemeGetter, new TEvents::TEvPoisonPill());
                     Self->RunningImportSchemeGetters.erase(schemeGetter);
@@ -83,6 +125,7 @@ struct TSchemeShard::TImport::TTxCancel: public TSchemeShard::TXxport::TTxBase {
         case TImportInfo::EState::Cancellation:
             importInfo->Issue = "Cancelled manually";
             importInfo->State = TImportInfo::EState::Cancelled;
+            StopImportChecksums(db, *importInfo);
 
             for (ui32 itemIdx : xrange(importInfo->Items.size())) {
                 const auto& item = importInfo->Items.at(itemIdx);
@@ -174,54 +217,17 @@ struct TSchemeShard::TImport::TTxCancelAck: public TSchemeShard::TXxport::TTxBas
             return true;
         }
 
-        bool found = false;
-        ui32 itemIdx;
-        ui32 cancelledItems = 0;
-        ui32 cancellableItems = 0;
-
         for (ui32 i : xrange(importInfo->Items.size())) {
             auto& item = importInfo->Items.at(i);
 
-            if (item.State != TImportInfo::EState::Transferring && item.State != TImportInfo::EState::BuildIndexes) {
-                continue;
-            }
-
-            if (item.WaitTxId != InvalidTxId) {
-                ++cancellableItems;
-            }
-
-            if (item.WaitTxId == TxId) {
-                found = true;
-
+            if ((item.State == TImportInfo::EState::Transferring || item.State == TImportInfo::EState::BuildIndexes) &&
+                item.WaitTxId == TxId && item.ChecksumState == TImportInfo::TItem::EChecksumState::None) {
                 item.State = TImportInfo::EState::Cancelled;
-                itemIdx = i;
+                Self->TxIdToImport.erase(TxId);
+                Self->PersistImportItemState(db, *importInfo, i);
+                TryFinishImportCancellation(db, importInfo);
+                break;
             }
-
-            if (item.State == TImportInfo::EState::Cancelled) {
-                ++cancelledItems;
-            }
-        }
-
-        if (!found) {
-            return true;
-        }
-
-        Self->TxIdToImport.erase(TxId);
-        Self->PersistImportItemState(db, *importInfo, itemIdx);
-
-        if (cancelledItems != cancellableItems) {
-            return true;
-        }
-
-        importInfo->State = TImportInfo::EState::Cancelled;
-        importInfo->EndTime = TAppData::TimeProvider->Now();
-        Self->PersistImportState(db, *importInfo);
-        Self->EraseEncryptionKey(db, *importInfo);
-
-        SendNotificationsIfFinished(importInfo);
-
-        if (importInfo->IsFinished()) {
-            AuditLogImportEnd(*importInfo.Get(), Self);
         }
 
         return true;
