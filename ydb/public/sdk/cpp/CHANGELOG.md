@@ -1,5 +1,7 @@
 ## v3.28.0
 
+* Added `SkipTableChecksumValidation()` to S3 and filesystem import settings to skip table checksum validation independently of file checksum validation.
+
 * Fixed endpoint pessimization percentages so unhealthy endpoint pools trigger discovery correctly, including pools with more than 100 endpoints.
 
 * Added draft `TTabletClient::ReassignTablets()` and `TReassignTabletsOperation`, with progress available through `TOperationClient::Get()`.
