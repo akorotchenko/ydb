@@ -2609,8 +2609,8 @@ private:
                 const auto& checksum = item.Metadata.GetTableChecksum();
                 const bool checkTableChecksum =
                     importInfo->ShouldValidateTableChecksum() && item.ParentIdx == Max<ui32>() && checksum.has_value();
+                TString error;
                 if (checkTableChecksum) {
-                    TString error;
                     if (checksum->Error) {
                         error = "exported checksum unavailable: " + checksum->ToString();
                     } else if (item.ChecksumState == EChecksumState::Interrupted) {
@@ -2625,15 +2625,16 @@ private:
                     } else {
                         error = "import checksum actor unavailable";
                     }
-                    item.WaitTxId = InvalidTxId;
-                    return CancelAndPersist(db, importInfo, itemIdx,
-                        TStringBuilder() << item.DstPathName << ": table checksum validation failed: " << error,
-                        "checksum validation failed", true);
                 }
                 if (const auto actor = Self->ImportChecksum.GetActor()) {
                     Send(actor, new NBackup::TEvTableChecksum::TEvFinishItem(importInfo->Id, itemIdx));
                 }
                 item.WaitTxId = InvalidTxId;
+                if (error) {
+                    return CancelAndPersist(db, importInfo, itemIdx,
+                        TStringBuilder() << item.DstPathName << ": table checksum validation failed: " << error,
+                        "checksum validation failed", true);
+                }
                 ContinueAfterData(*importInfo, itemIdx);
             }
             break;
