@@ -3,7 +3,7 @@ import json
 import os
 import time
 from threading import Thread
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 import boto3
@@ -253,20 +253,27 @@ class MixedTableChecksumCompatibilityBase(TableChecksumCompatibilityBase):
             self._hive_request(page="TabletAvailability", node=node.node_id, **params)
         for tablet in sorted(tablets):
             self._move_tablet(tablet, target)
-        self._wait_datashards(target, len(tablets), set(tablets))
+        if tablets:
+            self._wait_datashards(target, set(tablets))
 
-    def _wait_datashards(self, target, count, tablets=None):
+    def _table_shards(self, path, *, private=False):
+        request = SchemeDescribeRequest(path).with_partition_info().protobuf
+        if private:
+            request.Options.ShowPrivateTable = True
+        description = self.cluster.client.send(request, "SchemeDescribe")
+        tablets = {int(partition.DatashardId) for partition in description.PathDescription.TablePartitions}
+        assert tablets, description
+        return tablets
+
+    def _wait_datashards(self, target, tablets):
         deadline = time.monotonic() + OPERATION_TIMEOUT_SECONDS
+        placements = {}
         while time.monotonic() < deadline:
-            placements = self._datashards()
-            if (
-                len(placements) == count
-                and set(placements.values()) <= {target.node_id}
-                and (tablets is None or set(placements) == tablets)
-            ):
-                return placements
+            placements = {tablet: node for tablet, node in self._datashards().items() if tablet in tablets}
+            if set(placements) == tablets and all(node == target.node_id for node in placements.values()):
+                return
             time.sleep(0.2)
-        pytest.fail(f"DataShard placement did not settle: {placements}")
+        pytest.fail(f"Expected DataShards {sorted(tablets)} on node {target.node_id}, observed {placements}")
 
     def _datashards(self):
         node = self.cluster.nodes[1]
@@ -284,12 +291,7 @@ class TestMixedBinaryTableChecksumMetadata(MixedTableChecksumCompatibilityBase):
         worker = next(node for node in self.cluster.nodes.values() if node.binary_path == self.source_binary)
         self._place_datashards(worker)
         self._check_current_backup_import()
-        description = self.cluster.client.send(
-            SchemeDescribeRequest("/Root/FromCurrent").with_partition_info().protobuf, "SchemeDescribe"
-        )
-        tablets = {partition.DatashardId for partition in description.PathDescription.TablePartitions}
-        assert tablets, description
-        self._wait_datashards(worker, len(tablets), tablets)
+        self._wait_datashards(worker, self._table_shards("/Root/FromCurrent"))
 
         self._create_table(self.driver, "/Root/MixedSource")
         self._export(self.driver, "/Root/MixedSource", "mixed")
@@ -299,6 +301,23 @@ class TestMixedBinaryTableChecksumMetadata(MixedTableChecksumCompatibilityBase):
             assert checksum == self.current_checksum
         self._import("mixed", "/Root/FromMixed")
         assert self._metadata("mixed") == metadata
+
+
+class TestCurrentSchemeShardWithLegacyDataShards(MixedTableChecksumCompatibilityBase):
+    scheme_shard_node = 2
+
+    def test_import_rejects_unconfirmed_restore_version(self):
+        self._enable_current_nodes()
+        assert self.cluster.nodes[self.scheme_shard_node].binary_path == self.source_binary
+        worker = next(node for node in self.cluster.nodes.values() if node.binary_path != self.source_binary)
+        self._place_datashards(worker)
+
+        destination = "/Root/FromCurrent"
+        with pytest.raises(ydb.issues.Cancelled, match="restore shards did not confirm the planned write version"):
+            self._import("current", destination)
+
+        self._wait_datashards(worker, self._table_shards(destination))
+        self._assert_rows(self.driver, destination)
 
 
 class TestSchemeShardChecksumDowngrade(MixedTableChecksumCompatibilityBase):
@@ -318,8 +337,11 @@ class TestSchemeShardChecksumDowngrade(MixedTableChecksumCompatibilityBase):
         )
         # Both source shards and newly allocated copy shards initially run the old binary.
         self._place_datashards(old_data)
-        self._create_table(self.driver, "/Root/DowngradeSource")
-        source_shards = self._wait_datashards(old_data, 3)
+        source = "/Root/DowngradeSource"
+        self._create_table(self.driver, source)
+        source_shards = self._table_shards(source)
+        assert len(source_shards) == 3
+        self._wait_datashards(old_data, source_shards)
 
         with PortManager() as ports:
             port = ports.get_port()
@@ -332,12 +354,15 @@ class TestSchemeShardChecksumDowngrade(MixedTableChecksumCompatibilityBase):
                         self._s3_settings(ExportToS3Settings)
                         .with_endpoint(f"127.0.0.1:{port}")
                         .with_number_of_retries(100)
-                        .with_source_and_destination("/Root/DowngradeSource", "downgraded")
+                        .with_source_and_destination(source, "downgraded")
                     )
                     operation = client.export_to_s3(settings)
                     assert proxy.connected.wait(OPERATION_TIMEOUT_SECONDS), "Export did not reach its uploader"
-                    shards = self._wait_datashards(old_data, 6)
-                    assert len(set(shards) - set(source_shards)) == 3, shards
+                    export_id = int(parse_qs(urlsplit(operation.id).query)["id"][0])
+                    copy_shards = self._table_shards(f"/Root/export-{export_id}/0", private=True)
+                    assert len(copy_shards) == 3 and copy_shards.isdisjoint(source_shards)
+                    shards = source_shards | copy_shards
+                    self._wait_datashards(old_data, shards)
                     operation = client.get_export_to_s3_operation(
                         operation.id, settings=ydb.BaseRequestSettings().with_timeout(RPC_TIMEOUT_SECONDS)
                     )
