@@ -3,6 +3,7 @@ LIBRARY()
 PEERDIR(
     library/cpp/http/fetch
     library/cpp/testing/unittest
+    ydb/core/backup/query
     ydb/core/base
     ydb/core/blockstore/core
     ydb/core/cms/console
@@ -32,6 +33,7 @@ PEERDIR(
 )
 
 SRCS(
+    backup_test_fixture.h
     export_reboots_common.cpp
     failing_mtpq.cpp
     helpers.cpp
@@ -46,6 +48,7 @@ SRCS(
     schemeshard_counters.cpp
     schemeshard_counters.h
     shred_helpers.cpp
+    table_checksum_helpers.h
     test_env.cpp
     test_env.h
     test_incremental_restore.h
