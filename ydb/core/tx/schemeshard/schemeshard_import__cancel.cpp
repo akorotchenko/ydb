@@ -22,6 +22,10 @@ void TSchemeShard::TXxport::TTxBase::CancelImportChecksumItem(
     auto& item = info.Items.at(itemIdx);
     item.ChecksumState = TImportInfo::TItem::EChecksumState::None;
     item.State = TImportInfo::EState::Cancelled;
+    const auto route = Self->TxIdToImport.find(item.WaitTxId);
+    if (route != Self->TxIdToImport.end() && route->second == std::pair{ info.Id, itemIdx }) {
+        Self->TxIdToImport.erase(route);
+    }
     item.WaitTxId = InvalidTxId;
     if (issue) {
         item.Issue = issue;
