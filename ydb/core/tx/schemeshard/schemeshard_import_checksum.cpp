@@ -31,7 +31,8 @@ THolder<IEventHandle> TImportChecksum::StopOperation(ui64 operationId, TActorId 
 }
 
 void TImportChecksum::OnIdle(
-    const NBackup::TEvTableChecksum::TEvImportChecksumIdle::TPtr& ev, const TActorContext& ctx) {
+    const NBackup::TEvTableChecksum::TEvImportChecksumIdle::TPtr& ev, const TActorContext& ctx)
+{
     if (ev->Sender == Actor && ev->Cookie == IdleCookie && Operations.empty()) {
         ctx.Send(std::exchange(Actor, {}), new TEvents::TEvPoisonPill());
     }
@@ -92,7 +93,8 @@ void TSchemeShard::PrepareImportChecksum(
 }
 
 NBackup::TEvTableChecksum::TItem TSchemeShard::MakeImportChecksumItem(
-    const TImportInfo& info, ui32 itemIdx, TRowVersion snapshot) {
+    const TImportInfo& info, ui32 itemIdx, TRowVersion snapshot)
+{
     const auto& item = info.Items.at(itemIdx);
     return {
         .OperationId = info.Id,

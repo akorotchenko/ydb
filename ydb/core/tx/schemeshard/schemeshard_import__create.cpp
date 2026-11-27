@@ -716,7 +716,8 @@ private:
     }
 
     void StartChecksumValidation(
-        TImportInfo& info, ui32 itemIdx, NIceDb::TNiceDb& db, TActorId actor, const TRowVersion& snapshot) {
+        TImportInfo& info, ui32 itemIdx, NIceDb::TNiceDb& db, TActorId actor, const TRowVersion& snapshot)
+    {
         auto& item = info.Items.at(itemIdx);
         item.ChecksumState = EChecksumState::Validating;
         Self->PersistImportChecksumStarted(db, info, itemIdx);
@@ -1442,7 +1443,8 @@ private:
     }
 
     void Cancel(
-        NIceDb::TNiceDb& db, TImportInfo& importInfo, ui32 itemIdx, TStringBuf marker, bool drainChecksums = false) {
+        NIceDb::TNiceDb& db, TImportInfo& importInfo, ui32 itemIdx, TStringBuf marker, bool drainChecksums = false)
+    {
         const TItem* item = nullptr;
         if (itemIdx != ui32(-1)) {
             Y_ABORT_UNLESS(itemIdx < importInfo.Items.size());
@@ -2688,7 +2690,8 @@ private:
     }
 
     void PersistImportProgressAndNotify(
-        const TImportInfo::TPtr& importInfo, ui32 itemIdx, NIceDb::TNiceDb& db, const TActorContext& ctx) {
+        const TImportInfo::TPtr& importInfo, ui32 itemIdx, NIceDb::TNiceDb& db, const TActorContext& ctx)
+    {
         if (importInfo->Items.at(itemIdx).State == EState::Done) {
             // The base table is marked as imported only when all its impl tables are imported.
             KickParentFinalize(*importInfo, itemIdx);
